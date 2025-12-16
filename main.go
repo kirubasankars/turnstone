@@ -14,7 +14,7 @@ func main() {
 	port := flag.String("port", DefaultPort, "Port")
 	dir := flag.String("dir", DefaultDataDir, "Data dir")
 	debugEnv := flag.Bool("debug", false, "Debug logs")
-	maxConns := flag.Int("max-conns", 10000, "Max connections")
+	maxConns := flag.Int("max-conns", 500, "Max connections")
 	truncate := flag.Bool("truncate", false, "Repair corrupt file")
 	skipCrc := flag.Bool("skip-crc", false, "Faster reads (unsafe)")
 

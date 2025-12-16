@@ -56,7 +56,7 @@ type Store struct {
 }
 
 func NewStore(dataDir string, logger *slog.Logger, allowTruncate bool, skipCrc bool, useFsync bool, fsyncInterval time.Duration) (*Store, error) {
-	if err := os.MkdirAll(dataDir, 0755); err != nil {
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		return nil, fmt.Errorf("failed to init data dir: %w", err)
 	}
 
@@ -70,9 +70,9 @@ func NewStore(dataDir string, logger *slog.Logger, allowTruncate bool, skipCrc b
 	}
 
 	boltOpts := &bbolt.Options{Timeout: 1 * time.Second, NoSync: !useFsync}
-	boltDB, err := bbolt.Open(boltPath, 0600, boltOpts)
+	boltDB, err := bbolt.Open(boltPath, 0o600, boltOpts)
 	if err != nil {
-		journal.Close()
+		_ = journal.Close()
 		return nil, fmt.Errorf("failed to open bolt: %w", err)
 	}
 
@@ -98,8 +98,8 @@ func NewStore(dataDir string, logger *slog.Logger, allowTruncate bool, skipCrc b
 	}
 
 	if err := s.recover(); err != nil {
-		boltDB.Close()
-		journal.Close()
+		_ = boltDB.Close()
+		_ = journal.Close()
 		return nil, fmt.Errorf("recovery failed: %w", err)
 	}
 
@@ -184,7 +184,7 @@ func (s *Store) recover() error {
 	header := make([]byte, HeaderSize)
 	payloadBuf := make([]byte, 4096)
 
-	var validOffset int64 = startOffset
+	validOffset := startOffset
 	count := 0
 	startTime := time.Now()
 
@@ -285,7 +285,9 @@ func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.bolt != nil {
-		s.bolt.Close()
+		if err := s.bolt.Close(); err != nil {
+			return err
+		}
 	}
 	if s.journal != nil {
 		return s.journal.Close()
@@ -299,6 +301,15 @@ func (s *Store) flushJournal(pending []*request, batchBuf *bytes.Buffer) {
 	}
 	if err := s.flushBatch(pending, batchBuf); err != nil {
 		s.logger.Error("Journal Flush failed", "err", err)
+		// FIX: Propagate the flush error to all pending requests.
+		// This ensures that clients waiting in ApplyBatch are notified of the failure
+		// instead of timing out.
+		for _, req := range pending {
+			select {
+			case req.resp <- err:
+			default:
+			}
+		}
 	}
 	for _, req := range pending {
 		if !req.cancelled.Load() {
@@ -376,6 +387,7 @@ func (s *Store) runLoop() {
 				atomic.AddInt64(&s.pendingWriteBytes, -req.batchSize)
 				continue
 			}
+
 			if !s.validateBatch(req) {
 				atomic.AddInt64(&s.pendingWriteBytes, -req.batchSize)
 				continue
@@ -704,7 +716,6 @@ func (s *Store) Get(key string, readVersion int64, generation uint64) ([]byte, e
 		return nil, fmt.Errorf("read payload error: %w", err)
 	}
 	if !s.skipCrc {
-		// Use Castagnoli Table
 		if crc32.Checksum(*bufPtr, CrcTable) != binary.BigEndian.Uint32(header[8:12]) {
 			return nil, ErrCrcMismatch
 		}
@@ -807,7 +818,7 @@ func (s *Store) reopen() error {
 	s.journal = j
 
 	boltOpts := &bbolt.Options{Timeout: 1 * time.Second, NoSync: !s.useFsync}
-	b, err := bbolt.Open(boltPath, 0600, boltOpts)
+	b, err := bbolt.Open(boltPath, 0o600, boltOpts)
 	if err != nil {
 		return err
 	}
@@ -816,4 +827,3 @@ func (s *Store) reopen() error {
 
 	return nil
 }
-
