@@ -1,0 +1,96 @@
+package main
+
+import (
+	"errors"
+	"hash/crc32"
+	"time"
+)
+
+const (
+	// Network & Protocol defaults
+	DefaultPort         = ":6379"          // server port
+	DefaultReadTimeout  = 5 * time.Second  // network read timeout, affects slow client/network
+	DefaultWriteTimeout = 5 * time.Second  // network write timeout, affects slow client/network
+	IdleTimeout         = 60 * time.Second // idle timeout, affects inactive clients
+	ShutdownTimeout     = 10 * time.Second // when server stopped, wait for graceful shutdown
+
+	// Transaction Limits
+	MaxTxDuration = 20 * time.Second // max transaction life time
+	MaxTxOps      = 10000            // max number of operations in a transaction
+
+	// Storage Paths & Names
+	DefaultDataDir = "data"
+	DefaultDBName  = "data.db"
+	BoltDBName     = "index.db"
+	BoltBucketData = "index"
+	BoltBucketMeta = "meta"
+	KeyLastOffset  = "last_offset"
+
+	// Limits & Safety
+	MaxKeySize           = 1 * 1024
+	MaxValueSize         = 4 * 1024
+	MaxCommandSize       = 64 * 1024
+	MaxPooledBuffer      = 1 * 1024 * 1024
+	MaxPendingWriteBytes = 128 * 1024 * 1024
+	MaxMemoryLimit       = 1024 * 1024 * 1024
+
+	// Storage Format (Journal)
+	FileHeaderSize = 8  // New: Fixed size for the Generation Header
+	HeaderSize     = 12 // Entry Header (KeyLen + ValLen + CRC)
+	Tombstone      = ^uint32(0)
+
+	// Internal Op Types (Journal)
+	OpJournalSet    = 1
+	OpJournalDelete = 2
+	OpJournalGet    = 3
+
+	// Tuning Parameters
+	BatchDelay                 = 10 * time.Millisecond
+	MaxBatchSize               = 2000
+	FlushInterval              = 1 * time.Second
+	DefaultCompactionThreshold = 10 * 1024 * 1024
+)
+
+// Standard Errors
+var (
+	ErrKeyNotFound          = errors.New("key does not exist")
+	ErrCrcMismatch          = errors.New("crc checksum mismatch")
+	ErrClosed               = errors.New("store closed")
+	ErrCommandTooLarge      = errors.New("command line too large")
+	ErrConflict             = errors.New("transaction conflict")
+	ErrBusy                 = errors.New("server busy")
+	ErrTransactionTimeout   = errors.New("transaction timeout")
+	ErrCompactionInProgress = errors.New("compaction already in progress")
+)
+
+// Request OpCodes
+const (
+	OpCodePing    = 0x01
+	OpCodeGet     = 0x02
+	OpCodeSet     = 0x03
+	OpCodeDel     = 0x04
+	OpCodeBegin   = 0x10
+	OpCodeCommit  = 0x11
+	OpCodeAbort   = 0x12
+	OpCodeStat    = 0x20
+	OpCodeCompact = 0x21
+	OpCodeQuit    = 0xFF
+)
+
+// Response Status Codes
+const (
+	ResStatusOK             = 0x00
+	ResStatusErr            = 0x01
+	ResStatusNotFound       = 0x02
+	ResStatusTxRequired     = 0x03
+	ResStatusTxTimeout      = 0x04
+	ResStatusTxConflict     = 0x05
+	ResStatusServerBusy     = 0x06
+	ResStatusEntityTooLarge = 0x07
+)
+
+// Fixed Header Size: 1 byte OpCode + 4 bytes Length
+const ProtoHeaderSize = 5
+
+// Optimization: Use Castagnoli Table for hardware acceleration (SSE4.2)
+var CrcTable = crc32.MakeTable(crc32.Castagnoli)
