@@ -10,7 +10,7 @@ import (
 
 func setupTestStore(t *testing.T) (*Store, func()) {
 	t.Helper()
-	dir, err := os.MkdirTemp("", "turnstonedb-test")
+	dir, err := os.MkdirTemp("", "turnstone-test")
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
@@ -23,8 +23,8 @@ func setupTestStore(t *testing.T) (*Store, func()) {
 	}
 
 	cleanup := func() {
-		store.Close()
-		os.RemoveAll(dir)
+		_ = store.Close()
+		_ = os.RemoveAll(dir)
 	}
 
 	return store, cleanup
@@ -34,22 +34,18 @@ func TestStore_GetSet(t *testing.T) {
 	store, cleanup := setupTestStore(t)
 	defer cleanup()
 
-	// Begin a transaction
 	readVersion, generation := store.AcquireSnapshot()
 
-	// Set a value
 	ops := []bufferedOp{
 		{opType: OpJournalSet, key: "hello", val: []byte("world")},
 	}
-	err := store.ApplyBatch(ops, nil, readVersion, generation)
+	err := store.ApplyBatch(ops, readVersion, generation)
 	if err != nil {
 		t.Fatalf("ApplyBatch failed: %v", err)
 	}
 
-	// Commit the transaction
 	store.ReleaseSnapshot(readVersion)
 
-	// Begin a new transaction to get the value
 	readVersion2, generation2 := store.AcquireSnapshot()
 	defer store.ReleaseSnapshot(readVersion2)
 
@@ -68,22 +64,18 @@ func TestStore_GetSetDelete(t *testing.T) {
 	store, cleanup := setupTestStore(t)
 	defer cleanup()
 
-	// Begin a transaction
 	readVersion, generation := store.AcquireSnapshot()
 
-	// Set a value
 	ops := []bufferedOp{
 		{opType: OpJournalSet, key: "hello", val: []byte("world")},
 	}
-	err := store.ApplyBatch(ops, nil, readVersion, generation)
+	err := store.ApplyBatch(ops, readVersion, generation)
 	if err != nil {
 		t.Fatalf("ApplyBatch failed: %v", err)
 	}
 
-	// Commit the transaction
 	store.ReleaseSnapshot(readVersion)
 
-	// Begin a new transaction to get the value
 	readVersion2, generation2 := store.AcquireSnapshot()
 
 	// Get the value
@@ -98,26 +90,21 @@ func TestStore_GetSetDelete(t *testing.T) {
 
 	store.ReleaseSnapshot(readVersion2)
 
-	// Begin a new transaction to delete the value
 	readVersion3, generation3 := store.AcquireSnapshot()
 
-	// Delete the value
 	ops = []bufferedOp{
 		{opType: OpJournalDelete, key: "hello"},
 	}
-	err = store.ApplyBatch(ops, nil, readVersion3, generation3)
+	err = store.ApplyBatch(ops, readVersion3, generation3)
 	if err != nil {
 		t.Fatalf("ApplyBatch failed: %v", err)
 	}
 
-	// Commit the transaction
 	store.ReleaseSnapshot(readVersion3)
 
-	// Begin a new transaction to get the value
 	readVersion4, generation4 := store.AcquireSnapshot()
 	defer store.ReleaseSnapshot(readVersion4)
 
-	// Get the value
 	_, err = store.Get("hello", readVersion4, generation4)
 	if err != ErrKeyNotFound {
 		t.Errorf("Expected error ErrKeyNotFound, got %v", err)
@@ -128,35 +115,35 @@ func TestStore_TransactionIsolation_WriteWriteConflict_SameReadVersion(t *testin
 	store, cleanup := setupTestStore(t)
 	defer cleanup()
 
-	readVersion, generation := store.AcquireSnapshot()
-	defer store.ReleaseSnapshot(readVersion)
-
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	t1Done := make(chan struct{})
-
-	// T1: Set a value in a separate goroutine
 	go func() {
 		defer wg.Done()
+
+		readVersion, generation := store.AcquireSnapshot()
+		defer store.ReleaseSnapshot(readVersion)
+
 		ops1 := []bufferedOp{
 			{opType: OpJournalSet, key: "hello", val: []byte("world")},
 		}
-		err := store.ApplyBatch(ops1, nil, readVersion, generation)
+		err := store.ApplyBatch(ops1, readVersion, generation)
 		if err != nil {
 			t.Errorf("ApplyBatch failed: %v", err)
 		}
-		close(t1Done)
 	}()
 
-	// T2: Set a value to the same key in a separate goroutine
 	go func() {
 		defer wg.Done()
-		<-t1Done // Wait for T1 to complete
+
+		readVersion, generation := store.AcquireSnapshot()
+		defer store.ReleaseSnapshot(readVersion)
+
 		ops2 := []bufferedOp{
 			{opType: OpJournalSet, key: "hello", val: []byte("world2")},
 		}
-		err := store.ApplyBatch(ops2, nil, readVersion, generation)
+		time.Sleep(1 * time.Second)
+		err := store.ApplyBatch(ops2, readVersion, generation)
 		if err != ErrConflict {
 			t.Errorf("Expected error ErrConflict, got %v", err)
 		}
@@ -187,7 +174,7 @@ func TestStore_TransactionIsolation_WriteWriteConflict_SameReadVersion2(t *testi
 		ready <- struct{}{}
 		<-canStart
 
-		err := store.ApplyBatch(ops1, nil, readVersion, generation)
+		err := store.ApplyBatch(ops1, readVersion, generation)
 		if err != nil {
 			t.Errorf("T1 ApplyBatch failed (T1 should succeed): %v", err)
 		}
@@ -202,12 +189,11 @@ func TestStore_TransactionIsolation_WriteWriteConflict_SameReadVersion2(t *testi
 		defer store.ReleaseSnapshot(readVersion)
 
 		ready <- struct{}{}
-
 		<-canStart
 
 		time.Sleep(1 * time.Second)
 
-		err := store.ApplyBatch(ops2, nil, readVersion, generation)
+		err := store.ApplyBatch(ops2, readVersion, generation)
 		if err != ErrConflict {
 			t.Errorf("T2 Expected error ErrConflict, got %v", err)
 		}
@@ -243,7 +229,7 @@ func TestStore_TransactionIsolation_WriteWriteConflict_DiffReadVersion(t *testin
 		ready <- struct{}{}
 		<-canStart
 
-		err := store.ApplyBatch(ops1, nil, readVersion, generation)
+		err := store.ApplyBatch(ops1, readVersion, generation)
 		if err != nil {
 			t.Errorf("T1 ApplyBatch failed (T1 should succeed): %v", err)
 		}
@@ -263,7 +249,7 @@ func TestStore_TransactionIsolation_WriteWriteConflict_DiffReadVersion(t *testin
 
 		time.Sleep(1 * time.Second)
 
-		err := store.ApplyBatch(ops2, nil, readVersion, generation)
+		err := store.ApplyBatch(ops2, readVersion, generation)
 		if err != ErrConflict {
 			t.Errorf("T2 Expected error ErrConflict, got %v", err)
 		}
@@ -279,12 +265,92 @@ func TestStore_TransactionIsolation_WriteWriteConflict_DiffReadVersion(t *testin
 		{opType: OpJournalSet, key: "hello1", val: []byte("world2")},
 	}
 
-	err := store.ApplyBatch(ops3, nil, readVersion, generation)
+	err := store.ApplyBatch(ops3, readVersion, generation)
 	if err != nil {
 		t.Errorf("T3 ApplyBatch failed (T3 should succeed): %v", err)
 	}
 
 	close(canStart)
+
+	wg.Wait()
+}
+
+func TestStore_TransactionIsolation_ReadWriteConflict(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	readVersion, generation := store.AcquireSnapshot()
+	ops := []bufferedOp{
+		{opType: OpJournalSet, key: "hello", val: []byte("world2")},
+		{opType: OpJournalSet, key: "foo", val: []byte("bar")},
+	}
+	err := store.ApplyBatch(ops, readVersion, generation)
+	if err != nil {
+		t.Errorf("Setup ApplyBatch failed (Setup should succeed): %v", err)
+	}
+	store.ReleaseSnapshot(readVersion)
+
+	ready := make(chan struct{}, 2)
+	start := make(chan struct{})
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+
+		readVersion, generation := store.AcquireSnapshot()
+		ops1 := []bufferedOp{
+			{opType: OpJournalSet, key: "foo1", val: []byte("bar1")},
+		}
+		err := store.ApplyBatch(ops1, readVersion, generation)
+		if err != nil {
+			t.Errorf("T1 ApplyBatch failed (T1 should succeed): %v", err)
+		}
+		store.ReleaseSnapshot(readVersion)
+
+		readVersion, generation = store.AcquireSnapshot()
+		defer store.ReleaseSnapshot(readVersion)
+
+		ready <- struct{}{}
+		<-start
+
+		ops1 = []bufferedOp{
+			{opType: OpJournalGet, key: "hello", val: []byte("world")},
+			{opType: OpJournalSet, key: "foo", val: []byte("bar1")},
+		}
+
+		err = store.ApplyBatch(ops1, readVersion, generation)
+		if err != nil {
+			t.Errorf("T1 ApplyBatch failed (T1 should succeed): %v", err)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+
+		readVersion, generation := store.AcquireSnapshot()
+		defer store.ReleaseSnapshot(readVersion)
+
+		ready <- struct{}{}
+		<-start
+
+		time.Sleep(1 * time.Second)
+
+		ops2 := []bufferedOp{
+			{opType: OpJournalSet, key: "hello", val: []byte("world2")},
+			{opType: OpJournalGet, key: "hello3", val: []byte("world")},
+		}
+		err := store.ApplyBatch(ops2, readVersion, generation)
+		if err != ErrConflict {
+			t.Errorf("T2 Expected error ErrConflict, got %v", err)
+		}
+	}()
+
+	<-ready
+	<-ready
+
+	close(start)
 
 	wg.Wait()
 }

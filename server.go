@@ -69,16 +69,15 @@ func (s *Server) Run(ctx context.Context) error {
 				go s.handleConnection(ctx, conn)
 			default:
 				s.logger.Warn("Max connections reached")
-				// Fast fail response
-				s.writeBinaryResponse(conn, ResStatusServerBusy, []byte("Max connections"))
-				conn.Close()
+				_ = s.writeBinaryResponse(conn, ResStatusServerBusy, []byte("Max connections"))
+				_ = conn.Close()
 			}
 		}
 	}()
 
 	<-ctx.Done()
 	s.logger.Info("Shutdown received, draining connections...")
-	ln.Close()
+	_ = ln.Close()
 
 	done := make(chan struct{})
 	go func() {
@@ -108,7 +107,7 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 		if tx.active {
 			s.abortTx(tx)
 		}
-		conn.Close()
+		_ = conn.Close()
 		atomic.AddInt64(&s.activeConns, -1)
 		s.wg.Done()
 		<-s.sem
@@ -121,36 +120,32 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 		if ctx.Err() != nil {
 			return
 		}
-		conn.SetReadDeadline(time.Now().Add(IdleTimeout))
+		_ = conn.SetReadDeadline(time.Now().Add(IdleTimeout))
 
-		// MEMORY LEAK FIX: We wrap the request logic in a closure.
-		// This ensures that 'defer putBuffer' executes at the end of every request.
 		keepGoing := func() bool {
 			// 1. Read Header
 			if _, err := io.ReadFull(r, headerBuf); err != nil {
 				if err != io.EOF {
 					s.logger.Debug("Read error", "err", err)
 				}
-				return false // Stop loop on error
+				return false
 			}
 
 			opCode := headerBuf[0]
 			payloadLen := binary.BigEndian.Uint32(headerBuf[1:])
 
-			// 2. Sanity Checks
 			if payloadLen > MaxCommandSize {
-				s.writeBinaryResponse(conn, ResStatusEntityTooLarge, []byte("Payload too large"))
+				_ = s.writeBinaryResponse(conn, ResStatusEntityTooLarge, []byte("Payload too large"))
 				return false
 			}
 
-			// 3. Read Payload (if any)
+			// 2. Read Payload
 			var payload []byte
 			var bufPtr *[]byte
 
 			if payloadLen > 0 {
 				bufPtr = getBuffer(int(payloadLen))
 				payload = *bufPtr
-
 				defer putBuffer(bufPtr)
 
 				if _, err := io.ReadFull(r, payload); err != nil {
@@ -158,12 +153,12 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 				}
 			}
 
-			conn.SetWriteDeadline(time.Now().Add(DefaultWriteTimeout))
+			_ = conn.SetWriteDeadline(time.Now().Add(DefaultWriteTimeout))
 
 			if tx.active {
 				switch opCode {
 				case OpCodePing, OpCodeQuit, OpCodeStat, OpCodeCompact:
-					s.writeBinaryResponse(conn, ResStatusErr, []byte("Command not allowed in transaction"))
+					_ = s.writeBinaryResponse(conn, ResStatusErr, []byte("Command not allowed in transaction"))
 					return true
 				}
 			}
@@ -186,11 +181,11 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 			case OpCodeCompact:
 				s.handleCompact(conn)
 			case OpCodePing:
-				s.writeBinaryResponse(conn, ResStatusOK, []byte("PONG"))
+				_ = s.writeBinaryResponse(conn, ResStatusOK, []byte("PONG"))
 			case OpCodeQuit:
 				return false
 			default:
-				s.writeBinaryResponse(conn, ResStatusErr, []byte("Unknown OpCode"))
+				_ = s.writeBinaryResponse(conn, ResStatusErr, []byte("Unknown OpCode"))
 			}
 
 			return true
@@ -220,12 +215,12 @@ func (s *Server) writeBinaryResponse(w io.Writer, status byte, body []byte) erro
 
 func (s *Server) checkTx(w io.Writer, tx *txState) bool {
 	if !tx.active {
-		s.writeBinaryResponse(w, ResStatusTxRequired, []byte("Transaction required"))
+		_ = s.writeBinaryResponse(w, ResStatusTxRequired, []byte("Transaction required"))
 		return false
 	}
 	if time.Now().After(tx.deadline) {
 		s.abortTx(tx)
-		s.writeBinaryResponse(w, ResStatusTxTimeout, []byte("Transaction timed out"))
+		_ = s.writeBinaryResponse(w, ResStatusTxTimeout, []byte("Transaction timed out"))
 		return false
 	}
 	return true
@@ -241,26 +236,25 @@ func (s *Server) abortTx(tx *txState) {
 		}
 		s.store.ReleaseSnapshot(tx.readVersion)
 		tx.ops = nil
-		tx.reads = nil
 	}
 }
 
 func (s *Server) handleBegin(w io.Writer, tx *txState) {
 	if tx.active {
 		if time.Now().Before(tx.deadline) {
-			s.writeBinaryResponse(w, ResStatusErr, []byte("Transaction already active"))
+			_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Transaction already active"))
 			return
 		}
 		s.abortTx(tx)
 	}
 
 	tx.active = true
+	tx.readOnly = true // Default state
 	atomic.AddInt64(&s.activeTxs, 1)
 	tx.readVersion, tx.generation = s.store.AcquireSnapshot()
 	tx.deadline = time.Now().Add(MaxTxDuration)
 	tx.ops = make([]bufferedOp, 0)
-	tx.reads = make(map[string]struct{})
-	s.writeBinaryResponse(w, ResStatusOK, nil)
+	_ = s.writeBinaryResponse(w, ResStatusOK, nil)
 }
 
 func (s *Server) handleEnd(w io.Writer, tx *txState) {
@@ -275,38 +269,27 @@ func (s *Server) handleEnd(w io.Writer, tx *txState) {
 		}
 	}()
 
-	hasWrites := false
-	for _, op := range tx.ops {
-		if op.opType != OpJournalGet {
-			hasWrites = true
-			break
-		}
-	}
-
-	if !hasWrites {
+	// Read-Only Optimization: Snapshot Isolation consistency is guaranteed without commit.
+	if tx.readOnly {
 		s.abortTx(tx)
-		s.writeBinaryResponse(w, ResStatusOK, nil)
+		_ = s.writeBinaryResponse(w, ResStatusOK, nil)
 		return
 	}
 
-	reads := make([]string, 0, len(tx.reads))
-	for k := range tx.reads {
-		reads = append(reads, k)
-	}
-
-	if err := s.store.ApplyBatch(tx.ops, reads, tx.readVersion, tx.generation); err != nil {
+	// Read-Write Transaction: Check conflicts using full ops list (Gets+Sets+Dels)
+	if err := s.store.ApplyBatch(tx.ops, tx.readVersion, tx.generation); err != nil {
 		if err == ErrConflict {
-			s.writeBinaryResponse(w, ResStatusTxConflict, []byte("Conflict detected"))
+			_ = s.writeBinaryResponse(w, ResStatusTxConflict, []byte("Conflict detected"))
 		} else {
 			s.logger.Error("Commit failed", "err", err)
-			s.writeBinaryResponse(w, ResStatusErr, []byte("Internal commit failure"))
+			_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Internal commit failure"))
 		}
 		s.abortTx(tx)
 		return
 	}
 
 	s.abortTx(tx)
-	s.writeBinaryResponse(w, ResStatusOK, nil)
+	_ = s.writeBinaryResponse(w, ResStatusOK, nil)
 }
 
 func (s *Server) handleAbort(w io.Writer, tx *txState) {
@@ -314,12 +297,12 @@ func (s *Server) handleAbort(w io.Writer, tx *txState) {
 		return
 	}
 	s.abortTx(tx)
-	s.writeBinaryResponse(w, ResStatusOK, nil)
+	_ = s.writeBinaryResponse(w, ResStatusOK, nil)
 }
 
 func (s *Server) handleGet(w io.Writer, payload []byte, tx *txState) {
 	if len(payload) == 0 {
-		s.writeBinaryResponse(w, ResStatusErr, []byte("Missing Key"))
+		_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Missing Key"))
 		return
 	}
 	if !s.checkTx(w, tx) {
@@ -327,25 +310,22 @@ func (s *Server) handleGet(w io.Writer, payload []byte, tx *txState) {
 	}
 
 	if len(tx.ops) >= MaxTxOps {
-		s.writeBinaryResponse(w, ResStatusEntityTooLarge, []byte("Tx too large"))
+		_ = s.writeBinaryResponse(w, ResStatusEntityTooLarge, []byte("Tx too large"))
 		return
 	}
 
 	key := string(payload)
-	tx.reads[key] = struct{}{}
+	// Record operation for conflict detection
 	tx.ops = append(tx.ops, bufferedOp{opType: OpJournalGet, key: key})
 
-	// Read-Your-Writes logic
-	for i := len(tx.ops) - 1; i >= 0; i-- {
+	// Read-Your-Writes logic (scan backwards)
+	for i := len(tx.ops) - 2; i >= 0; i-- {
 		op := tx.ops[i]
-		if op.opType == OpJournalGet {
-			continue
-		}
-		if op.key == key {
+		if op.key == key && op.opType != OpJournalGet {
 			if op.opType == OpJournalDelete {
-				s.writeBinaryResponse(w, ResStatusNotFound, nil)
+				_ = s.writeBinaryResponse(w, ResStatusNotFound, nil)
 			} else {
-				s.writeBinaryResponse(w, ResStatusOK, op.val)
+				_ = s.writeBinaryResponse(w, ResStatusOK, op.val)
 			}
 			return
 		}
@@ -354,17 +334,17 @@ func (s *Server) handleGet(w io.Writer, payload []byte, tx *txState) {
 	val, err := s.store.Get(key, tx.readVersion, tx.generation)
 	if err != nil {
 		if err == ErrKeyNotFound {
-			s.writeBinaryResponse(w, ResStatusNotFound, nil)
+			_ = s.writeBinaryResponse(w, ResStatusNotFound, nil)
 		} else if err == ErrConflict {
-			s.writeBinaryResponse(w, ResStatusTxConflict, []byte("Snapshot lost"))
+			_ = s.writeBinaryResponse(w, ResStatusTxConflict, []byte("Snapshot lost"))
 			s.abortTx(tx)
 		} else {
 			s.logger.Error("Store read error", "err", err)
-			s.writeBinaryResponse(w, ResStatusErr, []byte("Internal Error"))
+			_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Internal Error"))
 		}
 		return
 	}
-	s.writeBinaryResponse(w, ResStatusOK, val)
+	_ = s.writeBinaryResponse(w, ResStatusOK, val)
 }
 
 func (s *Server) handleSet(conn net.Conn, payload []byte, tx *txState) {
@@ -373,18 +353,18 @@ func (s *Server) handleSet(conn net.Conn, payload []byte, tx *txState) {
 	}
 
 	if len(payload) < 4 {
-		s.writeBinaryResponse(conn, ResStatusErr, []byte("Bad format"))
+		_ = s.writeBinaryResponse(conn, ResStatusErr, []byte("Bad format"))
 		return
 	}
 
 	keyLen := int(binary.BigEndian.Uint32(payload[0:4]))
 	if keyLen == 0 || keyLen > MaxKeySize {
-		s.writeBinaryResponse(conn, ResStatusErr, []byte("Invalid Key Length"))
+		_ = s.writeBinaryResponse(conn, ResStatusErr, []byte("Invalid Key Length"))
 		return
 	}
 
 	if len(payload) < 4+keyLen {
-		s.writeBinaryResponse(conn, ResStatusErr, []byte("Short Payload"))
+		_ = s.writeBinaryResponse(conn, ResStatusErr, []byte("Short Payload"))
 		return
 	}
 
@@ -393,16 +373,16 @@ func (s *Server) handleSet(conn net.Conn, payload []byte, tx *txState) {
 	valLen := len(val)
 
 	if valLen > MaxValueSize {
-		s.writeBinaryResponse(conn, ResStatusEntityTooLarge, []byte("Value too large"))
+		_ = s.writeBinaryResponse(conn, ResStatusEntityTooLarge, []byte("Value too large"))
 		return
 	}
 
-	// RACE FIX: Optimistic allocation to prevent OOM
+	// Memory Limit Check
 	newUsage := atomic.AddInt64(&s.usedMemory, int64(valLen))
 	if newUsage > MaxMemoryLimit {
-		atomic.AddInt64(&s.usedMemory, -int64(valLen)) // Rollback
-		s.writeBinaryResponse(conn, ResStatusServerBusy, []byte("Memory limit exceeded"))
-		conn.Close()
+		atomic.AddInt64(&s.usedMemory, -int64(valLen))
+		_ = s.writeBinaryResponse(conn, ResStatusServerBusy, []byte("Memory limit exceeded"))
+		_ = conn.Close()
 		return
 	}
 
@@ -410,18 +390,19 @@ func (s *Server) handleSet(conn net.Conn, payload []byte, tx *txState) {
 	copy(valCopy, val)
 
 	tx.memUsage += int64(valLen)
+	tx.readOnly = false // Mutation flips flag
 
 	tx.ops = append(tx.ops, bufferedOp{
 		opType: OpJournalSet,
 		key:    key,
 		val:    valCopy,
 	})
-	s.writeBinaryResponse(conn, ResStatusOK, nil)
+	_ = s.writeBinaryResponse(conn, ResStatusOK, nil)
 }
 
 func (s *Server) handleDelete(w io.Writer, payload []byte, tx *txState) {
 	if len(payload) == 0 {
-		s.writeBinaryResponse(w, ResStatusErr, []byte("Missing Key"))
+		_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Missing Key"))
 		return
 	}
 	if !s.checkTx(w, tx) {
@@ -429,8 +410,10 @@ func (s *Server) handleDelete(w io.Writer, payload []byte, tx *txState) {
 	}
 
 	key := string(payload)
+	tx.readOnly = false // Mutation flips flag
+
 	tx.ops = append(tx.ops, bufferedOp{opType: OpJournalDelete, key: key})
-	s.writeBinaryResponse(w, ResStatusOK, nil)
+	_ = s.writeBinaryResponse(w, ResStatusOK, nil)
 }
 
 func (s *Server) handleStat(w io.Writer) {
@@ -438,22 +421,21 @@ func (s *Server) handleStat(w io.Writer) {
 	active := atomic.LoadInt64(&s.activeConns)
 	mem := atomic.LoadInt64(&s.usedMemory)
 
-	// FIX: Use spaces, not newlines, for single line response
 	msg := fmt.Sprintf("Keys:%d Uptime:%s Conns:%d TxMem:%d Pending:%d Snaps:%d Offset:%d,%d",
 		count, uptime, active, mem, pending, activeSnaps, generation, offset)
 
-	s.writeBinaryResponse(w, ResStatusOK, []byte(msg))
+	_ = s.writeBinaryResponse(w, ResStatusOK, []byte(msg))
 }
 
 func (s *Server) handleCompact(w io.Writer) {
 	if err := s.store.Compact(); err != nil {
 		if err == ErrCompactionInProgress {
-			s.writeBinaryResponse(w, ResStatusServerBusy, []byte("Compaction running"))
+			_ = s.writeBinaryResponse(w, ResStatusServerBusy, []byte("Compaction running"))
 		} else {
 			s.logger.Error("Compaction failed", "err", err)
-			s.writeBinaryResponse(w, ResStatusErr, []byte("Internal error"))
+			_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Internal error"))
 		}
 		return
 	}
-	s.writeBinaryResponse(w, ResStatusOK, nil)
+	_ = s.writeBinaryResponse(w, ResStatusOK, nil)
 }

@@ -20,25 +20,27 @@ type Mutation struct {
 
 // request wraps a client's transaction for processing by the single-writer loop.
 type request struct {
-	ops         []bufferedOp    // Write operations (Set/Delete)
-	reads       []string        // Read set for Anti-Dependency Checking (SSI)
-	resp        chan error      // Channel to signal completion/error to client
-	opLens      []int           // Byte lengths of operations for offset calculation
-	readVersion int64           // The snapshot (WAL offset) this tx sees
-	generation  uint64          // FIX: Validates that the file backing readVersion hasn't changed
-	cancelled   atomic.Bool     // Flag to abort processing on timeout/disconnect
-	accessMap   map[string]bool // Fast lookup for conflict checks against pending batches
-	batchSize   int64           // Total bytes in this request (for backpressure)
+	ops         []bufferedOp // Contains ALL ops (Gets + Sets + Deletes)
+	resp        chan error
+	opLens      []int
+	readVersion int64
+	generation  uint64
+	cancelled   atomic.Bool
+
+	// accessMap is derived from ops.
+	// It is the set of ALL keys touched by the transaction (Read + Write).
+	accessMap map[string]struct{}
+
+	batchSize int64
 }
 
 // txState tracks the state of an active client transaction context.
 type txState struct {
 	active      bool
+	readOnly    bool // Default true
 	deadline    time.Time
 	readVersion int64
-	generation  uint64 // FIX: The store generation this transaction belongs to
-	ops         []bufferedOp
-	reads       map[string]struct{}
+	generation  uint64
+	ops         []bufferedOp // The complete history of the transaction
 	memUsage    int64
 }
-

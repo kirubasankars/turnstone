@@ -8,14 +8,14 @@ import (
 
 const (
 	// Network & Protocol defaults
-	DefaultPort         = ":6379"          // server port
-	DefaultReadTimeout  = 5 * time.Second  // network read timeout, affects slow client/network
-	DefaultWriteTimeout = 5 * time.Second  // network write timeout, affects slow client/network
-	IdleTimeout         = 60 * time.Second // idle timeout, affects inactive clients
-	ShutdownTimeout     = 10 * time.Second // when server stopped, wait for graceful shutdown
+	DefaultPort         = ":6379"              // server port
+	DefaultReadTimeout  = 5 * time.Second      // network read timeout, affects slow client/network
+	DefaultWriteTimeout = 5 * time.Second      // network write timeout, affects slow client/network
+	IdleTimeout         = 3 * 60 * time.Second // idle timeout, affects inactive clients
+	ShutdownTimeout     = 10 * time.Second     // when server stopped, wait for graceful shutdown
 
 	// Transaction Limits
-	MaxTxDuration = 20 * time.Second // max transaction life time
+	MaxTxDuration = 60 * time.Second // max transaction life time
 	MaxTxOps      = 10000            // max number of operations in a transaction
 
 	// Storage Paths & Names

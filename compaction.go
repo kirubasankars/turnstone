@@ -42,8 +42,8 @@ func (s *Store) doCompact() error {
 	tmpBoltPath := filepath.Join(s.dataDir, "index.db.compact")
 
 	// Cleanup previous failed attempts
-	os.Remove(tmpJournalPath)
-	os.Remove(tmpBoltPath)
+	_ = os.Remove(tmpJournalPath)
+	_ = os.Remove(tmpBoltPath)
 
 	oldJournalReader, err := OpenJournal(filepath.Join(s.dataDir, DefaultDBName))
 	if err != nil {
@@ -65,7 +65,7 @@ func (s *Store) doCompact() error {
 		return fmt.Errorf("failed to write tmp journal header: %w", err)
 	}
 
-	tmpBolt, err := bbolt.Open(tmpBoltPath, 0600, &bbolt.Options{NoFreelistSync: true})
+	tmpBolt, err := bbolt.Open(tmpBoltPath, 0o600, &bbolt.Options{NoFreelistSync: true})
 	if err != nil {
 		return fmt.Errorf("failed to open tmp bolt: %w", err)
 	}
@@ -73,8 +73,8 @@ func (s *Store) doCompact() error {
 
 	tmpIndex := NewIndex(tmpBolt)
 
-	var readOffset int64 = int64(FileHeaderSize)
-	var writeOffset int64 = int64(FileHeaderSize)
+	readOffset := int64(FileHeaderSize)
+	writeOffset := int64(FileHeaderSize)
 	var keptCount, droppedCount int
 
 	payloadPtr := getBuffer(4096)
@@ -130,8 +130,7 @@ func (s *Store) doCompact() error {
 
 	// Clean up old state that will be invalid in the new generation
 	s.activeSnapshots = make(map[int64]int)
-	s.recentMutations = s.recentMutations[:0]
-	s.mutationIndex = make(map[string]int64)
+	s.conflictIndex = make(map[string][]int64)
 
 	finalOffset := s.offset
 	s.logger.Info("Compaction Finalizing (Stop-The-World)", "remaining_bytes", finalOffset-readOffset)
@@ -240,7 +239,6 @@ func (s *Store) copyRange(
 	payloadPtr *[]byte,
 	alreadyLocked bool,
 ) (int64, int, int, *[]byte, error) {
-
 	if _, err := src.Seek(startOff, 0); err != nil {
 		return writeOff, 0, 0, payloadPtr, err
 	}
@@ -333,4 +331,3 @@ func (s *Store) copyRange(
 
 	return writeOff, kept, dropped, payloadPtr, nil
 }
-
