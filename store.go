@@ -11,6 +11,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -55,14 +57,45 @@ type Store struct {
 	compactionThreshold int64
 }
 
+func findLatestGeneration(dataDir string) (uint64, error) {
+	files, err := os.ReadDir(dataDir)
+	if err != nil {
+		return 0, err
+	}
+
+	var maxGen uint64 = 0
+	for _, file := range files {
+		if file.IsDir() {
+			continue
+		}
+		fileName := file.Name()
+		if strings.HasSuffix(fileName, ".db") && !strings.Contains(fileName, ".tmp") {
+			genStr := strings.TrimSuffix(fileName, ".db")
+			gen, err := strconv.ParseUint(genStr, 10, 64)
+			if err == nil && gen > maxGen {
+				maxGen = gen
+			}
+		}
+	}
+	if maxGen == 0 {
+		return 1, nil // Start with generation 1 if no db file is found
+	}
+	return maxGen, nil
+}
+
 func NewStore(dataDir string, logger *slog.Logger, allowTruncate bool, skipCrc bool, useFsync bool, fsyncInterval time.Duration) (*Store, error) {
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		return nil, fmt.Errorf("failed to init data dir: %w", err)
 	}
 
-	journalPath := filepath.Join(dataDir, DefaultDBName)
-	boltPath := filepath.Join(dataDir, BoltDBName)
-	logger.Info("Opening store", "journal", journalPath, "bolt", boltPath, "fsync", useFsync)
+	gen, err := findLatestGeneration(dataDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find latest generation: %w", err)
+	}
+
+	journalPath := filepath.Join(dataDir, fmt.Sprintf("%d.db", gen))
+	boltPath := filepath.Join(dataDir, fmt.Sprintf("%d.idx", gen))
+	logger.Info("Opening store", "journal", journalPath, "bolt", boltPath, "fsync", useFsync, "generation", gen)
 
 	journal, err := OpenJournal(journalPath)
 	if err != nil {
@@ -94,6 +127,7 @@ func NewStore(dataDir string, logger *slog.Logger, allowTruncate bool, skipCrc b
 		done:                make(chan struct{}),
 		dataDir:             dataDir,
 		compactionThreshold: DefaultCompactionThreshold,
+		generation:          gen,
 	}
 
 	if err := s.recover(); err != nil {
@@ -115,16 +149,15 @@ func (s *Store) recover() error {
 	}
 
 	if info.Size() == 0 {
-		s.logger.Info("Initializing new journal with Generation 1")
+		s.logger.Info("Initializing new journal", "generation", s.generation)
 		var buf [FileHeaderSize]byte
-		binary.BigEndian.PutUint64(buf[:], 1)
+		binary.BigEndian.PutUint64(buf[:], s.generation)
 		if _, err := s.journal.WriteAt(buf[:], 0); err != nil {
 			return err
 		}
 		if err := s.journal.Sync(); err != nil {
 			return err
 		}
-		s.generation = 1
 		s.offset = int64(FileHeaderSize)
 	} else {
 		if info.Size() < int64(FileHeaderSize) {
@@ -134,7 +167,11 @@ func (s *Store) recover() error {
 		if _, err := s.journal.ReadAt(headerBuf, 0); err != nil {
 			return err
 		}
-		s.generation = binary.BigEndian.Uint64(headerBuf)
+		fileGen := binary.BigEndian.Uint64(headerBuf)
+		if fileGen != s.generation {
+			s.logger.Warn("generation mismatch", "file", fileGen, "store", s.generation)
+			// This could be a problem, but we'll proceed with the generation from the filename
+		}
 		s.logger.Info("Recovered generation", "gen", s.generation)
 	}
 
@@ -701,8 +738,8 @@ func (s *Store) Stats() (int, string, int64, int, int64, uint64) {
 }
 
 func (s *Store) reopen() error {
-	journalPath := filepath.Join(s.dataDir, DefaultDBName)
-	boltPath := filepath.Join(s.dataDir, BoltDBName)
+	journalPath := filepath.Join(s.dataDir, fmt.Sprintf("%d.db", s.generation))
+	boltPath := filepath.Join(s.dataDir, fmt.Sprintf("%d.idx", s.generation))
 
 	j, err := OpenJournal(journalPath)
 	if err != nil {

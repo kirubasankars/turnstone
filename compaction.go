@@ -38,14 +38,16 @@ func (s *Store) doCompact() error {
 	s.logger.Info("Starting compaction (Two-Phase)...")
 	start := time.Now()
 
-	tmpJournalPath := filepath.Join(s.dataDir, "data.db.compact")
-	tmpBoltPath := filepath.Join(s.dataDir, "index.db.compact")
+	newGen := s.generation + 1
+	tmpJournalPath := filepath.Join(s.dataDir, fmt.Sprintf("%d.db.tmp", newGen))
+	tmpBoltPath := filepath.Join(s.dataDir, fmt.Sprintf("%d.idx.tmp", newGen))
 
 	// Cleanup previous failed attempts
 	_ = os.Remove(tmpJournalPath)
 	_ = os.Remove(tmpBoltPath)
 
-	oldJournalReader, err := OpenJournal(filepath.Join(s.dataDir, DefaultDBName))
+	oldJournalPath := filepath.Join(s.dataDir, fmt.Sprintf("%d.db", s.generation))
+	oldJournalReader, err := OpenJournal(oldJournalPath)
 	if err != nil {
 		return fmt.Errorf("failed to open reader: %w", err)
 	}
@@ -58,7 +60,6 @@ func (s *Store) doCompact() error {
 	defer tmpJournal.Close()
 
 	// Write New Generation Header
-	newGen := s.generation + 1
 	var headerBuf [FileHeaderSize]byte
 	binary.BigEndian.PutUint64(headerBuf[:], newGen)
 	if _, err := tmpJournal.WriteAt(headerBuf[:], 0); err != nil {
@@ -190,16 +191,16 @@ func (s *Store) doCompact() error {
 		s.logger.Error("failed to close active bolt", "err", err)
 	}
 
-	oldJournalPath := filepath.Join(s.dataDir, DefaultDBName)
-	oldBoltPath := filepath.Join(s.dataDir, BoltDBName)
+	newJournalPath := filepath.Join(s.dataDir, fmt.Sprintf("%d.db", newGen))
+	newBoltPath := filepath.Join(s.dataDir, fmt.Sprintf("%d.idx", newGen))
 
-	if err := os.Rename(tmpJournalPath, oldJournalPath); err != nil {
+	if err := os.Rename(tmpJournalPath, newJournalPath); err != nil {
 		s.compacting = false
 		s.mu.Unlock()
 		s.reopen() // Try to recover
 		return fmt.Errorf("failed to swap journal: %w", err)
 	}
-	if err := os.Rename(tmpBoltPath, oldBoltPath); err != nil {
+	if err := os.Rename(tmpBoltPath, newBoltPath); err != nil {
 		s.compacting = false
 		s.mu.Unlock()
 		s.reopen() // Try to recover
@@ -207,6 +208,7 @@ func (s *Store) doCompact() error {
 	}
 
 	// Reopen the store with the new files
+	s.generation = newGen
 	if err := s.reopen(); err != nil {
 		s.compacting = false
 		s.mu.Unlock()
@@ -217,9 +219,18 @@ func (s *Store) doCompact() error {
 	s.index.active = warmCache
 
 	s.offset = writeOffset
-	s.generation = newGen
 	s.compacting = false
 	s.mu.Unlock()
+
+	// remove old files
+	oldDbPath := filepath.Join(s.dataDir, fmt.Sprintf("%d.db", newGen-1))
+	oldIdxPath := filepath.Join(s.dataDir, fmt.Sprintf("%d.idx", newGen-1))
+	if err := os.Remove(oldDbPath); err != nil {
+		s.logger.Warn("failed to remove old db file", "err", err)
+	}
+	if err := os.Remove(oldIdxPath); err != nil {
+		s.logger.Warn("failed to remove old idx file", "err", err)
+	}
 
 	s.logger.Info("Compaction complete",
 		"duration", time.Since(start),

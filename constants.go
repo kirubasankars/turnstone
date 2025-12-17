@@ -20,8 +20,6 @@ const (
 
 	// Storage Paths & Names
 	DefaultDataDir = "data"
-	DefaultDBName  = "data.db"
-	BoltDBName     = "index.db"
 	BoltBucketData = "index"
 	BoltBucketMeta = "meta"
 	KeyLastOffset  = "last_offset"

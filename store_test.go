@@ -3,6 +3,7 @@ package main
 import (
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -353,4 +354,95 @@ func TestStore_TransactionIsolation_ReadWriteConflict(t *testing.T) {
 	close(start)
 
 	wg.Wait()
+}
+
+func TestStore_Compaction_Generation(t *testing.T) {
+	dir, err := os.MkdirTemp("", "turnstone-test-compaction")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	store, err := NewStore(dir, logger, true, false, true, 500*time.Millisecond)
+	if err != nil {
+		t.Fatalf("Failed to create store: %v", err)
+	}
+
+	// Add some data
+	readVersion, generation := store.AcquireSnapshot()
+	ops := []bufferedOp{
+		{opType: OpJournalSet, key: "hello", val: []byte("world")},
+	}
+	err = store.ApplyBatch(ops, readVersion, generation)
+	if err != nil {
+		t.Fatalf("ApplyBatch failed: %v", err)
+	}
+	store.ReleaseSnapshot(readVersion)
+
+	// Trigger compaction
+	if err := store.Compact(); err != nil {
+		t.Fatalf("Compact failed: %v", err)
+	}
+
+	// Wait for compaction to finish
+	for store.compactionRunning.Load() {
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Check if new generation files are created
+	// Generation should be 2 now
+	if _, err := os.Stat(filepath.Join(dir, "2.db")); err != nil {
+		t.Errorf("Expected file 2.db to exist, but it doesn't")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "2.idx")); err != nil {
+		t.Errorf("Expected file 2.idx to exist, but it doesn't")
+	}
+
+	// Check if old files are removed
+	if _, err := os.Stat(filepath.Join(dir, "1.db")); !os.IsNotExist(err) {
+		t.Errorf("Expected file 1.db to be removed, but it exists")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "1.idx")); !os.IsNotExist(err) {
+		t.Errorf("Expected file 1.idx to be removed, but it exists")
+	}
+
+	// Check if data is still accessible
+	readVersion2, generation2 := store.AcquireSnapshot()
+	val, err := store.Get("hello", readVersion2, generation2)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	if string(val) != "world" {
+		t.Errorf("Expected value 'world', got '%s'", string(val))
+	}
+	store.ReleaseSnapshot(readVersion2)
+
+	// Close the store
+	if err := store.Close(); err != nil {
+		t.Fatalf("Failed to close store: %v", err)
+	}
+
+	// Create a new store in the same directory and check if it loads the latest generation
+	store2, err := NewStore(dir, logger, true, false, true, 500*time.Millisecond)
+	if err != nil {
+		t.Fatalf("Failed to create store2: %v", err)
+	}
+	defer store2.Close()
+
+	if store2.generation != 2 {
+		t.Errorf("Expected store to load generation 2, but got %d", store2.generation)
+	}
+
+	// Check if data is still accessible in the new store
+	readVersion3, generation3 := store2.AcquireSnapshot()
+	val2, err := store2.Get("hello", readVersion3, generation3)
+	if err != nil {
+		t.Fatalf("Get from store2 failed: %v", err)
+	}
+	if string(val2) != "world" {
+		t.Errorf("Expected value 'world' from store2, got '%s'", string(val2))
+	}
+	store2.ReleaseSnapshot(readVersion3)
 }
