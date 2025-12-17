@@ -10,9 +10,9 @@ Turnstone supports following operations.
 
 Above operations should be called inside transactions. More than one operations within transaction is allowed.
 
-`BEGIN` to start a transaction.
-`COMMIT` to commit a running transaction.
-`ABORT` to abort a running transaction.
+1. `BEGIN` to start a transaction.
+2. `COMMIT` to commit a running transaction.
+3. `ABORT` to abort a running transaction.
 
 There are non-transactional commands as follows
 
