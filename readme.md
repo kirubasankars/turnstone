@@ -26,6 +26,7 @@ There are non-transactional commands as follows
 Turnstone database follows single file and append-only design to deliver its features.
 
 File Format:
+
 `
 ......File Header.....|....................Data.......................
 <checksum><generation><checksum><key_length><value_length><key><value>`
