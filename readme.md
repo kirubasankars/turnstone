@@ -27,7 +27,7 @@ Turnstone database follows single file and append-only design to deliver its fea
 
 File Format:
 
-......File Header.....|....................Data.......................
+......File Header.....|....................Data.......................<br>
 `<checksum><generation><checksum><key_length><value_length><key><value>`
 
 
