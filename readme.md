@@ -14,7 +14,7 @@ Above operations should be called inside transactions. More than one operations 
 `COMMIT` to commit a running transaction.
 `ABORT` to abort a running transaction.
 
-There are non transaction commands as follows
+There are non-transactional commands as follows
 
 1. `PING` simple health check, return PONG
 2. `STAT` returns server stats.
@@ -27,7 +27,7 @@ Turnstone database follows single file and append-only design to deliver its fea
 
 File Format:
 
-......File Header.....|....................Data......................
-<checksum><GENERATION><checksum><key_length><value_length><key><value>
+......File Header.....|....................Data..........................................................................
+<checksum><GENERATION><checksum><key_length><value_length><key><value>...<checksum><key_length><value_length><key><value>
 
 
