@@ -9,10 +9,10 @@ import (
 const (
 	// Network & Protocol defaults
 	DefaultPort         = ":6379"              // server port
-	DefaultReadTimeout  = 5 * time.Second      // network read timeout, affects slow client/network
-	DefaultWriteTimeout = 5 * time.Second      // network write timeout, affects slow client/network
-	IdleTimeout         = 3 * 60 * time.Second // idle timeout, affects inactive clients
-	ShutdownTimeout     = 10 * time.Second     // when server stopped, wait for graceful shutdown
+	DefaultReadTimeout  = 5 * time.Second      // network read timeout
+	DefaultWriteTimeout = 5 * time.Second      // network write timeout
+	IdleTimeout         = 3 * 60 * time.Second // idle timeout
+	ShutdownTimeout     = 10 * time.Second     // graceful shutdown wait
 
 	// Transaction Limits
 	MaxTxDuration = 60 * time.Second // max transaction life time
@@ -33,7 +33,7 @@ const (
 	MaxMemoryLimit       = 1024 * 1024 * 1024
 
 	// Storage Format (Journal)
-	FileHeaderSize = 8  // New: Fixed size for the Generation Header
+	FileHeaderSize = 8  // Generation Header
 	HeaderSize     = 12 // Entry Header (KeyLen + ValLen + CRC)
 	Tombstone      = ^uint32(0)
 
@@ -47,6 +47,7 @@ const (
 	MaxBatchSize               = 2000
 	FlushInterval              = 1 * time.Second
 	DefaultCompactionThreshold = 10 * 1024 * 1024
+	IndexFlushThreshold        = 100_000 // From compaction logic
 )
 
 // Standard Errors

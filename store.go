@@ -34,9 +34,10 @@ type Store struct {
 	useFsync      bool
 	fsyncInterval time.Duration
 
-	offset         int64
-	minReadVersion int64
-	generation     uint64
+	offset            int64
+	minReadVersion    int64
+	lastPrunedVersion int64
+	generation        uint64
 
 	// locking states
 	compacting        bool
@@ -135,6 +136,10 @@ func NewStore(dataDir string, logger *slog.Logger, allowTruncate bool, skipCrc b
 		_ = journal.Close()
 		return nil, fmt.Errorf("recovery failed: %w", err)
 	}
+
+	// Initialize minReadVersion to current offset to ensure pruning works correctly from start
+	s.minReadVersion = s.offset
+	s.lastPrunedVersion = s.offset
 
 	s.wg.Add(1)
 	go s.runLoop()
@@ -588,8 +593,12 @@ func (s *Store) flushBatch(pending []*request, buf *bytes.Buffer) error {
 		}
 	}
 	s.offset = currentOffset
-	if s.activeSnapshots[minVer] <= 1 {
+
+	// Prune conflict index if the minimum read version has advanced.
+	// This prevents infinite growth of the conflict index while avoiding O(N) scans on every flush.
+	if minVer > s.lastPrunedVersion {
 		s.pruneMutations(minVer)
+		s.lastPrunedVersion = minVer
 	}
 	return nil
 }
@@ -599,7 +608,10 @@ func (s *Store) pruneMutations(minReadVersion int64) {
 		write := 0
 
 		for _, off := range snapshots {
-			if off > minReadVersion {
+			// Keep offsets >= minReadVersion.
+			// Entries < minReadVersion are strictly before the oldest active snapshot
+			// and cannot cause conflicts.
+			if off >= minReadVersion {
 				snapshots[write] = off
 				write++
 			}

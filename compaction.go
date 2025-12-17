@@ -15,8 +15,6 @@ import (
 	"go.etcd.io/bbolt"
 )
 
-const IndexFlushThreshold = 100_000
-
 func (s *Store) Compact() error {
 	if !s.compactionRunning.CompareAndSwap(false, true) {
 		return ErrCompactionInProgress

@@ -13,7 +13,7 @@ type JournalFile struct {
 }
 
 func OpenJournal(path string) (*JournalFile, error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, err
 	}
@@ -54,4 +54,3 @@ func (j *JournalFile) Seek(offset int64, whence int) (int64, error) {
 	defer j.mu.Unlock()
 	return j.f.Seek(offset, whence)
 }
-

@@ -319,4 +319,3 @@ func (idx *Index) decodeHistory(data []byte) []IndexEntry {
 	}
 	return hist
 }
-

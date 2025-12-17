@@ -32,4 +32,3 @@ func putBuffer(bufPtr *[]byte) {
 	*bufPtr = (*bufPtr)[:0]
 	bufferPool.Put(bufPtr)
 }
-
