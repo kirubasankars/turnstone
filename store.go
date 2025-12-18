@@ -73,6 +73,7 @@ func findLatestGeneration(dataDir string) (uint64, error) {
 		if strings.HasSuffix(fileName, ".db") && !strings.Contains(fileName, ".tmp") {
 			genStr := strings.TrimSuffix(fileName, ".db")
 			gen, err := strconv.ParseUint(genStr, 10, 64)
+			// Skip files that don't match the format or fail parsing
 			if err == nil && gen > maxGen {
 				maxGen = gen
 			}
@@ -166,7 +167,7 @@ func (s *Store) recover() error {
 		s.offset = int64(FileHeaderSize)
 	} else {
 		if info.Size() < int64(FileHeaderSize) {
-			return fmt.Errorf("file too small")
+			return fmt.Errorf("journal file too small: size %d < header %d", info.Size(), FileHeaderSize)
 		}
 		headerBuf := make([]byte, FileHeaderSize)
 		if _, err := s.journal.ReadAt(headerBuf, 0); err != nil {

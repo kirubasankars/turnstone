@@ -73,6 +73,7 @@ const (
 	OpCodeAbort   = 0x12
 	OpCodeStat    = 0x20
 	OpCodeCompact = 0x21
+	OpCodeAuth    = 0x23 // New OpCode
 	OpCodeQuit    = 0xFF
 )
 
@@ -86,6 +87,7 @@ const (
 	ResStatusTxConflict     = 0x05
 	ResStatusServerBusy     = 0x06
 	ResStatusEntityTooLarge = 0x07
+	ResStatusAuthRequired   = 0x08 // New Status
 )
 
 // Fixed Header Size: 1 byte OpCode + 4 bytes Length

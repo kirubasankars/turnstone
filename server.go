@@ -21,6 +21,7 @@ type Server struct {
 	logger      *slog.Logger
 	listener    net.Listener
 	maxConns    int
+	authPass    string // Password for authentication
 	sem         chan struct{}
 	wg          sync.WaitGroup
 	totalConns  uint64
@@ -29,12 +30,13 @@ type Server struct {
 	activeTxs   int64
 }
 
-func NewServer(addr string, store *Store, logger *slog.Logger, maxConns int) *Server {
+func NewServer(addr string, store *Store, logger *slog.Logger, maxConns int, authPass string) *Server {
 	return &Server{
 		addr:     addr,
 		store:    store,
 		logger:   logger,
 		maxConns: maxConns,
+		authPass: authPass,
 		sem:      make(chan struct{}, maxConns),
 	}
 }
@@ -97,6 +99,9 @@ func (s *Server) Run(ctx context.Context) error {
 func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 	tx := &txState{}
 
+	// If authPass is empty, authentication is disabled (authed = true)
+	authed := s.authPass == ""
+
 	defer func() {
 		if r := recover(); r != nil {
 			s.logger.Error("Panic", "stack", string(debug.Stack()))
@@ -107,7 +112,9 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 		if tx.active {
 			s.abortTx(tx)
 		}
-		_ = conn.Close()
+		if err := conn.Close(); err != nil {
+			s.logger.Debug("Error closing connection", "err", err)
+		}
 		atomic.AddInt64(&s.activeConns, -1)
 		s.wg.Done()
 		<-s.sem
@@ -120,7 +127,11 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 		if ctx.Err() != nil {
 			return
 		}
-		_ = conn.SetReadDeadline(time.Now().Add(IdleTimeout))
+
+		if err := conn.SetReadDeadline(time.Now().Add(IdleTimeout)); err != nil {
+			s.logger.Debug("Failed to set read deadline", "err", err)
+			return
+		}
 
 		keepGoing := func() bool {
 			// 1. Read Header
@@ -153,8 +164,29 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 				}
 			}
 
-			_ = conn.SetWriteDeadline(time.Now().Add(DefaultWriteTimeout))
+			if err := conn.SetWriteDeadline(time.Now().Add(DefaultWriteTimeout)); err != nil {
+				s.logger.Debug("Failed to set write deadline", "err", err)
+				return false
+			}
 
+			// Handle AUTH immediately
+			if opCode == OpCodeAuth {
+				s.handleAuth(conn, payload, &authed)
+				return true
+			}
+
+			// Check Authentication
+			if !authed {
+				switch opCode {
+				case OpCodePing, OpCodeQuit, OpCodeStat:
+					// Allowed without auth
+				default:
+					_ = s.writeBinaryResponse(conn, ResStatusAuthRequired, []byte("Authentication required"))
+					return true
+				}
+			}
+
+			// Check Transaction Constraints
 			if tx.active {
 				switch opCode {
 				case OpCodePing, OpCodeQuit, OpCodeStat, OpCodeCompact:
@@ -197,16 +229,36 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 	}
 }
 
+func (s *Server) handleAuth(w io.Writer, payload []byte, authed *bool) {
+	if s.authPass == "" {
+		// Redis behavior: ERR Client sent AUTH, but no password is set
+		_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Client sent AUTH, but no password is set"))
+		return
+	}
+
+	if string(payload) == s.authPass {
+		*authed = true
+		_ = s.writeBinaryResponse(w, ResStatusOK, []byte("OK"))
+	} else {
+		// Do not set authed to false here if it was already true?
+		// Usually a bad auth attempt doesn't logout, but let's be strict or neutral.
+		// Redis simple implementation: just return error.
+		_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Invalid password"))
+	}
+}
+
 func (s *Server) writeBinaryResponse(w io.Writer, status byte, body []byte) error {
 	header := make([]byte, 5)
 	header[0] = status
 	binary.BigEndian.PutUint32(header[1:], uint32(len(body)))
 
 	if _, err := w.Write(header); err != nil {
+		s.logger.Debug("Write response header failed", "err", err)
 		return err
 	}
 	if len(body) > 0 {
 		if _, err := w.Write(body); err != nil {
+			s.logger.Debug("Write response body failed", "err", err)
 			return err
 		}
 	}

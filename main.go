@@ -17,6 +17,7 @@ func main() {
 	maxConns := flag.Int("max-conns", 500, "Max connections")
 	truncate := flag.Bool("truncate", false, "Repair corrupt file")
 	skipCrc := flag.Bool("skip-crc", false, "Faster reads (unsafe)")
+	requirePass := flag.String("requirepass", "", "Require password for access")
 
 	// Fsync Configuration
 	fsync := flag.Bool("fsync", true, "Enable fsync on every transaction commit (safest)")
@@ -39,7 +40,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	srv := NewServer(*port, store, logger, *maxConns)
+	// Pass requirePass to NewServer
+	srv := NewServer(*port, store, logger, *maxConns, *requirePass)
 
 	errCh := make(chan error, 1)
 	go func() {

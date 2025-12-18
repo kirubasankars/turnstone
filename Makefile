@@ -1,6 +1,5 @@
 build:
-	rm -rf ./bin
-	mkdir ./bin
+	mkdir -p ./bin
 	go build -o turnstone
 	go build -o turnstone_cli ./cli/client.go
 	mv turnstone ./bin/turnstone
