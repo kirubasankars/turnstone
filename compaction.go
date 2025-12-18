@@ -74,13 +74,6 @@ func (s *Store) doCompact() (retErr error) {
 	}
 	defer tmpJournal.Close()
 
-	// Write New Generation Header
-	var headerBuf [FileHeaderSize]byte
-	binary.BigEndian.PutUint64(headerBuf[:], newGen)
-	if _, err := tmpJournal.WriteAt(headerBuf[:], 0); err != nil {
-		return fmt.Errorf("failed to write tmp journal header: %w", err)
-	}
-
 	tmpBolt, err := bbolt.Open(tmpBoltPath, 0o600, &bbolt.Options{NoFreelistSync: true})
 	if err != nil {
 		return fmt.Errorf("failed to open tmp bolt: %w", err)
@@ -89,8 +82,9 @@ func (s *Store) doCompact() (retErr error) {
 
 	tmpIndex := NewIndex(tmpBolt)
 
-	readOffset := int64(FileHeaderSize)
-	writeOffset := int64(FileHeaderSize)
+	// Start from 0 since we removed the FileHeader
+	readOffset := int64(0)
+	writeOffset := int64(0)
 	var keptCount, droppedCount int
 
 	payloadPtr := getBuffer(4096)

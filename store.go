@@ -156,28 +156,8 @@ func (s *Store) recover() error {
 
 	if info.Size() == 0 {
 		s.logger.Info("Initializing new journal", "generation", s.generation)
-		var buf [FileHeaderSize]byte
-		binary.BigEndian.PutUint64(buf[:], s.generation)
-		if _, err := s.journal.WriteAt(buf[:], 0); err != nil {
-			return err
-		}
-		if err := s.journal.Sync(); err != nil {
-			return err
-		}
-		s.offset = int64(FileHeaderSize)
+		s.offset = 0
 	} else {
-		if info.Size() < int64(FileHeaderSize) {
-			return fmt.Errorf("journal file too small: size %d < header %d", info.Size(), FileHeaderSize)
-		}
-		headerBuf := make([]byte, FileHeaderSize)
-		if _, err := s.journal.ReadAt(headerBuf, 0); err != nil {
-			return err
-		}
-		fileGen := binary.BigEndian.Uint64(headerBuf)
-		if fileGen != s.generation {
-			s.logger.Warn("generation mismatch", "file", fileGen, "store", s.generation)
-			// This could be a problem, but we'll proceed with the generation from the filename
-		}
 		s.logger.Info("Recovered generation", "gen", s.generation)
 	}
 
@@ -199,13 +179,13 @@ func (s *Store) recover() error {
 		return err
 	}
 
-	if startOffset < int64(FileHeaderSize) {
-		startOffset = int64(FileHeaderSize)
+	if startOffset < 0 {
+		startOffset = 0
 	}
 
 	if !lastOffsetFound {
 		s.logger.Warn("Rebuilding index from scratch...")
-		startOffset = int64(FileHeaderSize)
+		startOffset = 0
 	}
 
 	if _, err := s.journal.Seek(startOffset, 0); err != nil {
