@@ -1,0 +1,365 @@
+package main
+
+import (
+	"encoding/binary"
+	"flag"
+	"fmt"
+	"io"
+	"math/rand"
+	"net"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// OpCodes (Must match server)
+const (
+	OpCodePing   = 0x01
+	OpCodeGet    = 0x02
+	OpCodeSet    = 0x03
+	OpCodeBegin  = 0x10
+	OpCodeCommit = 0x11
+	OpCodeAuth   = 0x23
+)
+
+const (
+	ResStatusOK         = 0x00
+	ResStatusNotFound   = 0x02
+	ResStatusTxConflict = 0x05
+)
+
+// Config
+var (
+	host        = flag.String("host", "localhost:6379", "Target server address")
+	concurrency = flag.Int("c", 50, "Number of concurrent connections")
+	duration    = flag.Duration("d", 10*time.Second, "Test duration")
+	password    = flag.String("auth", "", "Password if required")
+	keySpace    = flag.Int("keys", 10000, "Key space size (e.g., key_0 to key_10000)")
+	writeRatio  = flag.Float64("w", 0.5, "Write ratio (0.0 - 1.0), default 50%")
+	readRatio   = flag.Float64("r", -1.0, "Read ratio (0.0 - 1.0), overrides -w if set")
+	valSize     = flag.Int("size", 128, "Size of value payload in bytes")
+)
+
+// WorkerStats prevents atomic contention by aggregating locally
+type WorkerStats struct {
+	Ops       int64
+	Errors    int64
+	Conflicts int64
+	Latencies []time.Duration
+}
+
+// ServerError allows checking specific status codes
+type ServerError struct {
+	Status byte
+	Msg    string
+}
+
+func (e *ServerError) Error() string {
+	return fmt.Sprintf("server error status: 0x%x, msg: %s", e.Status, e.Msg)
+}
+
+// Stats
+var (
+	opsCount  uint64
+	errCount  uint64
+	latencies []time.Duration
+	latMu     sync.Mutex
+	// Flag to ensure we only print the first error to avoid console flooding
+	hasPrintedError int32
+)
+
+func main() {
+	flag.Parse()
+
+	// Handle Read Ratio override
+	if *readRatio >= 0 {
+		*writeRatio = 1.0 - *readRatio
+	}
+
+	fmt.Printf("Starting benchmark against %s\n", *host)
+	fmt.Printf("Workers: %d | Duration: %v | Keys: %d\n", *concurrency, *duration, *keySpace)
+	fmt.Printf("Payload: %dB | Write Ratio: %.0f%% | Read Ratio: %.0f%%\n", *valSize, *writeRatio*100, (1.0-*writeRatio)*100)
+
+	var wg sync.WaitGroup
+	start := time.Now()
+
+	// Channel to collect stats from workers upon completion
+	statsCh := make(chan WorkerStats, *concurrency)
+	stopCh := make(chan struct{})
+
+	// Timer to stop test
+	time.AfterFunc(*duration, func() {
+		close(stopCh)
+	})
+
+	// Progress monitor
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		start := time.Now()
+		for {
+			select {
+			case <-stopCh:
+				return
+			case <-ticker.C:
+				elapsed := time.Since(start).Seconds()
+				fmt.Printf("\rRunning... %.0fs / %.0fs", elapsed, duration.Seconds())
+			}
+		}
+	}()
+
+	for i := 0; i < *concurrency; i++ {
+		wg.Add(1)
+		go worker(i, stopCh, statsCh, &wg)
+	}
+
+	wg.Wait()
+	close(statsCh)
+	fmt.Println("\n\n--- Aggregating Results ---")
+
+	var totalOps int64
+	var totalErr int64
+	var totalConflicts int64
+	var allLatencies []time.Duration
+
+	// Pre-allocate to avoid massive resizing if possible (estimate)
+	allLatencies = make([]time.Duration, 0, *concurrency*10000)
+
+	for s := range statsCh {
+		totalOps += s.Ops
+		totalErr += s.Errors
+		totalConflicts += s.Conflicts
+		allLatencies = append(allLatencies, s.Latencies...)
+	}
+
+	totalDuration := time.Since(start)
+	rps := float64(totalOps) / totalDuration.Seconds()
+
+	// Calculate Percentiles
+	sort.Slice(allLatencies, func(i, j int) bool {
+		return allLatencies[i] < allLatencies[j]
+	})
+
+	var p50, p95, p99 time.Duration
+	if len(allLatencies) > 0 {
+		p50 = allLatencies[int(float64(len(allLatencies))*0.50)]
+		p95 = allLatencies[int(float64(len(allLatencies))*0.95)]
+		p99 = allLatencies[int(float64(len(allLatencies))*0.99)]
+	}
+
+	fmt.Printf("Total Ops:       %d\n", totalOps)
+	fmt.Printf("Total Errors:    %d\n", totalErr)
+	fmt.Printf("Total Conflicts: %d\n", totalConflicts)
+	fmt.Printf("Duration:        %v\n", totalDuration.Round(time.Millisecond))
+	fmt.Printf("Throughput:      %.2f requests/sec\n", rps)
+	fmt.Println("Latency Distribution:")
+	fmt.Printf("  p50: %v\n", p50)
+	fmt.Printf("  p95: %v\n", p95)
+	fmt.Printf("  p99: %v\n", p99)
+}
+
+func worker(id int, stopCh <-chan struct{}, statsCh chan<- WorkerStats, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	// Thread-local random source to avoid global mutex contention
+	rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(id)))
+
+	stats := WorkerStats{
+		Latencies: make([]time.Duration, 0, 10000),
+	}
+
+	conn, err := net.Dial("tcp", *host)
+	if err != nil {
+		fmt.Printf("[Worker %d] Connect error: %v\n", id, err)
+		stats.Errors++
+		statsCh <- stats
+		return
+	}
+	defer conn.Close()
+
+	if *password != "" {
+		if err := sendAuth(conn, *password); err != nil {
+			fmt.Printf("[Worker %d] Auth error: %v\n", id, err)
+			stats.Errors++
+			statsCh <- stats
+			return
+		}
+	}
+
+	readBuf := make([]byte, 4096) // Reusable read buffer
+
+	// Pre-generate a static value payload to avoid allocs during benchmark
+	staticVal := make([]byte, *valSize)
+	rng.Read(staticVal)
+	valStr := string(staticVal)
+
+	for {
+		select {
+		case <-stopCh:
+			statsCh <- stats
+			return
+		default:
+			// Configurable Read/Write mix
+			isWrite := rng.Float64() < *writeRatio
+			key := fmt.Sprintf("key_%d", rng.Intn(*keySpace))
+			var err error
+
+			start := time.Now()
+
+			// 1. Begin Transaction
+			if err = sendBegin(conn); err == nil {
+				// 2. Perform Operation
+				if isWrite {
+					// Use random key, but static payload for performance
+					err = sendSet(conn, key, valStr, readBuf)
+				} else {
+					err = sendGet(conn, key, readBuf)
+				}
+
+				// 3. Commit Transaction
+				if err == nil {
+					err = sendCommit(conn)
+				}
+			}
+
+			// Record Latency
+			stats.Latencies = append(stats.Latencies, time.Since(start))
+
+			if err != nil {
+				// Check specific error types
+				if se, ok := err.(*ServerError); ok && se.Status == ResStatusTxConflict {
+					stats.Conflicts++
+					// Do not reconnect on conflict; the protocol allows continuing
+					continue
+				}
+
+				stats.Errors++
+				// Print error once
+				if atomic.CompareAndSwapInt32(&hasPrintedError, 0, 1) {
+					fmt.Printf("\n[!] First Error Encountered: %v\n", err)
+				}
+
+				// Reconnect on actual network/protocol errors
+				conn.Close()
+				conn, err = net.Dial("tcp", *host)
+				if err != nil {
+					statsCh <- stats
+					return
+				}
+				if *password != "" {
+					sendAuth(conn, *password)
+				}
+			} else {
+				stats.Ops++
+			}
+		}
+	}
+}
+
+// --- Protocol Helpers (Optimized) ---
+
+func sendAuth(conn net.Conn, pass string) error {
+	payload := []byte(pass)
+	send(conn, OpCodeAuth, payload)
+	return readResp(conn, nil)
+}
+
+func sendBegin(conn net.Conn) error {
+	send(conn, OpCodeBegin, nil)
+	return readResp(conn, nil)
+}
+
+func sendCommit(conn net.Conn) error {
+	send(conn, OpCodeCommit, nil)
+	return readResp(conn, nil)
+}
+
+func sendSet(conn net.Conn, key, val string, buf []byte) error {
+	// Optimization: Calculate size exactly to single alloc
+	totalLen := 4 + len(key) + len(val)
+	// In a real high-perf client, we'd use a sync.Pool for this buffer too
+	payload := make([]byte, totalLen)
+
+	binary.BigEndian.PutUint32(payload[0:4], uint32(len(key)))
+	copy(payload[4:], key)
+	copy(payload[4+len(key):], val)
+
+	send(conn, OpCodeSet, payload)
+	return readResp(conn, buf)
+}
+
+func sendGet(conn net.Conn, key string, buf []byte) error {
+	send(conn, OpCodeGet, []byte(key))
+	return readResp(conn, buf)
+}
+
+func send(w io.Writer, op byte, payload []byte) {
+	// Write header + payload in one go if possible to reduce syscalls,
+	// but standard net.Conn usually buffers anyway.
+	// For strictly adhering to protocol:
+	header := make([]byte, 5)
+	header[0] = op
+	binary.BigEndian.PutUint32(header[1:], uint32(len(payload)))
+
+	// Combining write might be slightly better for packet coalescence
+	if len(payload) > 0 {
+		// Small optimization: if payload small, alloc one buffer
+		if len(payload) < 1024 {
+			full := make([]byte, 5+len(payload))
+			copy(full, header)
+			copy(full[5:], payload)
+			w.Write(full)
+			return
+		}
+	}
+
+	w.Write(header)
+	if len(payload) > 0 {
+		w.Write(payload)
+	}
+}
+
+func readResp(r io.Reader, buf []byte) error {
+	header := make([]byte, 5)
+	if _, err := io.ReadFull(r, header); err != nil {
+		return err
+	}
+	status := header[0]
+	length := binary.BigEndian.Uint32(header[1:])
+
+	if status != ResStatusOK && status != ResStatusNotFound {
+		var msg string
+		if length > 0 {
+			// Cap error message reading to avoid massive allocations on bogus length
+			readLen := length
+			if readLen > 1024 {
+				readLen = 1024
+			}
+			msgBytes := make([]byte, readLen)
+			if _, err := io.ReadFull(r, msgBytes); err == nil {
+				msg = string(msgBytes)
+			}
+			// Discard rest if truncated
+			if length > readLen {
+				io.CopyN(io.Discard, r, int64(length-readLen))
+			}
+		}
+		// Return typed error for status code inspection
+		return &ServerError{Status: status, Msg: strings.TrimSpace(msg)}
+	}
+
+	if length > 0 {
+		if buf == nil || uint32(len(buf)) < length {
+			// If reusable buffer is too small, just discard the data for benchmarking
+			// (unless we strictly need to verify content).
+			// For benchmarking, we usually just want to consume the bytes.
+			io.CopyN(io.Discard, r, int64(length))
+			return nil
+		}
+		_, err := io.ReadFull(r, buf[:length])
+		return err
+	}
+	return nil
+}

@@ -1,6 +1,6 @@
 build:
 	mkdir -p ./bin
-	go build -o turnstone
-	go build -o turnstone_cli ./cli/client.go
-	mv turnstone ./bin/turnstone
-	mv turnstone_cli ./bin/turnstone_cli
+	go build -o ./bin/turnstone
+	go build -o ./bin/turnstone_cli ./tools/cli.go
+	go build -o ./bin/turnstone_stress ./tools/stress.go
+	go build -o ./bin/turnstone_data_loader ./tools/data_loader.go
