@@ -16,10 +16,11 @@ Above operations should be called inside transactions. More than one operations 
 
 There are non-transactional commands as follows
 
-1. `PING` simple health check, return PONG
-2. `STAT` returns server stats.
-3. `QUIT` terminate current client connection.
-4. `COMPACT` starts compaction on server.
+1. `AUTH <code>` to authenticate the current connection.
+2. `PING` simple health check, return PONG
+3. `STAT` returns server stats.
+4. `QUIT` terminate current client connection.
+5. `COMPACT` starts compaction on server.
 
 ## How does it work?
 
