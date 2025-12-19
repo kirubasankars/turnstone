@@ -14,7 +14,8 @@ func main() {
 	port := flag.String("port", DefaultPort, "Port")
 	dir := flag.String("dir", DefaultDataDir, "Data dir")
 	debugEnv := flag.Bool("debug", false, "Debug logs")
-	maxConns := flag.Int("max-conns", 500, "Max connections")
+	maxConns := flag.Int("max-conns", 500, "Max total connections")
+	maxSyncs := flag.Int("max-sync-clients", 10, "Max concurrent CDC sync clients (heavy I/O)")
 	truncate := flag.Bool("truncate", false, "Repair corrupt file")
 	skipCrc := flag.Bool("skip-crc", false, "Faster reads (unsafe)")
 	requirePass := flag.String("requirepass", "", "Require password for access")
@@ -40,8 +41,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Pass requirePass to NewServer
-	srv := NewServer(*port, store, logger, *maxConns, *requirePass)
+	// Pass maxSyncs to NewServer
+	srv := NewServer(*port, store, logger, *maxConns, *maxSyncs, *requirePass)
 
 	errCh := make(chan error, 1)
 	go func() {

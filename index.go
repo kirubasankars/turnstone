@@ -51,7 +51,7 @@ func (idx *Index) Len() int {
 		count += len(idx.flushing)
 	}
 
-	idx.db.View(func(tx *bbolt.Tx) error {
+	_ = idx.db.View(func(tx *bbolt.Tx) error {
 		b := tx.Bucket([]byte(BoltBucketData))
 		if b != nil {
 			// Bucket Stats() is fast (O(1)) as it reads metadata.
@@ -80,7 +80,7 @@ func (idx *Index) Get(key string, readVersion int64) (IndexEntry, bool) {
 	// 3. Check BoltDB (Cold)
 	var ent IndexEntry
 	found := false
-	idx.db.View(func(tx *bbolt.Tx) error {
+	_ = idx.db.View(func(tx *bbolt.Tx) error {
 		b := tx.Bucket([]byte(BoltBucketData))
 		if b == nil {
 			return nil
@@ -107,7 +107,7 @@ func (idx *Index) GetLatest(key string) (IndexEntry, bool) {
 	}
 	var ent IndexEntry
 	found := false
-	idx.db.View(func(tx *bbolt.Tx) error {
+	_ = idx.db.View(func(tx *bbolt.Tx) error {
 		b := tx.Bucket([]byte(BoltBucketData))
 		if b == nil {
 			return nil
@@ -297,9 +297,9 @@ func (idx *Index) pruneHistory(hist []IndexEntry, minVer int64) []IndexEntry {
 
 func (idx *Index) encodeHistory(hist []IndexEntry) []byte {
 	buf := new(bytes.Buffer)
-	binary.Write(buf, binary.LittleEndian, uint32(len(hist)))
+	_ = binary.Write(buf, binary.LittleEndian, uint32(len(hist)))
 	for _, entry := range hist {
-		binary.Write(buf, binary.LittleEndian, uint64(entry))
+		_ = binary.Write(buf, binary.LittleEndian, uint64(entry))
 	}
 	return buf.Bytes()
 }
@@ -310,11 +310,11 @@ func (idx *Index) decodeHistory(data []byte) []IndexEntry {
 	}
 	r := bytes.NewReader(data)
 	var count uint32
-	binary.Read(r, binary.LittleEndian, &count)
+	_ = binary.Read(r, binary.LittleEndian, &count)
 	hist := make([]IndexEntry, count)
 	for i := 0; i < int(count); i++ {
 		var packed uint64
-		binary.Read(r, binary.LittleEndian, &packed)
+		_ = binary.Read(r, binary.LittleEndian, &packed)
 		hist[i] = IndexEntry(packed)
 	}
 	return hist

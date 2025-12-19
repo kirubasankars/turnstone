@@ -31,11 +31,11 @@ const (
 	MaxPooledBuffer      = 1 * 1024 * 1024
 	MaxPendingWriteBytes = 128 * 1024 * 1024
 	MaxMemoryLimit       = 1024 * 1024 * 1024
+	MaxSyncBytes         = 16 * 1024 * 1024 // 16MB limit for CDC batches
 
 	// Storage Format (Journal)
-	FileHeaderSize = 8  // Generation Header
-	HeaderSize     = 12 // Entry Header (KeyLen + ValLen + CRC)
-	Tombstone      = ^uint32(0)
+	HeaderSize = 12 // Entry Header (KeyLen + ValLen + CRC)
+	Tombstone  = ^uint32(0)
 
 	// Internal Op Types (Journal)
 	OpJournalSet    = 1
@@ -45,6 +45,7 @@ const (
 	// Tuning Parameters
 	BatchDelay                 = 10 * time.Millisecond
 	MaxBatchSize               = 2000
+	MaxBatchBytes              = 64 * 1024 // Adaptive batching: flush if batch exceeds 64KB
 	FlushInterval              = 1 * time.Second
 	DefaultCompactionThreshold = 10 * 1024 * 1024
 	IndexFlushThreshold        = 100_000 // From compaction logic
@@ -60,6 +61,8 @@ var (
 	ErrBusy                 = errors.New("server busy")
 	ErrTransactionTimeout   = errors.New("transaction timeout")
 	ErrCompactionInProgress = errors.New("compaction already in progress")
+	ErrGenerationMismatch   = errors.New("generation mismatch")
+	ErrGenerationSwitch     = errors.New("generation switch required") // New Error
 )
 
 // Request OpCodes
@@ -73,7 +76,8 @@ const (
 	OpCodeAbort   = 0x12
 	OpCodeStat    = 0x20
 	OpCodeCompact = 0x21
-	OpCodeAuth    = 0x23 // New OpCode
+	OpCodeAuth    = 0x23
+	OpCodeSync    = 0x30
 	OpCodeQuit    = 0xFF
 )
 
@@ -87,7 +91,9 @@ const (
 	ResStatusTxConflict     = 0x05
 	ResStatusServerBusy     = 0x06
 	ResStatusEntityTooLarge = 0x07
-	ResStatusAuthRequired   = 0x08 // New Status
+	ResStatusAuthRequired   = 0x08
+	ResStatusGenMismatch    = 0x09
+	ResStatusGenSwitch      = 0x0A // New Status: Seamless Transition
 )
 
 // Fixed Header Size: 1 byte OpCode + 4 bytes Length

@@ -10,6 +10,7 @@ type bufferedOp struct {
 	opType int
 	key    string
 	val    []byte
+	header [HeaderSize]byte
 }
 
 // Mutation tracks a committed write for SSI conflict detection.
@@ -36,11 +37,12 @@ type request struct {
 
 // txState tracks the state of an active client transaction context.
 type txState struct {
-	active      bool
-	readOnly    bool // Default true
-	deadline    time.Time
-	readVersion int64
-	generation  uint64
-	ops         []bufferedOp // The complete history of the transaction
-	memUsage    int64
+	active       bool
+	readOnly     bool // Default true
+	isSyncClient bool // True if this connection has performed a CDC sync
+	deadline     time.Time
+	readVersion  int64
+	generation   uint64
+	ops          []bufferedOp // The complete history of the transaction
+	memUsage     int64
 }

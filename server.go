@@ -21,21 +21,24 @@ type Server struct {
 	logger      *slog.Logger
 	listener    net.Listener
 	maxConns    int
+	maxSyncs    int    // Limit for CDC clients
 	authPass    string // Password for authentication
 	sem         chan struct{}
 	wg          sync.WaitGroup
 	totalConns  uint64
 	activeConns int64
+	activeSyncs int64 // Counter for active CDC clients
 	usedMemory  int64
 	activeTxs   int64
 }
 
-func NewServer(addr string, store *Store, logger *slog.Logger, maxConns int, authPass string) *Server {
+func NewServer(addr string, store *Store, logger *slog.Logger, maxConns int, maxSyncs int, authPass string) *Server {
 	return &Server{
 		addr:     addr,
 		store:    store,
 		logger:   logger,
 		maxConns: maxConns,
+		maxSyncs: maxSyncs,
 		authPass: authPass,
 		sem:      make(chan struct{}, maxConns),
 	}
@@ -111,6 +114,10 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 		}
 		if tx.active {
 			s.abortTx(tx)
+		}
+		// If this connection was a Sync client, release the slot
+		if tx.isSyncClient {
+			atomic.AddInt64(&s.activeSyncs, -1)
 		}
 		if err := conn.Close(); err != nil {
 			s.logger.Debug("Error closing connection", "err", err)
@@ -189,7 +196,7 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 			// Check Transaction Constraints
 			if tx.active {
 				switch opCode {
-				case OpCodePing, OpCodeQuit, OpCodeStat, OpCodeCompact:
+				case OpCodePing, OpCodeQuit, OpCodeStat, OpCodeCompact, OpCodeSync:
 					_ = s.writeBinaryResponse(conn, ResStatusErr, []byte("Command not allowed in transaction"))
 					return true
 				}
@@ -212,6 +219,8 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 				s.handleStat(conn)
 			case OpCodeCompact:
 				s.handleCompact(conn)
+			case OpCodeSync:
+				s.handleSync(conn, payload, tx)
 			case OpCodePing:
 				_ = s.writeBinaryResponse(conn, ResStatusOK, []byte("PONG"))
 			case OpCodeQuit:
@@ -240,10 +249,75 @@ func (s *Server) handleAuth(w io.Writer, payload []byte, authed *bool) {
 		*authed = true
 		_ = s.writeBinaryResponse(w, ResStatusOK, []byte("OK"))
 	} else {
-		// Do not set authed to false here if it was already true?
-		// Usually a bad auth attempt doesn't logout, but let's be strict or neutral.
-		// Redis simple implementation: just return error.
 		_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Invalid password"))
+	}
+}
+
+func (s *Server) handleSync(w io.Writer, payload []byte, tx *txState) {
+	// CDC Client Quota Check
+	if !tx.isSyncClient {
+		current := atomic.LoadInt64(&s.activeSyncs)
+		if current >= int64(s.maxSyncs) {
+			s.logger.Warn("Max CDC sync clients reached", "current", current, "max", s.maxSyncs)
+			_ = s.writeBinaryResponse(w, ResStatusServerBusy, []byte("Max sync clients reached"))
+			return
+		}
+		// Upgrade connection to Sync Client
+		atomic.AddInt64(&s.activeSyncs, 1)
+		tx.isSyncClient = true
+	}
+
+	// Payload Request: [Generation 8 bytes][Offset 8 bytes]
+	if len(payload) != 16 {
+		_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Invalid payload size, expected 16 bytes"))
+		return
+	}
+
+	reqGen := binary.BigEndian.Uint64(payload[0:8])
+	reqOffset := int64(binary.BigEndian.Uint64(payload[8:16]))
+
+	data, nextOffset, currentGen, err := s.store.Sync(reqGen, reqOffset)
+	if err != nil {
+		if err == ErrGenerationMismatch {
+			resp := make([]byte, 8)
+			binary.BigEndian.PutUint64(resp, currentGen)
+			_ = s.writeBinaryResponse(w, ResStatusGenMismatch, resp)
+			return
+		}
+		if err == ErrGenerationSwitch {
+			resp := make([]byte, 8)
+			binary.BigEndian.PutUint64(resp, currentGen)
+			_ = s.writeBinaryResponse(w, ResStatusGenSwitch, resp)
+			return
+		}
+		s.logger.Error("Sync error", "err", err)
+		_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Internal sync error"))
+		return
+	}
+
+	totalLen := 8 + 8 + len(data)
+
+	// Write Header
+	header := make([]byte, 5)
+	header[0] = ResStatusOK
+	binary.BigEndian.PutUint32(header[1:], uint32(totalLen))
+	if _, err := w.Write(header); err != nil {
+		return
+	}
+
+	// Write Metadata (Gen + NextOffset)
+	meta := make([]byte, 16)
+	binary.BigEndian.PutUint64(meta[0:8], currentGen)
+	binary.BigEndian.PutUint64(meta[8:16], uint64(nextOffset))
+	if _, err := w.Write(meta); err != nil {
+		return
+	}
+
+	// Write Data
+	if len(data) > 0 {
+		if _, err := w.Write(data); err != nil {
+			return
+		}
 	}
 }
 
@@ -321,14 +395,12 @@ func (s *Server) handleEnd(w io.Writer, tx *txState) {
 		}
 	}()
 
-	// Read-Only Optimization: Snapshot Isolation consistency is guaranteed without commit.
 	if tx.readOnly {
 		s.abortTx(tx)
 		_ = s.writeBinaryResponse(w, ResStatusOK, nil)
 		return
 	}
 
-	// Read-Write Transaction: Check conflicts using full ops list (Gets+Sets+Dels)
 	if err := s.store.ApplyBatch(tx.ops, tx.readVersion, tx.generation); err != nil {
 		if err == ErrConflict {
 			_ = s.writeBinaryResponse(w, ResStatusTxConflict, []byte("Conflict detected"))
@@ -367,10 +439,8 @@ func (s *Server) handleGet(w io.Writer, payload []byte, tx *txState) {
 	}
 
 	key := string(payload)
-	// Record operation for conflict detection
 	tx.ops = append(tx.ops, bufferedOp{opType: OpJournalGet, key: key})
 
-	// Read-Your-Writes logic (scan backwards)
 	for i := len(tx.ops) - 2; i >= 0; i-- {
 		op := tx.ops[i]
 		if op.key == key && op.opType != OpJournalGet {
@@ -429,7 +499,6 @@ func (s *Server) handleSet(conn net.Conn, payload []byte, tx *txState) {
 		return
 	}
 
-	// Memory Limit Check
 	newUsage := atomic.AddInt64(&s.usedMemory, int64(valLen))
 	if newUsage > MaxMemoryLimit {
 		atomic.AddInt64(&s.usedMemory, -int64(valLen))
@@ -442,7 +511,7 @@ func (s *Server) handleSet(conn net.Conn, payload []byte, tx *txState) {
 	copy(valCopy, val)
 
 	tx.memUsage += int64(valLen)
-	tx.readOnly = false // Mutation flips flag
+	tx.readOnly = false
 
 	tx.ops = append(tx.ops, bufferedOp{
 		opType: OpJournalSet,
@@ -462,7 +531,7 @@ func (s *Server) handleDelete(w io.Writer, payload []byte, tx *txState) {
 	}
 
 	key := string(payload)
-	tx.readOnly = false // Mutation flips flag
+	tx.readOnly = false
 
 	tx.ops = append(tx.ops, bufferedOp{opType: OpJournalDelete, key: key})
 	_ = s.writeBinaryResponse(w, ResStatusOK, nil)
@@ -471,10 +540,11 @@ func (s *Server) handleDelete(w io.Writer, payload []byte, tx *txState) {
 func (s *Server) handleStat(w io.Writer) {
 	count, uptime, pending, activeSnaps, offset, generation := s.store.Stats()
 	active := atomic.LoadInt64(&s.activeConns)
+	activeSyncs := atomic.LoadInt64(&s.activeSyncs)
 	mem := atomic.LoadInt64(&s.usedMemory)
 
-	msg := fmt.Sprintf("Keys:%d Uptime:%s Conns:%d TxMem:%d Pending:%d Snaps:%d Offset:%d,%d",
-		count, uptime, active, mem, pending, activeSnaps, generation, offset)
+	msg := fmt.Sprintf("Keys:%d Uptime:%s Conns:%d Syncs:%d/%d TxMem:%d Pending:%d Snaps:%d Offset:%d,%d",
+		count, uptime, active, activeSyncs, s.maxSyncs, mem, pending, activeSnaps, generation, offset)
 
 	_ = s.writeBinaryResponse(w, ResStatusOK, []byte(msg))
 }

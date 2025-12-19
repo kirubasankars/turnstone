@@ -141,6 +141,8 @@ func (s *Store) doCompact() (retErr error) {
 	// Clean up old state that will be invalid in the new generation
 	s.activeSnapshots = make(map[int64]int)
 	s.conflictIndex = make(map[string][]int64)
+	// Reset the conflict queue as well to keep it in sync with conflictIndex
+	s.conflictQueue = make([]Mutation, 0, 1024)
 
 	finalOffset := s.offset
 	s.logger.Info("Compaction Finalizing (Stop-The-World)", "remaining_bytes", finalOffset-readOffset)
@@ -235,6 +237,12 @@ func (s *Store) doCompact() (retErr error) {
 	s.index.active = warmCache
 
 	s.offset = writeOffset
+	// Reset version tracking to match new offset.
+	// This prevents the new generation from inheriting a high minReadVersion from the old generation,
+	// which could cause premature pruning of conflict history before the first new snapshot is acquired.
+	s.minReadVersion = writeOffset
+	s.lastPrunedVersion = writeOffset
+
 	s.compacting = false
 	s.mu.Unlock()
 
@@ -271,7 +279,8 @@ func (s *Store) copyRange(
 	}
 
 	r := io.LimitReader(src.f, endOff-startOff)
-	reader := bufio.NewReader(r)
+	// Optimization: Increase read buffer size to 256KB for better throughput
+	reader := bufio.NewReaderSize(r, 256*1024)
 
 	currentReadOff := startOff
 	kept := 0
@@ -282,12 +291,31 @@ func (s *Store) copyRange(
 	type batchItem struct {
 		headerBuf [HeaderSize]byte
 		key       string
-		payload   []byte // Local copy of the payload
+		payload   []byte // Local copy of the payload (backed by batchPayloadBuf)
 		entryOff  int64  // Original offset in the old file
 		entrySize int64
 		valLen    uint32
 	}
 	batch := make([]batchItem, 0, batchSize)
+
+	// Optimization: Shared buffer for payloads in a single batch to reduce allocations
+	batchPayloadBuf := make([]byte, 0, 1024*1024) // 1MB initial cap
+
+	// Optimization: Write buffer to reduce syscalls (64KB)
+	writeBuf := make([]byte, 0, 64*1024)
+	currentFlushOffset := writeOff
+
+	flushWriteBuf := func() error {
+		if len(writeBuf) == 0 {
+			return nil
+		}
+		if _, err := dst.WriteAt(writeBuf, currentFlushOffset); err != nil {
+			return err
+		}
+		currentFlushOffset += int64(len(writeBuf))
+		writeBuf = writeBuf[:0]
+		return nil
+	}
 
 	// processBatch handles the locking (decision) and IO (writing) phases separately
 	processBatch := func() error {
@@ -324,13 +352,35 @@ func (s *Store) copyRange(
 				continue
 			}
 
-			// Write Header
-			if _, err := dst.WriteAt(item.headerBuf[:], writeOff); err != nil {
-				return err
-			}
-			// Write Payload
-			if _, err := dst.WriteAt(item.payload, writeOff+HeaderSize); err != nil {
-				return err
+			totalSize := HeaderSize + len(item.payload)
+
+			// Optimization: Buffer the writes
+			if len(writeBuf)+totalSize <= cap(writeBuf) {
+				writeBuf = append(writeBuf, item.headerBuf[:]...)
+				writeBuf = append(writeBuf, item.payload...)
+			} else {
+				// Buffer full, flush it
+				if err := flushWriteBuf(); err != nil {
+					return err
+				}
+
+				// If item is huge (larger than buffer), write directly
+				if totalSize > cap(writeBuf) {
+					// Write Header
+					if _, err := dst.WriteAt(item.headerBuf[:], currentFlushOffset); err != nil {
+						return err
+					}
+					currentFlushOffset += int64(HeaderSize)
+					// Write Payload
+					if _, err := dst.WriteAt(item.payload, currentFlushOffset); err != nil {
+						return err
+					}
+					currentFlushOffset += int64(len(item.payload))
+				} else {
+					// Otherwise, start filling the empty buffer
+					writeBuf = append(writeBuf, item.headerBuf[:]...)
+					writeBuf = append(writeBuf, item.payload...)
+				}
 			}
 
 			isDel := item.valLen == Tombstone
@@ -343,6 +393,7 @@ func (s *Store) copyRange(
 
 		// Reset batch for next iteration
 		batch = batch[:0]
+		batchPayloadBuf = batchPayloadBuf[:0]
 		return nil
 	}
 
@@ -388,10 +439,14 @@ func (s *Store) copyRange(
 			}
 		}
 
-		// Copy data to batch item (we need to copy because payloadPtr is reused)
+		// Copy data to batch item using the shared buffer (reduces allocations)
 		item.key = string(rawPayload[:keyLen])
-		item.payload = make([]byte, payloadLen)
-		copy(item.payload, rawPayload)
+
+		// Append rawPayload to batchPayloadBuf
+		start := len(batchPayloadBuf)
+		batchPayloadBuf = append(batchPayloadBuf, rawPayload...)
+		item.payload = batchPayloadBuf[start:]
+
 		item.entrySize = int64(HeaderSize) + payloadLen
 
 		batch = append(batch, item)
@@ -407,6 +462,11 @@ func (s *Store) copyRange(
 
 	// Process any remaining items
 	if err := processBatch(); err != nil {
+		return writeOff, kept, dropped, payloadPtr, err
+	}
+
+	// Flush any remaining data in the write buffer
+	if err := flushWriteBuf(); err != nil {
 		return writeOff, kept, dropped, payloadPtr, err
 	}
 
