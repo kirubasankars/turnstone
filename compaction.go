@@ -179,8 +179,15 @@ func (s *Store) doCompact() (retErr error) {
 		warmCache[key] = newEntries
 	}
 
+	// Copy active TX info too for cache
+	// Refactored to use int64 length instead of TxInfo struct
+	warmTxCache := make(map[int64]int64, len(tmpIndex.txActive))
+	for k, v := range tmpIndex.txActive {
+		warmTxCache[k] = v
+	}
+
 	// Flush whatever is left in tmpIndex to disk for durability
-	if tmpIndex.Len() > 0 {
+	if tmpIndex.Len() > 0 || len(tmpIndex.txActive) > 0 {
 		tmpIndex.Rotate()
 		if err := tmpIndex.FlushToBolt(0); err != nil {
 			s.compacting = false
@@ -235,6 +242,7 @@ func (s *Store) doCompact() (retErr error) {
 
 	// Inject the warm cache into the new index
 	s.index.active = warmCache
+	s.index.txActive = warmTxCache
 
 	s.offset = writeOffset
 	// Reset version tracking to match new offset.
@@ -295,6 +303,7 @@ func (s *Store) copyRange(
 		entryOff  int64  // Original offset in the old file
 		entrySize int64
 		valLen    uint32
+		txStart   int64 // Track transaction start
 	}
 	batch := make([]batchItem, 0, batchSize)
 
@@ -316,6 +325,10 @@ func (s *Store) copyRange(
 		writeBuf = writeBuf[:0]
 		return nil
 	}
+
+	// Transaction Tracking vars
+	var currentOldTxStart int64 = -1
+	var currentNewTxStart int64 = -1
 
 	// processBatch handles the locking (decision) and IO (writing) phases separately
 	processBatch := func() error {
@@ -351,6 +364,21 @@ func (s *Store) copyRange(
 				dropped++
 				continue
 			}
+
+			// Transaction Grouping Logic:
+			// If txStart changes, it's a new transaction boundary.
+			if currentOldTxStart == -1 {
+				currentOldTxStart = item.txStart
+				currentNewTxStart = writeOff
+			} else if item.txStart != currentOldTxStart {
+				// Flush previous transaction info: Key=Start, Value=Length
+				tmpIndex.SetTx(currentNewTxStart, writeOff-currentNewTxStart)
+				currentOldTxStart = item.txStart
+				currentNewTxStart = writeOff
+			}
+
+			// Patch Header with NEW TxStart
+			binary.BigEndian.PutUint64(item.headerBuf[8:16], uint64(currentNewTxStart))
 
 			totalSize := HeaderSize + len(item.payload)
 
@@ -412,8 +440,11 @@ func (s *Store) copyRange(
 
 		keyLen := binary.BigEndian.Uint32(item.headerBuf[0:4])
 		valLen := binary.BigEndian.Uint32(item.headerBuf[4:8])
-		storedCrc := binary.BigEndian.Uint32(item.headerBuf[8:12])
+		txStart := int64(binary.BigEndian.Uint64(item.headerBuf[8:16]))
+		storedCrc := binary.BigEndian.Uint32(item.headerBuf[16:20])
+
 		item.valLen = valLen
+		item.txStart = txStart
 
 		var payloadLen int64
 		if valLen == Tombstone {
@@ -463,6 +494,11 @@ func (s *Store) copyRange(
 	// Process any remaining items
 	if err := processBatch(); err != nil {
 		return writeOff, kept, dropped, payloadPtr, err
+	}
+
+	// Finalize any open transaction info
+	if currentOldTxStart != -1 {
+		tmpIndex.SetTx(currentNewTxStart, writeOff-currentNewTxStart)
 	}
 
 	// Flush any remaining data in the write buffer

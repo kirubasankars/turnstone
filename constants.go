@@ -22,6 +22,7 @@ const (
 	DefaultDataDir = "data"
 	BoltBucketData = "index"
 	BoltBucketMeta = "meta"
+	BoltBucketTx   = "tx" // New bucket for Transaction Info
 	KeyLastOffset  = "last_offset"
 
 	// Limits & Safety
@@ -32,9 +33,10 @@ const (
 	MaxPendingWriteBytes = 128 * 1024 * 1024
 	MaxMemoryLimit       = 1024 * 1024 * 1024
 	MaxSyncBytes         = 16 * 1024 * 1024 // 16MB limit for CDC batches
+	MaxResponseSize      = 32 * 1024 * 1024 // 32MB Limit for responses
 
 	// Storage Format (Journal)
-	HeaderSize = 12 // Entry Header (KeyLen + ValLen + CRC)
+	HeaderSize = 20 // Entry Header (KeyLen + ValLen + TxStart + CRC)
 	Tombstone  = ^uint32(0)
 
 	// Internal Op Types (Journal)

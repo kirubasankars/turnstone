@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -24,12 +25,18 @@ const (
 	ResStatusGenMismatch = 0x09
 	ResStatusGenSwitch   = 0x0A // New status for transparent transition
 
-	HeaderSize = 12         // KeyLen(4) + ValLen(4) + CRC(4)
+	HeaderSize = 20         // KeyLen(4) + ValLen(4) + TxStart(8) + CRC(4)
 	Tombstone  = ^uint32(0) // Max Uint32 indicates deletion
 
 	// Safety Limits
 	MaxResponseSize = 32 * 1024 * 1024 // 32MB Limit to prevent OOM on corrupt packets
 )
+
+// CheckpointState represents the persistent state for resumption.
+type CheckpointState struct {
+	Generation uint64 `json:"generation"`
+	Offset     int64  `json:"offset"`
+}
 
 // EventHandler defines the contract for processing CDC events.
 // Methods return error to stop the client (e.g., on broken pipe or disk full).
@@ -317,6 +324,8 @@ func (c *CDCClient) parseBatch(data []byte) (int64, error) {
 		header := data[consumed : consumed+HeaderSize]
 		keyLen := binary.BigEndian.Uint32(header[0:4])
 		valLen := binary.BigEndian.Uint32(header[4:8])
+		// TxStart is at header[8:16], CRC is at header[16:20]
+		// We don't currently expose TxStart to the handler, but we must account for the bytes.
 
 		isDelete := valLen == Tombstone
 		var payloadLen int
@@ -360,16 +369,39 @@ func (c *CDCClient) parseBatch(data []byte) (int64, error) {
 type PipeHandler struct {
 	EncodeBase64 bool
 	writer       *bufio.Writer
+	statePath    string
 }
 
-func NewPipeHandler(base64 bool) *PipeHandler {
+func NewPipeHandler(base64 bool, statePath string) *PipeHandler {
 	return &PipeHandler{
 		EncodeBase64: base64,
 		writer:       bufio.NewWriter(os.Stdout),
+		statePath:    statePath,
 	}
 }
 
+func (h *PipeHandler) saveState(gen uint64, offset int64) error {
+	if h.statePath == "" {
+		return nil
+	}
+	state := CheckpointState{Generation: gen, Offset: offset}
+	data, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+	// Atomic write
+	tmp := h.statePath + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, h.statePath)
+}
+
 func (h *PipeHandler) OnReset(newGen uint64) error {
+	// If reset, we should probably start from offset 0
+	if err := h.saveState(newGen, 0); err != nil {
+		return err
+	}
 	if err := h.Flush(); err != nil {
 		return err
 	}
@@ -398,7 +430,10 @@ func (h *PipeHandler) OnCheckpoint(generation uint64, offset int64) error {
 	if _, err := fmt.Fprintf(h.writer, "CP %d %d\n", generation, offset); err != nil {
 		return err
 	}
-	return h.Flush() // Flush on checkpoints to ensure consumer sees progress
+	if err := h.Flush(); err != nil {
+		return err
+	}
+	return h.saveState(generation, offset)
 }
 
 func (h *PipeHandler) Flush() error {
@@ -425,6 +460,18 @@ func isBrokenPipe(err error) bool {
 	return err == syscall.EPIPE || err == io.ErrClosedPipe || err.Error() == "write: broken pipe"
 }
 
+func loadState(path string) (uint64, int64, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, 0, err
+	}
+	var s CheckpointState
+	if err := json.Unmarshal(data, &s); err != nil {
+		return 0, 0, err
+	}
+	return s.Generation, s.Offset, nil
+}
+
 func main() {
 	addr := flag.String("addr", ":6379", "TurnstoneDB server address")
 	gen := flag.Uint64("gen", 0, "Start generation (resume state)")
@@ -432,14 +479,32 @@ func main() {
 	timeout := flag.Duration("timeout", 0, "Exit if no messages received for this duration (0 = forever)")
 	useBase64 := flag.Bool("base64", false, "Encode values as base64 in output")
 	auth := flag.String("auth", "", "Password for authentication")
+	stateFile := flag.String("state", "cdc.state", "State file path for resumption")
 
 	flag.Parse()
+
+	// Resume logic
+	if *stateFile != "" {
+		loadedGen, loadedOffset, err := loadState(*stateFile)
+		if err == nil {
+			// Prefer loaded state if flags are default (0/0)
+			if *gen == 0 {
+				*gen = loadedGen
+			}
+			if *offset == 0 {
+				*offset = loadedOffset
+			}
+			log.Printf("[CDC] Resuming from state file: Gen %d, Offset %d", *gen, *offset)
+		} else if !os.IsNotExist(err) {
+			log.Printf("[CDC] Failed to load state file: %v", err)
+		}
+	}
 
 	// Use Context for cancellation
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	handler := NewPipeHandler(*useBase64)
+	handler := NewPipeHandler(*useBase64, *stateFile)
 	client := NewCDCClient(*addr, *auth, handler, *gen, *offset, *timeout)
 
 	// Safe Shutdown Handling

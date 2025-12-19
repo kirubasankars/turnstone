@@ -13,6 +13,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 type Server struct {
@@ -22,7 +24,8 @@ type Server struct {
 	listener    net.Listener
 	maxConns    int
 	maxSyncs    int    // Limit for CDC clients
-	authPass    string // Password for authentication
+	authPass    string // Bcrypt Hash of the Password
+	readOnly    bool   // Server is in read-only mode (Follower)
 	sem         chan struct{}
 	wg          sync.WaitGroup
 	totalConns  uint64
@@ -32,7 +35,7 @@ type Server struct {
 	activeTxs   int64
 }
 
-func NewServer(addr string, store *Store, logger *slog.Logger, maxConns int, maxSyncs int, authPass string) *Server {
+func NewServer(addr string, store *Store, logger *slog.Logger, maxConns int, maxSyncs int, authPass string, readOnly bool) *Server {
 	return &Server{
 		addr:     addr,
 		store:    store,
@@ -40,6 +43,7 @@ func NewServer(addr string, store *Store, logger *slog.Logger, maxConns int, max
 		maxConns: maxConns,
 		maxSyncs: maxSyncs,
 		authPass: authPass,
+		readOnly: readOnly,
 		sem:      make(chan struct{}, maxConns),
 	}
 }
@@ -51,7 +55,7 @@ func (s *Server) Run(ctx context.Context) error {
 		return err
 	}
 	s.listener = ln
-	s.logger.Info("Binary Server listening", "addr", s.addr)
+	s.logger.Info("Binary Server listening", "addr", s.addr, "readonly", s.readOnly)
 
 	acceptErr := make(chan error, 1)
 	go func() {
@@ -104,6 +108,7 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 
 	// If authPass is empty, authentication is disabled (authed = true)
 	authed := s.authPass == ""
+	authFailures := 0
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -178,7 +183,16 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 
 			// Handle AUTH immediately
 			if opCode == OpCodeAuth {
-				s.handleAuth(conn, payload, &authed)
+				if s.handleAuth(conn, payload, &authed) {
+					authFailures = 0 // Reset on success
+				} else {
+					authFailures++
+					if authFailures > 3 {
+						// Silent close or send error then close
+						_ = s.writeBinaryResponse(conn, ResStatusErr, []byte("Too many authentication failures"))
+						return false
+					}
+				}
 				return true
 			}
 
@@ -238,18 +252,25 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 	}
 }
 
-func (s *Server) handleAuth(w io.Writer, payload []byte, authed *bool) {
+func (s *Server) handleAuth(w io.Writer, payload []byte, authed *bool) bool {
 	if s.authPass == "" {
 		// Redis behavior: ERR Client sent AUTH, but no password is set
 		_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Client sent AUTH, but no password is set"))
-		return
+		return false
 	}
 
-	if string(payload) == s.authPass {
+	// Compare stored bcrypt hash with the received plaintext payload
+	// payload is assumed to be the plaintext password sent by the client.
+	// s.authPass is the bcrypt hash loaded from config.
+	err := bcrypt.CompareHashAndPassword([]byte(s.authPass), payload)
+
+	if err == nil {
 		*authed = true
 		_ = s.writeBinaryResponse(w, ResStatusOK, []byte("OK"))
+		return true
 	} else {
 		_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Invalid password"))
+		return false
 	}
 }
 
@@ -276,7 +297,8 @@ func (s *Server) handleSync(w io.Writer, payload []byte, tx *txState) {
 	reqGen := binary.BigEndian.Uint64(payload[0:8])
 	reqOffset := int64(binary.BigEndian.Uint64(payload[8:16]))
 
-	data, nextOffset, currentGen, err := s.store.Sync(reqGen, reqOffset)
+	// Sync now returns a ReadCloser
+	rc, nextOffset, currentGen, err := s.store.Sync(reqGen, reqOffset)
 	if err != nil {
 		if err == ErrGenerationMismatch {
 			resp := make([]byte, 8)
@@ -295,9 +317,24 @@ func (s *Server) handleSync(w io.Writer, payload []byte, tx *txState) {
 		return
 	}
 
-	totalLen := 8 + 8 + len(data)
+	// Ensure cleanup if rc was returned
+	if rc != nil {
+		defer rc.Close()
+	}
 
-	// Write Header
+	// Calculate payload size
+	// Note: We are streaming only the data that was requested.
+	// If NextOffset > ReqOffset, the length is the difference.
+	dataLen := int64(0)
+	if nextOffset > reqOffset {
+		dataLen = nextOffset - reqOffset
+	}
+
+	// Response Format: [CurrentGen (8)] [NextOffset (8)] [Data (dataLen)]
+	metaLen := 16
+	totalLen := int64(metaLen) + dataLen
+
+	// Write Header (5 bytes)
 	header := make([]byte, 5)
 	header[0] = ResStatusOK
 	binary.BigEndian.PutUint32(header[1:], uint32(totalLen))
@@ -305,7 +342,7 @@ func (s *Server) handleSync(w io.Writer, payload []byte, tx *txState) {
 		return
 	}
 
-	// Write Metadata (Gen + NextOffset)
+	// Write Metadata (16 bytes)
 	meta := make([]byte, 16)
 	binary.BigEndian.PutUint64(meta[0:8], currentGen)
 	binary.BigEndian.PutUint64(meta[8:16], uint64(nextOffset))
@@ -313,9 +350,10 @@ func (s *Server) handleSync(w io.Writer, payload []byte, tx *txState) {
 		return
 	}
 
-	// Write Data
-	if len(data) > 0 {
-		if _, err := w.Write(data); err != nil {
+	// Stream Data using io.Copy (Zero-copy optimization)
+	if dataLen > 0 && rc != nil {
+		if _, err := io.Copy(w, rc); err != nil {
+			s.logger.Warn("Sync stream error", "err", err)
 			return
 		}
 	}
@@ -366,6 +404,11 @@ func (s *Server) abortTx(tx *txState) {
 }
 
 func (s *Server) handleBegin(w io.Writer, tx *txState) {
+	if s.readOnly {
+		_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Server is read-only"))
+		return
+	}
+
 	if tx.active {
 		if time.Now().Before(tx.deadline) {
 			_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Transaction already active"))
@@ -470,6 +513,11 @@ func (s *Server) handleGet(w io.Writer, payload []byte, tx *txState) {
 }
 
 func (s *Server) handleSet(conn net.Conn, payload []byte, tx *txState) {
+	if s.readOnly {
+		_ = s.writeBinaryResponse(conn, ResStatusErr, []byte("Server is read-only"))
+		return
+	}
+
 	if !s.checkTx(conn, tx) {
 		return
 	}
@@ -522,6 +570,11 @@ func (s *Server) handleSet(conn net.Conn, payload []byte, tx *txState) {
 }
 
 func (s *Server) handleDelete(w io.Writer, payload []byte, tx *txState) {
+	if s.readOnly {
+		_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Server is read-only"))
+		return
+	}
+
 	if len(payload) == 0 {
 		_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Missing Key"))
 		return

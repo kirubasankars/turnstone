@@ -33,14 +33,23 @@ func (e IndexEntry) Deleted() bool {
 type Index struct {
 	active   map[string][]IndexEntry // Hot writes go here
 	flushing map[string][]IndexEntry // Immutable snapshot for background flush
-	db       *bbolt.DB               // Persistent storage
+
+	// Transaction Index Maps (Offset -> Length)
+	// Key is the StartOffset of the transaction block.
+	// Value is the Length of the transaction block.
+	txActive   map[int64]int64
+	txFlushing map[int64]int64
+
+	db *bbolt.DB // Persistent storage
 }
 
 func NewIndex(db *bbolt.DB) *Index {
 	return &Index{
-		active:   make(map[string][]IndexEntry),
-		flushing: nil,
-		db:       db,
+		active:     make(map[string][]IndexEntry),
+		flushing:   nil,
+		txActive:   make(map[int64]int64),
+		txFlushing: nil,
+		db:         db,
 	}
 }
 
@@ -181,8 +190,13 @@ func (idx *Index) Set(key string, offset int64, deleted bool, minReadVersion int
 	}
 }
 
+// SetTx records a transaction block's metadata (Length).
+func (idx *Index) SetTx(offset int64, length int64) {
+	idx.txActive[offset] = length
+}
+
 func (idx *Index) Rotate() bool {
-	if len(idx.active) == 0 {
+	if len(idx.active) == 0 && len(idx.txActive) == 0 {
 		return false
 	}
 	if idx.flushing != nil {
@@ -190,11 +204,16 @@ func (idx *Index) Rotate() bool {
 	}
 	idx.flushing = idx.active
 	idx.active = make(map[string][]IndexEntry)
+
+	idx.txFlushing = idx.txActive
+	idx.txActive = make(map[int64]int64)
+
 	return true
 }
 
 func (idx *Index) FlushToBolt(minReadVersion int64) error {
-	if idx.flushing == nil {
+	// If nothing to flush (neither keys nor txs), return
+	if idx.flushing == nil && idx.txFlushing == nil {
 		return nil
 	}
 
@@ -205,65 +224,97 @@ func (idx *Index) FlushToBolt(minReadVersion int64) error {
 	sort.Strings(keys)
 
 	err := idx.db.Update(func(tx *bbolt.Tx) error {
-		b, err := tx.CreateBucketIfNotExists([]byte(BoltBucketData))
-		if err != nil {
-			return err
-		}
-		b.FillPercent = 0.9
-		meta, err := tx.CreateBucketIfNotExists([]byte(BoltBucketMeta))
-		if err != nil {
-			return err
-		}
-
-		var maxOffset int64
-
-		for _, key := range keys {
-			memHist := idx.flushing[key]
-			keyBytes := []byte(key)
-
-			var fullHist []IndexEntry
-			v := b.Get(keyBytes)
-			if v != nil {
-				fullHist = idx.decodeHistory(v)
-			}
-			fullHist = append(fullHist, memHist...)
-
-			prunedHist := idx.pruneHistory(fullHist, minReadVersion)
-
-			shouldDelete := false
-			if len(prunedHist) == 0 {
-				shouldDelete = true
-			} else {
-				lastEntry := prunedHist[len(prunedHist)-1]
-				if lastEntry.Deleted() && lastEntry.Offset() < minReadVersion {
-					shouldDelete = true
-				}
-			}
-
-			if shouldDelete {
-				if err := b.Delete(keyBytes); err != nil {
-					return err
-				}
-			} else {
-				encoded := idx.encodeHistory(prunedHist)
-				if err := b.Put(keyBytes, encoded); err != nil {
-					return err
-				}
-			}
-
-			if len(memHist) > 0 {
-				last := memHist[len(memHist)-1].Offset()
-				if last > maxOffset {
-					maxOffset = last
-				}
-			}
-		}
-
-		if maxOffset > 0 {
-			var buf [8]byte
-			binary.BigEndian.PutUint64(buf[:], uint64(maxOffset))
-			if err := meta.Put([]byte(KeyLastOffset), buf[:]); err != nil {
+		// 1. Flush Keys
+		if idx.flushing != nil {
+			b, err := tx.CreateBucketIfNotExists([]byte(BoltBucketData))
+			if err != nil {
 				return err
+			}
+			b.FillPercent = 0.9
+			meta, err := tx.CreateBucketIfNotExists([]byte(BoltBucketMeta))
+			if err != nil {
+				return err
+			}
+
+			var maxOffset int64
+
+			for _, key := range keys {
+				memHist := idx.flushing[key]
+				keyBytes := []byte(key)
+
+				var fullHist []IndexEntry
+				v := b.Get(keyBytes)
+				if v != nil {
+					fullHist = idx.decodeHistory(v)
+				}
+				fullHist = append(fullHist, memHist...)
+
+				prunedHist := idx.pruneHistory(fullHist, minReadVersion)
+
+				shouldDelete := false
+				if len(prunedHist) == 0 {
+					shouldDelete = true
+				} else {
+					lastEntry := prunedHist[len(prunedHist)-1]
+					if lastEntry.Deleted() && lastEntry.Offset() < minReadVersion {
+						shouldDelete = true
+					}
+				}
+
+				if shouldDelete {
+					if err := b.Delete(keyBytes); err != nil {
+						return err
+					}
+				} else {
+					encoded := idx.encodeHistory(prunedHist)
+					if err := b.Put(keyBytes, encoded); err != nil {
+						return err
+					}
+				}
+
+				if len(memHist) > 0 {
+					last := memHist[len(memHist)-1].Offset()
+					if last > maxOffset {
+						maxOffset = last
+					}
+				}
+			}
+
+			if maxOffset > 0 {
+				var buf [8]byte
+				binary.BigEndian.PutUint64(buf[:], uint64(maxOffset))
+				if err := meta.Put([]byte(KeyLastOffset), buf[:]); err != nil {
+					return err
+				}
+			}
+		}
+
+		// 2. Flush Transaction Info
+		if idx.txFlushing != nil {
+			bTx, err := tx.CreateBucketIfNotExists([]byte(BoltBucketTx))
+			if err != nil {
+				return err
+			}
+			bTx.FillPercent = 0.9
+
+			// Sort by offset for sequential writes
+			offsets := make([]int64, 0, len(idx.txFlushing))
+			for off := range idx.txFlushing {
+				offsets = append(offsets, off)
+			}
+			sort.Slice(offsets, func(i, j int) bool { return offsets[i] < offsets[j] })
+
+			var kBuf [8]byte
+			var vBuf [8]byte // 8 bytes Length only
+
+			for _, off := range offsets {
+				length := idx.txFlushing[off]
+				binary.BigEndian.PutUint64(kBuf[:], uint64(off))
+				binary.BigEndian.PutUint64(vBuf[0:8], uint64(length))
+
+				if err := bTx.Put(kBuf[:], vBuf[:]); err != nil {
+					return err
+				}
 			}
 		}
 
@@ -275,6 +326,7 @@ func (idx *Index) FlushToBolt(minReadVersion int64) error {
 
 func (idx *Index) FinishFlush() {
 	idx.flushing = nil
+	idx.txFlushing = nil
 }
 
 func (idx *Index) pruneHistory(hist []IndexEntry, minVer int64) []IndexEntry {

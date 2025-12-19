@@ -1,0 +1,414 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"os"
+	"syscall"
+	"time"
+)
+
+// CheckpointState represents the persistent state for resumption.
+type CheckpointState struct {
+	Generation uint64 `json:"generation"`
+	Offset     int64  `json:"offset"`
+}
+
+// EventHandler defines the contract for processing CDC events.
+type EventHandler interface {
+	OnSet(key string, value []byte, offset int64) error
+	OnDelete(key string, offset int64) error
+	OnReset(newGeneration uint64) error
+	OnCheckpoint(generation uint64, offset int64) error
+	Flush() error
+}
+
+// CDCClient handles the low-level replication protocol with TurnstoneDB.
+type CDCClient struct {
+	addr        string
+	authPass    string
+	conn        net.Conn
+	handler     EventHandler
+	generation  uint64
+	offset      int64
+	idleTimeout time.Duration
+	retryDelay  time.Duration
+}
+
+func NewCDCClient(addr string, authPass string, handler EventHandler, startGen uint64, startOffset int64) *CDCClient {
+	return &CDCClient{
+		addr:        addr,
+		authPass:    authPass,
+		handler:     handler,
+		generation:  startGen,
+		offset:      startOffset,
+		idleTimeout: 30 * time.Second,
+		retryDelay:  2 * time.Second,
+	}
+}
+
+func (c *CDCClient) Run(ctx context.Context) error {
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		if err := c.connect(ctx); err != nil {
+			log.Printf("[CDC] Connection failed: %v. Retrying in %v...", err, c.retryDelay)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(c.retryDelay):
+				continue
+			}
+		}
+
+		err := c.syncLoop(ctx)
+		c.closeConn()
+
+		if isBrokenPipe(err) {
+			return fmt.Errorf("output stream broken: %w", err)
+		}
+
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		log.Printf("[CDC] Disconnected: %v. Retrying in %v...", err, c.retryDelay)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(c.retryDelay):
+			continue
+		}
+	}
+}
+
+func (c *CDCClient) connect(ctx context.Context) error {
+	d := net.Dialer{Timeout: 5 * time.Second}
+	conn, err := d.DialContext(ctx, "tcp", c.addr)
+	if err != nil {
+		return err
+	}
+	c.conn = conn
+
+	if c.authPass != "" {
+		if err := c.authenticate(); err != nil {
+			c.conn.Close()
+			return err
+		}
+	}
+
+	log.Printf("[CDC] Connected to %s. Syncing from Gen: %d, Offset: %d", c.addr, c.generation, c.offset)
+	return nil
+}
+
+func (c *CDCClient) authenticate() error {
+	passBytes := []byte(c.authPass)
+	reqLen := len(passBytes)
+	reqBuf := make([]byte, 5+reqLen)
+
+	reqBuf[0] = OpCodeAuth
+	binary.BigEndian.PutUint32(reqBuf[1:5], uint32(reqLen))
+	copy(reqBuf[5:], passBytes)
+
+	if err := c.conn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		return err
+	}
+	if _, err := c.conn.Write(reqBuf); err != nil {
+		return err
+	}
+
+	headerBuf := make([]byte, 5)
+	if _, err := io.ReadFull(c.conn, headerBuf); err != nil {
+		return err
+	}
+	status := headerBuf[0]
+	payloadLen := binary.BigEndian.Uint32(headerBuf[1:])
+	body := make([]byte, payloadLen)
+	if _, err := io.ReadFull(c.conn, body); err != nil {
+		return err
+	}
+
+	if status != ResStatusOK {
+		return fmt.Errorf("authentication failed: %s", string(body))
+	}
+	return c.conn.SetDeadline(time.Time{})
+}
+
+func (c *CDCClient) closeConn() {
+	if c.conn != nil {
+		c.conn.Close()
+		c.conn = nil
+	}
+}
+
+func (c *CDCClient) syncLoop(ctx context.Context) error {
+	headerBuf := make([]byte, 5)
+	lastDataTime := time.Now()
+
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		if c.idleTimeout > 0 && time.Since(lastDataTime) > c.idleTimeout {
+			// No-op: Protocol relies on TCP keepalive mostly, or reconnect on timeout
+		}
+
+		reqLen := 16
+		reqBuf := make([]byte, 5+reqLen)
+		reqBuf[0] = OpCodeSync
+		binary.BigEndian.PutUint32(reqBuf[1:5], uint32(reqLen))
+		binary.BigEndian.PutUint64(reqBuf[5:13], c.generation)
+		binary.BigEndian.PutUint64(reqBuf[13:21], uint64(c.offset))
+
+		if err := c.conn.SetDeadline(time.Now().Add(60 * time.Second)); err != nil {
+			return err
+		}
+		if _, err := c.conn.Write(reqBuf); err != nil {
+			return err
+		}
+
+		if _, err := io.ReadFull(c.conn, headerBuf); err != nil {
+			return err
+		}
+
+		status := headerBuf[0]
+		payloadLen := binary.BigEndian.Uint32(headerBuf[1:])
+
+		if payloadLen > MaxResponseSize {
+			return fmt.Errorf("response too large: %d", payloadLen)
+		}
+
+		body := make([]byte, payloadLen)
+		if _, err := io.ReadFull(c.conn, body); err != nil {
+			return err
+		}
+
+		hasData, err := c.handleResponse(status, body)
+		if err != nil {
+			if isBrokenPipe(err) {
+				return err
+			}
+			log.Printf("[CDC] Protocol error: %v", err)
+			time.Sleep(1 * time.Second)
+		}
+
+		if hasData {
+			lastDataTime = time.Now()
+		}
+	}
+}
+
+func (c *CDCClient) handleResponse(status byte, body []byte) (bool, error) {
+	hasData := false
+
+	switch status {
+	case ResStatusGenMismatch, ResStatusGenSwitch:
+		serverGen := binary.BigEndian.Uint64(body)
+		if err := c.handler.OnReset(serverGen); err != nil {
+			return false, err
+		}
+		c.generation = serverGen
+		c.offset = 0
+		hasData = true
+		log.Printf("[CDC] Switched to Generation %d", serverGen)
+
+	case ResStatusOK:
+		if len(body) < 16 {
+			return false, fmt.Errorf("empty OK body")
+		}
+		serverGen := binary.BigEndian.Uint64(body[0:8])
+		rawData := body[16:]
+
+		var bytesConsumed int64
+		if len(rawData) > 0 {
+			var err error
+			bytesConsumed, err = c.parseBatch(rawData)
+			if err != nil {
+				return false, err
+			}
+			hasData = true
+		}
+
+		c.offset += bytesConsumed
+		c.generation = serverGen
+
+		if bytesConsumed > 0 {
+			if err := c.handler.OnCheckpoint(c.generation, c.offset); err != nil {
+				return false, err
+			}
+		} else {
+			time.Sleep(100 * time.Millisecond)
+		}
+
+	default:
+		return false, fmt.Errorf("server status: %d", status)
+	}
+	return hasData, nil
+}
+
+func (c *CDCClient) parseBatch(data []byte) (int64, error) {
+	var consumed int
+	totalLen := len(data)
+	currentEntryOffset := c.offset
+
+	for {
+		if totalLen-consumed < HeaderSize {
+			break
+		}
+		header := data[consumed : consumed+HeaderSize]
+		keyLen := binary.BigEndian.Uint32(header[0:4])
+		valLen := binary.BigEndian.Uint32(header[4:8])
+		// skip txStart [8:16] and CRC [16:20]
+
+		isDelete := valLen == Tombstone
+		var payloadLen int
+		if isDelete {
+			payloadLen = int(keyLen)
+		} else {
+			payloadLen = int(keyLen) + int(valLen)
+		}
+
+		entrySize := HeaderSize + payloadLen
+		if totalLen-consumed < entrySize {
+			break
+		}
+
+		payload := data[consumed+HeaderSize : consumed+entrySize]
+		key := string(payload[:keyLen])
+
+		if isDelete {
+			if err := c.handler.OnDelete(key, currentEntryOffset); err != nil {
+				return 0, err
+			}
+		} else {
+			val := payload[keyLen:]
+			if err := c.handler.OnSet(key, val, currentEntryOffset); err != nil {
+				return 0, err
+			}
+		}
+		consumed += entrySize
+		currentEntryOffset += int64(entrySize)
+	}
+	return int64(consumed), nil
+}
+
+func isBrokenPipe(err error) bool {
+	if err == nil {
+		return false
+	}
+	opErr, ok := err.(*net.OpError)
+	if ok {
+		if syscallErr, ok := opErr.Err.(*os.SyscallError); ok {
+			return syscallErr.Err == syscall.EPIPE
+		}
+	}
+	return err == io.ErrClosedPipe || err.Error() == "write: broken pipe"
+}
+
+// --- Handlers ---
+
+// PipeHandler dumps to stdout (CDC Mode)
+type PipeHandler struct {
+	EncodeBase64 bool
+	writer       *bufio.Writer
+	statePath    string
+}
+
+func NewPipeHandler(base64 bool, statePath string) *PipeHandler {
+	return &PipeHandler{EncodeBase64: base64, writer: bufio.NewWriter(os.Stdout), statePath: statePath}
+}
+
+func (h *PipeHandler) OnSet(key string, val []byte, offset int64) error {
+	valStr := string(val)
+	if h.EncodeBase64 {
+		valStr = base64.StdEncoding.EncodeToString(val)
+	}
+	_, err := fmt.Fprintf(h.writer, "SET %s %s\n", key, valStr)
+	return err
+}
+
+func (h *PipeHandler) OnDelete(key string, offset int64) error {
+	_, err := fmt.Fprintf(h.writer, "DEL %s\n", key)
+	return err
+}
+
+func (h *PipeHandler) OnReset(gen uint64) error {
+	h.saveState(gen, 0)
+	fmt.Fprintf(h.writer, "RESET %d\n", gen)
+	return h.Flush()
+}
+
+func (h *PipeHandler) OnCheckpoint(gen uint64, off int64) error {
+	fmt.Fprintf(h.writer, "CP %d %d\n", gen, off)
+	h.Flush()
+	return h.saveState(gen, off)
+}
+
+func (h *PipeHandler) Flush() error { return h.writer.Flush() }
+
+func (h *PipeHandler) saveState(gen uint64, off int64) error {
+	if h.statePath == "" {
+		return nil
+	}
+	data, _ := json.Marshal(CheckpointState{Generation: gen, Offset: off})
+	return os.WriteFile(h.statePath, data, 0o644)
+}
+
+// ReplicaHandler applies changes to local store (Follower Mode)
+type ReplicaHandler struct {
+	store *Store
+	batch []bufferedOp
+}
+
+func NewReplicaHandler(s *Store) *ReplicaHandler {
+	return &ReplicaHandler{store: s, batch: make([]bufferedOp, 0, 1000)}
+}
+
+func (h *ReplicaHandler) OnSet(key string, val []byte, offset int64) error {
+	// Copy val to avoid buffer reuse issues
+	v := make([]byte, len(val))
+	copy(v, val)
+	h.batch = append(h.batch, bufferedOp{opType: OpJournalSet, key: key, val: v})
+	return nil
+}
+
+func (h *ReplicaHandler) OnDelete(key string, offset int64) error {
+	h.batch = append(h.batch, bufferedOp{opType: OpJournalDelete, key: key})
+	return nil
+}
+
+func (h *ReplicaHandler) OnReset(gen uint64) error {
+	h.batch = h.batch[:0]
+	return h.store.SetReplicationState(gen, 0)
+}
+
+func (h *ReplicaHandler) OnCheckpoint(gen uint64, off int64) error {
+	if len(h.batch) == 0 {
+		return h.store.SetReplicationState(gen, off)
+	}
+
+	rv, localGen := h.store.AcquireSnapshot()
+	defer h.store.ReleaseSnapshot(rv)
+
+	// In follower mode, we assume the leader's stream is the source of truth.
+	// We apply the batch. The journal will append this data.
+	// Note: Store will calculate new CRCs and Headers (including new TxStart).
+	if err := h.store.ApplyBatch(h.batch, rv, localGen); err != nil {
+		log.Printf("[Replica] ApplyBatch warning: %v", err)
+	}
+
+	h.batch = h.batch[:0]
+	return h.store.SetReplicationState(gen, off)
+}
+
+func (h *ReplicaHandler) Flush() error { return nil }

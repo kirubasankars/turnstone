@@ -1,8 +1,10 @@
 module turnstone
 
-go 1.23.1
+go 1.24.0
 
 require (
-	go.etcd.io/bbolt v1.4.3 // indirect
-	golang.org/x/sys v0.29.0 // indirect
+	go.etcd.io/bbolt v1.4.3
+	golang.org/x/crypto v0.46.0
 )
+
+require golang.org/x/sys v0.39.0 // indirect
