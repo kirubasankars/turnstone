@@ -840,23 +840,23 @@ func (s *Store) readSyncFromPrevious(gen uint64, offset int64) (io.ReadCloser, i
 
 	info, err := f.Stat()
 	if err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, 0, s.generation, err
 	}
 
 	// If client is already at EOF of old file, time to switch
 	if offset >= info.Size() {
-		f.Close()
+		_ = f.Close()
 		return nil, 0, s.generation, ErrGenerationSwitch
 	}
 
 	// Open the previous generation's index to determine transaction boundaries.
 	idxDB, err := bbolt.Open(idxPath, 0o600, &bbolt.Options{ReadOnly: true, Timeout: 1 * time.Second})
 	if err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, 0, s.generation, fmt.Errorf("failed to open prev index: %w", err)
 	}
-	defer idxDB.Close()
+	defer func() { _ = idxDB.Close() }()
 
 	var bytesToRead int64
 	nextOffset := offset
@@ -882,12 +882,12 @@ func (s *Store) readSyncFromPrevious(gen uint64, offset int64) (io.ReadCloser, i
 		return nil
 	})
 	if err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, 0, s.generation, err
 	}
 
 	if bytesToRead == 0 {
-		f.Close()
+		_ = f.Close()
 		return nil, 0, s.generation, fmt.Errorf("corrupt index: offset %d not found", offset)
 	}
 
@@ -956,7 +956,10 @@ func (s *Store) ApplyBatch(ops []bufferedOp, readVersion int64, generation uint6
 
 			// Calculate CRC
 			digest := crc32.New(CrcTable)
-			io.WriteString(digest, op.key)
+			_, err := io.WriteString(digest, op.key)
+			if err != nil {
+				return err
+			}
 			if op.opType == OpJournalSet {
 				digest.Write(op.val)
 			}

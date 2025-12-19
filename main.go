@@ -33,7 +33,7 @@ type Config struct {
 func main() {
 	configPath := flag.String("config", "config.json", "Path to configuration file")
 	genConfig := flag.Bool("generate-config", false, "Generate a sample configuration file")
-	genHash := flag.String("gen-hash", "", "Generate bcrypt hash for a password and exit")
+	genHash := flag.String("generate-hash", "", "Generate bcrypt hash for a password and exit")
 	flag.Parse()
 
 	// Handle Hash Generation helper
