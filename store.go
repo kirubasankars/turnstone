@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/binary"
 	"errors"
@@ -49,7 +48,8 @@ type Store struct {
 	compactionRunning atomic.Bool
 	flushWg           sync.WaitGroup
 
-	dataDir string
+	dataDir               string
+	compactionGracePeriod time.Duration
 
 	activeSnapshots map[int64]int
 
@@ -120,23 +120,24 @@ func NewStore(dataDir string, logger *slog.Logger, allowTruncate bool, skipCrc b
 	idx := NewIndex(boltDB)
 
 	s := &Store{
-		journal:             journal,
-		bolt:                boltDB,
-		index:               idx,
-		conflictIndex:       make(map[string][]int64),
-		conflictQueue:       make([]Mutation, 0, 1024),
-		activeSnapshots:     make(map[int64]int),
-		startTime:           time.Now(),
-		logger:              logger,
-		allowTruncate:       allowTruncate,
-		skipCrc:             skipCrc,
-		useFsync:            useFsync,
-		fsyncInterval:       fsyncInterval,
-		opsChannel:          make(chan *request, 5000),
-		done:                make(chan struct{}),
-		dataDir:             dataDir,
-		compactionThreshold: DefaultCompactionThreshold,
-		generation:          gen,
+		journal:               journal,
+		bolt:                  boltDB,
+		index:                 idx,
+		conflictIndex:         make(map[string][]int64),
+		conflictQueue:         make([]Mutation, 0, 1024),
+		activeSnapshots:       make(map[int64]int),
+		startTime:             time.Now(),
+		logger:                logger,
+		allowTruncate:         allowTruncate,
+		skipCrc:               skipCrc,
+		useFsync:              useFsync,
+		fsyncInterval:         fsyncInterval,
+		opsChannel:            make(chan *request, 5000),
+		done:                  make(chan struct{}),
+		dataDir:               dataDir,
+		compactionThreshold:   DefaultCompactionThreshold,
+		compactionGracePeriod: CompactionGracePeriod,
+		generation:            gen,
 	}
 
 	if err := s.recover(); err != nil {
@@ -194,22 +195,25 @@ func (s *Store) recover() error {
 		startOffset = 0
 	}
 
+	// Seek to the start offset
 	if _, err := s.journal.Seek(startOffset, 0); err != nil {
 		return err
 	}
 
-	bufReader := bufio.NewReader(s.journal.f)
 	header := make([]byte, HeaderSize)
-	payloadBuf := make([]byte, 4096)
+	// No pooled buffer
+	var payload []byte
 
 	validOffset := startOffset
 	count := 0
 
-	// For transaction grouping logic
-	var currentTxStart int64 = -1
+	s.logger.Info("Starting recovery scan", "start_offset", startOffset)
 
 	for {
-		if _, err := io.ReadFull(bufReader, header); err != nil {
+		var scratch [8]byte // Reuse for lengths inside loop for safety
+
+		// Read Header directly from file
+		if _, err := io.ReadFull(s.journal.f, header); err != nil {
 			if err == io.EOF {
 				break
 			}
@@ -222,7 +226,7 @@ func (s *Store) recover() error {
 
 		keyLen := binary.BigEndian.Uint32(header[0:4])
 		valLen := binary.BigEndian.Uint32(header[4:8])
-		txStart := int64(binary.BigEndian.Uint64(header[8:16]))
+		// header[8:16] is minReadVersion, excluded from CRC
 		storedCrc := binary.BigEndian.Uint32(header[16:20])
 
 		var payloadLen int64
@@ -236,12 +240,11 @@ func (s *Store) recover() error {
 			return fmt.Errorf("corruption: massive payload length")
 		}
 
-		if int64(cap(payloadBuf)) < payloadLen {
-			payloadBuf = make([]byte, payloadLen)
-		}
-		payload := payloadBuf[:payloadLen]
+		// Always allocate fresh for simplicity
+		payload = make([]byte, payloadLen)
 
-		if _, err := io.ReadFull(bufReader, payload); err != nil {
+		// Read Payload directly from file
+		if _, err := io.ReadFull(s.journal.f, payload); err != nil {
 			if !s.allowTruncate {
 				return err
 			}
@@ -250,7 +253,14 @@ func (s *Store) recover() error {
 		}
 
 		if !s.skipCrc {
-			if crc32.Checksum(payload, CrcTable) != storedCrc {
+			// Calculate CRC: Lengths + Payload. Excludes MinReadVersion.
+			digest := crc32.New(CrcTable)
+			binary.BigEndian.PutUint32(scratch[0:4], keyLen)
+			binary.BigEndian.PutUint32(scratch[4:8], valLen)
+			digest.Write(scratch[:])
+			digest.Write(payload)
+
+			if digest.Sum32() != storedCrc {
 				if !s.allowTruncate {
 					return fmt.Errorf("crc mismatch at %d", validOffset)
 				}
@@ -259,31 +269,39 @@ func (s *Store) recover() error {
 			}
 		}
 
-		// Index Transaction Info (Group by TxStart)
-		if currentTxStart == -1 {
-			currentTxStart = txStart
-		} else if txStart != currentTxStart {
-			// Found new batch/txn, flush previous
-			s.index.SetTx(currentTxStart, validOffset-currentTxStart)
-			currentTxStart = txStart
-		}
-
 		key := string(payload[:keyLen])
 		isDel := valLen == Tombstone
 
-		s.index.Set(key, validOffset, isDel, 0)
-		validOffset += int64(HeaderSize) + payloadLen
+		entrySize := int64(HeaderSize) + payloadLen
+
+		// Update index (Combined key + pair length)
+		s.index.Set(key, validOffset, entrySize, isDel, 0)
+
+		validOffset += entrySize
 		count++
+
+		if count%10000 == 0 {
+			s.logger.Info("Recovery progress", "entries", count, "offset", validOffset)
+		}
 	}
 
-	if currentTxStart != -1 {
-		s.index.SetTx(currentTxStart, validOffset-currentTxStart)
-	}
+	s.logger.Info("Recovery complete", "entries", count, "final_offset", validOffset)
 
 	s.offset = validOffset
+
+	// Synchronous Flush Logic for Correctness
+	// If we rebuilt from scratch (e.g. idx file deleted), flush synchronously
+	// so the BoltDB state is immediately consistent.
 	if !lastOffsetFound && count > 0 {
-		s.triggerBoltFlush()
+		s.logger.Info("Flushing recovered index to BoltDB (Synchronous)...")
+		if s.index.Rotate() {
+			if err := s.index.FlushToBolt(0); err != nil {
+				return err
+			}
+			s.index.FinishFlush()
+		}
 	}
+
 	return nil
 }
 
@@ -316,7 +334,13 @@ func (s *Store) flushJournal(pending []*request, batchBuf *bytes.Buffer) {
 		return
 	}
 	if err := s.flushBatch(pending, batchBuf); err != nil {
-		s.logger.Error("Journal Flush failed", "err", err)
+		// Suppress logging for expected concurrency conflicts during compaction/rotation
+		if err == ErrConflict || err == ErrGenerationMismatch {
+			s.logger.Warn("Batch write skipped due to generation switch (clients must retry)", "err", err, "current_gen", s.generation)
+		} else {
+			s.logger.Error("Journal Flush failed", "err", err)
+		}
+
 		for _, req := range pending {
 			select {
 			case req.resp <- err:
@@ -351,17 +375,10 @@ func (s *Store) runLoop() {
 		fsyncChan = fsyncTicker.C
 	}
 
-	// Used to predict TxStart for headers before flush
-	currentWriteOffset := s.offset
-
 	flush := func() {
 		if len(pending) > 0 {
 			s.flushJournal(pending, &batchBuf)
 			pending = pending[:0]
-			// Sync our local prediction with the authoritative source after flush
-			s.mu.RLock()
-			currentWriteOffset = s.offset
-			s.mu.RUnlock()
 		}
 	}
 
@@ -408,8 +425,7 @@ func (s *Store) runLoop() {
 				continue
 			}
 
-			s.serializeBatch(req, &batchBuf, currentWriteOffset)
-			currentWriteOffset += req.batchSize
+			s.serializeBatch(req, &batchBuf)
 			pending = append(pending, req)
 
 			if len(pending) >= MaxBatchSize || batchBuf.Len() >= MaxBatchBytes {
@@ -509,17 +525,17 @@ func (s *Store) hasConflict(req *request, pending []*request) bool {
 	return false
 }
 
-func (s *Store) serializeBatch(req *request, buf *bytes.Buffer, txStart int64) {
-	for _, op := range req.ops {
+func (s *Store) serializeBatch(req *request, buf *bytes.Buffer) {
+	for i := range req.ops {
+		op := &req.ops[i]
 		if op.opType == OpJournalGet {
 			req.opLens = append(req.opLens, 0)
 			continue
 		}
 		startLen := buf.Len()
 
-		// Update Header with TxStart (offset of the *start* of this transaction)
-		// Since all ops in this batch belong to the same Tx, they share TxStart.
-		binary.BigEndian.PutUint64(op.header[8:16], uint64(txStart))
+		// Note: header[8:16] is pre-filled with the transaction's readVersion
+		// in ApplyBatch. We do NOT overwrite it here.
 
 		buf.Write(op.header[:])
 
@@ -528,7 +544,8 @@ func (s *Store) serializeBatch(req *request, buf *bytes.Buffer, txStart int64) {
 			buf.Write(op.val)
 		}
 
-		req.opLens = append(req.opLens, buf.Len()-startLen)
+		length := buf.Len() - startLen
+		req.opLens = append(req.opLens, length)
 	}
 }
 
@@ -558,10 +575,8 @@ func (s *Store) flushBatch(pending []*request, buf *bytes.Buffer) error {
 	}
 
 	// FIX: Use RLock for IO to prevent race with Compaction (Stop-The-World)
-	// Compaction grabs Lock, so RLock here prevents it from running during WriteAt.
 	s.mu.RLock()
 
-	// Verify generation again to ensure we aren't writing old data to new file
 	if len(pending) > 0 && s.generation != pending[0].generation {
 		s.mu.RUnlock()
 		return ErrConflict
@@ -585,24 +600,17 @@ func (s *Store) flushBatch(pending []*request, buf *bytes.Buffer) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Re-verify generation in case compaction happened in the tiny window between RUnlock and Lock
 	if len(pending) > 0 && s.generation != pending[0].generation {
-		// Data was written to the OLD file (validly), but generation switched.
-		// We cannot update the index to point to the old file/offset.
 		return ErrConflict
 	}
 
-	// Track Transaction Info in Index
+	// Track Pair Info in Index
 	currentOffset := s.offset
 	minVer := s.getMinReadVersion()
 
 	for _, req := range pending {
-		// Record Transaction Metadata: TxStart (currentOffset) -> Length (batchSize)
-		// Note: currentOffset increments with every op, so we must capture the start of the batch.
-		batchStart := currentOffset
-		s.index.SetTx(batchStart, req.batchSize)
-
-		for i, op := range req.ops {
+		for i := range req.ops {
+			op := &req.ops[i]
 			if op.opType == OpJournalGet {
 				s.conflictIndex[op.key] = append(s.conflictIndex[op.key], s.offset+1)
 				continue
@@ -612,7 +620,9 @@ func (s *Store) flushBatch(pending []*request, buf *bytes.Buffer) error {
 			currentOffset += int64(opLen)
 
 			isDel := op.opType == OpJournalDelete
-			s.index.Set(op.key, reqOffset, isDel, minVer)
+
+			// Updated: Single call to Set including pair length
+			s.index.Set(op.key, reqOffset, int64(opLen), isDel, minVer)
 
 			s.conflictIndex[op.key] = append(s.conflictIndex[op.key], reqOffset)
 			s.conflictQueue = append(s.conflictQueue, Mutation{Key: op.key, Offset: reqOffset})
@@ -629,6 +639,92 @@ func (s *Store) flushBatch(pending []*request, buf *bytes.Buffer) error {
 		s.lastPrunedVersion = minVer
 	}
 	return nil
+}
+
+func (s *Store) ApplyBatch(ops []bufferedOp, readVersion int64, generation uint64) error {
+	var batchSize int64
+	accessMap := make(map[string]struct{}, len(ops))
+	var scratch [8]byte
+
+	// Scan to build AccessMap (Reads+Writes) and calculate Write payload size.
+	// We also pre-calculate the header (incl. CRC) here to offload the single-writer runloop.
+	for i := range ops {
+		op := &ops[i]
+		accessMap[op.key] = struct{}{}
+		if op.opType != OpJournalGet {
+			keyLen := len(op.key)
+			valLen := uint32(len(op.val))
+			if op.opType == OpJournalDelete {
+				valLen = Tombstone
+			}
+			batchSize += int64(keyLen + int(len(op.val)) + HeaderSize)
+
+			// Calculate CRC (Lengths + Key + Value), Excluding MinReadVersion
+			digest := crc32.New(CrcTable)
+			binary.BigEndian.PutUint32(scratch[0:4], uint32(keyLen))
+			binary.BigEndian.PutUint32(scratch[4:8], valLen)
+			digest.Write(scratch[:])
+
+			_, err := io.WriteString(digest, op.key)
+			if err != nil {
+				return err
+			}
+			if op.opType == OpJournalSet {
+				digest.Write(op.val)
+			}
+			crc := digest.Sum32()
+
+			// Pack Header directly into the bufferedOp.
+			// Format: [KeyLen(4) | ValLen(4) | ReadVersion(8) | CRC(4)]
+			binary.BigEndian.PutUint32(op.header[0:4], uint32(keyLen))
+			binary.BigEndian.PutUint32(op.header[4:8], valLen)
+			binary.BigEndian.PutUint64(op.header[8:16], uint64(readVersion))
+			binary.BigEndian.PutUint32(op.header[16:20], crc)
+		}
+	}
+
+	if atomic.LoadInt64(&s.pendingWriteBytes)+batchSize > MaxPendingWriteBytes {
+		return ErrBusy
+	}
+	atomic.AddInt64(&s.pendingWriteBytes, batchSize)
+
+	req := &request{
+		ops:         ops,
+		resp:        make(chan error, 1),
+		readVersion: readVersion,
+		generation:  generation,
+		accessMap:   accessMap,
+		batchSize:   batchSize,
+	}
+
+	timer := time.NewTimer(DefaultWriteTimeout)
+	defer timer.Stop()
+
+	select {
+	case s.opsChannel <- req:
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer.Reset(DefaultWriteTimeout)
+
+		select {
+		case err := <-req.resp:
+			return err
+		case <-timer.C:
+			req.cancelled.Store(true)
+			atomic.AddInt64(&s.pendingWriteBytes, -batchSize)
+			return ErrTransactionTimeout
+		}
+	case <-timer.C:
+		atomic.AddInt64(&s.pendingWriteBytes, -batchSize)
+		return ErrBusy
+	case <-s.done:
+		atomic.AddInt64(&s.pendingWriteBytes, -batchSize)
+		return ErrClosed
+	}
 }
 
 func (s *Store) pruneMutations(minReadVersion int64) {
@@ -694,18 +790,26 @@ func (s *Store) Get(key string, readVersion int64, generation uint64) ([]byte, e
 	}
 
 	payloadLen := int(keyLen) + int(valLen)
-	bufPtr := getBuffer(payloadLen)
-	defer putBuffer(bufPtr)
+	// Standard allocation
+	payload := make([]byte, payloadLen)
 
-	if _, err := s.journal.ReadAt(*bufPtr, entry.Offset()+HeaderSize); err != nil {
+	if _, err := s.journal.ReadAt(payload, entry.Offset()+HeaderSize); err != nil {
 		return nil, fmt.Errorf("read payload error: %w", err)
 	}
 	if !s.skipCrc {
-		if crc32.Checksum(*bufPtr, CrcTable) != binary.BigEndian.Uint32(header[16:20]) {
+		// Verify CRC including lengths but excluding MinReadVersion
+		digest := crc32.New(CrcTable)
+		var scratch [8]byte
+		binary.BigEndian.PutUint32(scratch[0:4], keyLen)
+		binary.BigEndian.PutUint32(scratch[4:8], valLen)
+		digest.Write(scratch[:])
+		digest.Write(payload)
+
+		if digest.Sum32() != binary.BigEndian.Uint32(header[16:20]) {
 			return nil, ErrCrcMismatch
 		}
 	}
-	val := (*bufPtr)[keyLen:]
+	val := payload[keyLen:]
 	valCopy := make([]byte, len(val))
 	copy(valCopy, val)
 	return valCopy, nil
@@ -729,61 +833,83 @@ func (s *Store) Sync(reqGen uint64, reqOffset int64) (io.ReadCloser, int64, uint
 	}
 
 	// 3. Otherwise, they are too far behind or ahead.
+	s.logger.Warn("Sync: Generation mismatch", "req_gen", reqGen, "server_gen", s.generation)
 	return nil, 0, s.generation, ErrGenerationMismatch
 }
 
-func (s *Store) getTxBatchLength(startOffset int64, maxBytes int64) (int64, error) {
+func (s *Store) getBatchLength(startOffset int64, maxBytes int64) (int64, error) {
 	var totalBytes int64
 	nextOffset := startOffset
 
-	// Iterate through consecutive transactions to build a batch up to maxBytes
-	for totalBytes < maxBytes {
-		var length int64
-		found := false
+	// Optimization: Open BoltDB transaction ONCE for the whole batch calculation
+	// Since we hold s.mu.RLock in the caller (Sync), we can safely access memory maps.
+	err := s.bolt.View(func(tx *bbolt.Tx) error {
+		// 1. Check BoltDB (Cold Storage)
+		var c *bbolt.Cursor
+		if b := tx.Bucket([]byte(BoltBucketPair)); b != nil {
+			c = b.Cursor()
+		}
 
-		// 1. Check active memory (Hot)
-		if len, ok := s.index.txActive[nextOffset]; ok {
-			length = len
-			found = true
-		} else if s.index.txFlushing != nil {
-			// 2. Check flushing memory (Warm)
-			if len, ok := s.index.txFlushing[nextOffset]; ok {
-				length = len
-				found = true
+		if c != nil {
+			var kBuf [8]byte
+			binary.BigEndian.PutUint64(kBuf[:], uint64(nextOffset))
+			k, v := c.Seek(kBuf[:])
+
+			// If found in BoltDB, iterate there first
+			if k != nil && bytes.Equal(k, kBuf[:]) {
+				for totalBytes < maxBytes {
+					length := int64(binary.BigEndian.Uint64(v))
+					totalBytes += length
+					nextOffset += length
+
+					k, v = c.Next()
+					if k == nil {
+						break // End of bucket
+					}
+
+					// Verify continuity in BoltDB
+					binary.BigEndian.PutUint64(kBuf[:], uint64(nextOffset))
+					if !bytes.Equal(k, kBuf[:]) {
+						break // Gap in BoltDB, possibly continued in memory
+					}
+				}
 			}
 		}
 
-		// 3. Check persistent storage (Cold)
-		if !found {
-			err := s.bolt.View(func(tx *bbolt.Tx) error {
-				b := tx.Bucket([]byte(BoltBucketTx))
-				if b == nil {
-					return nil
-				}
-				var kBuf [8]byte
-				binary.BigEndian.PutUint64(kBuf[:], uint64(nextOffset))
-				v := b.Get(kBuf[:])
-				if v != nil {
-					length = int64(binary.BigEndian.Uint64(v))
+		// 2. Check Memory Maps (Warm & Hot Storage)
+		// Continue from where BoltDB left off (or started if not found in Bolt)
+		for totalBytes < maxBytes {
+			var length int64
+			found := false
+
+			// Check Flushing (Warm)
+			if s.index.flushingPairLengths != nil {
+				if l, ok := s.index.flushingPairLengths[nextOffset]; ok {
+					length = l
 					found = true
 				}
-				return nil
-			})
-			if err != nil {
-				return 0, err
 			}
+
+			// Check Active (Hot)
+			if !found {
+				if l, ok := s.index.activePairLengths[nextOffset]; ok {
+					length = l
+					found = true
+				}
+			}
+
+			if !found {
+				break // End of chain
+			}
+
+			totalBytes += length
+			nextOffset += length
 		}
 
-		if !found {
-			// No transaction starts at nextOffset.
-			// Stop batching.
-			break
-		}
+		return nil
+	})
 
-		totalBytes += length
-		nextOffset += length
-	}
-	return totalBytes, nil
+	return totalBytes, err
 }
 
 func (s *Store) readSyncFromCurrent(reqOffset int64) (io.ReadCloser, int64, uint64, error) {
@@ -793,6 +919,7 @@ func (s *Store) readSyncFromCurrent(reqOffset int64) (io.ReadCloser, int64, uint
 
 	currentOffset := s.offset // No atomic needed, we hold RLock
 	if reqOffset > currentOffset {
+		s.logger.Warn("Sync: Client ahead of server", "client_off", reqOffset, "server_off", currentOffset)
 		return nil, 0, s.generation, fmt.Errorf("client offset %d ahead of server %d", reqOffset, currentOffset)
 	}
 
@@ -800,19 +927,17 @@ func (s *Store) readSyncFromCurrent(reqOffset int64) (io.ReadCloser, int64, uint
 		return nil, currentOffset, s.generation, nil
 	}
 
-	// Determine the exact byte length of the transactions we can send.
-	// This ensures we never send a partial transaction.
-	bytesToRead, err := s.getTxBatchLength(reqOffset, MaxSyncBytes)
+	// Determine the exact byte length of the pairs we can send.
+	// This ensures we never send a partial pair.
+	bytesToRead, err := s.getBatchLength(reqOffset, MaxSyncBytes)
 	if err != nil {
 		return nil, 0, s.generation, err
 	}
 
 	if bytesToRead == 0 {
-		// We have data in the journal (reqOffset < currentOffset) but the index
-		// has no record of a transaction starting at reqOffset.
-		// This implies the client provided an offset that is in the middle of a transaction,
-		// or the index is corrupt.
-		return nil, 0, s.generation, fmt.Errorf("sync error: offset %d found in journal but missing from tx index", reqOffset)
+		// We have data in the journal but missing length info.
+		s.logger.Error("Sync: Offset found in journal but missing from index", "offset", reqOffset)
+		return nil, 0, s.generation, fmt.Errorf("sync error: offset %d found in journal but missing from pair index", reqOffset)
 	}
 
 	// Create a SectionReader on the active journal
@@ -822,7 +947,7 @@ func (s *Store) readSyncFromCurrent(reqOffset int64) (io.ReadCloser, int64, uint
 }
 
 // readSyncFromPrevious attempts to read from a closed journal file.
-// If EOF is reached, it signals ErrGenerationSwitch.
+// If EOF is reached, it signals ErrGenerationMismatch (triggering reset).
 func (s *Store) readSyncFromPrevious(gen uint64, offset int64) (io.ReadCloser, int64, uint64, error) {
 	dbPath := filepath.Join(s.dataDir, fmt.Sprintf("%d.db", gen))
 	idxPath := filepath.Join(s.dataDir, fmt.Sprintf("%d.idx", gen))
@@ -844,13 +969,18 @@ func (s *Store) readSyncFromPrevious(gen uint64, offset int64) (io.ReadCloser, i
 		return nil, 0, s.generation, err
 	}
 
-	// If client is already at EOF of old file, time to switch
+	// RESET TRIGGER:
+	// If the client has reached the end of the old file (offset >= size),
+	// we MUST return ErrGenerationMismatch.
+	// This tells the server to send ResStatusGenMismatch, which forces the
+	// client to call OnReset, update its generation, and set offset to 0.
 	if offset >= info.Size() {
+		s.logger.Info("Sync: Client finished previous generation. Triggering Reset.", "old_gen", gen, "size", info.Size())
 		_ = f.Close()
-		return nil, 0, s.generation, ErrGenerationSwitch
+		return nil, 0, s.generation, ErrGenerationMismatch
 	}
 
-	// Open the previous generation's index to determine transaction boundaries.
+	// Open the previous generation's index to determine pair boundaries.
 	idxDB, err := bbolt.Open(idxPath, 0o600, &bbolt.Options{ReadOnly: true, Timeout: 1 * time.Second})
 	if err != nil {
 		_ = f.Close()
@@ -861,14 +991,15 @@ func (s *Store) readSyncFromPrevious(gen uint64, offset int64) (io.ReadCloser, i
 	var bytesToRead int64
 	nextOffset := offset
 
-	// Iterate the Tx bucket to find consecutive transactions
+	// Iterate the Pair bucket to find consecutive pairs
 	err = idxDB.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket([]byte(BoltBucketTx))
+		b := tx.Bucket([]byte(BoltBucketPair))
 		if b == nil {
 			return nil
 		}
 
 		for bytesToRead < MaxSyncBytes {
+			// Use BigEndian so BoltDB seeks correctly (lexicographical byte order).
 			var kBuf [8]byte
 			binary.BigEndian.PutUint64(kBuf[:], uint64(nextOffset))
 			v := b.Get(kBuf[:])
@@ -887,6 +1018,7 @@ func (s *Store) readSyncFromPrevious(gen uint64, offset int64) (io.ReadCloser, i
 	}
 
 	if bytesToRead == 0 {
+		s.logger.Error("Sync: Corrupt index in previous gen", "gen", gen, "offset", offset)
 		_ = f.Close()
 		return nil, 0, s.generation, fmt.Errorf("corrupt index: offset %d not found", offset)
 	}
@@ -935,86 +1067,6 @@ func (s *Store) GetReplicationState() (uint64, int64, error) {
 		return err
 	})
 	return gen, offset, err
-}
-
-func (s *Store) ApplyBatch(ops []bufferedOp, readVersion int64, generation uint64) error {
-	var batchSize int64
-	accessMap := make(map[string]struct{}, len(ops))
-
-	// Scan to build AccessMap (Reads+Writes) and calculate Write payload size.
-	// We also pre-calculate the header (incl. CRC) here to offload the single-writer runloop.
-	for i := range ops {
-		op := &ops[i]
-		accessMap[op.key] = struct{}{}
-		if op.opType != OpJournalGet {
-			keyLen := len(op.key)
-			valLen := uint32(len(op.val))
-			if op.opType == OpJournalDelete {
-				valLen = Tombstone
-			}
-			batchSize += int64(keyLen + int(len(op.val)) + HeaderSize)
-
-			// Calculate CRC
-			digest := crc32.New(CrcTable)
-			_, err := io.WriteString(digest, op.key)
-			if err != nil {
-				return err
-			}
-			if op.opType == OpJournalSet {
-				digest.Write(op.val)
-			}
-			crc := digest.Sum32()
-
-			// Pack Header directly into the bufferedOp
-			binary.BigEndian.PutUint32(op.header[0:4], uint32(keyLen))
-			binary.BigEndian.PutUint32(op.header[4:8], valLen)
-			// Bytes 8-16 (TxStart) are filled in serializeBatch (runLoop) where we know the offset
-			binary.BigEndian.PutUint32(op.header[16:20], crc)
-		}
-	}
-
-	if atomic.LoadInt64(&s.pendingWriteBytes)+batchSize > MaxPendingWriteBytes {
-		return ErrBusy
-	}
-	atomic.AddInt64(&s.pendingWriteBytes, batchSize)
-
-	req := &request{
-		ops:         ops,
-		resp:        make(chan error, 1),
-		readVersion: readVersion,
-		generation:  generation,
-		accessMap:   accessMap,
-		batchSize:   batchSize,
-	}
-
-	timer := time.NewTimer(DefaultWriteTimeout)
-	defer timer.Stop()
-
-	select {
-	case s.opsChannel <- req:
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
-		timer.Reset(DefaultWriteTimeout)
-
-		select {
-		case err := <-req.resp:
-			return err
-		case <-timer.C:
-			req.cancelled.Store(true)
-			atomic.AddInt64(&s.pendingWriteBytes, -batchSize)
-			return ErrTransactionTimeout
-		}
-	case <-timer.C:
-		atomic.AddInt64(&s.pendingWriteBytes, -batchSize)
-		return ErrBusy
-	case <-s.done:
-		atomic.AddInt64(&s.pendingWriteBytes, -batchSize)
-		return ErrClosed
-	}
 }
 
 func (s *Store) Stats() (int, string, int64, int, int64, uint64) {

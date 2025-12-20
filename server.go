@@ -125,7 +125,7 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 			atomic.AddInt64(&s.activeSyncs, -1)
 		}
 		if err := conn.Close(); err != nil {
-			s.logger.Debug("Error closing connection", "err", err)
+			// error closing connection
 		}
 		atomic.AddInt64(&s.activeConns, -1)
 		s.wg.Done()
@@ -141,16 +141,12 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 		}
 
 		if err := conn.SetReadDeadline(time.Now().Add(IdleTimeout)); err != nil {
-			s.logger.Debug("Failed to set read deadline", "err", err)
 			return
 		}
 
 		keepGoing := func() bool {
 			// 1. Read Header
 			if _, err := io.ReadFull(r, headerBuf); err != nil {
-				if err != io.EOF {
-					s.logger.Debug("Read error", "err", err)
-				}
 				return false
 			}
 
@@ -164,12 +160,9 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 
 			// 2. Read Payload
 			var payload []byte
-			var bufPtr *[]byte
 
 			if payloadLen > 0 {
-				bufPtr = getBuffer(int(payloadLen))
-				payload = *bufPtr
-				defer putBuffer(bufPtr)
+				payload = make([]byte, payloadLen)
 
 				if _, err := io.ReadFull(r, payload); err != nil {
 					return false
@@ -177,7 +170,6 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 			}
 
 			if err := conn.SetWriteDeadline(time.Now().Add(DefaultWriteTimeout)); err != nil {
-				s.logger.Debug("Failed to set write deadline", "err", err)
 				return false
 			}
 
@@ -288,6 +280,19 @@ func (s *Server) handleSync(w io.Writer, payload []byte, tx *txState) {
 		tx.isSyncClient = true
 	}
 
+	// Compaction Hold: Pause sync requests while compaction is running.
+	// This avoids "split-brain" reads during the critical switch-over phase
+	// and reduces I/O contention during the catch-up phase.
+	for s.store.compactionRunning.Load() {
+		if conn, ok := w.(net.Conn); ok {
+			// Extend deadline to prevent timeout while holding
+			if err := conn.SetWriteDeadline(time.Now().Add(DefaultWriteTimeout)); err != nil {
+				return
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
 	// Payload Request: [Generation 8 bytes][Offset 8 bytes]
 	if len(payload) != 16 {
 		_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Invalid payload size, expected 16 bytes"))
@@ -304,12 +309,6 @@ func (s *Server) handleSync(w io.Writer, payload []byte, tx *txState) {
 			resp := make([]byte, 8)
 			binary.BigEndian.PutUint64(resp, currentGen)
 			_ = s.writeBinaryResponse(w, ResStatusGenMismatch, resp)
-			return
-		}
-		if err == ErrGenerationSwitch {
-			resp := make([]byte, 8)
-			binary.BigEndian.PutUint64(resp, currentGen)
-			_ = s.writeBinaryResponse(w, ResStatusGenSwitch, resp)
 			return
 		}
 		s.logger.Error("Sync error", "err", err)
@@ -365,12 +364,10 @@ func (s *Server) writeBinaryResponse(w io.Writer, status byte, body []byte) erro
 	binary.BigEndian.PutUint32(header[1:], uint32(len(body)))
 
 	if _, err := w.Write(header); err != nil {
-		s.logger.Debug("Write response header failed", "err", err)
 		return err
 	}
 	if len(body) > 0 {
 		if _, err := w.Write(body); err != nil {
-			s.logger.Debug("Write response body failed", "err", err)
 			return err
 		}
 	}

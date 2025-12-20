@@ -116,10 +116,10 @@ func TestStore_GetSetDelete(t *testing.T) {
 }
 
 func TestStore_TransactionIsolation_WriteWriteConflict_SameReadVersion(t *testing.T) {
-	// Tx1 BEGIN  (100) | Tx2 BEGIN (100)       |
-	// SET hello world  | set hello world       |
-	// COMMIT           | sleep 1               |
-	//                  | COMMIT (conflict)     |
+	// Tx1 BEGIN  (100) | Tx2 BEGIN (100)        |
+	// SET hello world  | set hello world        |
+	// COMMIT           | sleep 1                |
+	//                  | COMMIT (conflict)      |
 	store, cleanup := setupTestStore(t)
 	defer cleanup()
 
@@ -161,10 +161,10 @@ func TestStore_TransactionIsolation_WriteWriteConflict_SameReadVersion(t *testin
 }
 
 func TestStore_TransactionIsolation_WriteWriteConflict_SameReadVersion2(t *testing.T) {
-	// Tx1 BEGIN  (100) | Tx2 BEGIN (100)       |
-	// SET hello world  | set hello world       |
-	// COMMIT           | sleep 1               |
-	//                  | COMMIT (conflict)     |
+	// Tx1 BEGIN  (100) | Tx2 BEGIN (100)        |
+	// SET hello world  | set hello world        |
+	// COMMIT           | sleep 1                |
+	//                  | COMMIT (conflict)      |
 
 	store, cleanup := setupTestStore(t)
 	defer cleanup()
@@ -221,14 +221,14 @@ func TestStore_TransactionIsolation_WriteWriteConflict_SameReadVersion2(t *testi
 }
 
 func TestStore_TransactionIsolation_WriteWriteConflict_DiffReadVersion(t *testing.T) {
-	// Tx1 BEGIN  (100) |                       |
-	//                  |                       | Tx3 BEGIN (100)
-	//                  |                       | SET hello1 world2
-	//                  |                       | COMMIT
-	//                  | Tx2 BEGIN (105)       |
-	// SET hello world  | sleep 1               |
-	// COMMIT           | SET hello world2      |
-	//                  | COMMIT (conflict)     |
+	// Tx1 BEGIN  (100) |                        |
+	//                  |                        | Tx3 BEGIN (100)
+	//                  |                        | SET hello1 world2
+	//                  |                        | COMMIT
+	//                  | Tx2 BEGIN (105)        |
+	// SET hello world  | sleep 1                |
+	// COMMIT           | SET hello world2       |
+	//                  | COMMIT (conflict)      |
 
 	store, cleanup := setupTestStore(t)
 	defer cleanup()
@@ -298,18 +298,18 @@ func TestStore_TransactionIsolation_WriteWriteConflict_DiffReadVersion(t *testin
 }
 
 func TestStore_TransactionIsolation_ReadWriteConflict(t *testing.T) {
-	// Tx  BEGIN  (100) |                       |
-	// SET hello world2 |                       |
-	// SET foo bar      |                       |
-	// COMMIT           |                       |
-	//                  | Tx1 BEGIN (105)       |
-	//                  | SET foo1 bar1         |
-	//                  | COMMIT                |
-	//                  | BEGIN                 | BEGIN
-	//                  | GET hello             | sleep 1
-	//                  | SET foo bar1          | SET hello world2
-	//                  | COMMIT                | GET hello3 world
-	//                  |                       | COMMIT (conflict)
+	// Tx  BEGIN  (100) |                        |
+	// SET hello world2 |                        |
+	// SET foo bar      |                        |
+	// COMMIT           |                        |
+	//                  | Tx1 BEGIN (105)        |
+	//                  | SET foo1 bar1          |
+	//                  | COMMIT                 |
+	//                  | BEGIN                  | BEGIN
+	//                  | GET hello              | sleep 1
+	//                  | SET foo bar1           | SET hello world2
+	//                  | COMMIT                 | GET hello3 world
+	//                  |                        | COMMIT (conflict)
 	store, cleanup := setupTestStore(t)
 	defer cleanup()
 
@@ -449,11 +449,11 @@ func TestStore_Compaction_Generation(t *testing.T) {
 	}
 
 	// Check if old files are removed
-	if _, err := os.Stat(filepath.Join(dir, "1.db")); !os.IsNotExist(err) {
-		t.Errorf("Expected file 1.db to be removed, but it exists")
+	if _, err := os.Stat(filepath.Join(dir, "1.db")); os.IsNotExist(err) {
+		t.Errorf("Expected file 1.db to be exists")
 	}
-	if _, err := os.Stat(filepath.Join(dir, "1.idx")); !os.IsNotExist(err) {
-		t.Errorf("Expected file 1.idx to be removed, but it exists")
+	if _, err := os.Stat(filepath.Join(dir, "1.idx")); os.IsNotExist(err) {
+		t.Errorf("Expected file 1.idx to be exists")
 	}
 
 	// Check if data is still accessible
@@ -496,9 +496,9 @@ func TestStore_Compaction_Generation(t *testing.T) {
 }
 
 func TestStore_SetSet_DiffKey(t *testing.T) {
-	// Tx1 BEGIN  (100) | Tx2 BEGIN (100)       |
-	// SET hello world  | set hello1 world      |
-	// COMMIT           | COMMIT                |
+	// Tx1 BEGIN  (100) | Tx2 BEGIN (100)        |
+	// SET hello world  | set hello1 world       |
+	// COMMIT           | COMMIT                 |
 	store, cleanup := setupTestStore(t)
 	defer cleanup()
 
@@ -540,9 +540,9 @@ func TestStore_SetSet_DiffKey(t *testing.T) {
 }
 
 func TestStore_SetSet_SameKey(t *testing.T) {
-	// Tx1 BEGIN  (100) | Tx2 BEGIN (100)       |
-	// SET hello world  | set hello1 world      |
-	// COMMIT           | COMMIT                |
+	// Tx1 BEGIN  (100) | Tx2 BEGIN (100)        |
+	// SET hello world  | set hello1 world       |
+	// COMMIT           | COMMIT                 |
 	store, cleanup := setupTestStore(t)
 	defer cleanup()
 
@@ -589,10 +589,10 @@ func TestStore_SetSet_SameKey(t *testing.T) {
 }
 
 func TestStore_GetSet_RelatedKey(t *testing.T) {
-	// Tx1 BEGIN  (100) | Tx2 BEGIN (100)       |
-	// SET hello world  | get hello             |
-	//                  | SET hello1 world      |
-	// COMMIT           | COMMIT (conflict)     |
+	// Tx1 BEGIN  (100) | Tx2 BEGIN (100)        |
+	// SET hello world  | get hello              |
+	//                  | SET hello1 world       |
+	// COMMIT           | COMMIT (conflict)      |
 	store, cleanup := setupTestStore(t)
 	defer cleanup()
 

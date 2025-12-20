@@ -1,8 +1,6 @@
-
 package main
 
 import (
-	"io/ioutil"
 	"os"
 	"reflect"
 	"testing"
@@ -33,9 +31,10 @@ func TestIndex_SetAndGet(t *testing.T) {
 	defer cleanup()
 
 	idx := NewIndex(db)
-	idx.Set("key1", 1, false, 0)
-	idx.Set("key1", 2, false, 0)
-	idx.Set("key2", 3, false, 0)
+	// Added length argument (10) to Set calls
+	idx.Set("key1", 1, 10, false, 0)
+	idx.Set("key1", 2, 10, false, 0)
+	idx.Set("key2", 3, 10, false, 0)
 
 	// Test Get
 	entry, ok := idx.Get("key1", 3)
@@ -71,8 +70,8 @@ func TestIndex_Delete(t *testing.T) {
 	defer cleanup()
 
 	idx := NewIndex(db)
-	idx.Set("key1", 1, false, 0)
-	idx.Set("key1", 2, true, 0)
+	idx.Set("key1", 1, 10, false, 0)
+	idx.Set("key1", 2, 10, true, 0)
 
 	_, ok := idx.Get("key1", 3)
 	if ok {
@@ -90,8 +89,8 @@ func TestIndex_RotateAndFlush(t *testing.T) {
 	defer cleanup()
 
 	idx := NewIndex(db)
-	idx.Set("key1", 1, false, 0)
-	idx.Set("key2", 2, false, 0)
+	idx.Set("key1", 1, 10, false, 0)
+	idx.Set("key2", 2, 10, false, 0)
 
 	// Rotate
 	rotated := idx.Rotate()
@@ -171,8 +170,8 @@ func TestIndex_Len(t *testing.T) {
 	defer cleanup()
 
 	idx := NewIndex(db)
-	idx.Set("key1", 1, false, 0)
-	idx.Set("key2", 2, false, 0)
+	idx.Set("key1", 1, 10, false, 0)
+	idx.Set("key2", 2, 10, false, 0)
 	if idx.Len() != 2 {
 		t.Errorf("Expected length 2, got %d", idx.Len())
 	}
@@ -181,7 +180,7 @@ func TestIndex_Len(t *testing.T) {
 	if idx.Len() != 2 {
 		t.Errorf("Expected length 2, got %d", idx.Len())
 	}
-	idx.Set("key3", 3, false, 0)
+	idx.Set("key3", 3, 10, false, 0)
 	if idx.Len() != 3 {
 		t.Errorf("Expected length 3, got %d", idx.Len())
 	}
@@ -200,12 +199,12 @@ func TestIndex_Len(t *testing.T) {
 // newTestDB creates a new temporary bbolt database for testing.
 func newTestDB(t *testing.T) (*bbolt.DB, func()) {
 	t.Helper()
-	f, err := ioutil.TempFile("", "turnstone-test-")
+	f, err := os.CreateTemp("", "turnstone-test-")
 	if err != nil {
 		t.Fatal(err)
 	}
 	f.Close()
-	db, err := bbolt.Open(f.Name(), 0600, nil)
+	db, err := bbolt.Open(f.Name(), 0o600, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -202,8 +202,13 @@ func (c *CDCClient) syncLoop(ctx context.Context) error {
 			time.Sleep(1 * time.Second)
 		}
 
+		// Optimization: If we just switched generations or got data, loop immediately
+		// otherwise sleep briefly to avoid busy loop
 		if hasData {
 			lastDataTime = time.Now()
+		} else {
+			// If no data, sleep a bit to avoid hammering the server
+			time.Sleep(100 * time.Millisecond)
 		}
 	}
 }
@@ -212,7 +217,7 @@ func (c *CDCClient) handleResponse(status byte, body []byte) (bool, error) {
 	hasData := false
 
 	switch status {
-	case ResStatusGenMismatch, ResStatusGenSwitch:
+	case ResStatusGenMismatch:
 		serverGen := binary.BigEndian.Uint64(body)
 		if err := c.handler.OnReset(serverGen); err != nil {
 			return false, err
@@ -220,13 +225,14 @@ func (c *CDCClient) handleResponse(status byte, body []byte) (bool, error) {
 		c.generation = serverGen
 		c.offset = 0
 		hasData = true
-		log.Printf("[CDC] Switched to Generation %d", serverGen)
+		log.Printf("[CDC] Gen Mismatch. Switched to Generation %d", serverGen)
 
 	case ResStatusOK:
 		if len(body) < 16 {
 			return false, fmt.Errorf("empty OK body")
 		}
 		serverGen := binary.BigEndian.Uint64(body[0:8])
+		// serverNextOffset := binary.BigEndian.Uint64(body[8:16]) // Can be used for debugging
 		rawData := body[16:]
 
 		var bytesConsumed int64
@@ -246,8 +252,6 @@ func (c *CDCClient) handleResponse(status byte, body []byte) (bool, error) {
 			if err := c.handler.OnCheckpoint(c.generation, c.offset); err != nil {
 				return false, err
 			}
-		} else {
-			time.Sleep(100 * time.Millisecond)
 		}
 
 	default:
@@ -263,6 +267,12 @@ func (c *CDCClient) parseBatch(data []byte) (int64, error) {
 
 	for {
 		if totalLen-consumed < HeaderSize {
+			if totalLen-consumed > 0 {
+				msg := fmt.Sprintf("Partial header bytes remaining: %d. Consumed so far: %d", totalLen-consumed, consumed)
+				if consumed == 0 {
+					return 0, fmt.Errorf("%s (Batch invalid - Header incomplete)", msg)
+				}
+			}
 			break
 		}
 		header := data[consumed : consumed+HeaderSize]
@@ -278,8 +288,21 @@ func (c *CDCClient) parseBatch(data []byte) (int64, error) {
 			payloadLen = int(keyLen) + int(valLen)
 		}
 
+		// Safety check: ensure payloadLen is sane
+		if payloadLen < 0 {
+			return 0, fmt.Errorf("invalid negative payload length detected: %d", payloadLen)
+		}
+
 		entrySize := HeaderSize + payloadLen
 		if totalLen-consumed < entrySize {
+			msg := fmt.Sprintf("Incomplete entry. Need %d bytes, have %d. KeyLen=%d, ValLen=%d", entrySize, totalLen-consumed, keyLen, valLen)
+			// If we haven't consumed anything, this is a fatal error for this batch
+			// preventing an infinite tight loop of retries.
+			if consumed == 0 {
+				log.Printf("[CDC] CRITICAL: Raw Header Dump: %x (KeyLen=%d, ValLen=%d)", header, keyLen, valLen)
+				return 0, fmt.Errorf("%s (Stuck at head - Offset %d)", msg, currentEntryOffset)
+			}
+			log.Printf("[CDC] WARN: %s (Dropped partial tail)", msg)
 			break
 		}
 
@@ -334,11 +357,17 @@ func (h *PipeHandler) OnSet(key string, val []byte, offset int64) error {
 		valStr = base64.StdEncoding.EncodeToString(val)
 	}
 	_, err := fmt.Fprintf(h.writer, "SET %s %s\n", key, valStr)
+	if err == nil {
+		h.writer.Flush() // Explicit flush for interactive CLI feedback
+	}
 	return err
 }
 
 func (h *PipeHandler) OnDelete(key string, offset int64) error {
 	_, err := fmt.Fprintf(h.writer, "DEL %s\n", key)
+	if err == nil {
+		h.writer.Flush() // Explicit flush for interactive CLI feedback
+	}
 	return err
 }
 
@@ -349,7 +378,9 @@ func (h *PipeHandler) OnReset(gen uint64) error {
 }
 
 func (h *PipeHandler) OnCheckpoint(gen uint64, off int64) error {
-	fmt.Fprintf(h.writer, "CP %d %d\n", gen, off)
+	// Optional: Don't print every checkpoint to stdout to avoid clutter,
+	// or print it if you want to track progress.
+	// fmt.Fprintf(h.writer, "CP %d %d\n", gen, off)
 	h.Flush()
 	return h.saveState(gen, off)
 }

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"encoding/binary"
 	"sort"
 
@@ -34,22 +33,21 @@ type Index struct {
 	active   map[string][]IndexEntry // Hot writes go here
 	flushing map[string][]IndexEntry // Immutable snapshot for background flush
 
-	// Transaction Index Maps (Offset -> Length)
-	// Key is the StartOffset of the transaction block.
-	// Value is the Length of the transaction block.
-	txActive   map[int64]int64
-	txFlushing map[int64]int64
+	// Pair Length Maps (Offset -> Length)
+	// Key is the Offset of the pair.
+	// Value is the total Length of the pair (Header + Key + Value).
+	activePairLengths   map[int64]int64
+	flushingPairLengths map[int64]int64
 
 	db *bbolt.DB // Persistent storage
 }
 
 func NewIndex(db *bbolt.DB) *Index {
 	return &Index{
-		active:     make(map[string][]IndexEntry),
-		flushing:   nil,
-		txActive:   make(map[int64]int64),
-		txFlushing: nil,
-		db:         db,
+		active:            make(map[string][]IndexEntry),
+		flushing:          nil,
+		activePairLengths: make(map[int64]int64),
+		db:                db,
 	}
 }
 
@@ -63,8 +61,6 @@ func (idx *Index) Len() int {
 	_ = idx.db.View(func(tx *bbolt.Tx) error {
 		b := tx.Bucket([]byte(BoltBucketData))
 		if b != nil {
-			// Bucket Stats() is fast (O(1)) as it reads metadata.
-			// It counts the total number of keys in the B+Tree.
 			count += b.Stats().KeyN
 		}
 		return nil
@@ -164,39 +160,36 @@ func (idx *Index) searchHistory(history []IndexEntry, readVersion int64) (IndexE
 	return 0, false
 }
 
-func (idx *Index) Set(key string, offset int64, deleted bool, minReadVersion int64) {
+func (idx *Index) Set(key string, offset int64, length int64, deleted bool, minReadVersion int64) {
+	// 1. Update Key Index
 	entry := packIndexEntry(offset, deleted)
 	idx.active[key] = append(idx.active[key], entry)
 
 	history := idx.active[key]
-	if len(history) <= 1 {
-		return
-	}
+	if len(history) > 1 {
+		pivot := -1
+		for i := 0; i < len(history)-1; i++ {
+			if history[i+1].Offset() < minReadVersion {
+				pivot = i
+			} else {
+				break
+			}
+		}
 
-	pivot := -1
-	for i := range len(history) - 1 {
-		if history[i+1].Offset() < minReadVersion {
-			pivot = i
-		} else {
-			break
+		if pivot >= 0 {
+			remain := history[pivot+1:]
+			newHist := make([]IndexEntry, len(remain))
+			copy(newHist, remain)
+			idx.active[key] = newHist
 		}
 	}
 
-	if pivot >= 0 {
-		remain := history[pivot+1:]
-		newHist := make([]IndexEntry, len(remain))
-		copy(newHist, remain)
-		idx.active[key] = newHist
-	}
-}
-
-// SetTx records a transaction block's metadata (Length).
-func (idx *Index) SetTx(offset int64, length int64) {
-	idx.txActive[offset] = length
+	// 2. Update Pair Length Index (for Sync safety)
+	idx.activePairLengths[offset] = length
 }
 
 func (idx *Index) Rotate() bool {
-	if len(idx.active) == 0 && len(idx.txActive) == 0 {
+	if len(idx.active) == 0 && len(idx.activePairLengths) == 0 {
 		return false
 	}
 	if idx.flushing != nil {
@@ -205,15 +198,15 @@ func (idx *Index) Rotate() bool {
 	idx.flushing = idx.active
 	idx.active = make(map[string][]IndexEntry)
 
-	idx.txFlushing = idx.txActive
-	idx.txActive = make(map[int64]int64)
+	idx.flushingPairLengths = idx.activePairLengths
+	idx.activePairLengths = make(map[int64]int64)
 
 	return true
 }
 
 func (idx *Index) FlushToBolt(minReadVersion int64) error {
-	// If nothing to flush (neither keys nor txs), return
-	if idx.flushing == nil && idx.txFlushing == nil {
+	// If nothing to flush (neither keys nor pairs), return
+	if idx.flushing == nil && idx.flushingPairLengths == nil {
 		return nil
 	}
 
@@ -281,38 +274,40 @@ func (idx *Index) FlushToBolt(minReadVersion int64) error {
 			}
 
 			if maxOffset > 0 {
-				var buf [8]byte
-				binary.BigEndian.PutUint64(buf[:], uint64(maxOffset))
-				if err := meta.Put([]byte(KeyLastOffset), buf[:]); err != nil {
+				buf := make([]byte, 8)
+				binary.BigEndian.PutUint64(buf, uint64(maxOffset))
+				if err := meta.Put([]byte(KeyLastOffset), buf); err != nil {
 					return err
 				}
 			}
 		}
 
-		// 2. Flush Transaction Info
-		if idx.txFlushing != nil {
-			bTx, err := tx.CreateBucketIfNotExists([]byte(BoltBucketTx))
+		// 2. Flush Pair Lengths
+		if idx.flushingPairLengths != nil {
+			bPair, err := tx.CreateBucketIfNotExists([]byte(BoltBucketPair))
 			if err != nil {
 				return err
 			}
-			bTx.FillPercent = 0.9
+			bPair.FillPercent = 0.9
 
 			// Sort by offset for sequential writes
-			offsets := make([]int64, 0, len(idx.txFlushing))
-			for off := range idx.txFlushing {
+			offsets := make([]int64, 0, len(idx.flushingPairLengths))
+			for off := range idx.flushingPairLengths {
 				offsets = append(offsets, off)
 			}
 			sort.Slice(offsets, func(i, j int) bool { return offsets[i] < offsets[j] })
 
-			var kBuf [8]byte
-			var vBuf [8]byte // 8 bytes Length only
-
 			for _, off := range offsets {
-				length := idx.txFlushing[off]
-				binary.BigEndian.PutUint64(kBuf[:], uint64(off))
-				binary.BigEndian.PutUint64(vBuf[0:8], uint64(length))
+				length := idx.flushingPairLengths[off]
 
-				if err := bTx.Put(kBuf[:], vBuf[:]); err != nil {
+				// SAFETY: Allocate new buffers for each entry to avoid any reuse issues.
+				kBuf := make([]byte, 8)
+				vBuf := make([]byte, 8)
+
+				binary.BigEndian.PutUint64(kBuf, uint64(off))
+				binary.BigEndian.PutUint64(vBuf, uint64(length))
+
+				if err := bPair.Put(kBuf, vBuf); err != nil {
 					return err
 				}
 			}
@@ -326,7 +321,7 @@ func (idx *Index) FlushToBolt(minReadVersion int64) error {
 
 func (idx *Index) FinishFlush() {
 	idx.flushing = nil
-	idx.txFlushing = nil
+	idx.flushingPairLengths = nil
 }
 
 func (idx *Index) pruneHistory(hist []IndexEntry, minVer int64) []IndexEntry {
@@ -348,25 +343,34 @@ func (idx *Index) pruneHistory(hist []IndexEntry, minVer int64) []IndexEntry {
 }
 
 func (idx *Index) encodeHistory(hist []IndexEntry) []byte {
-	buf := new(bytes.Buffer)
-	_ = binary.Write(buf, binary.LittleEndian, uint32(len(hist)))
-	for _, entry := range hist {
-		_ = binary.Write(buf, binary.LittleEndian, uint64(entry))
+	// Protocol: [Count uint32] [Entry uint64]...
+	size := 4 + len(hist)*8
+	buf := make([]byte, size)
+
+	binary.LittleEndian.PutUint32(buf[0:4], uint32(len(hist)))
+
+	for i, entry := range hist {
+		offset := 4 + i*8
+		binary.LittleEndian.PutUint64(buf[offset:offset+8], uint64(entry))
 	}
-	return buf.Bytes()
+	return buf
 }
 
 func (idx *Index) decodeHistory(data []byte) []IndexEntry {
 	if len(data) < 4 {
 		return nil
 	}
-	r := bytes.NewReader(data)
-	var count uint32
-	_ = binary.Read(r, binary.LittleEndian, &count)
+	count := binary.LittleEndian.Uint32(data[0:4])
+
+	// Basic safety check for buffer size vs declared count
+	if len(data) < 4+int(count)*8 {
+		return nil
+	}
+
 	hist := make([]IndexEntry, count)
 	for i := 0; i < int(count); i++ {
-		var packed uint64
-		_ = binary.Read(r, binary.LittleEndian, &packed)
+		offset := 4 + i*8
+		packed := binary.LittleEndian.Uint64(data[offset : offset+8])
 		hist[i] = IndexEntry(packed)
 	}
 	return hist

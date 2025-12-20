@@ -22,21 +22,20 @@ const (
 	DefaultDataDir = "data"
 	BoltBucketData = "index"
 	BoltBucketMeta = "meta"
-	BoltBucketTx   = "tx" // New bucket for Transaction Info
+	BoltBucketPair = "pair" // New bucket: Offset -> Length (renamed from Record)
 	KeyLastOffset  = "last_offset"
 
 	// Limits & Safety
 	MaxKeySize           = 1 * 1024
 	MaxValueSize         = 4 * 1024
 	MaxCommandSize       = 64 * 1024
-	MaxPooledBuffer      = 1 * 1024 * 1024
 	MaxPendingWriteBytes = 128 * 1024 * 1024
 	MaxMemoryLimit       = 1024 * 1024 * 1024
 	MaxSyncBytes         = 16 * 1024 * 1024 // 16MB limit for CDC batches
 	MaxResponseSize      = 32 * 1024 * 1024 // 32MB Limit for responses
 
 	// Storage Format (Journal)
-	HeaderSize = 20 // Entry Header (KeyLen + ValLen + TxStart + CRC)
+	HeaderSize = 20 // Entry Header (KeyLen + ValLen + MinReadVersion + CRC)
 	Tombstone  = ^uint32(0)
 
 	// Internal Op Types (Journal)
@@ -50,7 +49,9 @@ const (
 	MaxBatchBytes              = 64 * 1024 // Adaptive batching: flush if batch exceeds 64KB
 	FlushInterval              = 1 * time.Second
 	DefaultCompactionThreshold = 10 * 1024 * 1024
-	IndexFlushThreshold        = 100_000 // From compaction logic
+	CompactionGracePeriod      = 5 * time.Minute // Time to keep old files after compaction for CDC
+	MaxCompactionIterations    = 10              // Max catch-up loops before forcing STW
+	IndexFlushThreshold        = 100_000         // From compaction logic
 )
 
 // Standard Errors
@@ -64,7 +65,6 @@ var (
 	ErrTransactionTimeout   = errors.New("transaction timeout")
 	ErrCompactionInProgress = errors.New("compaction already in progress")
 	ErrGenerationMismatch   = errors.New("generation mismatch")
-	ErrGenerationSwitch     = errors.New("generation switch required") // New Error
 )
 
 // Request OpCodes
@@ -95,7 +95,6 @@ const (
 	ResStatusEntityTooLarge = 0x07
 	ResStatusAuthRequired   = 0x08
 	ResStatusGenMismatch    = 0x09
-	ResStatusGenSwitch      = 0x0A // New Status: Seamless Transition
 )
 
 // Fixed Header Size: 1 byte OpCode + 4 bytes Length

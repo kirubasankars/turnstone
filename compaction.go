@@ -87,9 +87,6 @@ func (s *Store) doCompact() (retErr error) {
 	writeOffset := int64(0)
 	var keptCount, droppedCount int
 
-	payloadPtr := getBuffer(4096)
-	defer putBuffer(payloadPtr)
-
 	threshold := atomic.LoadInt64(&s.compactionThreshold)
 	iteration := 0
 
@@ -101,15 +98,16 @@ func (s *Store) doCompact() (retErr error) {
 
 		s.logger.Info("Compaction Loop", "iter", iteration, "processed", readOffset, "target", targetOffset, "lag", lag)
 
-		if lag < threshold {
+		// Exit condition: lag is small enough OR we've looped too many times (avoid infinite loop)
+		if lag < threshold || iteration > MaxCompactionIterations {
 			break
 		}
 
 		var newWriteOffset int64
 		var k, d int
-		newWriteOffset, k, d, payloadPtr, err = s.copyRange(
+		newWriteOffset, k, d, err = s.copyRange(
 			oldJournalReader, tmpJournal, tmpIndex,
-			readOffset, targetOffset, writeOffset, payloadPtr,
+			readOffset, targetOffset, writeOffset,
 			false,
 		)
 		if err != nil {
@@ -121,6 +119,7 @@ func (s *Store) doCompact() (retErr error) {
 		keptCount += k
 		droppedCount += d
 
+		// Intermediate flushing to keep memory usage low.
 		if tmpIndex.Len() > IndexFlushThreshold {
 			if tmpIndex.Rotate() {
 				if err := tmpIndex.FlushToBolt(0); err != nil {
@@ -149,9 +148,9 @@ func (s *Store) doCompact() (retErr error) {
 
 	var newWriteOffset int64
 	var k, d int
-	newWriteOffset, k, d, payloadPtr, err = s.copyRange(
+	newWriteOffset, k, d, err = s.copyRange(
 		oldJournalReader, tmpJournal, tmpIndex,
-		readOffset, finalOffset, writeOffset, payloadPtr,
+		readOffset, finalOffset, writeOffset,
 		true,
 	)
 	if err != nil {
@@ -169,31 +168,12 @@ func (s *Store) doCompact() (retErr error) {
 		return err
 	}
 
-	// PERFORMANCE FIX: Capture the 'hot' active entries from the tmpIndex before we close it.
-	// We will inject these into the new s.index after reopen to prevent a cold cache penalty.
-	warmCache := make(map[string][]IndexEntry, len(tmpIndex.active))
-	for key, entries := range tmpIndex.active {
-		// Deep copy the slice to be safe
-		newEntries := make([]IndexEntry, len(entries))
-		copy(newEntries, entries)
-		warmCache[key] = newEntries
-	}
-
-	// Copy active TX info too for cache
-	// Refactored to use int64 length instead of TxInfo struct
-	warmTxCache := make(map[int64]int64, len(tmpIndex.txActive))
-	for k, v := range tmpIndex.txActive {
-		warmTxCache[k] = v
-	}
-
 	// Flush whatever is left in tmpIndex to disk for durability
-	if tmpIndex.Len() > 0 || len(tmpIndex.txActive) > 0 {
-		tmpIndex.Rotate()
-		if err := tmpIndex.FlushToBolt(0); err != nil {
-			s.compacting = false
-			s.mu.Unlock()
-			return fmt.Errorf("failed to final flush tmp index: %w", err)
-		}
+	tmpIndex.Rotate()
+	if err := tmpIndex.FlushToBolt(0); err != nil {
+		s.compacting = false
+		s.mu.Unlock()
+		return fmt.Errorf("failed to final flush tmp index: %w", err)
 	}
 	tmpIndex.FinishFlush()
 
@@ -240,10 +220,6 @@ func (s *Store) doCompact() (retErr error) {
 		return fmt.Errorf("critical error reopening: %w", err)
 	}
 
-	// Inject the warm cache into the new index
-	s.index.active = warmCache
-	s.index.txActive = warmTxCache
-
 	s.offset = writeOffset
 	// Reset version tracking to match new offset.
 	// This prevents the new generation from inheriting a high minReadVersion from the old generation,
@@ -254,17 +230,30 @@ func (s *Store) doCompact() (retErr error) {
 	s.compacting = false
 	s.mu.Unlock()
 
-	// remove old files
-	oldDbPath := filepath.Join(s.dataDir, fmt.Sprintf("%d.db", newGen-1))
-	oldIdxPath := filepath.Join(s.dataDir, fmt.Sprintf("%d.idx", newGen-1))
-	if err := os.Remove(oldDbPath); err != nil && !os.IsNotExist(err) {
-		s.logger.Warn("failed to remove old db file", "err", err)
-	}
-	if err := os.Remove(oldIdxPath); err != nil && !os.IsNotExist(err) {
-		s.logger.Warn("failed to remove old idx file", "err", err)
-	}
+	// --- Graceful Deletion Logic ---
+	// Schedule deletion of the OLD files after a grace period.
+	// This allows CDC clients who are lagging slightly to finish the old generation
+	// and switch over without crashing.
+	oldGen := newGen - 1
+	oldDbPath := filepath.Join(s.dataDir, fmt.Sprintf("%d.db", oldGen))
+	oldIdxPath := filepath.Join(s.dataDir, fmt.Sprintf("%d.idx", oldGen))
 
-	s.logger.Info("Compaction complete",
+	s.logger.Info("Compaction complete. Scheduling cleanup.",
+		"old_gen", oldGen,
+		"grace_period", s.compactionGracePeriod,
+	)
+
+	time.AfterFunc(s.compactionGracePeriod, func() {
+		s.logger.Info("Cleaning up old generation files", "gen", oldGen)
+		if err := os.Remove(oldDbPath); err != nil && !os.IsNotExist(err) {
+			s.logger.Warn("failed to remove old db file", "path", oldDbPath, "err", err)
+		}
+		if err := os.Remove(oldIdxPath); err != nil && !os.IsNotExist(err) {
+			s.logger.Warn("failed to remove old idx file", "path", oldIdxPath, "err", err)
+		}
+	})
+
+	s.logger.Info("Compaction stats",
 		"duration", time.Since(start),
 		"old_size", finalOffset,
 		"new_size", writeOffset,
@@ -279,16 +268,14 @@ func (s *Store) doCompact() (retErr error) {
 func (s *Store) copyRange(
 	src *JournalFile, dst *JournalFile, tmpIndex *Index,
 	startOff, endOff, writeOff int64,
-	payloadPtr *[]byte,
 	alreadyLocked bool,
-) (int64, int, int, *[]byte, error) {
+) (int64, int, int, error) {
 	if _, err := src.Seek(startOff, 0); err != nil {
-		return writeOff, 0, 0, payloadPtr, err
+		return writeOff, 0, 0, err
 	}
 
 	r := io.LimitReader(src.f, endOff-startOff)
-	// Optimization: Increase read buffer size to 256KB for better throughput
-	reader := bufio.NewReaderSize(r, 256*1024)
+	reader := bufio.NewReader(r)
 
 	currentReadOff := startOff
 	kept := 0
@@ -299,36 +286,15 @@ func (s *Store) copyRange(
 	type batchItem struct {
 		headerBuf [HeaderSize]byte
 		key       string
-		payload   []byte // Local copy of the payload (backed by batchPayloadBuf)
-		entryOff  int64  // Original offset in the old file
+		payload   []byte
+		entryOff  int64 // Original offset in the old file
 		entrySize int64
 		valLen    uint32
-		txStart   int64 // Track transaction start
 	}
 	batch := make([]batchItem, 0, batchSize)
 
-	// Optimization: Shared buffer for payloads in a single batch to reduce allocations
-	batchPayloadBuf := make([]byte, 0, 1024*1024) // 1MB initial cap
-
-	// Optimization: Write buffer to reduce syscalls (64KB)
-	writeBuf := make([]byte, 0, 64*1024)
 	currentFlushOffset := writeOff
-
-	flushWriteBuf := func() error {
-		if len(writeBuf) == 0 {
-			return nil
-		}
-		if _, err := dst.WriteAt(writeBuf, currentFlushOffset); err != nil {
-			return err
-		}
-		currentFlushOffset += int64(len(writeBuf))
-		writeBuf = writeBuf[:0]
-		return nil
-	}
-
-	// Transaction Tracking vars
-	var currentOldTxStart int64 = -1
-	var currentNewTxStart int64 = -1
+	var scratch [8]byte // Reuse for CRC calculation
 
 	// processBatch handles the locking (decision) and IO (writing) phases separately
 	processBatch := func() error {
@@ -365,55 +331,27 @@ func (s *Store) copyRange(
 				continue
 			}
 
-			// Transaction Grouping Logic:
-			// If txStart changes, it's a new transaction boundary.
-			if currentOldTxStart == -1 {
-				currentOldTxStart = item.txStart
-				currentNewTxStart = writeOff
-			} else if item.txStart != currentOldTxStart {
-				// Flush previous transaction info: Key=Start, Value=Length
-				tmpIndex.SetTx(currentNewTxStart, writeOff-currentNewTxStart)
-				currentOldTxStart = item.txStart
-				currentNewTxStart = writeOff
+			// MinReadVersion (header[8:16]) is set to 0.
+			// Old versions are meaningless in the new file because the offset space resets.
+			binary.BigEndian.PutUint64(item.headerBuf[8:16], 0)
+
+			// Write Header
+			if _, err := dst.WriteAt(item.headerBuf[:], currentFlushOffset); err != nil {
+				return err
 			}
+			currentFlushOffset += int64(HeaderSize)
 
-			// Patch Header with NEW TxStart
-			binary.BigEndian.PutUint64(item.headerBuf[8:16], uint64(currentNewTxStart))
-
-			totalSize := HeaderSize + len(item.payload)
-
-			// Optimization: Buffer the writes
-			if len(writeBuf)+totalSize <= cap(writeBuf) {
-				writeBuf = append(writeBuf, item.headerBuf[:]...)
-				writeBuf = append(writeBuf, item.payload...)
-			} else {
-				// Buffer full, flush it
-				if err := flushWriteBuf(); err != nil {
-					return err
-				}
-
-				// If item is huge (larger than buffer), write directly
-				if totalSize > cap(writeBuf) {
-					// Write Header
-					if _, err := dst.WriteAt(item.headerBuf[:], currentFlushOffset); err != nil {
-						return err
-					}
-					currentFlushOffset += int64(HeaderSize)
-					// Write Payload
-					if _, err := dst.WriteAt(item.payload, currentFlushOffset); err != nil {
-						return err
-					}
-					currentFlushOffset += int64(len(item.payload))
-				} else {
-					// Otherwise, start filling the empty buffer
-					writeBuf = append(writeBuf, item.headerBuf[:]...)
-					writeBuf = append(writeBuf, item.payload...)
-				}
+			// Write Payload
+			if _, err := dst.WriteAt(item.payload, currentFlushOffset); err != nil {
+				return err
 			}
+			currentFlushOffset += int64(len(item.payload))
 
 			isDel := item.valLen == Tombstone
-			// Set entry in the temporary index for the new generation
-			tmpIndex.Set(item.key, writeOff, isDel, math.MaxInt64)
+
+			// Update: Combined Set call
+			// Note: We use MaxInt64 for minReadVersion here as we are establishing the base layer.
+			tmpIndex.Set(item.key, writeOff, item.entrySize, isDel, math.MaxInt64)
 
 			writeOff += item.entrySize
 			kept++
@@ -421,7 +359,6 @@ func (s *Store) copyRange(
 
 		// Reset batch for next iteration
 		batch = batch[:0]
-		batchPayloadBuf = batchPayloadBuf[:0]
 		return nil
 	}
 
@@ -435,16 +372,15 @@ func (s *Store) copyRange(
 			if err == io.EOF {
 				break
 			}
-			return writeOff, kept, dropped, payloadPtr, fmt.Errorf("read error at %d: %w", currentReadOff, err)
+			return writeOff, kept, dropped, fmt.Errorf("read error at %d: %w", currentReadOff, err)
 		}
 
 		keyLen := binary.BigEndian.Uint32(item.headerBuf[0:4])
 		valLen := binary.BigEndian.Uint32(item.headerBuf[4:8])
-		txStart := int64(binary.BigEndian.Uint64(item.headerBuf[8:16]))
+		// item.headerBuf[8:16] is MinReadVersion (previously TxStart), preserved
 		storedCrc := binary.BigEndian.Uint32(item.headerBuf[16:20])
 
 		item.valLen = valLen
-		item.txStart = txStart
 
 		var payloadLen int64
 		if valLen == Tombstone {
@@ -453,31 +389,27 @@ func (s *Store) copyRange(
 			payloadLen = int64(keyLen) + int64(valLen)
 		}
 
-		// Use the pooled buffer for reading from disk
-		if int64(cap(*payloadPtr)) < payloadLen {
-			putBuffer(payloadPtr)
-			payloadPtr = getBuffer(int(payloadLen))
-		}
-		rawPayload := (*payloadPtr)[:payloadLen]
+		// Allocate new buffer for reading (no pooling)
+		item.payload = make([]byte, payloadLen)
 
-		if _, err := io.ReadFull(reader, rawPayload); err != nil {
-			return writeOff, kept, dropped, payloadPtr, fmt.Errorf("payload read error at %d: %w", currentReadOff, err)
+		if _, err := io.ReadFull(reader, item.payload); err != nil {
+			return writeOff, kept, dropped, fmt.Errorf("payload read error at %d: %w", currentReadOff, err)
 		}
 
 		if !s.skipCrc {
-			if crc32.Checksum(rawPayload, CrcTable) != storedCrc {
-				return writeOff, kept, dropped, payloadPtr, fmt.Errorf("crc mismatch at %d", currentReadOff)
+			// Calculate CRC: Lengths + Payload. Excludes MinReadVersion.
+			digest := crc32.New(CrcTable)
+			binary.BigEndian.PutUint32(scratch[0:4], keyLen)
+			binary.BigEndian.PutUint32(scratch[4:8], valLen)
+			digest.Write(scratch[:])
+			digest.Write(item.payload)
+
+			if digest.Sum32() != storedCrc {
+				return writeOff, kept, dropped, fmt.Errorf("crc mismatch at %d", currentReadOff)
 			}
 		}
 
-		// Copy data to batch item using the shared buffer (reduces allocations)
-		item.key = string(rawPayload[:keyLen])
-
-		// Append rawPayload to batchPayloadBuf
-		start := len(batchPayloadBuf)
-		batchPayloadBuf = append(batchPayloadBuf, rawPayload...)
-		item.payload = batchPayloadBuf[start:]
-
+		item.key = string(item.payload[:keyLen])
 		item.entrySize = int64(HeaderSize) + payloadLen
 
 		batch = append(batch, item)
@@ -486,25 +418,15 @@ func (s *Store) copyRange(
 		// If batch is full, process it
 		if len(batch) >= batchSize {
 			if err := processBatch(); err != nil {
-				return writeOff, kept, dropped, payloadPtr, err
+				return writeOff, kept, dropped, err
 			}
 		}
 	}
 
 	// Process any remaining items
 	if err := processBatch(); err != nil {
-		return writeOff, kept, dropped, payloadPtr, err
+		return writeOff, kept, dropped, err
 	}
 
-	// Finalize any open transaction info
-	if currentOldTxStart != -1 {
-		tmpIndex.SetTx(currentNewTxStart, writeOff-currentNewTxStart)
-	}
-
-	// Flush any remaining data in the write buffer
-	if err := flushWriteBuf(); err != nil {
-		return writeOff, kept, dropped, payloadPtr, err
-	}
-
-	return writeOff, kept, dropped, payloadPtr, nil
+	return writeOff, kept, dropped, nil
 }
