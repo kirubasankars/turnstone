@@ -1,29 +1,22 @@
-package main
+package client
 
 import (
-	"bufio"
 	"context"
-	"encoding/base64"
+	"crypto/tls"
 	"encoding/binary"
-	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
-	"os/signal"
 	"syscall"
 	"time"
 )
 
-// Constants replicated from the server definition
+// Constants specific to CDC
 const (
-	OpCodeAuth           = 0x23
-	OpCodeSync           = 0x30
-	ResStatusOK          = 0x00
-	ResStatusGenMismatch = 0x09
-	ResStatusGenSwitch   = 0x0A // New status for transparent transition
+	OpCodeSync         = 0x30
+	ResStatusGenSwitch = 0x0A // New status for transparent transition
 
 	HeaderSize = 20         // KeyLen(4) + ValLen(4) + TxStart(8) + CRC(4)
 	Tombstone  = ^uint32(0) // Max Uint32 indicates deletion
@@ -32,28 +25,20 @@ const (
 	MaxResponseSize = 32 * 1024 * 1024 // 32MB Limit to prevent OOM on corrupt packets
 )
 
-// CheckpointState represents the persistent state for resumption.
-type CheckpointState struct {
-	Generation uint64 `json:"generation"`
-	Offset     int64  `json:"offset"`
-}
-
 // EventHandler defines the contract for processing CDC events.
 // Methods return error to stop the client (e.g., on broken pipe or disk full).
 type EventHandler interface {
 	OnSet(key string, value []byte, offset int64) error
 	OnDelete(key string, offset int64) error
 	OnReset(newGeneration uint64) error
-	// OnCheckpoint is called after a batch is processed to indicate safe resume point.
 	OnCheckpoint(generation uint64, offset int64) error
-	// Flush forces any buffered output to be written.
 	Flush() error
 }
 
-// CDCClient handles the low-level replication protocol with TurnstoneDB.
-type CDCClient struct {
+// Client handles the low-level replication protocol with TurnstoneDB.
+type Client struct {
 	addr        string
-	authPass    string
+	tlsConfig   *tls.Config
 	conn        net.Conn
 	handler     EventHandler
 	generation  uint64
@@ -62,11 +47,11 @@ type CDCClient struct {
 	retryDelay  time.Duration
 }
 
-// NewCDCClient creates a client that will pump events to the provided handler.
-func NewCDCClient(addr string, authPass string, handler EventHandler, startGen uint64, startOffset int64, idleTimeout time.Duration) *CDCClient {
-	return &CDCClient{
+// NewClient creates a client that will pump events to the provided handler.
+func NewClient(addr string, tlsConfig *tls.Config, handler EventHandler, startGen uint64, startOffset int64, idleTimeout time.Duration) *Client {
+	return &Client{
 		addr:        addr,
-		authPass:    authPass,
+		tlsConfig:   tlsConfig,
 		handler:     handler,
 		generation:  startGen,
 		offset:      startOffset,
@@ -76,7 +61,7 @@ func NewCDCClient(addr string, authPass string, handler EventHandler, startGen u
 }
 
 // Run starts the replication loop with automatic reconnection.
-func (c *CDCClient) Run(ctx context.Context) error {
+func (c *Client) Run(ctx context.Context) error {
 	// Reconnection Loop
 	for {
 		if ctx.Err() != nil {
@@ -98,8 +83,7 @@ func (c *CDCClient) Run(ctx context.Context) error {
 		c.closeConn()
 
 		// If the error was from the handler (e.g. Broken Pipe), we should exit immediately
-		// rather than reconnecting.
-		if isBrokenPipe(err) {
+		if IsBrokenPipe(err) {
 			return fmt.Errorf("output stream broken (consumer stopped?): %w", err)
 		}
 
@@ -117,73 +101,35 @@ func (c *CDCClient) Run(ctx context.Context) error {
 	}
 }
 
-func (c *CDCClient) connect(ctx context.Context) error {
-	d := net.Dialer{Timeout: 5 * time.Second}
-	conn, err := d.DialContext(ctx, "tcp", c.addr)
+func (c *Client) connect(ctx context.Context) error {
+	var conn net.Conn
+	var err error
+
+	dialer := net.Dialer{Timeout: 5 * time.Second}
+
+	if c.tlsConfig != nil {
+		conn, err = tls.DialWithDialer(&dialer, "tcp", c.addr, c.tlsConfig)
+	} else {
+		conn, err = dialer.DialContext(ctx, "tcp", c.addr)
+	}
+
 	if err != nil {
 		return err
 	}
 	c.conn = conn
 
-	// Perform Auth if password is provided
-	if c.authPass != "" {
-		if err := c.authenticate(); err != nil {
-			c.conn.Close()
-			return err
-		}
-	}
-
 	log.Printf("[CDC] Connected to %s. Syncing from Gen: %d, Offset: %d", c.addr, c.generation, c.offset)
 	return nil
 }
 
-func (c *CDCClient) authenticate() error {
-	passBytes := []byte(c.authPass)
-	reqLen := len(passBytes)
-	reqBuf := make([]byte, 5+reqLen)
-
-	reqBuf[0] = OpCodeAuth
-	binary.BigEndian.PutUint32(reqBuf[1:5], uint32(reqLen))
-	copy(reqBuf[5:], passBytes)
-
-	// Set a short deadline for auth
-	if err := c.conn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
-		return fmt.Errorf("failed to set deadline for auth: %w", err)
-	}
-
-	if _, err := c.conn.Write(reqBuf); err != nil {
-		return fmt.Errorf("auth write error: %w", err)
-	}
-
-	headerBuf := make([]byte, 5)
-	if _, err := io.ReadFull(c.conn, headerBuf); err != nil {
-		return fmt.Errorf("auth read header error: %w", err)
-	}
-
-	status := headerBuf[0]
-	payloadLen := binary.BigEndian.Uint32(headerBuf[1:])
-
-	body := make([]byte, payloadLen)
-	if _, err := io.ReadFull(c.conn, body); err != nil {
-		return fmt.Errorf("auth read body error: %w", err)
-	}
-
-	if status != ResStatusOK {
-		return fmt.Errorf("authentication failed: %s", string(body))
-	}
-
-	// Reset deadline for normal operation
-	return c.conn.SetDeadline(time.Time{})
-}
-
-func (c *CDCClient) closeConn() {
+func (c *Client) closeConn() {
 	if c.conn != nil {
 		c.conn.Close()
 		c.conn = nil
 	}
 }
 
-func (c *CDCClient) syncLoop(ctx context.Context) error {
+func (c *Client) syncLoop(ctx context.Context) error {
 	headerBuf := make([]byte, 5)
 	lastDataTime := time.Now()
 
@@ -238,7 +184,7 @@ func (c *CDCClient) syncLoop(ctx context.Context) error {
 		hasData, err := c.handleResponse(status, body)
 		if err != nil {
 			// If it's a pipe error, stop immediately
-			if isBrokenPipe(err) {
+			if IsBrokenPipe(err) {
 				return err
 			}
 
@@ -254,7 +200,7 @@ func (c *CDCClient) syncLoop(ctx context.Context) error {
 }
 
 // handleResponse processes the server response. Returns true if meaningful data was received.
-func (c *CDCClient) handleResponse(status byte, body []byte) (bool, error) {
+func (c *Client) handleResponse(status byte, body []byte) (bool, error) {
 	hasData := false
 
 	switch status {
@@ -311,7 +257,7 @@ func (c *CDCClient) handleResponse(status byte, body []byte) (bool, error) {
 	return hasData, nil
 }
 
-func (c *CDCClient) parseBatch(data []byte) (int64, error) {
+func (c *Client) parseBatch(data []byte) (int64, error) {
 	var consumed int
 	totalLen := len(data)
 	currentEntryOffset := c.offset
@@ -325,7 +271,6 @@ func (c *CDCClient) parseBatch(data []byte) (int64, error) {
 		keyLen := binary.BigEndian.Uint32(header[0:4])
 		valLen := binary.BigEndian.Uint32(header[4:8])
 		// TxStart is at header[8:16], CRC is at header[16:20]
-		// We don't currently expose TxStart to the handler, but we must account for the bytes.
 
 		isDelete := valLen == Tombstone
 		var payloadLen int
@@ -362,90 +307,12 @@ func (c *CDCClient) parseBatch(data []byte) (int64, error) {
 	return int64(consumed), nil
 }
 
-// --- Pipe-Friendly Implementation ---
-
-// PipeHandler formats output for downstream processing.
-// Data commands go to STDOUT. Logs go to STDERR.
-type PipeHandler struct {
-	EncodeBase64 bool
-	writer       *bufio.Writer
-	statePath    string
-}
-
-func NewPipeHandler(base64 bool, statePath string) *PipeHandler {
-	return &PipeHandler{
-		EncodeBase64: base64,
-		writer:       bufio.NewWriter(os.Stdout),
-		statePath:    statePath,
-	}
-}
-
-func (h *PipeHandler) saveState(gen uint64, offset int64) error {
-	if h.statePath == "" {
-		return nil
-	}
-	state := CheckpointState{Generation: gen, Offset: offset}
-	data, err := json.Marshal(state)
-	if err != nil {
-		return err
-	}
-	// Atomic write
-	tmp := h.statePath + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, h.statePath)
-}
-
-func (h *PipeHandler) OnReset(newGen uint64) error {
-	// If reset, we should probably start from offset 0
-	if err := h.saveState(newGen, 0); err != nil {
-		return err
-	}
-	if err := h.Flush(); err != nil {
-		return err
-	}
-	log.Printf("[CDC] RESET DETECTED. New Generation: %d", newGen)
-	_, err := fmt.Fprintf(h.writer, "RESET %d\n", newGen)
-	return err
-}
-
-func (h *PipeHandler) OnSet(key string, val []byte, offset int64) error {
-	var valueStr string
-	if h.EncodeBase64 {
-		valueStr = base64.StdEncoding.EncodeToString(val)
-	} else {
-		valueStr = string(val)
-	}
-	_, err := fmt.Fprintf(h.writer, "SET %s %s\n", key, valueStr)
-	return err
-}
-
-func (h *PipeHandler) OnDelete(key string, offset int64) error {
-	_, err := fmt.Fprintf(h.writer, "DEL %s\n", key)
-	return err
-}
-
-func (h *PipeHandler) OnCheckpoint(generation uint64, offset int64) error {
-	if _, err := fmt.Fprintf(h.writer, "CP %d %d\n", generation, offset); err != nil {
-		return err
-	}
-	if err := h.Flush(); err != nil {
-		return err
-	}
-	return h.saveState(generation, offset)
-}
-
-func (h *PipeHandler) Flush() error {
-	return h.writer.Flush()
-}
-
-func isBrokenPipe(err error) bool {
+// IsBrokenPipe checks for pipe errors (e.g. consumer closed stdout)
+func IsBrokenPipe(err error) bool {
 	if err == nil {
 		return false
 	}
 	// Check for broken pipe error (syscall.EPIPE)
-	// This usually happens when the downstream process (e.g. grep, jq) closes stdout.
 	opErr, ok := err.(*net.OpError)
 	if ok {
 		if syscallErr, ok := opErr.Err.(*os.SyscallError); ok {
@@ -456,73 +323,6 @@ func isBrokenPipe(err error) bool {
 	if syscallErr, ok := err.(*os.SyscallError); ok {
 		return syscallErr.Err == syscall.EPIPE
 	}
-	// Check for generic "broken pipe" string (Go standard lib behavior in some contexts)
+	// Generic checks
 	return err == syscall.EPIPE || err == io.ErrClosedPipe || err.Error() == "write: broken pipe"
-}
-
-func loadState(path string) (uint64, int64, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return 0, 0, err
-	}
-	var s CheckpointState
-	if err := json.Unmarshal(data, &s); err != nil {
-		return 0, 0, err
-	}
-	return s.Generation, s.Offset, nil
-}
-
-func main() {
-	addr := flag.String("addr", ":6379", "TurnstoneDB server address")
-	gen := flag.Uint64("gen", 0, "Start generation (resume state)")
-	offset := flag.Int64("offset", 0, "Start offset (resume state)")
-	timeout := flag.Duration("timeout", 0, "Exit if no messages received for this duration (0 = forever)")
-	useBase64 := flag.Bool("base64", false, "Encode values as base64 in output")
-	auth := flag.String("auth", "", "Password for authentication")
-	stateFile := flag.String("state", "cdc.state", "State file path for resumption")
-
-	flag.Parse()
-
-	// Resume logic
-	if *stateFile != "" {
-		loadedGen, loadedOffset, err := loadState(*stateFile)
-		if err == nil {
-			// Prefer loaded state if flags are default (0/0)
-			if *gen == 0 {
-				*gen = loadedGen
-			}
-			if *offset == 0 {
-				*offset = loadedOffset
-			}
-			log.Printf("[CDC] Resuming from state file: Gen %d, Offset %d", *gen, *offset)
-		} else if !os.IsNotExist(err) {
-			log.Printf("[CDC] Failed to load state file: %v", err)
-		}
-	}
-
-	// Use Context for cancellation
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	handler := NewPipeHandler(*useBase64, *stateFile)
-	client := NewCDCClient(*addr, *auth, handler, *gen, *offset, *timeout)
-
-	// Safe Shutdown Handling
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	go func() {
-		<-sigChan
-		log.Println("\n[CDC] Interrupt received, shutting down...")
-		cancel()
-	}()
-
-	if err := client.Run(ctx); err != nil && err != context.Canceled {
-		// Log fatal errors to stderr
-		log.Printf("Fatal Error: %v", err)
-		os.Exit(1)
-	}
-
-	// Ensure any remaining buffer is flushed on exit
-	_ = handler.Flush()
 }

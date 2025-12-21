@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -21,9 +22,8 @@ func main() {
 	flag.StringVar(&homeDir, "home", "", "Home directory for configuration, data, and certificates (Required)")
 	genConfig := flag.Bool("generate-config", false, "Generate a sample configuration file and certificates")
 
-	// Flag overrides (optional pointers)
-	flagPort := flag.String("port", "", "Override port")
-	flagRole := flag.String("role", "", "Override role")
+	// New flag for CDC client DB selection
+	flagDB := flag.Int("db", 0, "Database index for CDC operations (default 0)")
 
 	flag.Parse()
 
@@ -75,15 +75,7 @@ func main() {
 		_ = os.MkdirAll(homeDir, 0o755)
 	}
 
-	// 3. Apply Flag Overrides
-	if *flagPort != "" {
-		cfg.Port = *flagPort
-	}
-	if *flagRole != "" {
-		cfg.Role = *flagRole
-	}
-
-	// 4. Resolve Paths
+	// 3. Resolve Paths
 	cfg.Dir = ResolvePath(homeDir, cfg.Dir)
 	cfg.CDCState = ResolvePath(homeDir, cfg.CDCState)
 	cfg.TLSCertFile = ResolvePath(homeDir, cfg.TLSCertFile)
@@ -113,31 +105,15 @@ func main() {
 			logger.Error("Follower mode requires leader_addr in config")
 			os.Exit(1)
 		}
-		// Initialize Server with Read-Only Mode
-		// Note: Follower also does lazy loading now.
-		// However, for CDC replication to work, the ReplicaHandler needs the stores.
-		// ReplicaHandler logic needs to be updated to use server's getStore?
-		// Actually, standard follower replication logic below iterates MaxDatabases.
-		// To replicate, we need the stores.
 
-		// For the sake of the exercise (Lazy Load), we will initialize stores lazily
-		// BUT the CDC loop below iterates 0..15. This will force initialization of all DBs at startup
-		// if we are in Follower mode. This is acceptable for Follower mode as it needs to replicate everything.
-		// Lazy load applies primarily to Leader mode (client-driven).
-
-		srv := runServer(ctx, cfg, logger, true)
+		// Initialize stores eagerly
+		stores := runServer(ctx, cfg, logger, true)
 
 		// Start CDC Client for EACH database
-		// This loop inherently disables lazy loading for Follower, which is correct (Full Replication).
 		for i := 0; i < MaxDatabases; i++ {
-			// We access the store via the Server to ensure it's initialized
-			store, err := srv.getStore(i)
-			if err != nil {
-				logger.Error("Failed to init store for replication", "db", i, "err", err)
-				continue
-			}
-
+			store := stores[i]
 			dbIdx := i
+
 			startGen, startOff, err := store.GetReplicationState()
 			if err != nil {
 				logger.Warn("Failed to load replication state", "db", dbIdx, "err", err)
@@ -159,7 +135,7 @@ func main() {
 		<-ctx.Done()
 
 	case "cdc-stdout":
-		runCDCStdout(ctx, cfg, logger)
+		runCDCStdout(ctx, cfg, *flagDB, logger)
 
 	case "sentinel":
 		runSentinelMode(cfg)
@@ -170,13 +146,17 @@ func main() {
 	}
 }
 
-func runCDCStdout(ctx context.Context, cfg Config, logger *slog.Logger) {
+func runCDCStdout(ctx context.Context, cfg Config, dbIdx int, logger *slog.Logger) {
 	if cfg.LeaderAddr == "" {
 		fmt.Println("Usage: config role=cdc-stdout requires leader_addr")
 		os.Exit(1)
 	}
 
-	dbIdx := 0
+	if dbIdx < 0 || dbIdx >= MaxDatabases {
+		fmt.Fprintf(os.Stderr, "Error: Invalid database index %d\n", dbIdx)
+		os.Exit(1)
+	}
+
 	var startGen uint64
 	var startOff int64
 
@@ -191,6 +171,8 @@ func runCDCStdout(ctx context.Context, cfg Config, logger *slog.Logger) {
 	if cfg.MetricsAddr != "" {
 		StartMetricsServer(cfg.MetricsAddr, nil, logger)
 	}
+
+	logger.Info("Starting CDC Stdout", "db", dbIdx, "leader", cfg.LeaderAddr)
 
 	handler := NewPipeHandler(cfg.CDCBase64, cfg.CDCState)
 	client := NewCDCClient(cfg.LeaderAddr, handler, dbIdx, startGen, startOff, cfg.TLSClientCertFile, cfg.TLSClientKeyFile, cfg.TLSCAFile)
@@ -227,24 +209,30 @@ func runSentinelMode(cfg Config) {
 	os.Exit(0)
 }
 
-// runServer starts the Server without pre-initializing stores (Lazy Loading).
-func runServer(ctx context.Context, cfg Config, logger *slog.Logger, readOnly bool) *Server {
-	storeCfg := StoreConfig{
-		Dir:           cfg.Dir,
-		Logger:        logger,
-		Fsync:         cfg.Fsync,
-		FsyncInterval: 500 * time.Millisecond,
+// runServer starts the Server with eagerly initialized stores.
+func runServer(ctx context.Context, cfg Config, logger *slog.Logger, readOnly bool) []*Store {
+	var stores []*Store
+
+	// Eager Initialization Loop
+	for i := 0; i < MaxDatabases; i++ {
+		dbPath := filepath.Join(cfg.Dir, strconv.Itoa(i))
+		store, err := NewStore(dbPath, logger, false, false, cfg.Fsync, 500*time.Millisecond)
+		if err != nil {
+			logger.Error("Failed to init store", "db", i, "err", err)
+			os.Exit(1)
+		}
+		stores = append(stores, store)
 	}
 
-	srv := NewServer(cfg.Port, cfg.MetricsAddr, storeCfg, logger, cfg.MaxConns, cfg.MaxSyncs, readOnly, cfg.TLSCertFile, cfg.TLSKeyFile, cfg.TLSCAFile)
+	srv := NewServer(cfg.Port, cfg.MetricsAddr, stores, logger, cfg.MaxConns, cfg.MaxSyncs, readOnly, cfg.TLSCertFile, cfg.TLSKeyFile, cfg.TLSCAFile)
 
 	go func() {
 		if err := srv.Run(ctx); err != nil {
 			logger.Error("Server stopped", "err", err)
 		}
-		// Ensure all lazy-loaded stores are closed on shutdown
+		// Ensure all stores are closed on shutdown
 		srv.CloseAll()
 	}()
 
-	return srv
+	return stores
 }

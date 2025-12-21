@@ -2,76 +2,79 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"io"
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
-
-	"golang.org/x/crypto/bcrypt"
 )
 
-// --- Existing Tests (Auth & Happy Path) ---
-
-func TestIntegration_Authentication(t *testing.T) {
-	// Setup
-	dir, cleanup := createTempDir(t)
-	defer cleanup()
-	pass := "secret123"
-	hash, _ := bcrypt.GenerateFromPassword([]byte(pass), bcrypt.MinCost)
-
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	store, _ := NewStore(dir, logger, true, false, false, 0)
-	defer store.Close()
-
-	server := NewServer(":0", store, logger, 10, 2, string(hash), false)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { _ = server.Run(ctx) }()
-	time.Sleep(50 * time.Millisecond)
-	addr := server.listener.Addr().String()
-
-	// 1. Verify Ping (Allowed)
-	conn, _ := net.Dial("tcp", addr)
-	defer conn.Close()
-	status, _, _ := sendCommand(conn, OpCodePing, nil)
-	if status != ResStatusOK {
-		t.Errorf("Ping failed without auth")
+// --- Helper: Setup TLS ---
+// Generates certs in a temp dir and returns the config for a client to connect.
+func setupSecurity(t testing.TB) (string, string, string, string, string, *tls.Config) {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "turnstone-certs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Note: generateCerts is in config.go and must be available in the package
+	if err := generateCerts(dir); err != nil {
+		t.Fatal(err)
 	}
 
-	// 2. Verify Set (Denied)
-	status, _, _ = sendCommand(conn, OpCodeSet, buildSetPayload("k", "v"))
-	if status != ResStatusAuthRequired {
-		t.Errorf("Set allowed without auth")
+	caPath := filepath.Join(dir, "ca.crt")
+	srvCert := filepath.Join(dir, "server.crt")
+	srvKey := filepath.Join(dir, "server.key")
+	cliCertPath := filepath.Join(dir, "client.crt")
+	cliKeyPath := filepath.Join(dir, "client.key")
+
+	// Create Client TLS Config
+	cert, err := tls.LoadX509KeyPair(cliCertPath, cliKeyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caData, err := os.ReadFile(caPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caPool := x509.NewCertPool()
+	caPool.AppendCertsFromPEM(caData)
+
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		RootCAs:      caPool,
 	}
 
-	// 3. Verify Auth Flow
-	status, _, _ = sendCommand(conn, OpCodeAuth, []byte(pass))
-	if status != ResStatusOK {
-		t.Errorf("Auth failed with correct password")
-	}
-
-	mustSend(t, conn, OpCodeBegin, nil)
-	status, _, _ = sendCommand(conn, OpCodeSet, buildSetPayload("k", "v"))
-	if status != ResStatusOK {
-		t.Errorf("Set failed after auth")
-	}
-
-	mustSend(t, conn, OpCodeCommit, nil)
+	return caPath, srvCert, srvKey, cliCertPath, cliKeyPath, tlsConfig
 }
 
-// --- New Tests from Test Plan ---
+// --- Integration Tests ---
 
 // 1. Concurrency & Isolation (SSI)
 func TestIntegration_Concurrency_SSI(t *testing.T) {
 	dir, cleanup := createTempDir(t)
 	defer cleanup()
 
+	// Security Setup
+	ca, srvCert, srvKey, _, _, clientTLS := setupSecurity(t)
+
 	store, _ := NewStore(dir, slog.New(slog.NewTextHandler(io.Discard, nil)), true, false, false, 0)
 	defer store.Close()
-	server := NewServer(":0", store, slog.New(slog.NewTextHandler(io.Discard, nil)), 10, 2, "", false)
+
+	// Server expects a slice of stores. Since MaxDatabases is 3, we fill index 0.
+	// For testing index 0, a slice of length 1 is technically enough if getStore checks bounds against len(stores)
+	// But to be safe with the new "MaxDatabases=3" fixed array approach if implemented that way,
+	// we pass a slice containing our test store.
+	stores := []*Store{store}
+
+	// NewServer signature: addr, metricsAddr, stores, logger, maxConns, maxSyncs, readOnly, cert, key, ca
+	server := NewServer(":0", "", stores, slog.New(slog.NewTextHandler(io.Discard, nil)), 10, 2, false, srvCert, srvKey, ca)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -80,9 +83,16 @@ func TestIntegration_Concurrency_SSI(t *testing.T) {
 	addr := server.listener.Addr().String()
 
 	t.Run("Write-Write Conflict", func(t *testing.T) {
-		connA, _ := net.Dial("tcp", addr)
+		connA, err := tls.Dial("tcp", addr, clientTLS)
+		if err != nil {
+			t.Fatalf("ConnA failed: %v", err)
+		}
 		defer connA.Close()
-		connB, _ := net.Dial("tcp", addr)
+
+		connB, err := tls.Dial("tcp", addr, clientTLS)
+		if err != nil {
+			t.Fatalf("ConnB failed: %v", err)
+		}
 		defer connB.Close()
 
 		// Both begin
@@ -104,9 +114,9 @@ func TestIntegration_Concurrency_SSI(t *testing.T) {
 	})
 
 	t.Run("Snapshot Isolation", func(t *testing.T) {
-		connA, _ := net.Dial("tcp", addr)
+		connA, _ := tls.Dial("tcp", addr, clientTLS)
 		defer connA.Close()
-		connB, _ := net.Dial("tcp", addr)
+		connB, _ := tls.Dial("tcp", addr, clientTLS)
 		defer connB.Close()
 
 		// TxA Begins (Snapshot taken here)
@@ -133,17 +143,20 @@ func TestIntegration_Persistence(t *testing.T) {
 	dir, cleanup := createTempDir(t)
 	defer cleanup()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ca, srvCert, srvKey, _, _, clientTLS := setupSecurity(t)
 
 	// Phase 1: Start, Write Data, Stop
 	func() {
 		store, _ := NewStore(dir, logger, true, false, true, 0)
-		server := NewServer(":0", store, logger, 10, 2, "", false)
+		stores := []*Store{store}
+		server := NewServer(":0", "", stores, logger, 10, 2, false, srvCert, srvKey, ca)
+
 		ctx, cancel := context.WithCancel(context.Background())
 		go func() { _ = server.Run(ctx) }()
 		time.Sleep(50 * time.Millisecond)
 		addr := server.listener.Addr().String()
 
-		conn, _ := net.Dial("tcp", addr)
+		conn, _ := tls.Dial("tcp", addr, clientTLS)
 		mustSend(t, conn, OpCodeBegin, nil)
 		mustSend(t, conn, OpCodeSet, buildSetPayload("persist_key", "persist_val"))
 		mustSend(t, conn, OpCodeCommit, nil)
@@ -162,14 +175,16 @@ func TestIntegration_Persistence(t *testing.T) {
 		}
 		defer store.Close()
 
-		server := NewServer(":0", store, logger, 10, 2, "", false)
+		stores := []*Store{store}
+		server := NewServer(":0", "", stores, logger, 10, 2, false, srvCert, srvKey, ca)
+
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		go func() { _ = server.Run(ctx) }()
 		time.Sleep(50 * time.Millisecond)
 		addr := server.listener.Addr().String()
 
-		conn, _ := net.Dial("tcp", addr)
+		conn, _ := tls.Dial("tcp", addr, clientTLS)
 		defer conn.Close()
 
 		mustSend(t, conn, OpCodeBegin, nil)
@@ -185,10 +200,12 @@ func TestIntegration_Persistence(t *testing.T) {
 func TestIntegration_Compaction(t *testing.T) {
 	dir, cleanup := createTempDir(t)
 	defer cleanup()
+	ca, srvCert, srvKey, _, _, clientTLS := setupSecurity(t)
 
 	store, _ := NewStore(dir, slog.New(slog.NewTextHandler(io.Discard, nil)), true, false, false, 0)
 	defer store.Close()
-	server := NewServer(":0", store, slog.New(slog.NewTextHandler(io.Discard, nil)), 10, 2, "", false)
+	stores := []*Store{store}
+	server := NewServer(":0", "", stores, slog.New(slog.NewTextHandler(io.Discard, nil)), 10, 2, false, srvCert, srvKey, ca)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -196,7 +213,7 @@ func TestIntegration_Compaction(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	addr := server.listener.Addr().String()
 
-	conn, _ := net.Dial("tcp", addr)
+	conn, _ := tls.Dial("tcp", addr, clientTLS)
 	defer conn.Close()
 
 	// Write enough data to make compaction meaningful
@@ -211,8 +228,6 @@ func TestIntegration_Compaction(t *testing.T) {
 		t.Fatalf("Compaction request failed: %x", status)
 	}
 
-	// Allow time for background compaction (though in tests it might be fast)
-	// We poll the store generation or just check data validity
 	time.Sleep(200 * time.Millisecond)
 
 	// Verify Data survives compaction
@@ -228,10 +243,12 @@ func TestIntegration_Compaction(t *testing.T) {
 func TestIntegration_Limits(t *testing.T) {
 	dir, cleanup := createTempDir(t)
 	defer cleanup()
+	ca, srvCert, srvKey, _, _, clientTLS := setupSecurity(t)
 
 	store, _ := NewStore(dir, slog.New(slog.NewTextHandler(io.Discard, nil)), true, false, false, 0)
 	defer store.Close()
-	server := NewServer(":0", store, slog.New(slog.NewTextHandler(io.Discard, nil)), 10, 2, "", false)
+	stores := []*Store{store}
+	server := NewServer(":0", "", stores, slog.New(slog.NewTextHandler(io.Discard, nil)), 10, 2, false, srvCert, srvKey, ca)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -239,11 +256,10 @@ func TestIntegration_Limits(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	addr := server.listener.Addr().String()
 
-	conn, _ := net.Dial("tcp", addr)
+	conn, _ := tls.Dial("tcp", addr, clientTLS)
 	defer conn.Close()
 
 	t.Run("Max Payload Exceeded", func(t *testing.T) {
-		// MaxValueSize is 4KB (4096). Let's send 5KB.
 		hugeVal := make([]byte, 5000)
 
 		mustSend(t, conn, OpCodeBegin, nil)
@@ -258,22 +274,119 @@ func TestIntegration_Limits(t *testing.T) {
 	})
 
 	t.Run("Transaction Timeout", func(t *testing.T) {
-		// Note: MaxTxDuration is 60s in constants.go.
-		// We can't wait 60s in a unit test easily without mocking time or changing config.
-		// However, we can test that the server checks timeouts.
-		// For this test to be practical, we assume the test environment allows modifying
-		// MaxTxDuration or we rely on the logic check.
-		// Since we cannot change the constant constant easily, we verify that
-		// the Commit checks validity.
-
-		// NOTE: Real integration tests for timeout usually require configurable timeouts.
-		// We will skip the sleep wait here to avoid slowing down the suite,
-		// but verify the mechanism exists via code inspection or if we had a config option.
-		// As a placeholder, we perform a valid commit to ensure logic is sound.
-
+		// Just verify the basic cycle works, as we can't easily wait 60s in unit tests
 		mustSend(t, conn, OpCodeBegin, nil)
 		mustSend(t, conn, OpCodeCommit, nil)
 	})
+}
+
+// 6. Multi-Database Isolation
+func TestIntegration_MultiDB(t *testing.T) {
+	dir, cleanup := createTempDir(t)
+	defer cleanup()
+	ca, srvCert, srvKey, _, _, clientTLS := setupSecurity(t)
+
+	// Initialize 3 stores
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	var stores []*Store
+	for i := 0; i < 3; i++ {
+		dbPath := filepath.Join(dir, strconv.Itoa(i))
+		s, _ := NewStore(dbPath, logger, true, false, false, 0)
+		defer s.Close()
+		stores = append(stores, s)
+	}
+
+	server := NewServer(":0", "", stores, logger, 10, 2, false, srvCert, srvKey, ca)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = server.Run(ctx) }()
+	time.Sleep(50 * time.Millisecond)
+	addr := server.listener.Addr().String()
+
+	conn, _ := tls.Dial("tcp", addr, clientTLS)
+	defer conn.Close()
+
+	// 1. Default (DB 0): Write data
+	mustSend(t, conn, OpCodeBegin, nil)
+	mustSend(t, conn, OpCodeSet, buildSetPayload("key0", "val0"))
+	mustSend(t, conn, OpCodeCommit, nil)
+
+	// 2. Select DB 1
+	mustSend(t, conn, OpCodeSelect, []byte{1})
+
+	// 3. DB 1: Write different data
+	mustSend(t, conn, OpCodeBegin, nil)
+	mustSend(t, conn, OpCodeSet, buildSetPayload("key1", "val1"))
+	mustSend(t, conn, OpCodeCommit, nil)
+
+	// 4. Verify Isolation in DB 1 (Should not see key0)
+	mustSend(t, conn, OpCodeBegin, nil)
+	status, body, _ := sendCommand(conn, OpCodeGet, []byte("key1"))
+	if status != ResStatusOK || string(body) != "val1" {
+		t.Errorf("DB1 missing key1")
+	}
+	status, _, _ = sendCommand(conn, OpCodeGet, []byte("key0"))
+	if status != ResStatusNotFound {
+		t.Errorf("DB1 should not access key0 from DB0")
+	}
+	mustSend(t, conn, OpCodeCommit, nil)
+
+	// 5. Switch back to DB 0
+	mustSend(t, conn, OpCodeSelect, []byte{0})
+
+	// 6. Verify Isolation in DB 0 (Should not see key1)
+	mustSend(t, conn, OpCodeBegin, nil)
+	status, body, _ = sendCommand(conn, OpCodeGet, []byte("key0"))
+	if status != ResStatusOK || string(body) != "val0" {
+		t.Errorf("DB0 missing key0")
+	}
+	status, _, _ = sendCommand(conn, OpCodeGet, []byte("key1"))
+	if status != ResStatusNotFound {
+		t.Errorf("DB0 should not access key1 from DB1")
+	}
+	mustSend(t, conn, OpCodeCommit, nil)
+
+	// 7. Invalid Select
+	status, _, _ = sendCommand(conn, OpCodeSelect, []byte{5}) // 5 >= 3
+	if status != ResStatusErr {
+		t.Errorf("Expected error for invalid DB select")
+	}
+}
+
+// 7. Stats Command
+func TestIntegration_Stats(t *testing.T) {
+	dir, cleanup := createTempDir(t)
+	defer cleanup()
+	ca, srvCert, srvKey, _, _, clientTLS := setupSecurity(t)
+
+	store, _ := NewStore(dir, slog.New(slog.NewTextHandler(io.Discard, nil)), true, false, false, 0)
+	defer store.Close()
+	stores := []*Store{store}
+
+	server := NewServer(":0", "", stores, slog.New(slog.NewTextHandler(io.Discard, nil)), 10, 2, false, srvCert, srvKey, ca)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = server.Run(ctx) }()
+	time.Sleep(50 * time.Millisecond)
+	addr := server.listener.Addr().String()
+
+	conn, _ := tls.Dial("tcp", addr, clientTLS)
+	defer conn.Close()
+
+	status, body, err := sendCommand(conn, OpCodeStat, nil)
+	if err != nil {
+		t.Fatalf("Stat failed: %v", err)
+	}
+	if status != ResStatusOK {
+		t.Errorf("Stat returned status %x", status)
+	}
+	if len(body) == 0 {
+		t.Error("Stat returned empty body")
+	}
+	// Body format: "DB:%d Keys:%d..."
+	if len(body) > 2 && (body[0] != 'D' || body[1] != 'B') {
+		t.Errorf("Unexpected stat format: %s", string(body))
+	}
 }
 
 // --- Helpers (Shared) ---

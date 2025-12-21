@@ -11,45 +11,34 @@ import (
 	"log/slog"
 	"net"
 	"os"
-	"path/filepath"
 	"runtime/debug"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-type StoreConfig struct {
-	Dir           string
-	Logger        *slog.Logger
-	Fsync         bool
-	FsyncInterval time.Duration
-}
-
 type Server struct {
-	stores      []*Store // Slice of stores [0..15], entries may be nil if not initialized
-	storeMu     sync.RWMutex
-	storeConfig StoreConfig
-
-	addr        string
-	metricsAddr string
-	logger      *slog.Logger
-	listener    net.Listener
-	maxConns    int
-	maxSyncs    int
-	readOnly    bool // If true, only GET/SYNC operations are allowed
-	sem         chan struct{}
-	wg          sync.WaitGroup
-	totalConns  uint64
-	activeConns int64
-	activeSyncs int64
-	usedMemory  int64
-	activeTxs   int64
-	tlsConfig   *tls.Config
+	stores           []*Store // Slice of stores [0..MaxDatabases-1], always initialized
+	addr             string
+	metricsAddr      string
+	logger           *slog.Logger
+	listener         net.Listener
+	maxConns         int
+	maxSyncs         int
+	readOnly         bool // If true, only GET/SYNC operations are allowed
+	sem              chan struct{}
+	wg               sync.WaitGroup
+	totalConns       uint64
+	activeConns      int64
+	activeSyncs      int64
+	activeSyncsPerDB [MaxDatabases]int64 // Track sync clients per database
+	usedMemory       int64
+	activeTxs        int64
+	tlsConfig        *tls.Config
 }
 
-func NewServer(addr string, metricsAddr string, storeConfig StoreConfig, logger *slog.Logger, maxConns int, maxSyncs int, readOnly bool, tlsCert, tlsKey, tlsCA string) *Server {
+func NewServer(addr string, metricsAddr string, stores []*Store, logger *slog.Logger, maxConns int, maxSyncs int, readOnly bool, tlsCert, tlsKey, tlsCA string) *Server {
 	if tlsCert == "" || tlsKey == "" || tlsCA == "" {
 		logger.Error("Server requires TLS cert, key, and CA file for mTLS")
 		os.Exit(1)
@@ -78,8 +67,7 @@ func NewServer(addr string, metricsAddr string, storeConfig StoreConfig, logger 
 	return &Server{
 		addr:        addr,
 		metricsAddr: metricsAddr,
-		stores:      make([]*Store, MaxDatabases), // Pre-allocate slice, but stores are nil
-		storeConfig: storeConfig,
+		stores:      stores,
 		logger:      logger,
 		maxConns:    maxConns,
 		maxSyncs:    maxSyncs,
@@ -89,52 +77,22 @@ func NewServer(addr string, metricsAddr string, storeConfig StoreConfig, logger 
 	}
 }
 
-// getStore returns the store for the given index, initializing it if necessary.
+// getStore returns the store for the given index.
+// Since stores are eagerly initialized, this is a simple lookup.
 func (s *Server) getStore(idx int) (*Store, error) {
-	if idx < 0 || idx >= MaxDatabases {
+	if idx < 0 || idx >= len(s.stores) {
 		return nil, ErrInvalidDB
 	}
-
-	// Fast path: Check if already initialized
-	s.storeMu.RLock()
-	store := s.stores[idx]
-	s.storeMu.RUnlock()
-
-	if store != nil {
-		return store, nil
-	}
-
-	// Slow path: Initialize under lock
-	s.storeMu.Lock()
-	defer s.storeMu.Unlock()
-
-	// Double-check
-	if s.stores[idx] != nil {
-		return s.stores[idx], nil
-	}
-
-	dbPath := filepath.Join(s.storeConfig.Dir, strconv.Itoa(idx))
-	// Pass allowTruncate=false, skipCrc=false by default for safety
-	newStore, err := NewStore(dbPath, s.storeConfig.Logger, false, false, s.storeConfig.Fsync, s.storeConfig.FsyncInterval)
-	if err != nil {
-		return nil, err
-	}
-
-	s.stores[idx] = newStore
-	s.logger.Info("Database initialized", "db", idx, "path", dbPath)
-	return newStore, nil
+	return s.stores[idx], nil
 }
 
 // CloseAll closes all initialized stores.
 func (s *Server) CloseAll() {
-	s.storeMu.Lock()
-	defer s.storeMu.Unlock()
 	for i, store := range s.stores {
 		if store != nil {
 			if err := store.Close(); err != nil {
 				s.logger.Error("Failed to close store", "db", i, "err", err)
 			}
-			s.stores[i] = nil
 		}
 	}
 }
@@ -149,12 +107,7 @@ func (s *Server) Run(ctx context.Context) error {
 		return err
 	}
 	s.listener = ln
-	s.logger.Info("mTLS Server listening", "addr", s.addr, "readonly", s.readOnly, "lazy_init", true)
-
-	// Ensure default DB 0 is initialized immediately
-	if _, err := s.getStore(0); err != nil {
-		return fmt.Errorf("failed to initialize default db 0: %w", err)
-	}
+	s.logger.Info("mTLS Server listening", "addr", s.addr, "readonly", s.readOnly, "dbs", len(s.stores))
 
 	acceptErr := make(chan error, 1)
 	go func() {
@@ -219,6 +172,7 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 		}
 		if tx.isSyncClient {
 			atomic.AddInt64(&s.activeSyncs, -1)
+			atomic.AddInt64(&s.activeSyncsPerDB[tx.dbIndex], -1)
 		}
 		conn.Close()
 		atomic.AddInt64(&s.activeConns, -1)
@@ -319,18 +273,25 @@ func (s *Server) handleSelect(w io.Writer, payload []byte, tx *txState) {
 		return
 	}
 
-	// Trigger Lazy Initialization on Select
-	if _, err := s.getStore(idx); err != nil {
-		s.logger.Error("Failed to lazy init db", "db", idx, "err", err)
-		_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Failed to initialize database"))
-		return
-	}
-
 	tx.dbIndex = idx
 	_ = s.writeBinaryResponse(w, ResStatusOK, []byte(fmt.Sprintf("OK Selected %d", idx)))
 }
 
 func (s *Server) handleSync(w io.Writer, payload []byte, tx *txState) {
+	if len(payload) != 17 {
+		_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Invalid payload size, expected 17 bytes"))
+		return
+	}
+
+	dbIdx := int(payload[0])
+	if dbIdx < 0 || dbIdx >= MaxDatabases {
+		_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Invalid DB Index"))
+		return
+	}
+
+	// Update the tx.dbIndex to match Sync request for correct metrics tracking
+	tx.dbIndex = dbIdx
+
 	if !tx.isSyncClient {
 		current := atomic.LoadInt64(&s.activeSyncs)
 		if current >= int64(s.maxSyncs) {
@@ -338,20 +299,13 @@ func (s *Server) handleSync(w io.Writer, payload []byte, tx *txState) {
 			return
 		}
 		atomic.AddInt64(&s.activeSyncs, 1)
+		atomic.AddInt64(&s.activeSyncsPerDB[dbIdx], 1)
 		tx.isSyncClient = true
 	}
 
-	if len(payload) != 17 {
-		_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Invalid payload size, expected 17 bytes"))
-		return
-	}
-
-	dbIdx := int(payload[0])
-
-	// Ensure DB is initialized for Sync
 	targetStore, err := s.getStore(dbIdx)
 	if err != nil {
-		_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Invalid DB or Init Failed"))
+		_ = s.writeBinaryResponse(w, ResStatusErr, []byte("DB access error"))
 		return
 	}
 
@@ -450,7 +404,6 @@ func (s *Server) abortTx(tx *txState) {
 			tx.memUsage = 0
 		}
 
-		// Ensure store exists (it should, as Tx started)
 		if store, err := s.getStore(tx.dbIndex); err == nil {
 			store.ReleaseSnapshot(tx.readVersion)
 		}
@@ -504,7 +457,7 @@ func (s *Server) handleEnd(w io.Writer, tx *txState) {
 	store, err := s.getStore(tx.dbIndex)
 	if err != nil {
 		s.abortTx(tx)
-		_ = s.writeBinaryResponse(w, ResStatusErr, []byte("DB init error"))
+		_ = s.writeBinaryResponse(w, ResStatusErr, []byte("DB access error"))
 		return
 	}
 
@@ -555,7 +508,7 @@ func (s *Server) handleGet(w io.Writer, payload []byte, tx *txState) {
 
 	store, err := s.getStore(tx.dbIndex)
 	if err != nil {
-		_ = s.writeBinaryResponse(w, ResStatusErr, []byte("DB init error"))
+		_ = s.writeBinaryResponse(w, ResStatusErr, []byte("DB access error"))
 		return
 	}
 
@@ -627,24 +580,13 @@ func (s *Server) handleDelete(w io.Writer, payload []byte, tx *txState) {
 }
 
 func (s *Server) handleStat(w io.Writer, tx *txState) {
-	// For stats, we don't necessarily want to create the DB if it doesn't exist
-	s.storeMu.RLock()
-	store := s.stores[tx.dbIndex]
-	s.storeMu.RUnlock()
-
-	var count int
-	var uptime string
-	var pending int64
-	var activeSnaps int
-	var offset int64
-	var generation uint64
-
-	if store != nil {
-		count, uptime, pending, activeSnaps, offset, generation = store.Stats()
-	} else {
-		uptime = "0s (Uninitialized)"
+	store, err := s.getStore(tx.dbIndex)
+	if err != nil {
+		_ = s.writeBinaryResponse(w, ResStatusErr, []byte("DB access error"))
+		return
 	}
 
+	count, uptime, pending, activeSnaps, offset, generation := store.Stats()
 	active := atomic.LoadInt64(&s.activeConns)
 	mem := atomic.LoadInt64(&s.usedMemory)
 
@@ -657,7 +599,7 @@ func (s *Server) handleStat(w io.Writer, tx *txState) {
 func (s *Server) handleCompact(w io.Writer, tx *txState) {
 	store, err := s.getStore(tx.dbIndex)
 	if err != nil {
-		_ = s.writeBinaryResponse(w, ResStatusErr, []byte("DB init error"))
+		_ = s.writeBinaryResponse(w, ResStatusErr, []byte("DB access error"))
 		return
 	}
 

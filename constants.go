@@ -34,7 +34,7 @@ const (
 	MaxMemoryLimit       = 1024 * 1024 * 1024
 	MaxSyncBytes         = 16 * 1024 * 1024 // 16MB limit for CDC batches
 	MaxResponseSize      = 32 * 1024 * 1024 // 32MB Limit for responses
-	MaxDatabases         = 16               // Support 16 namespaces (0-15)
+	MaxDatabases         = 3                // Support 3 namespaces (0-2)
 
 	// Storage Format (Journal)
 	// KeyLen(4) + ValLen(4) + MinReadVersion(8) + CRC32(4)

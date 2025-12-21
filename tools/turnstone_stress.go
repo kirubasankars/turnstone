@@ -1,41 +1,32 @@
 package main
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
 	"math/rand"
 	"net"
+	"os"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-)
 
-// OpCodes (Must match server)
-const (
-	OpCodePing   = 0x01
-	OpCodeGet    = 0x02
-	OpCodeSet    = 0x03
-	OpCodeBegin  = 0x10
-	OpCodeCommit = 0x11
-	OpCodeAuth   = 0x23
-)
-
-const (
-	ResStatusOK         = 0x00
-	ResStatusNotFound   = 0x02
-	ResStatusTxConflict = 0x05
+	"turnstone/client"
 )
 
 // Config
 var (
 	host        = flag.String("host", "localhost:6379", "Target server address")
+	caFile      = flag.String("ca", "", "CA Certificate file")
+	certFile    = flag.String("cert", "", "Client Certificate file")
+	keyFile     = flag.String("key", "", "Client Key file")
 	concurrency = flag.Int("c", 50, "Number of concurrent connections")
 	duration    = flag.Duration("d", 10*time.Second, "Test duration")
-	password    = flag.String("auth", "", "Password if required")
 	keySpace    = flag.Int("keys", 10000, "Key space size (e.g., key_0 to key_10000)")
 	writeRatio  = flag.Float64("w", 0.5, "Write ratio (0.0 - 1.0), default 50%")
 	readRatio   = flag.Float64("r", -1.0, "Read ratio (0.0 - 1.0), overrides -w if set")
@@ -62,10 +53,6 @@ func (e *ServerError) Error() string {
 
 // Stats
 var (
-	opsCount  uint64
-	errCount  uint64
-	latencies []time.Duration
-	latMu     sync.Mutex
 	// Flag to ensure we only print the first error to avoid console flooding
 	hasPrintedError int32
 )
@@ -78,7 +65,12 @@ func main() {
 		*writeRatio = 1.0 - *readRatio
 	}
 
-	fmt.Printf("Starting benchmark against %s\n", *host)
+	fmt.Printf("Starting stress test against %s\n", *host)
+	if *caFile != "" {
+		fmt.Println("Security: mTLS Enabled")
+	} else {
+		fmt.Println("Security: Insecure TCP")
+	}
 	fmt.Printf("Workers: %d | Duration: %v | Keys: %d\n", *concurrency, *duration, *keySpace)
 	fmt.Printf("Payload: %dB | Write Ratio: %.0f%% | Read Ratio: %.0f%%\n", *valSize, *writeRatio*100, (1.0-*writeRatio)*100)
 
@@ -98,13 +90,13 @@ func main() {
 	go func() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
-		start := time.Now()
+		startLog := time.Now()
 		for {
 			select {
 			case <-stopCh:
 				return
 			case <-ticker.C:
-				elapsed := time.Since(start).Seconds()
+				elapsed := time.Since(startLog).Seconds()
 				fmt.Printf("\rRunning... %.0fs / %.0fs", elapsed, duration.Seconds())
 			}
 		}
@@ -149,15 +141,52 @@ func main() {
 		p99 = allLatencies[int(float64(len(allLatencies))*0.99)]
 	}
 
-	fmt.Printf("Total Ops:       %d\n", totalOps)
-	fmt.Printf("Total Errors:    %d\n", totalErr)
-	fmt.Printf("Total Conflicts: %d\n", totalConflicts)
-	fmt.Printf("Duration:        %v\n", totalDuration.Round(time.Millisecond))
-	fmt.Printf("Throughput:      %.2f requests/sec\n", rps)
+	fmt.Printf("Total Ops:        %d\n", totalOps)
+	fmt.Printf("Total Errors:     %d\n", totalErr)
+	fmt.Printf("Total Conflicts:  %d\n", totalConflicts)
+	fmt.Printf("Duration:         %v\n", totalDuration.Round(time.Millisecond))
+	fmt.Printf("Throughput:       %.2f requests/sec\n", rps)
 	fmt.Println("Latency Distribution:")
 	fmt.Printf("  p50: %v\n", p50)
 	fmt.Printf("  p95: %v\n", p95)
 	fmt.Printf("  p99: %v\n", p99)
+}
+
+func connect(id int) (net.Conn, error) {
+	var conn net.Conn
+	var err error
+
+	dialer := net.Dialer{Timeout: 5 * time.Second}
+
+	if *caFile != "" && *certFile != "" && *keyFile != "" {
+		caCert, readErr := os.ReadFile(*caFile)
+		if readErr != nil {
+			return nil, fmt.Errorf("read ca: %v", readErr)
+		}
+		caCertPool := x509.NewCertPool()
+		if !caCertPool.AppendCertsFromPEM(caCert) {
+			return nil, fmt.Errorf("failed to parse CA pem")
+		}
+
+		cert, readErr := tls.LoadX509KeyPair(*certFile, *keyFile)
+		if readErr != nil {
+			return nil, fmt.Errorf("load keys: %v", readErr)
+		}
+
+		tlsCfg := &tls.Config{
+			RootCAs:      caCertPool,
+			Certificates: []tls.Certificate{cert},
+		}
+		conn, err = tls.DialWithDialer(&dialer, "tcp", *host, tlsCfg)
+	} else {
+		conn, err = dialer.Dial("tcp", *host)
+	}
+
+	if err != nil {
+		fmt.Printf("[Worker %d] Connect error: %v\n", id, err)
+		return nil, err
+	}
+	return conn, nil
 }
 
 func worker(id int, stopCh <-chan struct{}, statsCh chan<- WorkerStats, wg *sync.WaitGroup) {
@@ -170,23 +199,13 @@ func worker(id int, stopCh <-chan struct{}, statsCh chan<- WorkerStats, wg *sync
 		Latencies: make([]time.Duration, 0, 10000),
 	}
 
-	conn, err := net.Dial("tcp", *host)
+	conn, err := connect(id)
 	if err != nil {
-		fmt.Printf("[Worker %d] Connect error: %v\n", id, err)
 		stats.Errors++
 		statsCh <- stats
 		return
 	}
 	defer conn.Close()
-
-	if *password != "" {
-		if err := sendAuth(conn, *password); err != nil {
-			fmt.Printf("[Worker %d] Auth error: %v\n", id, err)
-			stats.Errors++
-			statsCh <- stats
-			return
-		}
-	}
 
 	readBuf := make([]byte, 4096) // Reusable read buffer
 
@@ -229,7 +248,7 @@ func worker(id int, stopCh <-chan struct{}, statsCh chan<- WorkerStats, wg *sync
 
 			if err != nil {
 				// Check specific error types
-				if se, ok := err.(*ServerError); ok && se.Status == ResStatusTxConflict {
+				if se, ok := err.(*ServerError); ok && se.Status == client.ResStatusTxConflict {
 					stats.Conflicts++
 					// Do not reconnect on conflict; the protocol allows continuing
 					continue
@@ -243,13 +262,10 @@ func worker(id int, stopCh <-chan struct{}, statsCh chan<- WorkerStats, wg *sync
 
 				// Reconnect on actual network/protocol errors
 				conn.Close()
-				conn, err = net.Dial("tcp", *host)
+				conn, err = connect(id)
 				if err != nil {
 					statsCh <- stats
 					return
-				}
-				if *password != "" {
-					sendAuth(conn, *password)
 				}
 			} else {
 				stats.Ops++
@@ -260,19 +276,13 @@ func worker(id int, stopCh <-chan struct{}, statsCh chan<- WorkerStats, wg *sync
 
 // --- Protocol Helpers (Optimized) ---
 
-func sendAuth(conn net.Conn, pass string) error {
-	payload := []byte(pass)
-	send(conn, OpCodeAuth, payload)
-	return readResp(conn, nil)
-}
-
 func sendBegin(conn net.Conn) error {
-	send(conn, OpCodeBegin, nil)
+	send(conn, client.OpCodeBegin, nil)
 	return readResp(conn, nil)
 }
 
 func sendCommit(conn net.Conn) error {
-	send(conn, OpCodeCommit, nil)
+	send(conn, client.OpCodeCommit, nil)
 	return readResp(conn, nil)
 }
 
@@ -286,12 +296,12 @@ func sendSet(conn net.Conn, key, val string, buf []byte) error {
 	copy(payload[4:], key)
 	copy(payload[4+len(key):], val)
 
-	send(conn, OpCodeSet, payload)
+	send(conn, client.OpCodeSet, payload)
 	return readResp(conn, buf)
 }
 
 func sendGet(conn net.Conn, key string, buf []byte) error {
-	send(conn, OpCodeGet, []byte(key))
+	send(conn, client.OpCodeGet, []byte(key))
 	return readResp(conn, buf)
 }
 
@@ -329,7 +339,7 @@ func readResp(r io.Reader, buf []byte) error {
 	status := header[0]
 	length := binary.BigEndian.Uint32(header[1:])
 
-	if status != ResStatusOK && status != ResStatusNotFound {
+	if status != client.ResStatusOK && status != client.ResStatusNotFound {
 		var msg string
 		if length > 0 {
 			// Cap error message reading to avoid massive allocations on bogus length

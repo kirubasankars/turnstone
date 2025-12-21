@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"encoding/csv"
 	"flag"
@@ -31,6 +33,11 @@ var (
 	cfgWorkers    int
 	cfgBatchSize  int
 	cfgReportFreq time.Duration
+
+	// mTLS Configuration
+	cfgCAFile   string
+	cfgCertFile string
+	cfgKeyFile  string
 )
 
 // Protocol Constants
@@ -80,8 +87,19 @@ func main() {
 	}
 	defer f.Close()
 
+	// Verify Cert Files
+	if _, err := os.Stat(cfgCAFile); os.IsNotExist(err) {
+		log.Fatalf("Fatal: CA file not found: %s", cfgCAFile)
+	}
+	if _, err := os.Stat(cfgCertFile); os.IsNotExist(err) {
+		log.Fatalf("Fatal: Client Cert file not found: %s", cfgCertFile)
+	}
+	if _, err := os.Stat(cfgKeyFile); os.IsNotExist(err) {
+		log.Fatalf("Fatal: Client Key file not found: %s", cfgKeyFile)
+	}
+
 	log.Printf("--- Turnstone Data Loader ---")
-	log.Printf("Target:   %s:%d", cfgHost, cfgPort)
+	log.Printf("Target:   %s:%d (mTLS Enabled)", cfgHost, cfgPort)
 	log.Printf("Source:   %s", cfgFile)
 	log.Printf("Workers:  %d", cfgWorkers)
 	log.Printf("Batching: %d records/tx", cfgBatchSize)
@@ -127,11 +145,17 @@ func main() {
 func parseFlags() {
 	flag.StringVar(&cfgHost, "host", "127.0.0.1", "Database host")
 	flag.IntVar(&cfgPort, "port", 6379, "Database port")
-	flag.StringVar(&cfgAuth, "auth", "", "Authentication password")
+	flag.StringVar(&cfgAuth, "auth", "", "Authentication password (if server requires separate auth)")
 	flag.StringVar(&cfgFile, "file", "fake_weather_data.csv", "Path to CSV file to load")
 	flag.IntVar(&cfgWorkers, "workers", 10, "Number of concurrent loader threads")
 	flag.IntVar(&cfgBatchSize, "batch", 100, "Number of records per transaction")
 	flag.DurationVar(&cfgReportFreq, "report", 2*time.Second, "Progress report frequency")
+
+	// TLS Flags
+	flag.StringVar(&cfgCAFile, "ca", "certs/ca.crt", "Path to CA certificate")
+	flag.StringVar(&cfgCertFile, "cert", "certs/client.crt", "Path to client certificate")
+	flag.StringVar(&cfgKeyFile, "key", "certs/client.key", "Path to client key")
+
 	flag.Parse()
 }
 
@@ -292,14 +316,34 @@ func (c *Client) Connect() error {
 		c.conn.Close()
 	}
 
-	conn, err := net.DialTimeout("tcp", c.addr, DialTimeout)
+	// Load Client Certs
+	cert, err := tls.LoadX509KeyPair(cfgCertFile, cfgKeyFile)
+	if err != nil {
+		return fmt.Errorf("failed to load client keypair: %w", err)
+	}
+
+	// Load CA
+	caCert, err := os.ReadFile(cfgCAFile)
+	if err != nil {
+		return fmt.Errorf("failed to read CA file: %w", err)
+	}
+	caCertPool := x509.NewCertPool()
+	caCertPool.AppendCertsFromPEM(caCert)
+
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		RootCAs:      caCertPool,
+	}
+
+	dialer := &net.Dialer{Timeout: DialTimeout}
+	conn, err := tls.DialWithDialer(dialer, "tcp", c.addr, tlsConfig)
 	if err != nil {
 		return err
 	}
 	c.conn = conn
 	c.reader = bufio.NewReader(conn)
 
-	// Authenticate if password is provided
+	// Authenticate if password is provided (Optional second factor)
 	if c.password != "" {
 		if err := c.auth(); err != nil {
 			conn.Close()

@@ -97,11 +97,18 @@ func TestIndex_RotateAndFlush(t *testing.T) {
 	if !rotated {
 		t.Fatal("Expected rotation to happen")
 	}
-	if len(idx.active) != 0 {
+
+	// Updated: Check idx.active.keys due to memState refactor
+	if len(idx.active.keys) != 0 {
 		t.Error("Expected active index to be empty after rotation")
 	}
-	if len(idx.flushing) != 2 {
-		t.Errorf("Expected flushing index to have 2 keys, got %d", len(idx.flushing))
+
+	// Updated: Check idx.flushing.keys due to memState refactor
+	if idx.flushing == nil {
+		t.Fatal("Expected flushing index to be non-nil")
+	}
+	if len(idx.flushing.keys) != 2 {
+		t.Errorf("Expected flushing index to have 2 keys, got %d", len(idx.flushing.keys))
 	}
 
 	// Flush

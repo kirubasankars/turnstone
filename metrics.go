@@ -61,7 +61,7 @@ func NewTurnstoneCollector(s *Server) *TurnstoneCollector {
 		),
 		activeSyncs: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "server", "cdc_clients_active"),
-			"Active CDC clients.", nil, nil,
+			"Active CDC clients.", []string{"db"}, nil,
 		),
 		memoryUsed: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "server", "memory_used_bytes"),
@@ -92,11 +92,7 @@ func (c *TurnstoneCollector) Collect(ch chan<- prometheus.Metric) {
 		return
 	}
 
-	// Lock to safely iterate over stores which might be initializing
-	c.server.storeMu.RLock()
-	defer c.server.storeMu.RUnlock()
-
-	// Collect metrics for each DB
+	// No Lock needed as stores are initialized at startup and immutable in length
 	for i, store := range c.server.stores {
 		var keys int
 		var pending int64
@@ -104,7 +100,6 @@ func (c *TurnstoneCollector) Collect(ch chan<- prometheus.Metric) {
 		var off int64
 		var gen uint64
 
-		// Check if initialized to get actual stats, otherwise report 0s
 		if store != nil {
 			keys, _, pending, snaps, off, gen = store.Stats()
 		}
@@ -116,17 +111,18 @@ func (c *TurnstoneCollector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(c.activeSnapshots, prometheus.GaugeValue, float64(snaps), dbLabel)
 		ch <- prometheus.MustNewConstMetric(c.walOffset, prometheus.GaugeValue, float64(off), dbLabel)
 		ch <- prometheus.MustNewConstMetric(c.generation, prometheus.GaugeValue, float64(gen), dbLabel)
+
+		activeSyncs := atomic.LoadInt64(&c.server.activeSyncsPerDB[i])
+		ch <- prometheus.MustNewConstMetric(c.activeSyncs, prometheus.GaugeValue, float64(activeSyncs), dbLabel)
 	}
 
 	activeConns := atomic.LoadInt64(&c.server.activeConns)
 	totalConns := atomic.LoadUint64(&c.server.totalConns)
-	activeSyncs := atomic.LoadInt64(&c.server.activeSyncs)
 	mem := atomic.LoadInt64(&c.server.usedMemory)
 	txs := atomic.LoadInt64(&c.server.activeTxs)
 
 	ch <- prometheus.MustNewConstMetric(c.activeConns, prometheus.GaugeValue, float64(activeConns))
 	ch <- prometheus.MustNewConstMetric(c.totalConns, prometheus.CounterValue, float64(totalConns))
-	ch <- prometheus.MustNewConstMetric(c.activeSyncs, prometheus.GaugeValue, float64(activeSyncs))
 	ch <- prometheus.MustNewConstMetric(c.memoryUsed, prometheus.GaugeValue, float64(mem))
 	ch <- prometheus.MustNewConstMetric(c.activeTxs, prometheus.GaugeValue, float64(txs))
 }

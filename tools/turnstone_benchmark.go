@@ -2,41 +2,32 @@ package main
 
 import (
 	"bufio"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
 	"math/rand"
 	"net"
+	"os"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-)
 
-// OpCodes (Must match server)
-const (
-	OpCodePing   = 0x01
-	OpCodeGet    = 0x02
-	OpCodeSet    = 0x03
-	OpCodeBegin  = 0x10
-	OpCodeCommit = 0x11
-	OpCodeAuth   = 0x23
-)
-
-const (
-	ResStatusOK         = 0x00
-	ResStatusNotFound   = 0x02
-	ResStatusTxConflict = 0x05
+	"turnstone/client"
 )
 
 // Config
 var (
 	host         = flag.String("host", "localhost:6379", "Target server address")
+	caFile       = flag.String("ca", "", "CA Certificate file")
+	certFile     = flag.String("cert", "", "Client Certificate file")
+	keyFile      = flag.String("key", "", "Client Key file")
 	concurrency  = flag.Int("c", 50, "Number of concurrent connections")
 	duration     = flag.Duration("d", 10*time.Second, "Test duration")
-	password     = flag.String("auth", "", "Password if required")
 	keySpace     = flag.Int("keys", 10000, "Key space size (e.g., key_0 to key_10000)")
 	writeRatio   = flag.Float64("w", 0.5, "Write ratio (0.0 - 1.0), default 50%")
 	readRatio    = flag.Float64("r", -1.0, "Read ratio (0.0 - 1.0), overrides -w if set")
@@ -64,10 +55,6 @@ func (e *ServerError) Error() string {
 
 // Stats
 var (
-	opsCount        uint64
-	errCount        uint64
-	latencies       []time.Duration
-	latMu           sync.Mutex
 	hasPrintedError int32
 )
 
@@ -79,6 +66,11 @@ func main() {
 	}
 
 	fmt.Printf("Starting benchmark against %s\n", *host)
+	if *caFile != "" {
+		fmt.Println("Security: mTLS Enabled")
+	} else {
+		fmt.Println("Security: Insecure TCP")
+	}
 	fmt.Printf("Workers: %d | Duration: %v | Keys: %d | Flush Interval: %d\n", *concurrency, *duration, *keySpace, *pipelineSize)
 	fmt.Printf("Payload: %dB | Write Ratio: %.0f%% | Read Ratio: %.0f%%\n", *valSize, *writeRatio*100, (1.0-*writeRatio)*100)
 	fmt.Printf("Mode: Async Pipelining with Backpressure\n")
@@ -96,13 +88,13 @@ func main() {
 	go func() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
-		start := time.Now()
+		startLog := time.Now()
 		for {
 			select {
 			case <-stopCh:
 				return
 			case <-ticker.C:
-				elapsed := time.Since(start).Seconds()
+				elapsed := time.Since(startLog).Seconds()
 				fmt.Printf("\rRunning... %.0fs / %.0fs", elapsed, duration.Seconds())
 			}
 		}
@@ -145,11 +137,11 @@ func main() {
 		p99 = allLatencies[int(float64(len(allLatencies))*0.99)]
 	}
 
-	fmt.Printf("Total Ops:       %d\n", totalOps)
-	fmt.Printf("Total Errors:    %d\n", totalErr)
-	fmt.Printf("Total Conflicts: %d\n", totalConflicts)
-	fmt.Printf("Duration:        %v\n", totalDuration.Round(time.Millisecond))
-	fmt.Printf("Throughput:      %.2f requests/sec\n", rps)
+	fmt.Printf("Total Ops:        %d\n", totalOps)
+	fmt.Printf("Total Errors:     %d\n", totalErr)
+	fmt.Printf("Total Conflicts:  %d\n", totalConflicts)
+	fmt.Printf("Duration:         %v\n", totalDuration.Round(time.Millisecond))
+	fmt.Printf("Throughput:       %.2f requests/sec\n", rps)
 	fmt.Println("Latency Distribution:")
 	fmt.Printf("  p50: %v\n", p50)
 	fmt.Printf("  p95: %v\n", p95)
@@ -186,26 +178,45 @@ func worker(id int, stopCh <-chan struct{}, statsCh chan<- WorkerStats, wg *sync
 }
 
 func connect(id int) (net.Conn, *bufio.Writer, error) {
-	c, err := net.Dial("tcp", *host)
+	var conn net.Conn
+	var err error
+
+	// 1. mTLS Strategy
+	if *caFile != "" && *certFile != "" && *keyFile != "" {
+		caCert, readErr := os.ReadFile(*caFile)
+		if readErr != nil {
+			return nil, nil, fmt.Errorf("read ca: %v", readErr)
+		}
+		caCertPool := x509.NewCertPool()
+		caCertPool.AppendCertsFromPEM(caCert)
+
+		cert, readErr := tls.LoadX509KeyPair(*certFile, *keyFile)
+		if readErr != nil {
+			return nil, nil, fmt.Errorf("load keys: %v", readErr)
+		}
+
+		tlsCfg := &tls.Config{
+			RootCAs:      caCertPool,
+			Certificates: []tls.Certificate{cert},
+		}
+		conn, err = tls.Dial("tcp", *host, tlsCfg)
+	} else {
+		// 2. Plain TCP
+		conn, err = net.Dial("tcp", *host)
+	}
+
 	if err != nil {
 		fmt.Printf("[Worker %d] Connect error: %v\n", id, err)
 		return nil, nil, err
 	}
-	if *password != "" {
-		if err := performAuth(c, *password); err != nil {
-			c.Close()
-			return nil, nil, err
-		}
-	}
+
 	// Use a large write buffer to minimize syscalls
-	return c, bufio.NewWriterSize(c, 32*1024), nil
+	return conn, bufio.NewWriterSize(conn, 32*1024), nil
 }
 
 func runAsyncSession(conn net.Conn, bw *bufio.Writer, rng *rand.Rand, stopCh <-chan struct{}, stats *WorkerStats) {
 	// IMPORTANT: Tying channel capacity to pipeline size prevents buffer bloat.
-	// We allow enough buffer for a few batches to be in flight, but not 10,000.
-	// This creates "backpressure": if the reader is slow (server is slow),
-	// the writer blocks here, preventing latency from exploding.
+	// This creates "backpressure".
 	queueDepth := *pipelineSize * 2
 	if queueDepth < 50 {
 		queueDepth = 50
@@ -245,7 +256,7 @@ func runAsyncSession(conn net.Conn, bw *bufio.Writer, rng *rand.Rand, stopCh <-c
 
 			// 3. COMMIT Resp
 			if err := readResp(conn, nil); err != nil {
-				if se, ok := err.(*ServerError); ok && se.Status == ResStatusTxConflict {
+				if se, ok := err.(*ServerError); ok && se.Status == client.ResStatusTxConflict {
 					txConflict = true
 				} else {
 					errCh <- err
@@ -290,7 +301,6 @@ func runAsyncSession(conn net.Conn, bw *bufio.Writer, rng *rand.Rand, stopCh <-c
 			t := time.Now()
 
 			// Write 3 commands
-			// Note: We use manual buffering in writeX helpers to avoid 'binary.Write' reflection overhead
 			writeBegin(bw)
 			if isWrite {
 				writeSet(bw, key, valStr)
@@ -299,10 +309,7 @@ func runAsyncSession(conn net.Conn, bw *bufio.Writer, rng *rand.Rand, stopCh <-c
 			}
 			writeCommit(bw)
 
-			// Notify Reader.
-			// This is the BACKPRESSURE point.
-			// If inflightCh is full (Reader is slow), this BLOCKS the Writer.
-			// This prevents the queue from growing indefinitely.
+			// Notify Reader (Backpressure point)
 			select {
 			case inflightCh <- t:
 			case err := <-errCh:
@@ -327,23 +334,17 @@ func runAsyncSession(conn net.Conn, bw *bufio.Writer, rng *rand.Rand, stopCh <-c
 
 // --- Protocol Helpers (Optimized) ---
 
-func performAuth(conn net.Conn, pass string) error {
-	payload := []byte(pass)
-	write(conn, OpCodeAuth, payload)
-	return readResp(conn, nil)
-}
-
 func writeBegin(w io.Writer) {
-	write(w, OpCodeBegin, nil)
+	write(w, client.OpCodeBegin, nil)
 }
 
 func writeCommit(w io.Writer) {
-	write(w, OpCodeCommit, nil)
+	write(w, client.OpCodeCommit, nil)
 }
 
 func writeSet(w io.Writer, key, val string) {
 	totalLen := 4 + len(key) + len(val)
-	writeHeader(w, OpCodeSet, totalLen)
+	writeHeader(w, client.OpCodeSet, totalLen)
 
 	// Optimized: Manual uint32 write to avoid allocation/reflection
 	var buf [4]byte
@@ -355,12 +356,10 @@ func writeSet(w io.Writer, key, val string) {
 }
 
 func writeGet(w io.Writer, key string) {
-	write(w, OpCodeGet, []byte(key))
+	write(w, client.OpCodeGet, []byte(key))
 }
 
 func writeHeader(w io.Writer, op byte, length int) {
-	// Reusing a small buffer here would be ideal, but Go's escape analysis
-	// usually handles this small fixed-size array on stack well.
 	var header [5]byte
 	header[0] = op
 	binary.BigEndian.PutUint32(header[1:], uint32(length))
@@ -382,7 +381,7 @@ func readResp(r io.Reader, buf []byte) error {
 	status := header[0]
 	length := binary.BigEndian.Uint32(header[1:])
 
-	if status != ResStatusOK && status != ResStatusNotFound {
+	if status != client.ResStatusOK && status != client.ResStatusNotFound {
 		var msg string
 		if length > 0 {
 			readLen := length
