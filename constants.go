@@ -22,8 +22,9 @@ const (
 	DefaultDataDir = "data"
 	BoltBucketData = "index"
 	BoltBucketMeta = "meta"
-	BoltBucketPair = "pair" // New bucket: Offset -> Length (renamed from Record)
+	BoltBucketPair = "pair" // Offset -> Length mapping
 	KeyLastOffset  = "last_offset"
+	KeyReplState   = "repl_state"
 
 	// Limits & Safety
 	MaxKeySize           = 1 * 1024
@@ -68,6 +69,7 @@ var (
 	ErrCompactionInProgress = errors.New("compaction already in progress")
 	ErrGenerationMismatch   = errors.New("generation mismatch")
 	ErrInvalidDB            = errors.New("invalid database index")
+	ErrReadOnly             = errors.New("server is read-only")
 )
 
 // Request OpCodes
@@ -96,6 +98,7 @@ const (
 	ResStatusTxConflict     = 0x05
 	ResStatusServerBusy     = 0x06
 	ResStatusEntityTooLarge = 0x07
+	ResStatusAuthRequired   = 0x08 // Placeholder for auth if needed
 	ResStatusGenMismatch    = 0x09
 )
 

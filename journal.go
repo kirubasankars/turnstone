@@ -28,6 +28,10 @@ func (j *JournalFile) Close() error {
 
 // ReadAt wraps pread (safe for concurrent use)
 func (j *JournalFile) ReadAt(p []byte, off int64) (int, error) {
+	// Note: os.File.ReadAt is thread-safe on UNIX, but using RLock here
+	// ensures no conflict with Truncate/Close operations.
+	j.mu.RLock()
+	defer j.mu.RUnlock()
 	return j.f.ReadAt(p, off)
 }
 
@@ -39,6 +43,8 @@ func (j *JournalFile) WriteAt(p []byte, off int64) (int, error) {
 }
 
 func (j *JournalFile) Sync() error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
 	return j.f.Sync()
 }
 

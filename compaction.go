@@ -82,7 +82,6 @@ func (s *Store) doCompact() (retErr error) {
 
 	tmpIndex := NewIndex(tmpBolt)
 
-	// Start from 0 since we removed the FileHeader
 	readOffset := int64(0)
 	writeOffset := int64(0)
 	var keptCount, droppedCount int
@@ -140,7 +139,6 @@ func (s *Store) doCompact() (retErr error) {
 	// Clean up old state that will be invalid in the new generation
 	s.activeSnapshots = make(map[int64]int)
 	s.conflictIndex = make(map[string][]int64)
-	// Reset the conflict queue as well to keep it in sync with conflictIndex
 	s.conflictQueue = make([]Mutation, 0, 1024)
 
 	finalOffset := s.offset
@@ -200,15 +198,14 @@ func (s *Store) doCompact() (retErr error) {
 	}
 
 	if err := os.Rename(tmpBoltPath, newBoltPath); err != nil {
-		// ROLLBACK: Try to rename the journal back to tmp if bolt fails.
-		// This prevents leaving the system in a split-brain state (new DB, old Index).
+		// ROLLBACK
 		if rollbackErr := os.Rename(newJournalPath, tmpJournalPath); rollbackErr != nil {
-			s.logger.Error("CRITICAL: Failed to rollback journal rename after bolt swap failure", "err", rollbackErr)
+			s.logger.Error("CRITICAL: Failed to rollback journal rename", "err", rollbackErr)
 		}
 
 		s.compacting = false
 		s.mu.Unlock()
-		s.reopen() // Try to recover
+		s.reopen()
 		return fmt.Errorf("failed to swap bolt: %w", err)
 	}
 
@@ -221,19 +218,13 @@ func (s *Store) doCompact() (retErr error) {
 	}
 
 	s.offset = writeOffset
-	// Reset version tracking to match new offset.
-	// This prevents the new generation from inheriting a high minReadVersion from the old generation,
-	// which could cause premature pruning of conflict history before the first new snapshot is acquired.
 	s.minReadVersion = writeOffset
 	s.lastPrunedVersion = writeOffset
 
 	s.compacting = false
 	s.mu.Unlock()
 
-	// --- Graceful Deletion Logic ---
-	// Schedule deletion of the OLD files after a grace period.
-	// This allows CDC clients who are lagging slightly to finish the old generation
-	// and switch over without crashing.
+	// Graceful Deletion Logic
 	oldGen := newGen - 1
 	oldDbPath := filepath.Join(s.dataDir, fmt.Sprintf("%d.db", oldGen))
 	oldIdxPath := filepath.Join(s.dataDir, fmt.Sprintf("%d.idx", oldGen))
@@ -245,12 +236,8 @@ func (s *Store) doCompact() (retErr error) {
 
 	time.AfterFunc(s.compactionGracePeriod, func() {
 		s.logger.Info("Cleaning up old generation files", "gen", oldGen)
-		if err := os.Remove(oldDbPath); err != nil && !os.IsNotExist(err) {
-			s.logger.Warn("failed to remove old db file", "path", oldDbPath, "err", err)
-		}
-		if err := os.Remove(oldIdxPath); err != nil && !os.IsNotExist(err) {
-			s.logger.Warn("failed to remove old idx file", "path", oldIdxPath, "err", err)
-		}
+		os.Remove(oldDbPath)
+		os.Remove(oldIdxPath)
 	})
 
 	s.logger.Info("Compaction stats",
@@ -287,29 +274,25 @@ func (s *Store) copyRange(
 		headerBuf [HeaderSize]byte
 		key       string
 		payload   []byte
-		entryOff  int64 // Original offset in the old file
+		entryOff  int64
 		entrySize int64
 		valLen    uint32
 	}
 	batch := make([]batchItem, 0, batchSize)
 
 	currentFlushOffset := writeOff
-	var scratch [8]byte // Reuse for CRC calculation
+	var scratch [8]byte
 
-	// processBatch handles the locking (decision) and IO (writing) phases separately
 	processBatch := func() error {
 		if len(batch) == 0 {
 			return nil
 		}
 
-		// 1. DECISION PHASE: Check liveness (Hold Lock)
-		// We use a bool slice to mark survivors so we don't do IO under lock
 		survivors := make([]bool, len(batch))
 
 		checkLiveness := func() {
 			for i, item := range batch {
 				latest, exists := s.index.GetLatest(item.key)
-				// It is live if the version in the MAIN index matches exactly the offset we just read
 				if exists && latest.Offset() == item.entryOff {
 					survivors[i] = true
 				}
@@ -324,15 +307,13 @@ func (s *Store) copyRange(
 			s.mu.RUnlock()
 		}
 
-		// 2. IO PHASE: Write to new file (No Lock)
 		for i, item := range batch {
 			if !survivors[i] {
 				dropped++
 				continue
 			}
 
-			// MinReadVersion (header[8:16]) is set to 0.
-			// Old versions are meaningless in the new file because the offset space resets.
+			// Reset MinReadVersion to 0 in new file
 			binary.BigEndian.PutUint64(item.headerBuf[8:16], 0)
 
 			// Write Header
@@ -349,25 +330,20 @@ func (s *Store) copyRange(
 
 			isDel := item.valLen == Tombstone
 
-			// Update: Combined Set call
-			// Note: We use MaxInt64 for minReadVersion here as we are establishing the base layer.
 			tmpIndex.Set(item.key, writeOff, item.entrySize, isDel, math.MaxInt64)
 
 			writeOff += item.entrySize
 			kept++
 		}
 
-		// Reset batch for next iteration
 		batch = batch[:0]
 		return nil
 	}
 
 	for currentReadOff < endOff {
-		// Prepare a new item
 		var item batchItem
 		item.entryOff = currentReadOff
 
-		// Read Header
 		if _, err := io.ReadFull(reader, item.headerBuf[:]); err != nil {
 			if err == io.EOF {
 				break
@@ -377,7 +353,6 @@ func (s *Store) copyRange(
 
 		keyLen := binary.BigEndian.Uint32(item.headerBuf[0:4])
 		valLen := binary.BigEndian.Uint32(item.headerBuf[4:8])
-		// item.headerBuf[8:16] is MinReadVersion (previously TxStart), preserved
 		storedCrc := binary.BigEndian.Uint32(item.headerBuf[16:20])
 
 		item.valLen = valLen
@@ -389,7 +364,6 @@ func (s *Store) copyRange(
 			payloadLen = int64(keyLen) + int64(valLen)
 		}
 
-		// Allocate new buffer for reading (no pooling)
 		item.payload = make([]byte, payloadLen)
 
 		if _, err := io.ReadFull(reader, item.payload); err != nil {
@@ -397,7 +371,6 @@ func (s *Store) copyRange(
 		}
 
 		if !s.skipCrc {
-			// Calculate CRC: Lengths + Payload. Excludes MinReadVersion.
 			digest := crc32.New(CrcTable)
 			binary.BigEndian.PutUint32(scratch[0:4], keyLen)
 			binary.BigEndian.PutUint32(scratch[4:8], valLen)
@@ -415,7 +388,6 @@ func (s *Store) copyRange(
 		batch = append(batch, item)
 		currentReadOff += item.entrySize
 
-		// If batch is full, process it
 		if len(batch) >= batchSize {
 			if err := processBatch(); err != nil {
 				return writeOff, kept, dropped, err
@@ -423,7 +395,6 @@ func (s *Store) copyRange(
 		}
 	}
 
-	// Process any remaining items
 	if err := processBatch(); err != nil {
 		return writeOff, kept, dropped, err
 	}

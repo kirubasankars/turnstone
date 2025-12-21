@@ -92,10 +92,24 @@ func (c *TurnstoneCollector) Collect(ch chan<- prometheus.Metric) {
 		return
 	}
 
+	// Lock to safely iterate over stores which might be initializing
+	c.server.storeMu.RLock()
+	defer c.server.storeMu.RUnlock()
+
 	// Collect metrics for each DB
 	for i, store := range c.server.stores {
+		var keys int
+		var pending int64
+		var snaps int
+		var off int64
+		var gen uint64
+
+		// Check if initialized to get actual stats, otherwise report 0s
+		if store != nil {
+			keys, _, pending, snaps, off, gen = store.Stats()
+		}
+
 		dbLabel := strconv.Itoa(i)
-		keys, _, pending, snaps, off, gen := store.Stats()
 
 		ch <- prometheus.MustNewConstMetric(c.keys, prometheus.GaugeValue, float64(keys), dbLabel)
 		ch <- prometheus.MustNewConstMetric(c.pendingBytes, prometheus.GaugeValue, float64(pending), dbLabel)
