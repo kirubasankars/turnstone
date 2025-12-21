@@ -3,59 +3,90 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"os"
 	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"golang.org/x/crypto/bcrypt"
 )
 
 type Server struct {
-	store       *Store
+	stores      []*Store // Slice of stores [0..15]
 	addr        string
+	metricsAddr string
 	logger      *slog.Logger
 	listener    net.Listener
 	maxConns    int
-	maxSyncs    int    // Limit for CDC clients
-	authPass    string // Bcrypt Hash of the Password
-	readOnly    bool   // Server is in read-only mode (Follower)
+	maxSyncs    int
+	readOnly    bool
 	sem         chan struct{}
 	wg          sync.WaitGroup
 	totalConns  uint64
 	activeConns int64
-	activeSyncs int64 // Counter for active CDC clients
+	activeSyncs int64
 	usedMemory  int64
 	activeTxs   int64
+	tlsConfig   *tls.Config
 }
 
-func NewServer(addr string, store *Store, logger *slog.Logger, maxConns int, maxSyncs int, authPass string, readOnly bool) *Server {
+func NewServer(addr string, metricsAddr string, stores []*Store, logger *slog.Logger, maxConns int, maxSyncs int, readOnly bool, tlsCert, tlsKey, tlsCA string) *Server {
+	if tlsCert == "" || tlsKey == "" || tlsCA == "" {
+		logger.Error("Server requires TLS cert, key, and CA file for mTLS")
+		os.Exit(1)
+	}
+
+	cert, err := tls.LoadX509KeyPair(tlsCert, tlsKey)
+	if err != nil {
+		logger.Error("Failed to load TLS keys", "err", err)
+		os.Exit(1)
+	}
+
+	caCert, err := os.ReadFile(tlsCA)
+	if err != nil {
+		logger.Error("Failed to load CA", "err", err)
+		os.Exit(1)
+	}
+	caCertPool := x509.NewCertPool()
+	caCertPool.AppendCertsFromPEM(caCert)
+
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		ClientCAs:    caCertPool,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+	}
+
 	return &Server{
-		addr:     addr,
-		store:    store,
-		logger:   logger,
-		maxConns: maxConns,
-		maxSyncs: maxSyncs,
-		authPass: authPass,
-		readOnly: readOnly,
-		sem:      make(chan struct{}, maxConns),
+		addr:        addr,
+		metricsAddr: metricsAddr,
+		stores:      stores,
+		logger:      logger,
+		maxConns:    maxConns,
+		maxSyncs:    maxSyncs,
+		readOnly:    readOnly,
+		sem:         make(chan struct{}, maxConns),
+		tlsConfig:   tlsConfig,
 	}
 }
 
 func (s *Server) Run(ctx context.Context) error {
-	lc := net.ListenConfig{KeepAlive: 30 * time.Second}
-	ln, err := lc.Listen(ctx, "tcp", s.addr)
+	if s.metricsAddr != "" {
+		StartMetricsServer(s.metricsAddr, s, s.logger)
+	}
+
+	ln, err := tls.Listen("tcp", s.addr, s.tlsConfig)
 	if err != nil {
 		return err
 	}
 	s.listener = ln
-	s.logger.Info("Binary Server listening", "addr", s.addr, "readonly", s.readOnly)
+	s.logger.Info("mTLS Server listening", "addr", s.addr, "readonly", s.readOnly, "dbs", len(s.stores))
 
 	acceptErr := make(chan error, 1)
 	go func() {
@@ -104,11 +135,9 @@ func (s *Server) Run(ctx context.Context) error {
 }
 
 func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
-	tx := &txState{}
-
-	// If authPass is empty, authentication is disabled (authed = true)
-	authed := s.authPass == ""
-	authFailures := 0
+	tx := &txState{
+		dbIndex: 0, // Default to DB 0
+	}
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -120,13 +149,10 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 		if tx.active {
 			s.abortTx(tx)
 		}
-		// If this connection was a Sync client, release the slot
 		if tx.isSyncClient {
 			atomic.AddInt64(&s.activeSyncs, -1)
 		}
-		if err := conn.Close(); err != nil {
-			// error closing connection
-		}
+		conn.Close()
 		atomic.AddInt64(&s.activeConns, -1)
 		s.wg.Done()
 		<-s.sem
@@ -139,13 +165,11 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 		if ctx.Err() != nil {
 			return
 		}
-
 		if err := conn.SetReadDeadline(time.Now().Add(IdleTimeout)); err != nil {
 			return
 		}
 
 		keepGoing := func() bool {
-			// 1. Read Header
 			if _, err := io.ReadFull(r, headerBuf); err != nil {
 				return false
 			}
@@ -158,12 +182,9 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 				return false
 			}
 
-			// 2. Read Payload
 			var payload []byte
-
 			if payloadLen > 0 {
 				payload = make([]byte, payloadLen)
-
 				if _, err := io.ReadFull(r, payload); err != nil {
 					return false
 				}
@@ -173,42 +194,18 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 				return false
 			}
 
-			// Handle AUTH immediately
-			if opCode == OpCodeAuth {
-				if s.handleAuth(conn, payload, &authed) {
-					authFailures = 0 // Reset on success
-				} else {
-					authFailures++
-					if authFailures > 3 {
-						// Silent close or send error then close
-						_ = s.writeBinaryResponse(conn, ResStatusErr, []byte("Too many authentication failures"))
-						return false
-					}
-				}
-				return true
-			}
-
-			// Check Authentication
-			if !authed {
-				switch opCode {
-				case OpCodePing, OpCodeQuit, OpCodeStat:
-					// Allowed without auth
-				default:
-					_ = s.writeBinaryResponse(conn, ResStatusAuthRequired, []byte("Authentication required"))
-					return true
-				}
-			}
-
-			// Check Transaction Constraints
+			// Check Tx Constraints
 			if tx.active {
 				switch opCode {
-				case OpCodePing, OpCodeQuit, OpCodeStat, OpCodeCompact, OpCodeSync:
+				case OpCodePing, OpCodeQuit, OpCodeStat, OpCodeCompact, OpCodeSync, OpCodeSelect:
 					_ = s.writeBinaryResponse(conn, ResStatusErr, []byte("Command not allowed in transaction"))
 					return true
 				}
 			}
 
 			switch opCode {
+			case OpCodeSelect:
+				s.handleSelect(conn, payload, tx)
 			case OpCodeBegin:
 				s.handleBegin(conn, tx)
 			case OpCodeCommit:
@@ -222,9 +219,9 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 			case OpCodeDel:
 				s.handleDelete(conn, payload, tx)
 			case OpCodeStat:
-				s.handleStat(conn)
+				s.handleStat(conn, tx)
 			case OpCodeCompact:
-				s.handleCompact(conn)
+				s.handleCompact(conn, tx)
 			case OpCodeSync:
 				s.handleSync(conn, payload, tx)
 			case OpCodePing:
@@ -234,7 +231,6 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 			default:
 				_ = s.writeBinaryResponse(conn, ResStatusErr, []byte("Unknown OpCode"))
 			}
-
 			return true
 		}()
 
@@ -244,48 +240,48 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 	}
 }
 
-func (s *Server) handleAuth(w io.Writer, payload []byte, authed *bool) bool {
-	if s.authPass == "" {
-		// Redis behavior: ERR Client sent AUTH, but no password is set
-		_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Client sent AUTH, but no password is set"))
-		return false
+func (s *Server) handleSelect(w io.Writer, payload []byte, tx *txState) {
+	if len(payload) != 1 {
+		_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Invalid DB index format"))
+		return
 	}
-
-	// Compare stored bcrypt hash with the received plaintext payload
-	// payload is assumed to be the plaintext password sent by the client.
-	// s.authPass is the bcrypt hash loaded from config.
-	err := bcrypt.CompareHashAndPassword([]byte(s.authPass), payload)
-
-	if err == nil {
-		*authed = true
-		_ = s.writeBinaryResponse(w, ResStatusOK, []byte("OK"))
-		return true
-	} else {
-		_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Invalid password"))
-		return false
+	idx := int(payload[0])
+	if idx < 0 || idx >= MaxDatabases {
+		_ = s.writeBinaryResponse(w, ResStatusErr, []byte("DB index out of range"))
+		return
 	}
+	tx.dbIndex = idx
+	_ = s.writeBinaryResponse(w, ResStatusOK, []byte(fmt.Sprintf("OK Selected %d", idx)))
 }
 
 func (s *Server) handleSync(w io.Writer, payload []byte, tx *txState) {
-	// CDC Client Quota Check
 	if !tx.isSyncClient {
 		current := atomic.LoadInt64(&s.activeSyncs)
 		if current >= int64(s.maxSyncs) {
-			s.logger.Warn("Max CDC sync clients reached", "current", current, "max", s.maxSyncs)
 			_ = s.writeBinaryResponse(w, ResStatusServerBusy, []byte("Max sync clients reached"))
 			return
 		}
-		// Upgrade connection to Sync Client
 		atomic.AddInt64(&s.activeSyncs, 1)
 		tx.isSyncClient = true
 	}
 
-	// Compaction Hold: Pause sync requests while compaction is running.
-	// This avoids "split-brain" reads during the critical switch-over phase
-	// and reduces I/O contention during the catch-up phase.
-	for s.store.compactionRunning.Load() {
+	// Payload: [DB_Idx 1b][Gen 8b][Off 8b] = 17 bytes
+	if len(payload) != 17 {
+		_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Invalid payload size, expected 17 bytes"))
+		return
+	}
+
+	dbIdx := int(payload[0])
+	if dbIdx < 0 || dbIdx >= MaxDatabases {
+		_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Invalid DB Index"))
+		return
+	}
+
+	targetStore := s.stores[dbIdx]
+
+	// Compaction Hold
+	for targetStore.compactionRunning.Load() {
 		if conn, ok := w.(net.Conn); ok {
-			// Extend deadline to prevent timeout while holding
 			if err := conn.SetWriteDeadline(time.Now().Add(DefaultWriteTimeout)); err != nil {
 				return
 			}
@@ -293,17 +289,10 @@ func (s *Server) handleSync(w io.Writer, payload []byte, tx *txState) {
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	// Payload Request: [Generation 8 bytes][Offset 8 bytes]
-	if len(payload) != 16 {
-		_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Invalid payload size, expected 16 bytes"))
-		return
-	}
+	reqGen := binary.BigEndian.Uint64(payload[1:9])
+	reqOffset := int64(binary.BigEndian.Uint64(payload[9:17]))
 
-	reqGen := binary.BigEndian.Uint64(payload[0:8])
-	reqOffset := int64(binary.BigEndian.Uint64(payload[8:16]))
-
-	// Sync now returns a ReadCloser
-	rc, nextOffset, currentGen, err := s.store.Sync(reqGen, reqOffset)
+	rc, nextOffset, currentGen, err := targetStore.Sync(reqGen, reqOffset)
 	if err != nil {
 		if err == ErrGenerationMismatch {
 			resp := make([]byte, 8)
@@ -311,29 +300,21 @@ func (s *Server) handleSync(w io.Writer, payload []byte, tx *txState) {
 			_ = s.writeBinaryResponse(w, ResStatusGenMismatch, resp)
 			return
 		}
-		s.logger.Error("Sync error", "err", err)
 		_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Internal sync error"))
 		return
 	}
-
-	// Ensure cleanup if rc was returned
 	if rc != nil {
 		defer rc.Close()
 	}
 
-	// Calculate payload size
-	// Note: We are streaming only the data that was requested.
-	// If NextOffset > ReqOffset, the length is the difference.
 	dataLen := int64(0)
 	if nextOffset > reqOffset {
 		dataLen = nextOffset - reqOffset
 	}
 
-	// Response Format: [CurrentGen (8)] [NextOffset (8)] [Data (dataLen)]
 	metaLen := 16
 	totalLen := int64(metaLen) + dataLen
 
-	// Write Header (5 bytes)
 	header := make([]byte, 5)
 	header[0] = ResStatusOK
 	binary.BigEndian.PutUint32(header[1:], uint32(totalLen))
@@ -341,7 +322,6 @@ func (s *Server) handleSync(w io.Writer, payload []byte, tx *txState) {
 		return
 	}
 
-	// Write Metadata (16 bytes)
 	meta := make([]byte, 16)
 	binary.BigEndian.PutUint64(meta[0:8], currentGen)
 	binary.BigEndian.PutUint64(meta[8:16], uint64(nextOffset))
@@ -349,20 +329,20 @@ func (s *Server) handleSync(w io.Writer, payload []byte, tx *txState) {
 		return
 	}
 
-	// Stream Data using io.Copy (Zero-copy optimization)
 	if dataLen > 0 && rc != nil {
 		if _, err := io.Copy(w, rc); err != nil {
-			s.logger.Warn("Sync stream error", "err", err)
 			return
 		}
 	}
 }
 
+// Helpers for checkTx, abortTx, handleBegin/End/Abort/Get/Set/Del are updated
+// to use s.stores[tx.dbIndex]
+
 func (s *Server) writeBinaryResponse(w io.Writer, status byte, body []byte) error {
 	header := make([]byte, 5)
 	header[0] = status
 	binary.BigEndian.PutUint32(header[1:], uint32(len(body)))
-
 	if _, err := w.Write(header); err != nil {
 		return err
 	}
@@ -395,7 +375,7 @@ func (s *Server) abortTx(tx *txState) {
 			atomic.AddInt64(&s.usedMemory, -tx.memUsage)
 			tx.memUsage = 0
 		}
-		s.store.ReleaseSnapshot(tx.readVersion)
+		s.stores[tx.dbIndex].ReleaseSnapshot(tx.readVersion)
 		tx.ops = nil
 	}
 }
@@ -405,19 +385,13 @@ func (s *Server) handleBegin(w io.Writer, tx *txState) {
 		_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Server is read-only"))
 		return
 	}
-
 	if tx.active {
-		if time.Now().Before(tx.deadline) {
-			_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Transaction already active"))
-			return
-		}
 		s.abortTx(tx)
 	}
-
 	tx.active = true
-	tx.readOnly = true // Default state
+	tx.readOnly = true
 	atomic.AddInt64(&s.activeTxs, 1)
-	tx.readVersion, tx.generation = s.store.AcquireSnapshot()
+	tx.readVersion, tx.generation = s.stores[tx.dbIndex].AcquireSnapshot()
 	tx.deadline = time.Now().Add(MaxTxDuration)
 	tx.ops = make([]bufferedOp, 0)
 	_ = s.writeBinaryResponse(w, ResStatusOK, nil)
@@ -427,31 +401,26 @@ func (s *Server) handleEnd(w io.Writer, tx *txState) {
 	if !s.checkTx(w, tx) {
 		return
 	}
-
 	defer func() {
 		if tx.memUsage > 0 {
 			atomic.AddInt64(&s.usedMemory, -tx.memUsage)
 			tx.memUsage = 0
 		}
 	}()
-
 	if tx.readOnly {
 		s.abortTx(tx)
 		_ = s.writeBinaryResponse(w, ResStatusOK, nil)
 		return
 	}
-
-	if err := s.store.ApplyBatch(tx.ops, tx.readVersion, tx.generation); err != nil {
+	if err := s.stores[tx.dbIndex].ApplyBatch(tx.ops, tx.readVersion, tx.generation); err != nil {
 		if err == ErrConflict {
 			_ = s.writeBinaryResponse(w, ResStatusTxConflict, []byte("Conflict detected"))
 		} else {
-			s.logger.Error("Commit failed", "err", err)
 			_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Internal commit failure"))
 		}
 		s.abortTx(tx)
 		return
 	}
-
 	s.abortTx(tx)
 	_ = s.writeBinaryResponse(w, ResStatusOK, nil)
 }
@@ -473,14 +442,10 @@ func (s *Server) handleGet(w io.Writer, payload []byte, tx *txState) {
 		return
 	}
 
-	if len(tx.ops) >= MaxTxOps {
-		_ = s.writeBinaryResponse(w, ResStatusEntityTooLarge, []byte("Tx too large"))
-		return
-	}
-
 	key := string(payload)
 	tx.ops = append(tx.ops, bufferedOp{opType: OpJournalGet, key: key})
 
+	// Read Your Own Writes (Scan ops)
 	for i := len(tx.ops) - 2; i >= 0; i-- {
 		op := tx.ops[i]
 		if op.key == key && op.opType != OpJournalGet {
@@ -493,7 +458,7 @@ func (s *Server) handleGet(w io.Writer, payload []byte, tx *txState) {
 		}
 	}
 
-	val, err := s.store.Get(key, tx.readVersion, tx.generation)
+	val, err := s.stores[tx.dbIndex].Get(key, tx.readVersion, tx.generation)
 	if err != nil {
 		if err == ErrKeyNotFound {
 			_ = s.writeBinaryResponse(w, ResStatusNotFound, nil)
@@ -501,7 +466,6 @@ func (s *Server) handleGet(w io.Writer, payload []byte, tx *txState) {
 			_ = s.writeBinaryResponse(w, ResStatusTxConflict, []byte("Snapshot lost"))
 			s.abortTx(tx)
 		} else {
-			s.logger.Error("Store read error", "err", err)
 			_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Internal Error"))
 		}
 		return
@@ -514,7 +478,6 @@ func (s *Server) handleSet(conn net.Conn, payload []byte, tx *txState) {
 		_ = s.writeBinaryResponse(conn, ResStatusErr, []byte("Server is read-only"))
 		return
 	}
-
 	if !s.checkTx(conn, tx) {
 		return
 	}
@@ -523,26 +486,14 @@ func (s *Server) handleSet(conn net.Conn, payload []byte, tx *txState) {
 		_ = s.writeBinaryResponse(conn, ResStatusErr, []byte("Bad format"))
 		return
 	}
-
 	keyLen := int(binary.BigEndian.Uint32(payload[0:4]))
-	if keyLen == 0 || keyLen > MaxKeySize {
-		_ = s.writeBinaryResponse(conn, ResStatusErr, []byte("Invalid Key Length"))
-		return
-	}
-
 	if len(payload) < 4+keyLen {
 		_ = s.writeBinaryResponse(conn, ResStatusErr, []byte("Short Payload"))
 		return
 	}
-
 	key := string(payload[4 : 4+keyLen])
 	val := payload[4+keyLen:]
 	valLen := len(val)
-
-	if valLen > MaxValueSize {
-		_ = s.writeBinaryResponse(conn, ResStatusEntityTooLarge, []byte("Value too large"))
-		return
-	}
 
 	newUsage := atomic.AddInt64(&s.usedMemory, int64(valLen))
 	if newUsage > MaxMemoryLimit {
@@ -554,15 +505,9 @@ func (s *Server) handleSet(conn net.Conn, payload []byte, tx *txState) {
 
 	valCopy := make([]byte, valLen)
 	copy(valCopy, val)
-
 	tx.memUsage += int64(valLen)
 	tx.readOnly = false
-
-	tx.ops = append(tx.ops, bufferedOp{
-		opType: OpJournalSet,
-		key:    key,
-		val:    valCopy,
-	})
+	tx.ops = append(tx.ops, bufferedOp{opType: OpJournalSet, key: key, val: valCopy})
 	_ = s.writeBinaryResponse(conn, ResStatusOK, nil)
 }
 
@@ -571,36 +516,30 @@ func (s *Server) handleDelete(w io.Writer, payload []byte, tx *txState) {
 		_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Server is read-only"))
 		return
 	}
-
-	if len(payload) == 0 {
-		_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Missing Key"))
-		return
-	}
 	if !s.checkTx(w, tx) {
 		return
 	}
-
 	key := string(payload)
 	tx.readOnly = false
-
 	tx.ops = append(tx.ops, bufferedOp{opType: OpJournalDelete, key: key})
 	_ = s.writeBinaryResponse(w, ResStatusOK, nil)
 }
 
-func (s *Server) handleStat(w io.Writer) {
-	count, uptime, pending, activeSnaps, offset, generation := s.store.Stats()
+func (s *Server) handleStat(w io.Writer, tx *txState) {
+	// Show stats for CURRENT selected DB
+	store := s.stores[tx.dbIndex]
+	count, uptime, pending, activeSnaps, offset, generation := store.Stats()
 	active := atomic.LoadInt64(&s.activeConns)
-	activeSyncs := atomic.LoadInt64(&s.activeSyncs)
 	mem := atomic.LoadInt64(&s.usedMemory)
 
-	msg := fmt.Sprintf("Keys:%d Uptime:%s Conns:%d Syncs:%d/%d TxMem:%d Pending:%d Snaps:%d Offset:%d,%d",
-		count, uptime, active, activeSyncs, s.maxSyncs, mem, pending, activeSnaps, generation, offset)
+	msg := fmt.Sprintf("DB:%d Keys:%d Uptime:%s Conns:%d TxMem:%d Pending:%d Snaps:%d Offset:%d,%d",
+		tx.dbIndex, count, uptime, active, mem, pending, activeSnaps, generation, offset)
 
 	_ = s.writeBinaryResponse(w, ResStatusOK, []byte(msg))
 }
 
-func (s *Server) handleCompact(w io.Writer) {
-	if err := s.store.Compact(); err != nil {
+func (s *Server) handleCompact(w io.Writer, tx *txState) {
+	if err := s.stores[tx.dbIndex].Compact(); err != nil {
 		if err == ErrCompactionInProgress {
 			_ = s.writeBinaryResponse(w, ResStatusServerBusy, []byte("Compaction running"))
 		} else {

@@ -2,12 +2,15 @@ package main
 
 import (
 	"bufio"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -20,9 +23,9 @@ const (
 	OpCodeBegin   = 0x10
 	OpCodeCommit  = 0x11
 	OpCodeAbort   = 0x12
+	OpCodeSelect  = 0x13
 	OpCodeStat    = 0x20
 	OpCodeCompact = 0x21
-	OpCodeAuth    = 0x23
 	OpCodeQuit    = 0xFF
 )
 
@@ -36,7 +39,7 @@ const (
 	ResStatusTxConflict     = 0x05
 	ResStatusServerBusy     = 0x06
 	ResStatusEntityTooLarge = 0x07
-	ResStatusAuthRequired   = 0x08
+	ResStatusGenMismatch    = 0x09
 )
 
 // serverResponse wraps the parsed protocol response or a network error
@@ -48,17 +51,55 @@ type serverResponse struct {
 
 func main() {
 	host := flag.String("host", "localhost:6379", "Server address")
+	caFile := flag.String("ca", "", "CA Certificate file")
+	certFile := flag.String("cert", "", "Client Certificate file")
+	keyFile := flag.String("key", "", "Client Key file")
 	flag.Parse()
 
-	conn, err := net.Dial("tcp", *host)
+	var conn net.Conn
+	var err error
+
+	// mTLS Connection Strategy
+	if *caFile != "" && *certFile != "" && *keyFile != "" {
+		// Load CA
+		caCert, readErr := os.ReadFile(*caFile)
+		if readErr != nil {
+			fmt.Printf("Failed to read CA file: %v\n", readErr)
+			os.Exit(1)
+		}
+		caCertPool := x509.NewCertPool()
+		if !caCertPool.AppendCertsFromPEM(caCert) {
+			fmt.Println("Failed to parse CA certificate PEM.")
+			os.Exit(1)
+		}
+
+		// Load Client Cert/Key
+		cert, readErr := tls.LoadX509KeyPair(*certFile, *keyFile)
+		if readErr != nil {
+			fmt.Printf("Failed to load client keypair: %v\n", readErr)
+			os.Exit(1)
+		}
+
+		tlsConfig := &tls.Config{
+			RootCAs:      caCertPool,
+			Certificates: []tls.Certificate{cert},
+		}
+
+		fmt.Printf("Connecting to %s via mTLS...\n", *host)
+		conn, err = tls.Dial("tcp", *host, tlsConfig)
+	} else {
+		fmt.Printf("Connecting to %s via insecure TCP (server may reject if mTLS is enforced)...\n", *host)
+		conn, err = net.Dial("tcp", *host)
+	}
+
 	if err != nil {
 		fmt.Printf("Failed to connect: %v\n", err)
 		os.Exit(1)
 	}
 	defer conn.Close()
 
-	fmt.Println("Connected to", *host)
-	fmt.Println("Commands: get <k>, set <k> <v>, del <k>, begin, commit, abort, stat, compact, auth <pass>, clear, quit")
+	fmt.Println("Connected.")
+	fmt.Println("Commands: select <db>, get <k>, set <k> <v>, del <k>, begin, commit, abort, stat, compact, clear, quit")
 
 	// 1. Async Input Reader
 	inputChan := make(chan string)
@@ -111,8 +152,6 @@ func main() {
 				}
 				return
 			}
-			// If we get valid data here, it's unexpected (protocol violation or lag),
-			// but we print it just in case.
 			printResponse(resp.status, resp.body)
 			fmt.Print("> ")
 
@@ -153,12 +192,18 @@ func main() {
 				send(conn, OpCodeCommit, nil)
 			case "abort":
 				send(conn, OpCodeAbort, nil)
-			case "auth":
+			case "select":
 				if len(parts) < 2 {
-					fmt.Println("Usage: auth <password>")
+					fmt.Println("Usage: select <db_index>")
 					shouldExpectResponse = false
 				} else {
-					send(conn, OpCodeAuth, []byte(parts[1]))
+					dbIdx, err := strconv.Atoi(parts[1])
+					if err != nil || dbIdx < 0 || dbIdx > 255 {
+						fmt.Println("Invalid DB index (0-255)")
+						shouldExpectResponse = false
+					} else {
+						send(conn, OpCodeSelect, []byte{byte(dbIdx)})
+					}
 				}
 			case "get":
 				if len(parts) < 2 {
@@ -250,8 +295,6 @@ func printResponse(status byte, body []byte) {
 		fmt.Println("ERR: Conflict Detected (Retry)")
 	case ResStatusServerBusy:
 		fmt.Println("ERR: Server Busy")
-	case ResStatusAuthRequired:
-		fmt.Println("(error) NOAUTH Authentication required.")
 	default:
 		fmt.Printf("Unknown Status: %x Body: %s\n", status, string(body))
 	}

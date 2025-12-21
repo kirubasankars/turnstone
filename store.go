@@ -226,7 +226,7 @@ func (s *Store) recover() error {
 
 		keyLen := binary.BigEndian.Uint32(header[0:4])
 		valLen := binary.BigEndian.Uint32(header[4:8])
-		// header[8:16] is minReadVersion, excluded from CRC
+		// header[8:16] is minReadVersion
 		storedCrc := binary.BigEndian.Uint32(header[16:20])
 
 		var payloadLen int64
@@ -290,8 +290,6 @@ func (s *Store) recover() error {
 	s.offset = validOffset
 
 	// Synchronous Flush Logic for Correctness
-	// If we rebuilt from scratch (e.g. idx file deleted), flush synchronously
-	// so the BoltDB state is immediately consistent.
 	if !lastOffsetFound && count > 0 {
 		s.logger.Info("Flushing recovered index to BoltDB (Synchronous)...")
 		if s.index.Rotate() {
@@ -816,8 +814,6 @@ func (s *Store) Get(key string, readVersion int64, generation uint64) ([]byte, e
 }
 
 // Sync reads raw log entries.
-// It supports reading from the previous generation to allow seamless handover during compaction.
-// It returns an io.ReadCloser to allow the caller to stream the data using io.Copy.
 func (s *Store) Sync(reqGen uint64, reqOffset int64) (io.ReadCloser, int64, uint64, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -947,7 +943,6 @@ func (s *Store) readSyncFromCurrent(reqOffset int64) (io.ReadCloser, int64, uint
 }
 
 // readSyncFromPrevious attempts to read from a closed journal file.
-// If EOF is reached, it signals ErrGenerationMismatch (triggering reset).
 func (s *Store) readSyncFromPrevious(gen uint64, offset int64) (io.ReadCloser, int64, uint64, error) {
 	dbPath := filepath.Join(s.dataDir, fmt.Sprintf("%d.db", gen))
 	idxPath := filepath.Join(s.dataDir, fmt.Sprintf("%d.idx", gen))
@@ -960,8 +955,6 @@ func (s *Store) readSyncFromPrevious(gen uint64, offset int64) (io.ReadCloser, i
 		}
 		return nil, 0, s.generation, err
 	}
-	// Note: We do NOT defer f.Close() here because we are returning a Reader that wraps f.
-	// We only close if an error occurs before return.
 
 	info, err := f.Stat()
 	if err != nil {
@@ -969,18 +962,12 @@ func (s *Store) readSyncFromPrevious(gen uint64, offset int64) (io.ReadCloser, i
 		return nil, 0, s.generation, err
 	}
 
-	// RESET TRIGGER:
-	// If the client has reached the end of the old file (offset >= size),
-	// we MUST return ErrGenerationMismatch.
-	// This tells the server to send ResStatusGenMismatch, which forces the
-	// client to call OnReset, update its generation, and set offset to 0.
 	if offset >= info.Size() {
 		s.logger.Info("Sync: Client finished previous generation. Triggering Reset.", "old_gen", gen, "size", info.Size())
 		_ = f.Close()
 		return nil, 0, s.generation, ErrGenerationMismatch
 	}
 
-	// Open the previous generation's index to determine pair boundaries.
 	idxDB, err := bbolt.Open(idxPath, 0o600, &bbolt.Options{ReadOnly: true, Timeout: 1 * time.Second})
 	if err != nil {
 		_ = f.Close()
@@ -991,7 +978,6 @@ func (s *Store) readSyncFromPrevious(gen uint64, offset int64) (io.ReadCloser, i
 	var bytesToRead int64
 	nextOffset := offset
 
-	// Iterate the Pair bucket to find consecutive pairs
 	err = idxDB.View(func(tx *bbolt.Tx) error {
 		b := tx.Bucket([]byte(BoltBucketPair))
 		if b == nil {
@@ -999,7 +985,6 @@ func (s *Store) readSyncFromPrevious(gen uint64, offset int64) (io.ReadCloser, i
 		}
 
 		for bytesToRead < MaxSyncBytes {
-			// Use BigEndian so BoltDB seeks correctly (lexicographical byte order).
 			var kBuf [8]byte
 			binary.BigEndian.PutUint64(kBuf[:], uint64(nextOffset))
 			v := b.Get(kBuf[:])
@@ -1023,13 +1008,10 @@ func (s *Store) readSyncFromPrevious(gen uint64, offset int64) (io.ReadCloser, i
 		return nil, 0, s.generation, fmt.Errorf("corrupt index: offset %d not found", offset)
 	}
 
-	// Create a SectionReader on the old journal file.
-	// We return a custom ReadCloser that closes the underlying os.File when done.
 	r := io.NewSectionReader(f, offset, bytesToRead)
 	return &fileSectionReader{SectionReader: r, f: f}, offset + bytesToRead, gen, nil
 }
 
-// fileSectionReader wraps an io.SectionReader and closes the underlying file when closed.
 type fileSectionReader struct {
 	*io.SectionReader
 	f *os.File
@@ -1045,7 +1027,6 @@ func (s *Store) SetReplicationState(gen uint64, offset int64) error {
 		if b == nil {
 			return fmt.Errorf("meta bucket missing")
 		}
-		// Format: "gen:offset"
 		val := fmt.Sprintf("%d:%d", gen, offset)
 		return b.Put([]byte(KeyReplState), []byte(val))
 	})

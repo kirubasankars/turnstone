@@ -33,9 +33,11 @@ const (
 	MaxMemoryLimit       = 1024 * 1024 * 1024
 	MaxSyncBytes         = 16 * 1024 * 1024 // 16MB limit for CDC batches
 	MaxResponseSize      = 32 * 1024 * 1024 // 32MB Limit for responses
+	MaxDatabases         = 16               // Support 16 namespaces (0-15)
 
 	// Storage Format (Journal)
-	HeaderSize = 20 // Entry Header (KeyLen + ValLen + MinReadVersion + CRC)
+	// KeyLen(4) + ValLen(4) + MinReadVersion(8) + CRC32(4)
+	HeaderSize = 20
 	Tombstone  = ^uint32(0)
 
 	// Internal Op Types (Journal)
@@ -65,6 +67,7 @@ var (
 	ErrTransactionTimeout   = errors.New("transaction timeout")
 	ErrCompactionInProgress = errors.New("compaction already in progress")
 	ErrGenerationMismatch   = errors.New("generation mismatch")
+	ErrInvalidDB            = errors.New("invalid database index")
 )
 
 // Request OpCodes
@@ -76,9 +79,9 @@ const (
 	OpCodeBegin   = 0x10
 	OpCodeCommit  = 0x11
 	OpCodeAbort   = 0x12
+	OpCodeSelect  = 0x13 // Select Database (0-15)
 	OpCodeStat    = 0x20
 	OpCodeCompact = 0x21
-	OpCodeAuth    = 0x23
 	OpCodeSync    = 0x30
 	OpCodeQuit    = 0xFF
 )
@@ -93,7 +96,6 @@ const (
 	ResStatusTxConflict     = 0x05
 	ResStatusServerBusy     = 0x06
 	ResStatusEntityTooLarge = 0x07
-	ResStatusAuthRequired   = 0x08
 	ResStatusGenMismatch    = 0x09
 )
 

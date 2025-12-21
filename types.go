@@ -45,4 +45,7 @@ type txState struct {
 	generation   uint64
 	ops          []bufferedOp // The complete history of the transaction
 	memUsage     int64
+
+	// Multi-DB Support
+	dbIndex int // Current selected database (0-15)
 }

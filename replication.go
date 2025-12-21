@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -32,25 +34,31 @@ type EventHandler interface {
 
 // CDCClient handles the low-level replication protocol with TurnstoneDB.
 type CDCClient struct {
-	addr        string
-	authPass    string
-	conn        net.Conn
-	handler     EventHandler
-	generation  uint64
-	offset      int64
-	idleTimeout time.Duration
-	retryDelay  time.Duration
+	addr       string
+	conn       net.Conn
+	handler    EventHandler
+	dbIndex    int
+	generation uint64
+	offset     int64
+	retryDelay time.Duration
+
+	// TLS Config
+	clientCertFile string
+	clientKeyFile  string
+	serverCAFile   string
 }
 
-func NewCDCClient(addr string, authPass string, handler EventHandler, startGen uint64, startOffset int64) *CDCClient {
+func NewCDCClient(addr string, handler EventHandler, dbIdx int, startGen uint64, startOffset int64, clientCert, clientKey, serverCA string) *CDCClient {
 	return &CDCClient{
-		addr:        addr,
-		authPass:    authPass,
-		handler:     handler,
-		generation:  startGen,
-		offset:      startOffset,
-		idleTimeout: 30 * time.Second,
-		retryDelay:  2 * time.Second,
+		addr:           addr,
+		handler:        handler,
+		dbIndex:        dbIdx,
+		generation:     startGen,
+		offset:         startOffset,
+		retryDelay:     2 * time.Second,
+		clientCertFile: clientCert,
+		clientKeyFile:  clientKey,
+		serverCAFile:   serverCA,
 	}
 }
 
@@ -61,7 +69,7 @@ func (c *CDCClient) Run(ctx context.Context) error {
 		}
 
 		if err := c.connect(ctx); err != nil {
-			log.Printf("[CDC] Connection failed: %v. Retrying in %v...", err, c.retryDelay)
+			log.Printf("[CDC DB:%d] Connect failed: %v. Retry in %v", c.dbIndex, err, c.retryDelay)
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -81,7 +89,7 @@ func (c *CDCClient) Run(ctx context.Context) error {
 			return ctx.Err()
 		}
 
-		log.Printf("[CDC] Disconnected: %v. Retrying in %v...", err, c.retryDelay)
+		log.Printf("[CDC DB:%d] Disconnected: %v. Retry in %v...", c.dbIndex, err, c.retryDelay)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -93,54 +101,34 @@ func (c *CDCClient) Run(ctx context.Context) error {
 
 func (c *CDCClient) connect(ctx context.Context) error {
 	d := net.Dialer{Timeout: 5 * time.Second}
-	conn, err := d.DialContext(ctx, "tcp", c.addr)
+
+	// Always use mTLS
+	tlsConfig := &tls.Config{}
+
+	// Load CA
+	caCert, err := os.ReadFile(c.serverCAFile)
+	if err != nil {
+		return fmt.Errorf("failed to load Server CA: %w", err)
+	}
+	caCertPool := x509.NewCertPool()
+	caCertPool.AppendCertsFromPEM(caCert)
+	tlsConfig.RootCAs = caCertPool
+
+	// Load Client Certs
+	cert, err := tls.LoadX509KeyPair(c.clientCertFile, c.clientKeyFile)
+	if err != nil {
+		return fmt.Errorf("failed to load client certs for mTLS: %w", err)
+	}
+	tlsConfig.Certificates = []tls.Certificate{cert}
+
+	conn, err := tls.DialWithDialer(&d, "tcp", c.addr, tlsConfig)
 	if err != nil {
 		return err
 	}
 	c.conn = conn
 
-	if c.authPass != "" {
-		if err := c.authenticate(); err != nil {
-			c.conn.Close()
-			return err
-		}
-	}
-
-	log.Printf("[CDC] Connected to %s. Syncing from Gen: %d, Offset: %d", c.addr, c.generation, c.offset)
+	log.Printf("[CDC DB:%d] Connected to %s (mTLS). Syncing from Gen: %d, Offset: %d", c.dbIndex, c.addr, c.generation, c.offset)
 	return nil
-}
-
-func (c *CDCClient) authenticate() error {
-	passBytes := []byte(c.authPass)
-	reqLen := len(passBytes)
-	reqBuf := make([]byte, 5+reqLen)
-
-	reqBuf[0] = OpCodeAuth
-	binary.BigEndian.PutUint32(reqBuf[1:5], uint32(reqLen))
-	copy(reqBuf[5:], passBytes)
-
-	if err := c.conn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
-		return err
-	}
-	if _, err := c.conn.Write(reqBuf); err != nil {
-		return err
-	}
-
-	headerBuf := make([]byte, 5)
-	if _, err := io.ReadFull(c.conn, headerBuf); err != nil {
-		return err
-	}
-	status := headerBuf[0]
-	payloadLen := binary.BigEndian.Uint32(headerBuf[1:])
-	body := make([]byte, payloadLen)
-	if _, err := io.ReadFull(c.conn, body); err != nil {
-		return err
-	}
-
-	if status != ResStatusOK {
-		return fmt.Errorf("authentication failed: %s", string(body))
-	}
-	return c.conn.SetDeadline(time.Time{})
 }
 
 func (c *CDCClient) closeConn() {
@@ -152,15 +140,10 @@ func (c *CDCClient) closeConn() {
 
 func (c *CDCClient) syncLoop(ctx context.Context) error {
 	headerBuf := make([]byte, 5)
-	lastDataTime := time.Now()
 
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
-		}
-
-		if c.idleTimeout > 0 && time.Since(lastDataTime) > c.idleTimeout {
-			// No-op: Protocol relies on TCP keepalive mostly, or reconnect on timeout
 		}
 
 		reqLen := 16
@@ -170,10 +153,23 @@ func (c *CDCClient) syncLoop(ctx context.Context) error {
 		binary.BigEndian.PutUint64(reqBuf[5:13], c.generation)
 		binary.BigEndian.PutUint64(reqBuf[13:21], uint64(c.offset))
 
+		// Set Payload: DB Index
+		reqPayload := make([]byte, 17)
+		reqPayload[0] = byte(c.dbIndex)
+		binary.BigEndian.PutUint64(reqPayload[1:9], c.generation)
+		binary.BigEndian.PutUint64(reqPayload[9:17], uint64(c.offset))
+
+		reqHeader := make([]byte, 5)
+		reqHeader[0] = OpCodeSync
+		binary.BigEndian.PutUint32(reqHeader[1:], uint32(len(reqPayload)))
+
 		if err := c.conn.SetDeadline(time.Now().Add(60 * time.Second)); err != nil {
 			return err
 		}
-		if _, err := c.conn.Write(reqBuf); err != nil {
+		if _, err := c.conn.Write(reqHeader); err != nil {
+			return err
+		}
+		if _, err := c.conn.Write(reqPayload); err != nil {
 			return err
 		}
 
@@ -198,15 +194,13 @@ func (c *CDCClient) syncLoop(ctx context.Context) error {
 			if isBrokenPipe(err) {
 				return err
 			}
-			log.Printf("[CDC] Protocol error: %v", err)
+			log.Printf("[CDC DB:%d] Protocol error: %v", c.dbIndex, err)
 			time.Sleep(1 * time.Second)
 		}
 
 		// Optimization: If we just switched generations or got data, loop immediately
 		// otherwise sleep briefly to avoid busy loop
-		if hasData {
-			lastDataTime = time.Now()
-		} else {
+		if !hasData {
 			// If no data, sleep a bit to avoid hammering the server
 			time.Sleep(100 * time.Millisecond)
 		}
@@ -225,7 +219,7 @@ func (c *CDCClient) handleResponse(status byte, body []byte) (bool, error) {
 		c.generation = serverGen
 		c.offset = 0
 		hasData = true
-		log.Printf("[CDC] Gen Mismatch. Switched to Generation %d", serverGen)
+		log.Printf("[CDC DB:%d] Gen Mismatch. Switched to Generation %d", c.dbIndex, serverGen)
 
 	case ResStatusOK:
 		if len(body) < 16 {
@@ -278,7 +272,7 @@ func (c *CDCClient) parseBatch(data []byte) (int64, error) {
 		header := data[consumed : consumed+HeaderSize]
 		keyLen := binary.BigEndian.Uint32(header[0:4])
 		valLen := binary.BigEndian.Uint32(header[4:8])
-		// skip txStart [8:16] and CRC [16:20]
+		// skip minReadVersion [8:16] and CRC [16:20]
 
 		isDelete := valLen == Tombstone
 		var payloadLen int
@@ -378,9 +372,6 @@ func (h *PipeHandler) OnReset(gen uint64) error {
 }
 
 func (h *PipeHandler) OnCheckpoint(gen uint64, off int64) error {
-	// Optional: Don't print every checkpoint to stdout to avoid clutter,
-	// or print it if you want to track progress.
-	// fmt.Fprintf(h.writer, "CP %d %d\n", gen, off)
 	h.Flush()
 	return h.saveState(gen, off)
 }
