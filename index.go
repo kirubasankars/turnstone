@@ -591,7 +591,10 @@ func (idx *LevelDBIndex) SizeBytes() int64 {
 }
 
 func (idx *LevelDBIndex) Get(key string, readLSN uint64) (IndexEntry, bool) {
-	// Construct Target Key: prefix + key + readLSN
+	// Construct Target Key: prefix + key + ^readLSN
+	// Inverting LSN makes keys sort in DESCENDING LSN order.
+	// Seek will find the smallest inverted LSN >= target, which corresponds
+	// to the largest real LSN <= readLSN.
 	kLen := len(key)
 	targetSize := 1 + kLen + 8
 	target := getBuf(targetSize)
@@ -599,81 +602,48 @@ func (idx *LevelDBIndex) Get(key string, readLSN uint64) (IndexEntry, bool) {
 
 	target[0] = prefixIndex
 	copy(target[1:], key)
-	binary.BigEndian.PutUint64(target[1+kLen:], readLSN)
+	binary.BigEndian.PutUint64(target[1+kLen:], ^readLSN)
 
 	iter := idx.db.NewIterator(nil, nil)
 	defer iter.Release()
 
-	// Seek to >= target
+	// Simple Seek. No Prev() needed.
 	if iter.Seek(target) {
-		// If exact match (LSN == readLSN), we are good.
-		// If > target (LSN > readLSN), we must go back to find <= readLSN.
-		if !isSameKey(iter.Key(), []byte(key)) || decodeLSN(iter.Key()) > readLSN {
-			if !iter.Prev() {
+		if isSameKey(iter.Key(), []byte(key)) {
+			entry := decodeIndexVal(iter.Value())
+			entry.LSN = decodeLSN(iter.Key())
+			if entry.Deleted {
 				return IndexEntry{}, false
 			}
-		}
-	} else {
-		// Seek went past the end. Try the last key.
-		if !iter.Last() {
-			return IndexEntry{}, false
+			return entry, true
 		}
 	}
-
-	// Verify we are still on the correct key after Prev/Last
-	currentKey := iter.Key()
-	if !isSameKey(currentKey, []byte(key)) {
-		return IndexEntry{}, false
-	}
-
-	// Double check LSN condition (should be guaranteed by logic above)
-	entryLSN := decodeLSN(currentKey)
-	if entryLSN > readLSN {
-		return IndexEntry{}, false
-	}
-
-	entry := decodeIndexVal(iter.Value())
-	entry.LSN = entryLSN
-	if entry.Deleted {
-		return IndexEntry{}, false
-	}
-	return entry, true
+	return IndexEntry{}, false
 }
 
 func (idx *LevelDBIndex) GetHead(key string) (IndexEntry, bool) {
+	// To find the HEAD (newest version), we seek the prefix.
+	// Since keys are [Prefix][Key][^LSN], and ^LSN sorts descending,
+	// the first entry for [Prefix][Key] is the Head.
 	kLen := len(key)
-	targetSize := 1 + kLen + 8
+	targetSize := 1 + kLen
 	target := getBuf(targetSize)
 	defer putBuf(target)
 
 	target[0] = prefixIndex
 	copy(target[1:], key)
-	binary.BigEndian.PutUint64(target[1+kLen:], ^uint64(0)) // Max Uint64
 
 	iter := idx.db.NewIterator(nil, nil)
 	defer iter.Release()
 
 	if iter.Seek(target) {
-		// If we found exact MaxUint64 (unlikely), good.
-		// If we landed on next key "KeyB", go back.
-		if !isSameKey(iter.Key(), []byte(key)) {
-			if !iter.Prev() {
-				return IndexEntry{}, false
-			}
-		}
-	} else {
-		if !iter.Last() {
-			return IndexEntry{}, false
+		if isSameKey(iter.Key(), []byte(key)) {
+			entry := decodeIndexVal(iter.Value())
+			entry.LSN = decodeLSN(iter.Key())
+			return entry, true
 		}
 	}
-
-	if !isSameKey(iter.Key(), []byte(key)) {
-		return IndexEntry{}, false
-	}
-
-	entry := decodeIndexVal(iter.Value())
-	entry.LSN = decodeLSN(iter.Key())
-	return entry, true
+	return IndexEntry{}, false
 }
 
 func (idx *LevelDBIndex) GetLatest(key string) (IndexEntry, bool) {
@@ -695,7 +665,8 @@ func (idx *LevelDBIndex) Set(key string, offset int64, length int64, lsn uint64,
 
 	dbKey[0] = prefixIndex
 	copy(dbKey[1:], key)
-	binary.BigEndian.PutUint64(dbKey[1+kLen:], lsn)
+	// STORE AS INVERTED LSN
+	binary.BigEndian.PutUint64(dbKey[1+kLen:], ^lsn)
 
 	// Use stack-allocated array for value (small constant size) to avoid malloc
 	var val [13]byte
@@ -722,7 +693,8 @@ func (idx *LevelDBIndex) UpdateHead(key string, newOffset int64, newLength int64
 
 	dbKey[0] = prefixIndex
 	copy(dbKey[1:], key)
-	binary.BigEndian.PutUint64(dbKey[1+kLen:], lsn)
+	// STORE AS INVERTED LSN
+	binary.BigEndian.PutUint64(dbKey[1+kLen:], ^lsn)
 
 	v, err := idx.db.Get(dbKey, nil)
 	if err == nil && v != nil {
@@ -745,13 +717,12 @@ func (idx *LevelDBIndex) UpdateHead(key string, newOffset int64, newLength int64
 
 func (idx *LevelDBIndex) Remove(key string) {
 	kLen := len(key)
-	targetSize := 1 + kLen + 8
+	targetSize := 1 + kLen
 	target := getBuf(targetSize)
 	defer putBuf(target)
 
 	target[0] = prefixIndex
 	copy(target[1:], key)
-	binary.BigEndian.PutUint64(target[1+kLen:], 0)
 
 	iter := idx.db.NewIterator(nil, nil)
 	defer iter.Release()
@@ -775,7 +746,87 @@ func (idx *LevelDBIndex) Remove(key string) {
 }
 
 func (idx *LevelDBIndex) OffloadColdKeys(minReadLSN uint64) (int, error) {
-	return 0, nil
+	iter := idx.db.NewIterator(util.BytesPrefix([]byte{prefixIndex}), nil)
+	defer iter.Release()
+
+	batch := new(leveldb.Batch)
+	batchSize := 0
+	const MaxBatchSize = 1000
+	deletedCount := 0
+
+	var lastUserKey []byte
+	keptVersionBelowMin := false
+
+	for iter.Next() {
+		key := iter.Key()
+
+		// Key format: [prefixIndex (1)] [UserKey (N)] [InvertedLSN (8)]
+		if len(key) < 9 {
+			continue
+		}
+
+		// Extract UserKey and LSN
+		userKey := key[1 : len(key)-8]
+		// LSN is stored inverted (^lsn) for descending sort order in LevelDB
+		invertedLSN := binary.BigEndian.Uint64(key[len(key)-8:])
+		lsn := ^invertedLSN
+
+		// Check if we switched to a new user key
+		// Note: The iterator sorts by Key bytes, so all versions of a key are contiguous.
+		if !bytes.Equal(userKey, lastUserKey) {
+			lastUserKey = make([]byte, len(userKey))
+			copy(lastUserKey, userKey)
+			keptVersionBelowMin = false
+		}
+
+		// 1. Keep recent versions (>= minReadLSN)
+		if lsn >= minReadLSN {
+			continue
+		}
+
+		// 2. Keep the LATEST version that is < minReadLSN
+		// Because keys are sorted by LSN descending (due to inverted storage),
+		// the first version we encounter that is < minReadLSN is the newest one in that range.
+		if !keptVersionBelowMin {
+			keptVersionBelowMin = true
+			continue
+		}
+
+		// 3. Prune older versions
+		// We copy the key because the iterator's buffer is transient
+		keyCopy := make([]byte, len(key))
+		copy(keyCopy, key)
+		batch.Delete(keyCopy)
+		batchSize++
+		deletedCount++
+
+		if batchSize >= MaxBatchSize {
+			if err := idx.db.Write(batch, nil); err != nil {
+				return deletedCount, fmt.Errorf("failed to write batch cleanup: %w", err)
+			}
+			batch.Reset()
+			batchSize = 0
+		}
+	}
+
+	if batchSize > 0 {
+		if err := idx.db.Write(batch, nil); err != nil {
+			return deletedCount, fmt.Errorf("failed to write final batch cleanup: %w", err)
+		}
+	}
+
+	if err := iter.Error(); err != nil {
+		return deletedCount, fmt.Errorf("iterator error during cleanup: %w", err)
+	}
+
+	// Trigger manual compaction to reclaim disk space immediately
+	if deletedCount > 0 {
+		if err := idx.db.CompactRange(util.Range{Start: nil, Limit: nil}); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to trigger manual compaction: %v\n", err)
+		}
+	}
+
+	return deletedCount, nil
 }
 
 func (idx *LevelDBIndex) PutState(nextLSN uint64, offset int64) error {
@@ -816,7 +867,8 @@ func decodeLSN(dbKey []byte) uint64 {
 	if len(dbKey) < 8 {
 		return 0
 	}
-	return binary.BigEndian.Uint64(dbKey[len(dbKey)-8:])
+	// INVERT BACK
+	return ^binary.BigEndian.Uint64(dbKey[len(dbKey)-8:])
 }
 
 func decodeIndexVal(val []byte) IndexEntry {
