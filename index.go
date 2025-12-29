@@ -40,6 +40,11 @@ type Index interface {
 	UpdateHead(key string, newOffset int64, newLength int64, lsn uint64) bool
 	Remove(key string)
 	OffloadColdKeys(minReadLSN uint64) (int, error)
+
+	// PutState persists the global store state (NextLSN and WAL Offset).
+	PutState(nextLSN uint64, offset int64) error
+	// GetState retrieves the persisted global store state.
+	GetState() (nextLSN uint64, offset int64, err error)
 }
 
 // NewIndex initializes the storage based on the type.
@@ -249,6 +254,15 @@ func (mi *MemoryIndex) OffloadColdKeys(minReadLSN uint64) (int, error) {
 	return pruned, nil
 }
 
+// MemoryIndex does not persist state across restarts (rebuilds from WAL).
+func (mi *MemoryIndex) PutState(nextLSN uint64, offset int64) error {
+	return nil
+}
+
+func (mi *MemoryIndex) GetState() (uint64, int64, error) {
+	return 0, 0, nil
+}
+
 // --- Sharded Map Implementation ---
 
 const numShards = 128 // Power of 2 for efficient modulo
@@ -449,6 +463,15 @@ func (s *ShardedIndex) OffloadColdKeys(minReadLSN uint64) (int, error) {
 	return pruned, nil
 }
 
+// ShardedIndex does not persist state across restarts.
+func (s *ShardedIndex) PutState(nextLSN uint64, offset int64) error {
+	return nil
+}
+
+func (s *ShardedIndex) GetState() (uint64, int64, error) {
+	return 0, 0, nil
+}
+
 // --- LevelDB Implementation ---
 
 // Estimated overhead per entry is not tracked in Pure LevelDB mode
@@ -458,6 +481,7 @@ const entrySizeOverhead = 0
 const (
 	prefixIndex      = byte('i') // Key Prefix: 'i' + key + LSN
 	prefixCheckpoint = byte('c') // Key Prefix: 'c' + big-endian LSN
+	prefixState      = byte('s') // Key Prefix: 's' (Single key for global state)
 )
 
 // bufferPool reuses byte slices to reduce GC pressure for LevelDB key construction.
@@ -752,6 +776,28 @@ func (idx *LevelDBIndex) Remove(key string) {
 
 func (idx *LevelDBIndex) OffloadColdKeys(minReadLSN uint64) (int, error) {
 	return 0, nil
+}
+
+func (idx *LevelDBIndex) PutState(nextLSN uint64, offset int64) error {
+	key := []byte{prefixState}
+	val := make([]byte, 16)
+	binary.BigEndian.PutUint64(val[0:8], nextLSN)
+	binary.BigEndian.PutUint64(val[8:16], uint64(offset))
+	return idx.db.Put(key, val, nil)
+}
+
+func (idx *LevelDBIndex) GetState() (uint64, int64, error) {
+	key := []byte{prefixState}
+	val, err := idx.db.Get(key, nil)
+	if err != nil {
+		return 0, 0, err
+	}
+	if len(val) != 16 {
+		return 0, 0, fmt.Errorf("corrupted state")
+	}
+	nextLSN := binary.BigEndian.Uint64(val[0:8])
+	offset := binary.BigEndian.Uint64(val[8:16])
+	return nextLSN, int64(offset), nil
 }
 
 // --- Helpers ---

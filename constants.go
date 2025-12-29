@@ -51,7 +51,7 @@ const (
 const (
 	BatchDelay    = 10 * time.Millisecond // BatchDelay is the micro-batch window for the Group Commit.
 	MaxBatchSize  = 4000                  // MaxBatchSize is the maximum count of requests in a Group Commit.
-	MaxBatchBytes = 512 * 1024            // MaxBatchBytes (512KB) triggers an immediate flush.
+	MaxBatchBytes = 64 * 1024             // MaxBatchBytes (512KB) triggers an immediate flush.
 )
 
 // Bit Packing Constants

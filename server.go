@@ -265,7 +265,7 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 			return
 		}
 
-		shouldClose, err := s.processCommand(conn, opCode, payload, tx)
+		shouldClose, err := s.processCommand(conn, r, opCode, payload, tx)
 		if err != nil {
 			s.logger.Error("Command processing error", "err", err)
 		}
@@ -276,7 +276,9 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 }
 
 // processCommand dispatches the opcode to the specific handler.
-func (s *Server) processCommand(conn net.Conn, opCode byte, payload []byte, tx *txState) (bool, error) {
+// IMPORTANT: We pass *bufio.Reader to ensure any buffered data (like ACKs in replication)
+// is not lost when switching handlers.
+func (s *Server) processCommand(conn net.Conn, r *bufio.Reader, opCode byte, payload []byte, tx *txState) (bool, error) {
 	if tx.active {
 		switch opCode {
 		case OpCodePing, OpCodeQuit, OpCodeStat, OpCodeReplHello:
@@ -303,7 +305,8 @@ func (s *Server) processCommand(conn net.Conn, opCode byte, payload []byte, tx *
 	case OpCodeCompact:
 		s.handleCompact(conn)
 	case OpCodeReplHello:
-		s.HandleReplicaConnection(conn, payload)
+		// Pass the buffered reader to handle replication ACKs
+		s.HandleReplicaConnection(conn, r, payload)
 		return true, nil
 	case OpCodePing:
 		_ = s.writeBinaryResponse(conn, ResStatusOK, []byte("PONG"))

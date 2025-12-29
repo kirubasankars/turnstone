@@ -19,7 +19,7 @@ type WAL struct {
 
 // OpenWAL opens or creates the single wal.log file.
 func OpenWAL(dir string) (*WAL, error) {
-	path := filepath.Join(dir, "wal.log")
+	path := filepath.Join(dir, "values.log")
 
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
