@@ -246,7 +246,7 @@ func (s *Server) dispatchCommand(conn net.Conn, r *bufio.Reader, opCode byte, pa
 	case OpCodeCompact:
 		s.handleCompact(conn, st)
 	case OpCodeStat:
-		s.handleStat(conn)
+		s.handleStat(conn, st)
 	case OpCodeReplicaOf:
 		s.handleReplicaOf(conn, payload, st)
 	case OpCodeReplHello:
@@ -458,17 +458,14 @@ func (s *Server) handleCompact(w io.Writer, st *connState) {
 	}
 }
 
-func (s *Server) handleStat(w io.Writer) {
-	var sb strings.Builder
-	for name, db := range s.stores {
-		// Filter out System DB from stats to satisfy "excludes in config for database count" request
-		if name == "0" {
-			continue
-		}
-		stats := db.Stats()
-		sb.WriteString(fmt.Sprintf("[%s] Keys:%d Index:%d NextLSN:%d | ", name, stats.KeyCount, stats.IndexSizeBytes, stats.NextLSN))
+func (s *Server) handleStat(w io.Writer, st *connState) {
+	if st.db == nil {
+		s.writeBinaryResponse(w, ResStatusErr, []byte("No DB selected"))
+		return
 	}
-	s.writeBinaryResponse(w, ResStatusOK, []byte(sb.String()))
+	stats := st.db.Stats()
+	msg := fmt.Sprintf("[%s] Keys:%d Index:%d NextLSN:%d", st.dbName, stats.KeyCount, stats.IndexSizeBytes, stats.NextLSN)
+	s.writeBinaryResponse(w, ResStatusOK, []byte(msg))
 }
 
 // handleReplicaOf handles the admin command to configure replication dynamically.
