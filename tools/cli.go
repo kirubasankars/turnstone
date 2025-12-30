@@ -53,8 +53,7 @@ func main() {
 	defer cl.Close()
 
 	fmt.Println("Connected.")
-	// Updated help text: Removed 'flush', added 'compact'
-	fmt.Println("Commands: get <k>, set <k> <v>, del <k>, begin, commit, abort, stat, compact, clear, quit")
+	fmt.Println("Commands: select <db>, replicaof <host:port> <remote_db>, get <k>, set <k> <v>, del <k>, begin, commit, abort, stat, compact, clear, quit")
 	fmt.Print("> ")
 
 	// 2. Interactive Loop
@@ -102,7 +101,36 @@ func handleCommand(cl *client.Client, cmd string, parts []string) {
 			fmt.Println(resultStr)
 		}
 
-	// Case 'flush' removed as it is no longer supported by the server
+	case "select":
+		if len(parts) < 2 {
+			fmt.Println("Usage: select <db>")
+			return
+		}
+		err = cl.Select(parts[1])
+		if err == nil {
+			fmt.Println("OK")
+		}
+
+	case "replicaof":
+		// Handle "replicaof no one" as stop replication
+		if len(parts) >= 3 && parts[1] == "no" && parts[2] == "one" {
+			err = cl.ReplicaOf("", "")
+			if err == nil {
+				fmt.Println("Replication stopped (NO ONE)")
+			}
+		} else if len(parts) < 3 {
+			// Also allow empty args to stop
+			err = cl.ReplicaOf("", "")
+			if err == nil {
+				fmt.Println("Replication stopped (Empty args)")
+			}
+		} else {
+			// Normal case: replicaof <host> <db>
+			err = cl.ReplicaOf(parts[1], parts[2])
+			if err == nil {
+				fmt.Printf("Replication started from %s/%s\n", parts[1], parts[2])
+			}
+		}
 
 	case "compact":
 		err = cl.Compact()
