@@ -10,8 +10,8 @@ import (
 	"time"
 )
 
-// TestStore_MinReadLSN verifies snapshot isolation pins MinReadLSN.
-func TestStore_MinReadLSN(t *testing.T) {
+// TestStore_MinReadTxID verifies snapshot isolation pins MinReadTxID.
+func TestStore_MinReadTxID(t *testing.T) {
 	dir := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	s, err := NewStore(dir, logger, true, 0, true)
@@ -20,35 +20,35 @@ func TestStore_MinReadLSN(t *testing.T) {
 	}
 	defer s.Close()
 
-	// 1. Advance LSN to 10
-	var currentReadLSN uint64 = 0
+	// 1. Advance TxID to 10
+	var currentReadTxID uint64 = 0
 	for i := 0; i < 9; i++ {
-		s.ApplyBatch([]bufferedOp{{opType: OpJournalSet, key: "k", val: []byte("v")}}, currentReadLSN)
-		currentReadLSN++
+		s.ApplyBatch([]bufferedOp{{opType: OpJournalSet, key: "k", val: []byte("v")}}, currentReadTxID)
+		currentReadTxID++
 	}
 
-	// 2. Acquire Snapshot at LSN 9
-	snapLSN := s.AcquireSnapshot()
-	if snapLSN != 9 {
-		t.Fatalf("Expected snap 9, got %d", snapLSN)
+	// 2. Acquire Snapshot at TxID 9
+	snapTxID := s.AcquireSnapshot()
+	if snapTxID != 9 {
+		t.Fatalf("Expected snap 9, got %d", snapTxID)
 	}
 
-	// Write more (LSN 10, 11, 12)
+	// Write more (TxID 10, 11, 12)
 	s.ApplyBatch([]bufferedOp{{opType: OpJournalSet, key: "a", val: []byte("v")}}, 0)
 	s.ApplyBatch([]bufferedOp{{opType: OpJournalSet, key: "b", val: []byte("v")}}, 0)
 	s.ApplyBatch([]bufferedOp{{opType: OpJournalSet, key: "c", val: []byte("v")}}, 0)
 
-	// MinReadLSN should still be 9 because of the active snapshot.
-	if s.minReadLSN != 9 {
-		t.Errorf("MinReadLSN should be pinned by snapshot (9), got %d", s.minReadLSN)
+	// MinReadTxID should still be 9 because of the active snapshot.
+	if s.minReadTxID != 9 {
+		t.Errorf("MinReadTxID should be pinned by snapshot (9), got %d", s.minReadTxID)
 	}
 
 	// 4. Release Snapshot
-	s.ReleaseSnapshot(snapLSN)
+	s.ReleaseSnapshot(snapTxID)
 
-	// MinReadLSN should move to Head (12)
-	if s.minReadLSN != 12 {
-		t.Errorf("MinReadLSN should move to head (12), got %d", s.minReadLSN)
+	// MinReadTxID should move to Head (12)
+	if s.minReadTxID != 12 {
+		t.Errorf("MinReadTxID should move to head (12), got %d", s.minReadTxID)
 	}
 }
 
@@ -307,7 +307,7 @@ func TestStore_Recover_Basic(t *testing.T) {
 	}
 
 	keys := []string{"alpha", "beta", "gamma"}
-	currentLSN := atomic.LoadUint64(&s1.nextLSN) - 1
+	currentTxID := atomic.LoadUint64(&s1.nextTxID) - 1
 
 	for _, k := range keys {
 		op := bufferedOp{
@@ -315,10 +315,10 @@ func TestStore_Recover_Basic(t *testing.T) {
 			key:    k,
 			val:    []byte("val-" + k),
 		}
-		if err := s1.ApplyBatch([]bufferedOp{op}, currentLSN); err != nil {
+		if err := s1.ApplyBatch([]bufferedOp{op}, currentTxID); err != nil {
 			t.Fatalf("ApplyBatch failed for key %s: %v", k, err)
 		}
-		currentLSN = atomic.LoadUint64(&s1.nextLSN) - 1
+		currentTxID = atomic.LoadUint64(&s1.nextTxID) - 1
 	}
 
 	if err := s1.Close(); err != nil {
@@ -334,12 +334,13 @@ func TestStore_Recover_Basic(t *testing.T) {
 
 	// 3. Verify Data
 	stats := s2.Stats()
-	if stats.KeyCount != 3 {
-		t.Errorf("Expected 3 keys, got %d", stats.KeyCount)
+	// Fix: Expect 4 keys (3 user keys + 1 system "_id" key)
+	if stats.KeyCount != 4 {
+		t.Errorf("Expected 4 keys, got %d", stats.KeyCount)
 	}
 
 	for _, k := range keys {
-		val, err := s2.Get(k, s2.nextLSN)
+		val, err := s2.Get(k, s2.nextTxID)
 		if err != nil {
 			t.Errorf("Failed to get key %s: %v", k, err)
 		}
@@ -414,7 +415,7 @@ func TestStore_Recover_CRC_Corruption(t *testing.T) {
 	defer s2.Close()
 
 	// 4. Verify Entry 1 exists
-	val, err := s2.Get("key1", s2.nextLSN)
+	val, err := s2.Get("key1", s2.nextTxID)
 	if err != nil {
 		t.Errorf("Expected key1 to survive corruption, got error: %v", err)
 	}
@@ -423,19 +424,12 @@ func TestStore_Recover_CRC_Corruption(t *testing.T) {
 	}
 
 	// 5. Verify Entry 2 is gone
-	_, err = s2.Get("key2", s2.nextLSN)
+	_, err = s2.Get("key2", s2.nextTxID)
 	if err != ErrKeyNotFound {
 		t.Errorf("Expected key2 to be dropped due to CRC failure, got: %v", err)
 	}
 
 	// 6. Verify Store Offset is truncated
-	// The file on disk might still be the full size until new writes happen or depending on truncate impl,
-	// but the internal store offset should point before the corrupted record.
-	// Actually, NewStore calls WAL.Truncate, so the file size should shrink.
-
-	// Calculate expected size: Header(24) + "key1"(4) + "val1"(4) = 32 bytes approx.
-	// NOTE: Serialization adds op headers etc. Let's just check it's smaller than original.
-
 	f2, _ := os.Open(walPath)
 	stat2, _ := f2.Stat()
 	f2.Close()
@@ -477,7 +471,7 @@ func TestStore_Recover_PartialWrite(t *testing.T) {
 	defer s2.Close()
 
 	// 4. Verify Valid Data remains
-	if _, err := s2.Get("key1", s2.nextLSN); err != nil {
+	if _, err := s2.Get("key1", s2.nextTxID); err != nil {
 		t.Error("key1 lost during partial write recovery")
 	}
 }
@@ -511,10 +505,12 @@ func TestStore_Replication_Quorum(t *testing.T) {
 	}
 
 	// 4. Register Replica and Ack
-	// The write above generates a LogID. Since it's the first write, LogID should be 1.
-	// We simulate a replica connecting and acknowledging LogID 1.
+	// The write above generates a LogSeq.
+	// NOTE: Because the store bootstraps an internal _id key, the first user write ("k")
+	// will typically have LogSeq = 2 (1 for _id, 2 for k).
+	// We acknowledge 2 to ensure the write is unblocked.
 	s.RegisterReplica("replica-1", 0)
-	s.UpdateReplicaLogID("replica-1", 1)
+	s.UpdateReplicaLogSeq("replica-1", 2)
 
 	// 5. Verify Unblock
 	// Now that quorum is met, the write should complete successfully.
@@ -532,17 +528,17 @@ func TestStore_Replication_ApplyBatch(t *testing.T) {
 	dir := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	// Follower store (MinReplicas=0 because followers typically don't require downstream quorum)
+	// Replica store (MinReplicas=0 because replicas typically don't require downstream quorum)
 	s, err := NewStore(dir, logger, true, 0, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
 
-	// Simulate incoming batch from Leader
+	// Simulate incoming batch from Primary
 	entries := []LogEntry{
-		{LogID: 100, LSN: 50, OpType: OpJournalSet, Key: []byte("k1"), Value: []byte("v1")},
-		{LogID: 101, LSN: 51, OpType: OpJournalSet, Key: []byte("k2"), Value: []byte("v2")},
+		{LogSeq: 100, TxID: 50, OpType: OpJournalSet, Key: []byte("k1"), Value: []byte("v1")},
+		{LogSeq: 101, TxID: 51, OpType: OpJournalSet, Key: []byte("k2"), Value: []byte("v2")},
 	}
 
 	if err := s.ReplicateBatch(entries); err != nil {
@@ -550,7 +546,7 @@ func TestStore_Replication_ApplyBatch(t *testing.T) {
 	}
 
 	// Verify Data is readable
-	// We use a high LSN (60) to ensure we are reading a snapshot that includes the replicated data (LSN 50, 51).
+	// We use a high TxID (60) to ensure we are reading a snapshot that includes the replicated data (TxID 50, 51).
 	val, err := s.Get("k1", 60)
 	if err != nil {
 		t.Fatal(err)
@@ -565,5 +561,51 @@ func TestStore_Replication_ApplyBatch(t *testing.T) {
 	}
 	if string(val2) != "v2" {
 		t.Errorf("Want v2, got %s", val2)
+	}
+}
+
+// TestStore_AutoIDGeneration verifies that the store automatically generates
+// and persists a unique _id key upon initialization.
+func TestStore_AutoIDGeneration(t *testing.T) {
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	// 1. Create new store (First run)
+	s, err := NewStore(dir, logger, true, 0, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Retrieve the generated _id
+	// We access the store directly.
+	val, err := s.Get("_id", s.nextTxID)
+	if err != nil {
+		t.Fatalf("Failed to retrieve _id: %v", err)
+	}
+	id1 := string(val)
+	if len(id1) < 10 {
+		t.Errorf("Generated _id seems too short or invalid: %s", id1)
+	}
+	t.Logf("Generated Store ID: %s", id1)
+
+	// 3. Close the store
+	s.Close()
+
+	// 4. Re-open the store (Second run)
+	s2, err := NewStore(dir, logger, true, 0, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+
+	// 5. Verify the _id is persisted and unchanged
+	val2, err := s2.Get("_id", s2.nextTxID)
+	if err != nil {
+		t.Fatalf("Failed to retrieve _id after restart: %v", err)
+	}
+	id2 := string(val2)
+
+	if id1 != id2 {
+		t.Errorf("Store ID changed after restart. Original: %s, New: %s", id1, id2)
 	}
 }

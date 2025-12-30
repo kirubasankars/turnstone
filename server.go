@@ -167,7 +167,7 @@ type connState struct {
 	active   bool
 	readOnly bool
 	deadline time.Time
-	readLSN  uint64
+	readTxID uint64 // Previously readLSN
 	ops      []bufferedOp
 }
 
@@ -300,7 +300,7 @@ func (s *Server) handleBegin(w io.Writer, st *connState) {
 	st.active = true
 	st.readOnly = true
 	st.deadline = time.Now().Add(s.txDuration)
-	st.readLSN = st.db.AcquireSnapshot()
+	st.readTxID = st.db.AcquireSnapshot()
 	st.ops = make([]bufferedOp, 0)
 	atomic.AddInt64(&s.activeTxs, 1)
 	s.writeBinaryResponse(w, ResStatusOK, nil)
@@ -337,7 +337,7 @@ func (s *Server) handleCommit(w io.Writer, st *connState) {
 		}
 	}
 
-	if err := st.db.ApplyBatch(st.ops, st.readLSN); err != nil {
+	if err := st.db.ApplyBatch(st.ops, st.readTxID); err != nil {
 		status := byte(ResStatusErr)
 		if err == ErrConflict {
 			status = ResStatusTxConflict
@@ -351,7 +351,7 @@ func (s *Server) handleCommit(w io.Writer, st *connState) {
 func (s *Server) abortTx(st *connState) {
 	if st.active {
 		if st.db != nil {
-			st.db.ReleaseSnapshot(st.readLSN)
+			st.db.ReleaseSnapshot(st.readTxID)
 		}
 		st.active = false
 		st.ops = nil
@@ -388,7 +388,7 @@ func (s *Server) handleGet(w io.Writer, payload []byte, st *connState) {
 		}
 	}
 
-	val, err := st.db.Get(key, st.readLSN)
+	val, err := st.db.Get(key, st.readTxID)
 	if err == ErrKeyNotFound {
 		s.writeBinaryResponse(w, ResStatusNotFound, nil)
 	} else if err != nil {
@@ -408,6 +408,12 @@ func (s *Server) handleSet(w io.Writer, payload []byte, st *connState) {
 		s.writeBinaryResponse(w, ResStatusErr, []byte("System DB '0' is read-only"))
 		return
 	}
+	// Check replica status
+	if s.replManager != nil && s.replManager.IsReplica(st.dbName) {
+		s.writeBinaryResponse(w, ResStatusErr, []byte("Replica database is read-only"))
+		return
+	}
+
 	if !st.active {
 		s.writeBinaryResponse(w, ResStatusTxRequired, nil)
 		return
@@ -419,6 +425,12 @@ func (s *Server) handleSet(w io.Writer, payload []byte, st *connState) {
 	kLen := binary.BigEndian.Uint32(payload[:4])
 	key := string(payload[4 : 4+kLen])
 	val := payload[4+kLen:]
+
+	// Check internal keys
+	if strings.HasPrefix(key, "_") {
+		s.writeBinaryResponse(w, ResStatusErr, []byte("Key starting with '_' is read-only"))
+		return
+	}
 
 	valCopy := make([]byte, len(val))
 	copy(valCopy, val)
@@ -437,11 +449,25 @@ func (s *Server) handleDel(w io.Writer, payload []byte, st *connState) {
 		s.writeBinaryResponse(w, ResStatusErr, []byte("System DB '0' is read-only"))
 		return
 	}
+	// Check replica status
+	if s.replManager != nil && s.replManager.IsReplica(st.dbName) {
+		s.writeBinaryResponse(w, ResStatusErr, []byte("Replica database is read-only"))
+		return
+	}
+
 	if !st.active {
 		s.writeBinaryResponse(w, ResStatusTxRequired, nil)
 		return
 	}
-	st.ops = append(st.ops, bufferedOp{opType: OpJournalDelete, key: string(payload)})
+
+	key := string(payload)
+	// Check internal keys
+	if strings.HasPrefix(key, "_") {
+		s.writeBinaryResponse(w, ResStatusErr, []byte("Key starting with '_' is read-only"))
+		return
+	}
+
+	st.ops = append(st.ops, bufferedOp{opType: OpJournalDelete, key: key})
 	st.readOnly = false
 	s.writeBinaryResponse(w, ResStatusOK, nil)
 }
@@ -464,7 +490,7 @@ func (s *Server) handleStat(w io.Writer, st *connState) {
 		return
 	}
 	stats := st.db.Stats()
-	msg := fmt.Sprintf("[%s] Keys:%d Index:%d NextLSN:%d", st.dbName, stats.KeyCount, stats.IndexSizeBytes, stats.NextLSN)
+	msg := fmt.Sprintf("[%s] Keys:%d Index:%d NextTxID:%d", st.dbName, stats.KeyCount, stats.IndexSizeBytes, stats.NextTxID)
 	s.writeBinaryResponse(w, ResStatusOK, []byte(msg))
 }
 

@@ -15,11 +15,11 @@ import (
 
 var ReplicaSendTimeout = 5 * time.Second
 
-// --- LEADER SIDE (Multiplexer) ---
+// --- PRIMARY SIDE (Multiplexer) ---
 
 // HandleReplicaConnection multiplexes streams from multiple databases onto one connection.
 func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []byte) {
-	// 1. Parse Hello: [Ver:4][NumDBs:4] ... [NameLen:4][Name][LogID:8]
+	// 1. Parse Hello: [Ver:4][NumDBs:4] ... [NameLen:4][Name][LogSeq:8]
 	if len(payload) < 8 {
 		s.logger.Error("HandleReplicaConnection: payload too short for header")
 		return
@@ -28,8 +28,8 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 
 	cursor := 8
 	type subReq struct {
-		name  string
-		logID uint64
+		name   string
+		logSeq uint64
 	}
 	var subs []subReq
 	replicaID := conn.RemoteAddr().String()
@@ -42,18 +42,18 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 		nLen := int(binary.BigEndian.Uint32(payload[cursor : cursor+4]))
 		cursor += 4
 		if cursor+nLen+8 > len(payload) {
-			s.logger.Error("HandleReplicaConnection: payload truncated reading name/logID", "replica", replicaID)
+			s.logger.Error("HandleReplicaConnection: payload truncated reading name/logSeq", "replica", replicaID)
 			return
 		}
 		name := string(payload[cursor : cursor+nLen])
 		cursor += nLen
-		logID := binary.BigEndian.Uint64(payload[cursor : cursor+8])
+		logSeq := binary.BigEndian.Uint64(payload[cursor : cursor+8])
 		cursor += 8
-		subs = append(subs, subReq{name, logID})
+		subs = append(subs, subReq{name, logSeq})
 
 		if st, ok := s.stores[name]; ok {
-			s.logger.Info("Replica subscribed", "replica", replicaID, "db", name, "startLogID", logID)
-			st.RegisterReplica(replicaID, logID)
+			s.logger.Info("Replica subscribed", "replica", replicaID, "db", name, "startLogSeq", logSeq)
+			st.RegisterReplica(replicaID, logSeq)
 			defer st.UnregisterReplica(replicaID)
 		} else {
 			s.logger.Warn("Replica requested unknown db", "replica", replicaID, "db", name)
@@ -76,9 +76,9 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 		}
 
 		wg.Add(1)
-		go func(name string, st *Store, startLogID uint64) {
+		go func(name string, st *Store, startLogSeq uint64) {
 			defer wg.Done()
-			if err := s.streamDB(name, st, startLogID, outCh, done); err != nil {
+			if err := s.streamDB(name, st, startLogSeq, outCh, done); err != nil {
 				s.logger.Error("StreamDB failed", "db", name, "err", err)
 				// Non-blocking send to avoid hanging if main loop is gone
 				select {
@@ -86,13 +86,13 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 				default:
 				}
 			}
-		}(req.name, store, req.logID)
+		}(req.name, store, req.logSeq)
 	}
 
 	// ACK Reader
 	go func() {
 		// Just consume ACKs to keep connection alive and update offsets
-		// Format: [OpCode][Len][DBNameLen][DBName][LogID]
+		// Format: [OpCode][Len][DBNameLen][DBName][LogSeq]
 		h := make([]byte, 5)
 		for {
 			if _, err := io.ReadFull(r, h); err != nil {
@@ -113,10 +113,10 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 					nL := binary.BigEndian.Uint32(b[:4])
 					if len(b) >= 4+int(nL)+8 {
 						dbName := string(b[4 : 4+nL])
-						logID := binary.BigEndian.Uint64(b[4+nL:])
+						logSeq := binary.BigEndian.Uint64(b[4+nL:])
 						if st, ok := s.stores[dbName]; ok {
-							s.logger.Debug("Received ACK", "replica", replicaID, "db", dbName, "logID", logID)
-							st.UpdateReplicaLogID(replicaID, logID)
+							s.logger.Debug("Received ACK", "replica", replicaID, "db", dbName, "logSeq", logSeq)
+							st.UpdateReplicaLogSeq(replicaID, logSeq)
 						}
 					}
 				}
@@ -171,9 +171,9 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 	}
 }
 
-func (s *Server) streamDB(name string, store *Store, minLogID uint64, outCh chan<- replPacket, done <-chan struct{}) error {
-	startOffset := store.FindOffsetForLogID(minLogID)
-	s.logger.Info("StreamDB started", "db", name, "minLogID", minLogID, "startOffset", startOffset)
+func (s *Server) streamDB(name string, store *Store, minLogSeq uint64, outCh chan<- replPacket, done <-chan struct{}) error {
+	startOffset := store.FindOffsetForLogSeq(minLogSeq)
+	s.logger.Info("StreamDB started", "db", name, "minLogSeq", minLogSeq, "startOffset", startOffset)
 	curr := startOffset
 	buf := make([]byte, 1024*1024)
 	batchBuf := new(bytes.Buffer)
@@ -246,8 +246,8 @@ func (s *Server) streamDB(name string, store *Store, minLogID uint64, outCh chan
 
 			packed := binary.BigEndian.Uint32(buf[parseOff : parseOff+4])
 			keyLen, valLen, isDel := UnpackMeta(packed)
-			lsn := binary.BigEndian.Uint64(buf[parseOff+4 : parseOff+12])
-			logID := binary.BigEndian.Uint64(buf[parseOff+12 : parseOff+20])
+			txID := binary.BigEndian.Uint64(buf[parseOff+4 : parseOff+12])
+			logSeq := binary.BigEndian.Uint64(buf[parseOff+12 : parseOff+20])
 
 			payloadLen := int(keyLen)
 			if !isDel {
@@ -258,11 +258,11 @@ func (s *Server) streamDB(name string, store *Store, minLogID uint64, outCh chan
 				break
 			}
 
-			if logID > minLogID {
-				// Reconstruct Wire Format: [LogID][LSN][Op][KLen][Key][VLen][Val]
-				binary.BigEndian.PutUint64(scratch, logID)
+			if logSeq > minLogSeq {
+				// Reconstruct Wire Format: [LogSeq][TxID][Op][KLen][Key][VLen][Val]
+				binary.BigEndian.PutUint64(scratch, logSeq)
 				batchBuf.Write(scratch)
-				binary.BigEndian.PutUint64(scratch, lsn)
+				binary.BigEndian.PutUint64(scratch, txID)
 				batchBuf.Write(scratch)
 
 				op := byte(OpJournalSet)
@@ -294,14 +294,14 @@ func (s *Server) streamDB(name string, store *Store, minLogID uint64, outCh chan
 	}
 }
 
-// --- FOLLOWER SIDE (Manager) ---
+// --- REPLICA SIDE (Manager) ---
 
 type ReplicaSource struct {
 	LocalDB  string
 	RemoteDB string
 }
 
-// ReplicationManager handles shared connections to upstream servers.
+// ReplicationManager handles shared connections to upstream primary servers.
 type ReplicationManager struct {
 	mu         sync.Mutex
 	peers      map[string][]ReplicaSource // Address -> []ReplicaSource
@@ -394,6 +394,19 @@ func (rm *ReplicationManager) StopReplication(dbName string) {
 	}
 }
 
+func (rm *ReplicationManager) IsReplica(dbName string) bool {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	for _, sources := range rm.peers {
+		for _, src := range sources {
+			if src.LocalDB == dbName {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // spawnConnection starts the loop for a specific address. Caller must hold lock.
 func (rm *ReplicationManager) spawnConnection(addr string) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -449,7 +462,7 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 	}()
 	defer conn.Close()
 
-	rm.logger.Info("Connected to Leader for replication", "addr", addr, "count", len(dbs))
+	rm.logger.Info("Connected to Primary for replication", "addr", addr, "count", len(dbs))
 
 	// Map RemoteDB -> []LocalDB
 	remoteToLocal := make(map[string][]string)
@@ -461,11 +474,11 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 
 	for _, cfg := range dbs {
 		stats := rm.stores[cfg.LocalDB].Stats()
-		logID := stats.NextLogID - 1
+		logSeq := stats.NextLogSeq - 1
 		binary.Write(buf, binary.BigEndian, uint32(len(cfg.RemoteDB)))
 		buf.WriteString(cfg.RemoteDB)
-		binary.Write(buf, binary.BigEndian, logID)
-		rm.logger.Debug("Sending Hello for DB", "remote_db", cfg.RemoteDB, "local_db", cfg.LocalDB, "startLogID", logID)
+		binary.Write(buf, binary.BigEndian, logSeq)
+		rm.logger.Debug("Sending Hello for DB", "remote_db", cfg.RemoteDB, "local_db", cfg.LocalDB, "startLogSeq", logSeq)
 
 		remoteToLocal[cfg.RemoteDB] = append(remoteToLocal[cfg.RemoteDB], cfg.LocalDB)
 	}
@@ -522,7 +535,7 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 			for _, localDBName := range localDBNames {
 				if st, ok := rm.stores[localDBName]; ok {
 					if maxID, err := applyReplicationBatch(st, count, data); err == nil {
-						// Send ACK with REMOTE DB Name, so leader knows which stream to update
+						// Send ACK with REMOTE DB Name, so primary knows which stream to update
 						ackBuf := new(bytes.Buffer)
 						binary.Write(ackBuf, binary.BigEndian, uint32(len(remoteDBName)))
 						ackBuf.WriteString(remoteDBName)
@@ -558,7 +571,7 @@ func applyReplicationBatch(store *Store, count uint32, data []byte) (uint64, err
 			return 0, fmt.Errorf("malformed batch entry header")
 		}
 		lid := binary.BigEndian.Uint64(data[cursor : cursor+8])
-		lsn := binary.BigEndian.Uint64(data[cursor+8 : cursor+16])
+		txID := binary.BigEndian.Uint64(data[cursor+8 : cursor+16])
 		op := data[cursor+16]
 		cursor += 17
 
@@ -588,7 +601,7 @@ func applyReplicationBatch(store *Store, count uint32, data []byte) (uint64, err
 			val = data[cursor : cursor+vLen]
 			cursor += vLen
 		}
-		ops = append(ops, LogEntry{LogID: lid, LSN: lsn, OpType: op, Key: key, Value: val})
+		ops = append(ops, LogEntry{LogSeq: lid, TxID: txID, OpType: op, Key: key, Value: val})
 		if lid > maxID {
 			maxID = lid
 		}

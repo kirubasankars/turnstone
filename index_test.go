@@ -28,6 +28,7 @@ func runIndexTests(t *testing.T, factory func(t *testing.T) Index) {
 
 func testIndex_CRUD(t *testing.T, idx Index) {
 	key := "key1"
+	// Set(key, offset, length, txID, deleted, minReadTxID)
 	idx.Set(key, 100, 10, 1, false, 0)
 
 	entry, ok := idx.GetHead(key)
@@ -44,22 +45,25 @@ func testIndex_CRUD(t *testing.T, idx Index) {
 
 func testIndex_Versioning(t *testing.T, idx Index) {
 	key := "vKey"
+	// txID 10
 	idx.Set(key, 100, 10, 10, false, 0)
+	// txID 20
 	idx.Set(key, 200, 20, 20, false, 0)
 
-	// Read old version
+	// Read old version (TxID 15 should see TxID 10)
 	entry, ok := idx.Get(key, 15)
-	if !ok || entry.LSN != 10 {
-		t.Errorf("Read 15 mismatch. Want 10, got %v", entry)
+	if !ok || entry.TxID != 10 {
+		t.Errorf("Read 15 mismatch. Want TxID 10, got %v", entry)
 	}
-	// Read newer version
+	// Read newer version (TxID 25 should see TxID 20)
 	entry, ok = idx.Get(key, 25)
-	if !ok || entry.LSN != 20 {
-		t.Errorf("Read 25 mismatch. Want 20, got %v", entry)
+	if !ok || entry.TxID != 20 {
+		t.Errorf("Read 25 mismatch. Want TxID 20, got %v", entry)
 	}
 }
 
 func testIndex_Checkpoints(t *testing.T, idx Index) {
+	// Checkpoints key off LogSeq
 	idx.PutCheckpoint(100, 12345)
 	ckpts, err := idx.GetCheckpoints()
 	if err != nil {

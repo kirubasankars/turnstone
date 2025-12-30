@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
@@ -42,9 +43,9 @@ type Store struct {
 
 	// Storage State (Protected by mu)
 	offset          int64
-	nextLSN         uint64
-	nextLogID       uint64
-	minReadLSN      uint64
+	nextTxID        uint64 // Previously NextLSN
+	nextLogSeq      uint64 // Previously NextLogID
+	minReadTxID     uint64 // Previously MinReadLSN
 	compactedOffset int64
 	checkpoints     []Checkpoint
 	activeSnapshots map[uint64]int
@@ -85,7 +86,7 @@ func NewStore(dataDir string, logger *slog.Logger, allowTruncate bool, minReplic
 	s := &Store{
 		wal:               wal,
 		index:             idx,
-		minReplicas:       minReplicas,
+		minReplicas:       0, // Initialize to 0 to allow bootstrap writes (like _id) without hanging
 		fsyncEnabled:      fsyncEnabled,
 		allowTruncate:     allowTruncate,
 		dataDir:           dataDir,
@@ -97,8 +98,8 @@ func NewStore(dataDir string, logger *slog.Logger, allowTruncate bool, minReplic
 		checkpoints:       make([]Checkpoint, 0),
 		activeSnapshots:   make(map[uint64]int),
 		replicationSlots:  make(map[string]ReplicaState),
-		nextLSN:           1,
-		nextLogID:         1,
+		nextTxID:          1,
+		nextLogSeq:        1,
 		reqPool: &sync.Pool{
 			New: func() any {
 				return &request{resp: make(chan error, 1), opLengths: make([]int, 0, 16)}
@@ -112,9 +113,30 @@ func NewStore(dataDir string, logger *slog.Logger, allowTruncate bool, minReplic
 		return nil, fmt.Errorf("recovery failed: %w", err)
 	}
 
-	s.minReadLSN = s.nextLSN - 1
+	s.minReadTxID = s.nextTxID - 1
 	s.wg.Add(1)
 	go s.runLoop()
+
+	// Initialize _id (GUID) if missing
+	// This write will proceed immediately because s.minReplicas is 0
+	if _, err := s.Get("_id", atomic.LoadUint64(&s.nextTxID)); err == ErrKeyNotFound {
+		uuid := make([]byte, 16)
+		if _, err := rand.Read(uuid); err == nil {
+			id := fmt.Sprintf("%x-%x-%x-%x-%x", uuid[0:4], uuid[4:6], uuid[6:8], uuid[8:10], uuid[10:])
+			// Write directly to store via internal batch
+			s.ApplyBatch([]bufferedOp{{
+				opType: OpJournalSet,
+				key:    "_id",
+				val:    []byte(id),
+			}}, 0)
+			s.logger.Info("Generated new database ID", "id", id)
+		}
+	}
+
+	// Set the actual configured MinReplicas now that bootstrap is done
+	s.mu.Lock()
+	s.minReplicas = minReplicas
+	s.mu.Unlock()
 
 	return s, nil
 }
@@ -196,10 +218,10 @@ func (s *Store) handleMaintenance() {
 	s.PruneStaleReplicas()
 
 	s.mu.RLock()
-	safeLSN := s.minReadLSN
+	safeTxID := s.minReadTxID
 	s.mu.RUnlock()
 
-	count, err := s.index.OffloadColdKeys(safeLSN)
+	count, err := s.index.OffloadColdKeys(safeTxID)
 	if err != nil {
 		s.logger.Error("Offload failed", "err", err)
 	} else if count > 0 {
@@ -270,12 +292,12 @@ func (s *Store) compactLogSync() {
 
 			latest, exists := s.index.GetLatest(key)
 			if exists && latest.Offset == originalOffset {
-				oldLSN := binary.BigEndian.Uint64(buffer[parseOff+4 : parseOff+12])
+				oldTxID := binary.BigEndian.Uint64(buffer[parseOff+4 : parseOff+12])
 				entryData := buffer[parseOff : parseOff+HeaderSize+payloadLen]
 
-				// Re-stamp LogID
-				binary.BigEndian.PutUint64(entryData[12:20], s.nextLogID)
-				s.nextLogID++
+				// Re-stamp LogSeq
+				binary.BigEndian.PutUint64(entryData[12:20], s.nextLogSeq)
+				s.nextLogSeq++
 
 				crc := crc32.Checksum(entryData[:20], crc32Table)
 				crc = crc32.Update(crc, crc32Table, entryData[24:])
@@ -287,7 +309,7 @@ func (s *Store) compactLogSync() {
 					Key:     key,
 					Offset:  newOffset,
 					Length:  int64(len(entryData)),
-					LSN:     oldLSN,
+					TxID:    oldTxID,
 					Deleted: isDel,
 				})
 
@@ -361,17 +383,17 @@ func (s *Store) flushBatch(pending []*request, buf *bytes.Buffer) {
 	}
 
 	s.mu.Lock()
-	currentLSN := s.nextLSN
-	currentLogID := s.nextLogID
-	startBatchLogID := currentLogID
+	currentTxID := s.nextTxID
+	currentLogSeq := s.nextLogSeq
+	startBatchLogSeq := currentLogSeq
 	bufBytes := buf.Bytes()
 	bufPtr := 0
 
-	// 1. Stamp LSNs and CRCs
+	// 1. Stamp TxIDs and CRCs
 	for _, req := range activeReqs {
-		commitLSN := currentLSN
-		if !req.isCompaction && !req.isReplication {
-			currentLSN++
+		commitTxID := currentTxID
+		if !req.isReplication {
+			currentTxID++
 		}
 
 		for i := range req.ops {
@@ -380,14 +402,15 @@ func (s *Store) flushBatch(pending []*request, buf *bytes.Buffer) {
 				continue
 			}
 			opLen := req.opLengths[i]
-			lsnToWrite := commitLSN
-			if req.isCompaction || req.isReplication {
-				lsnToWrite = binary.BigEndian.Uint64(op.header[4:12])
+			txIDToWrite := commitTxID
+			if req.isReplication {
+				txIDToWrite = binary.BigEndian.Uint64(op.header[4:12])
 			}
 
-			binary.BigEndian.PutUint64(bufBytes[bufPtr+4:bufPtr+12], lsnToWrite)
-			binary.BigEndian.PutUint64(bufBytes[bufPtr+12:bufPtr+20], currentLogID)
-			currentLogID++
+			// Format: [Meta:4][TxID:8][LogSeq:8][CRC:4]
+			binary.BigEndian.PutUint64(bufBytes[bufPtr+4:bufPtr+12], txIDToWrite)
+			binary.BigEndian.PutUint64(bufBytes[bufPtr+12:bufPtr+20], currentLogSeq)
+			currentLogSeq++
 
 			crc := crc32.Checksum(bufBytes[bufPtr:bufPtr+20], crc32Table)
 			crc = crc32.Update(crc, crc32Table, bufBytes[bufPtr+24:bufPtr+opLen])
@@ -421,15 +444,14 @@ func (s *Store) flushBatch(pending []*request, buf *bytes.Buffer) {
 		lastCkptOffset = s.checkpoints[len(s.checkpoints)-1].Offset
 	}
 	if writeOffset-lastCkptOffset >= CheckpointInterval {
-		s.checkpoints = append(s.checkpoints, Checkpoint{LogID: startBatchLogID, Offset: writeOffset})
+		s.checkpoints = append(s.checkpoints, Checkpoint{LogSeq: startBatchLogSeq, Offset: writeOffset})
 	}
 	s.mu.Unlock()
 
 	// 3. Wait for Replication Quorum
-	batchMaxLogID := currentLogID - 1
-	if s.minReplicas > 0 && batchMaxLogID >= startBatchLogID {
-		s.logger.Debug("Batch requiring quorum", "startLogID", startBatchLogID, "endLogID", batchMaxLogID)
-		if err := s.WaitForQuorum(batchMaxLogID); err != nil {
+	batchMaxLogSeq := currentLogSeq - 1
+	if batchMaxLogSeq >= startBatchLogSeq {
+		if err := s.WaitForQuorum(batchMaxLogSeq); err != nil {
 			s.logger.Error("Replication quorum failed", "err", err)
 		}
 	}
@@ -439,13 +461,13 @@ func (s *Store) flushBatch(pending []*request, buf *bytes.Buffer) {
 	defer s.mu.Unlock()
 
 	currentOffset := writeOffset
-	indexLSN := s.nextLSN
+	indexTxID := s.nextTxID
 	var indexUpdates []IndexUpdate
 
 	for _, req := range activeReqs {
-		reqLSN := indexLSN
-		if !req.isCompaction && !req.isReplication {
-			indexLSN++
+		reqTxID := indexTxID
+		if !req.isReplication {
+			indexTxID++
 		}
 		for i := range req.ops {
 			op := &req.ops[i]
@@ -453,27 +475,23 @@ func (s *Store) flushBatch(pending []*request, buf *bytes.Buffer) {
 				continue
 			}
 			opLen := req.opLengths[i]
-			entryLSN := reqLSN
-			if req.isCompaction || req.isReplication {
-				entryLSN = binary.BigEndian.Uint64(op.header[4:12])
-				// Ensure local clock advances to cover replicated LSNs so they are visible
-				if entryLSN >= indexLSN {
-					indexLSN = entryLSN + 1
+			entryTxID := reqTxID
+			if req.isReplication {
+				entryTxID = binary.BigEndian.Uint64(op.header[4:12])
+				// Ensure local clock advances to cover replicated TxIDs so they are visible
+				if entryTxID >= indexTxID {
+					indexTxID = entryTxID + 1
 				}
 			}
 
-			if req.isCompaction {
-				s.index.UpdateHead(op.key, currentOffset, int64(opLen), entryLSN)
-			} else {
-				isDel := op.opType == OpJournalDelete
-				indexUpdates = append(indexUpdates, IndexUpdate{
-					Key:     op.key,
-					Offset:  currentOffset,
-					Length:  int64(opLen),
-					LSN:     entryLSN,
-					Deleted: isDel,
-				})
-			}
+			isDel := op.opType == OpJournalDelete
+			indexUpdates = append(indexUpdates, IndexUpdate{
+				Key:     op.key,
+				Offset:  currentOffset,
+				Length:  int64(opLen),
+				TxID:    entryTxID,
+				Deleted: isDel,
+			})
 			currentOffset += int64(opLen)
 		}
 		select {
@@ -488,13 +506,13 @@ func (s *Store) flushBatch(pending []*request, buf *bytes.Buffer) {
 		}
 	}
 
-	s.nextLSN = indexLSN
-	s.nextLogID = currentLogID
+	s.nextTxID = indexTxID
+	s.nextLogSeq = currentLogSeq
 	s.offset = currentOffset
-	s.recalcMinReadLSN()
+	s.recalcMinReadTxID()
 
 	// Persist state including the current KeyCount to allow fast recovery of stats
-	if err := s.index.PutState(s.nextLSN, s.nextLogID, s.offset, int64(s.index.Len())); err != nil {
+	if err := s.index.PutState(s.nextTxID, s.nextLogSeq, s.offset, int64(s.index.Len())); err != nil {
 		s.logger.Warn("Failed to persist state", "err", err)
 	}
 
@@ -515,6 +533,11 @@ func (s *Store) failBatch(reqs []*request, err error) {
 }
 
 func (s *Store) hasConflict(req *request, pending []*request) bool {
+	// Replication batches are authoritative and should not conflict check against local state
+	if req.isReplication {
+		return false
+	}
+
 	for _, pReq := range pending {
 		if !pReq.cancelled.Load() {
 			for _, op := range pReq.ops {
@@ -528,7 +551,7 @@ func (s *Store) hasConflict(req *request, pending []*request) bool {
 	defer s.mu.RUnlock()
 	for key := range req.accessMap {
 		latest, exists := s.index.GetHead(key)
-		if exists && latest.LSN > req.readLSN {
+		if exists && latest.TxID > req.readTxID {
 			return true
 		}
 	}
@@ -547,18 +570,18 @@ func (s *Store) recover() error {
 	s.logger.Info("Recovering index...", "file_size", size)
 
 	var offset int64
-	var maxLSN, maxLogID uint64
+	var maxTxID, maxLogSeq uint64
 
 	// Optimization: Try to fast-forward using state persisted in LevelDB
-	stateLSN, stateLogID, stateOffset, _, err := s.index.GetState()
+	stateTxID, stateLogSeq, stateOffset, _, err := s.index.GetState()
 	if err == nil && stateOffset <= size {
-		s.logger.Info("Fast recovery engaged", "offset", stateOffset, "lsn", stateLSN, "logID", stateLogID)
+		s.logger.Info("Fast recovery engaged", "offset", stateOffset, "txID", stateTxID, "logSeq", stateLogSeq)
 		offset = stateOffset
-		if stateLSN > 0 {
-			maxLSN = stateLSN - 1
+		if stateTxID > 0 {
+			maxTxID = stateTxID - 1
 		}
-		if stateLogID > 0 {
-			maxLogID = stateLogID - 1
+		if stateLogSeq > 0 {
+			maxLogSeq = stateLogSeq - 1
 		}
 	} else {
 		s.logger.Info("Performing full recovery scan", "reason", err)
@@ -595,8 +618,8 @@ func (s *Store) recover() error {
 
 		packed := binary.BigEndian.Uint32(header[0:4])
 		keyLen, valLen, isDel := UnpackMeta(packed)
-		entryLSN := binary.BigEndian.Uint64(header[4:12])
-		entryLogID := binary.BigEndian.Uint64(header[12:20])
+		entryTxID := binary.BigEndian.Uint64(header[4:12])
+		entryLogSeq := binary.BigEndian.Uint64(header[12:20])
 		storedCrc := binary.BigEndian.Uint32(header[20:24])
 
 		payloadLen := int(keyLen)
@@ -630,7 +653,7 @@ func (s *Store) recover() error {
 			Key:     key,
 			Offset:  offset,
 			Length:  entrySize,
-			LSN:     entryLSN,
+			TxID:    entryTxID,
 			Deleted: isDel,
 		})
 
@@ -641,15 +664,15 @@ func (s *Store) recover() error {
 			batch = batch[:0]
 		}
 
-		if entryLSN > maxLSN {
-			maxLSN = entryLSN
+		if entryTxID > maxTxID {
+			maxTxID = entryTxID
 		}
-		if entryLogID > maxLogID {
-			maxLogID = entryLogID
+		if entryLogSeq > maxLogSeq {
+			maxLogSeq = entryLogSeq
 		}
 
 		if len(s.checkpoints) == 0 || offset-s.checkpoints[len(s.checkpoints)-1].Offset >= CheckpointInterval {
-			s.checkpoints = append(s.checkpoints, Checkpoint{LogID: entryLogID, Offset: offset})
+			s.checkpoints = append(s.checkpoints, Checkpoint{LogSeq: entryLogSeq, Offset: offset})
 		}
 		offset += entrySize
 	}
@@ -661,48 +684,48 @@ func (s *Store) recover() error {
 	}
 
 	s.offset = offset
-	s.nextLSN = maxLSN + 1
-	s.nextLogID = maxLogID + 1
+	s.nextTxID = maxTxID + 1
+	s.nextLogSeq = maxLogSeq + 1
 	return nil
 }
 
 func (s *Store) AcquireSnapshot() uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	lsn := s.nextLSN - 1
-	if lsn < 0 {
-		lsn = 0
+	txID := s.nextTxID - 1
+	if txID < 0 {
+		txID = 0
 	}
-	s.activeSnapshots[lsn]++
-	s.recalcMinReadLSN()
-	return lsn
+	s.activeSnapshots[txID]++
+	s.recalcMinReadTxID()
+	return txID
 }
 
-func (s *Store) ReleaseSnapshot(readLSN uint64) {
+func (s *Store) ReleaseSnapshot(readTxID uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if count, ok := s.activeSnapshots[readLSN]; ok {
-		s.activeSnapshots[readLSN] = count - 1
-		if s.activeSnapshots[readLSN] <= 0 {
-			delete(s.activeSnapshots, readLSN)
-			s.recalcMinReadLSN()
+	if count, ok := s.activeSnapshots[readTxID]; ok {
+		s.activeSnapshots[readTxID] = count - 1
+		if s.activeSnapshots[readTxID] <= 0 {
+			delete(s.activeSnapshots, readTxID)
+			s.recalcMinReadTxID()
 		}
 	}
 }
 
-func (s *Store) recalcMinReadLSN() {
-	min := s.nextLSN - 1
-	for lsn := range s.activeSnapshots {
-		if lsn < min {
-			min = lsn
+func (s *Store) recalcMinReadTxID() {
+	min := s.nextTxID - 1
+	for txID := range s.activeSnapshots {
+		if txID < min {
+			min = txID
 		}
 	}
-	s.minReadLSN = min
+	s.minReadTxID = min
 }
 
-func (s *Store) Get(key string, readLSN uint64) ([]byte, error) {
+func (s *Store) Get(key string, readTxID uint64) ([]byte, error) {
 	s.mu.RLock()
-	entry, ok := s.index.Get(key, readLSN)
+	entry, ok := s.index.Get(key, readTxID)
 	safeLimit := s.offset
 	s.mu.RUnlock()
 
@@ -740,7 +763,7 @@ func (s *Store) Get(key string, readLSN uint64) ([]byte, error) {
 	return payload[keyLen:], nil
 }
 
-func (s *Store) ApplyBatch(ops []bufferedOp, readLSN uint64) error {
+func (s *Store) ApplyBatch(ops []bufferedOp, readTxID uint64) error {
 	req := s.reqPool.Get().(*request)
 
 	if cap(req.ops) < len(ops) {
@@ -750,7 +773,7 @@ func (s *Store) ApplyBatch(ops []bufferedOp, readLSN uint64) error {
 	}
 	copy(req.ops, ops)
 
-	req.readLSN = readLSN
+	req.readTxID = readTxID
 	req.accessMap = make(map[string]struct{}, len(ops))
 	for i := range req.ops {
 		op := &req.ops[i]
@@ -766,7 +789,7 @@ func (s *Store) ApplyBatch(ops []bufferedOp, readLSN uint64) error {
 		}
 	}
 	req.cancelled.Store(false)
-	req.isCompaction = false
+	// Simplified: Compaction doesn't run through this path
 	req.isReplication = false
 	req.opLengths = req.opLengths[:0]
 
@@ -811,7 +834,7 @@ func (s *Store) ReplicateBatch(entries []LogEntry) error {
 			key:    string(entry.Key),
 			val:    entry.Value,
 		}
-		binary.BigEndian.PutUint64(ops[i].header[4:12], entry.LSN)
+		binary.BigEndian.PutUint64(ops[i].header[4:12], entry.TxID)
 		kLen := len(entry.Key)
 		vLen := len(entry.Value)
 		isDel := entry.OpType == OpJournalDelete
@@ -832,7 +855,7 @@ func (s *Store) ReplicateBatch(entries []LogEntry) error {
 
 	req.cancelled.Store(false)
 	req.isReplication = true
-	req.isCompaction = false
+	// Simplified: Compaction doesn't run through this path
 	req.opLengths = req.opLengths[:0]
 
 	select {
@@ -877,10 +900,10 @@ func (s *Store) drainChannels() {
 	}
 }
 
-func (s *Store) RegisterReplica(id string, startLogID uint64) {
+func (s *Store) RegisterReplica(id string, startLogSeq uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.replicationSlots[id] = ReplicaState{LogID: startLogID, LastSeen: time.Now()}
+	s.replicationSlots[id] = ReplicaState{LogSeq: startLogSeq, LastSeen: time.Now()}
 	s.ackCond.Broadcast()
 }
 
@@ -891,18 +914,18 @@ func (s *Store) UnregisterReplica(id string) {
 	s.ackCond.Broadcast()
 }
 
-func (s *Store) UpdateReplicaLogID(id string, logID uint64) {
+func (s *Store) UpdateReplicaLogSeq(id string, logSeq uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.replicationSlots[id] = ReplicaState{LogID: logID, LastSeen: time.Now()}
+	s.replicationSlots[id] = ReplicaState{LogSeq: logSeq, LastSeen: time.Now()}
 	s.ackCond.Broadcast()
 }
 
-func (s *Store) FindOffsetForLogID(logID uint64) int64 {
+func (s *Store) FindOffsetForLogSeq(logSeq uint64) int64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	idx := sort.Search(len(s.checkpoints), func(i int) bool {
-		return s.checkpoints[i].LogID > logID
+		return s.checkpoints[i].LogSeq > logSeq
 	})
 	var hintOffset int64
 	if idx == 0 {
@@ -928,25 +951,25 @@ func (s *Store) PruneStaleReplicas() {
 	}
 }
 
-func (s *Store) WaitForQuorum(targetLogID uint64) error {
+func (s *Store) WaitForQuorum(targetLogSeq uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.minReplicas <= 0 {
 		return nil
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.logger.Debug("Waiting for quorum", "targetLogID", targetLogID, "minReplicas", s.minReplicas)
+	s.logger.Debug("Waiting for quorum", "targetLogSeq", targetLogSeq, "minReplicas", s.minReplicas)
 	for {
 		if s.closing.Load() {
 			return ErrClosed
 		}
 		acks := 0
 		for _, state := range s.replicationSlots {
-			if state.LogID >= targetLogID {
+			if state.LogSeq >= targetLogSeq {
 				acks++
 			}
 		}
 		if acks >= s.minReplicas {
-			s.logger.Debug("Quorum met", "targetLogID", targetLogID, "acks", acks)
+			s.logger.Debug("Quorum met", "targetLogSeq", targetLogSeq, "acks", acks)
 			return nil
 		}
 		s.ackCond.Wait()
@@ -971,8 +994,8 @@ func (s *Store) Stats() StoreStats {
 		Uptime:                 time.Since(s.startTime).Round(time.Second).String(),
 		ActiveSnapshots:        len(s.activeSnapshots),
 		Offset:                 s.offset,
-		NextLSN:                atomic.LoadUint64(&s.nextLSN),
-		NextLogID:              atomic.LoadUint64(&s.nextLogID),
+		NextTxID:               atomic.LoadUint64(&s.nextTxID),
+		NextLogSeq:             atomic.LoadUint64(&s.nextLogSeq),
 		ConflictCount:          atomic.LoadInt64(&s.conflictCount),
 		RecoveryDuration:       s.recoveryDuration,
 		PendingOps:             len(s.opsChannel),

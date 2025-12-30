@@ -140,6 +140,10 @@ func TestMetrics_StorageIO(t *testing.T) {
 	// Select DB 1
 	client.AssertStatus(OpCodeSelect, []byte("1"), ResStatusOK)
 
+	// Capture baseline metrics (accounts for system keys)
+	m0 := gatherMetrics(t, srv)
+	baseKeys := m0["turnstone_store_keys_total"]
+
 	// Write Data
 	client.AssertStatus(OpCodeBegin, nil, ResStatusOK)
 	key := []byte("io_key")
@@ -153,8 +157,8 @@ func TestMetrics_StorageIO(t *testing.T) {
 
 	m1 := gatherMetrics(t, srv)
 
-	if m1["turnstone_store_keys_total"] != 1 {
-		t.Errorf("Expected 1 key, got %v", m1["turnstone_store_keys_total"])
+	if m1["turnstone_store_keys_total"] != baseKeys+1 {
+		t.Errorf("Expected %v keys, got %v", baseKeys+1, m1["turnstone_store_keys_total"])
 	}
 	if m1["turnstone_store_bytes_written_total"] <= 0 {
 		t.Errorf("Expected bytes written > 0")
