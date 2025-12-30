@@ -304,8 +304,28 @@ func (s *Store) recover() error {
 	}
 
 	var offset int64 = 0
-	header := make([]byte, HeaderSize)
 	var maxLSN uint64 = 0
+
+	// RECOVERY OPTIMIZATION: Try to load persistent state from LevelDB
+	stateLSN, stateOffset, err := s.index.GetState()
+	if err == nil && stateOffset > 0 {
+		s.logger.Info("Fast recovery: Found persistent state", "next_lsn", stateLSN, "offset", stateOffset)
+		// We can skip the WAL up to stateOffset.
+		// NOTE: stateOffset points to where we should WRITE next.
+		// However, the loop below iterates over existing data.
+		// If we set offset = stateOffset, we assume everything before it is already indexed.
+		if stateOffset <= size {
+			offset = stateOffset
+			// If persistent state says NextLSN is X, then max applied LSN was X-1.
+			if stateLSN > 0 {
+				maxLSN = stateLSN - 1
+			}
+		} else {
+			s.logger.Warn("Persistent state offset is larger than WAL size, falling back to full scan", "state_offset", stateOffset, "wal_size", size)
+		}
+	}
+
+	header := make([]byte, HeaderSize)
 	count := 0
 	var lastCheckpointOffset int64 = 0
 	if len(s.checkpoints) > 0 {
@@ -404,9 +424,16 @@ func (s *Store) recover() error {
 		count++
 	}
 
-	s.logger.Info("Recovery complete", "entries", count, "offset", offset, "checkpoints", len(s.checkpoints))
+	s.logger.Info("Recovery complete", "entries_scanned", count, "offset", offset, "checkpoints", len(s.checkpoints))
 	s.offset = offset
 	s.nextLSN = maxLSN + 1
+
+	// CRITICAL FIX: Persist state at end of recovery.
+	// This ensures that even if we don't write new data, the next startup is fast.
+	if err := s.index.PutState(s.nextLSN, s.offset); err != nil {
+		s.logger.Warn("Failed to persist state after recovery", "err", err)
+	}
+
 	return nil
 }
 
@@ -787,6 +814,15 @@ func (s *Store) flushBatch(pending []*request, buf *bytes.Buffer) {
 	}
 
 	s.offset = currentOffset
+	s.recalcMinReadLSN()
+
+	// PERSISTENCE OPTIMIZATION:
+	// Save the global state (NextLSN + Offset) to the index.
+	// This enables fast recovery by skipping the already-processed WAL.
+	if err := s.index.PutState(s.nextLSN, s.offset); err != nil {
+		s.logger.Warn("Failed to persist state", "err", err)
+	}
+
 	buf.Reset()
 }
 

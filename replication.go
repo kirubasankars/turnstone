@@ -28,7 +28,9 @@ type LogEntry struct {
 // HandleReplicaConnection manages the lifecycle of a connected follower.
 // It performs the handshake to determine the follower's position, then
 // streams log entries.
-func (s *Server) HandleReplicaConnection(conn net.Conn, payload []byte) {
+// IMPORTANT: It takes an io.Reader (the bufio.Reader) to ensure we consume
+// any buffered ACKs from the previous handshake phase.
+func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []byte) {
 	if len(payload) < 16 {
 		s.logger.Error("Invalid REPL_HELLO payload size")
 		return
@@ -41,31 +43,40 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, payload []byte) {
 	s.store.RegisterReplica(replicaID, followerLSN)
 	defer s.store.UnregisterReplica(replicaID)
 
+	// Clear the read deadline to prevent timeouts during long streaming sessions.
+	// The ACKs act as heartbeats.
+	conn.SetReadDeadline(time.Time{})
+	// Clear the write deadline to prevent the initial handshake deadline from
+	// killing the long-lived replication stream.
+	conn.SetWriteDeadline(time.Time{})
+
 	// Locate the approximate byte offset in the WAL for the requested LSN
 	startOffset := s.store.FindOffsetForLSN(followerLSN)
 
-	s.logger.Info("Replica connected", "id", replicaID, "follower_lsn", followerLSN, "leader_scan_start", startOffset)
+	// Zero cost: Removed the info log to avoid overhead during connections
+	// s.logger.Info("Replica connected", "id", replicaID, "follower_lsn", followerLSN, "leader_scan_start", startOffset)
 
-	// Separate goroutine to consume ACKs from the follower so writes don't block
-	go s.ReadReplicaAcks(conn, replicaID)
+	// Separate goroutine to consume ACKs from the follower so writes don't block.
+	// We MUST use the bufio.Reader `r` passed from handleConnection.
+	go s.ReadReplicaAcks(r, replicaID)
 
-	// Main loop: stream data to follower
+	// Main loop: stream data to follower (writes to conn)
 	s.StreamReplication(conn, replicaID, startOffset, followerLSN)
 }
 
 // ReadReplicaAcks continuously reads ACKs from the follower to update its progress.
 // This is critical for synchronous replication (Quorum waits).
-func (s *Server) ReadReplicaAcks(conn net.Conn, replicaID string) {
+func (s *Server) ReadReplicaAcks(r io.Reader, replicaID string) {
 	headerBuf := make([]byte, 5)
 	for {
-		if _, err := io.ReadFull(conn, headerBuf); err != nil {
+		if _, err := io.ReadFull(r, headerBuf); err != nil {
 			return
 		}
 		opCode := headerBuf[0]
 		length := binary.BigEndian.Uint32(headerBuf[1:])
 
 		payload := make([]byte, length)
-		if _, err := io.ReadFull(conn, payload); err != nil {
+		if _, err := io.ReadFull(r, payload); err != nil {
 			return
 		}
 
@@ -80,35 +91,42 @@ func (s *Server) ReadReplicaAcks(conn net.Conn, replicaID string) {
 // It effectively acts as a "tail -f" on the WAL file.
 func (s *Server) StreamReplication(conn net.Conn, replicaID string, startOffset int64, minLSN uint64) {
 	currentOffset := startOffset
-	buffer := make([]byte, 1024*1024)
+	readBuffer := make([]byte, 1024*1024)
 
-	var pendingBatch []LogEntry
-	var currentTxLSN uint64
-	firstEntry := true
+	// Optimization: Reuse a write buffer to avoid per-entry allocations.
+	// This drastically reduces GC pressure on the leader.
+	batchBuf := new(bytes.Buffer)
+	batchBuf.Grow(512 * 1024) // Pre-allocate 512KB
+	var batchCount uint32
+
+	// Scratch buffer for encoding integers
+	scratch := make([]byte, 8)
+
+	const MaxBatchSize = 512 * 1024 // 512KB batch limit
 
 	for {
 		walSize := s.store.wal.Size()
 		if currentOffset >= walSize {
 			// End of file reached. Flush any pending batch and wait for new data.
-			if len(pendingBatch) > 0 {
-				if err := s.sendBatch(conn, pendingBatch); err != nil {
+			if batchCount > 0 {
+				if err := s.sendRawBatch(conn, batchBuf, batchCount); err != nil {
 					s.logger.Error("Failed to flush trailing batch", "err", err)
 					return
 				}
-				pendingBatch = pendingBatch[:0]
-				firstEntry = true
+				batchBuf.Reset()
+				batchCount = 0
 			}
 			// Block until the WAL grows
 			s.store.wal.Wait(currentOffset)
 			walSize = s.store.wal.Size()
 		}
 
-		readSize := int64(len(buffer))
+		readSize := int64(len(readBuffer))
 		if currentOffset+readSize > walSize {
 			readSize = walSize - currentOffset
 		}
 
-		n, err := s.store.wal.ReadAt(buffer[:readSize], currentOffset)
+		n, err := s.store.wal.ReadAt(readBuffer[:readSize], currentOffset)
 		if err != nil && err != io.EOF {
 			s.logger.Error("WAL read failed during replication", "err", err)
 			return
@@ -125,7 +143,7 @@ func (s *Server) StreamReplication(conn net.Conn, replicaID string, startOffset 
 				break
 			}
 			// Skip zero-padding (holes punched by compaction or pre-allocation)
-			if buffer[parseOff] == 0 && buffer[parseOff+1] == 0 && buffer[parseOff+2] == 0 && buffer[parseOff+3] == 0 {
+			if readBuffer[parseOff] == 0 && readBuffer[parseOff+1] == 0 && readBuffer[parseOff+2] == 0 && readBuffer[parseOff+3] == 0 {
 				aligned := (parseOff/4096 + 1) * 4096
 				if aligned > n {
 					break
@@ -138,10 +156,10 @@ func (s *Server) StreamReplication(conn net.Conn, replicaID string, startOffset 
 				break
 			}
 
-			packed := binary.BigEndian.Uint32(buffer[parseOff : parseOff+4])
+			packed := binary.BigEndian.Uint32(readBuffer[parseOff : parseOff+4])
 			keyLen, valLen, isDel := UnpackMeta(packed)
-			lsn := binary.BigEndian.Uint64(buffer[parseOff+4 : parseOff+12])
-			storedCrc := binary.BigEndian.Uint32(buffer[parseOff+12 : parseOff+16])
+			lsn := binary.BigEndian.Uint64(readBuffer[parseOff+4 : parseOff+12])
+			storedCrc := binary.BigEndian.Uint32(readBuffer[parseOff+12 : parseOff+16])
 
 			var payloadLen int
 			if isDel {
@@ -155,56 +173,60 @@ func (s *Server) StreamReplication(conn net.Conn, replicaID string, startOffset 
 			}
 
 			digest := crc32.New(crc32Table)
-			digest.Write(buffer[parseOff : parseOff+12])
-			digest.Write(buffer[parseOff+HeaderSize : parseOff+HeaderSize+payloadLen])
+			digest.Write(readBuffer[parseOff : parseOff+12])
+			digest.Write(readBuffer[parseOff+HeaderSize : parseOff+HeaderSize+payloadLen])
 			if digest.Sum32() != storedCrc {
 				s.logger.Error("CRC mismatch in replication stream", "offset", currentOffset+int64(parseOff))
 				return
 			}
 
-			// Group entries by LSN (Transactions)
-			if !firstEntry && lsn != currentTxLSN {
-				if len(pendingBatch) > 0 {
-					if err := s.sendBatch(conn, pendingBatch); err != nil {
-						s.logger.Error("Failed to send batch", "err", err)
-						return
-					}
-					pendingBatch = pendingBatch[:0]
-				}
-			}
-
-			if firstEntry {
-				currentTxLSN = lsn
-				firstEntry = false
-			}
-			currentTxLSN = lsn
-
 			// Only send entries newer than what the follower has
 			if lsn > minLSN {
 				kStart := parseOff + HeaderSize
 				kEnd := kStart + int(keyLen)
-				kCopy := make([]byte, int(keyLen))
-				copy(kCopy, buffer[kStart:kEnd])
 
-				var vCopy []byte
+				// --- Serialize directly to batchBuf ---
+
+				// 1. LSN (8 bytes)
+				binary.BigEndian.PutUint64(scratch, lsn)
+				batchBuf.Write(scratch)
+
+				// 2. OpType (1 byte)
+				if isDel {
+					batchBuf.WriteByte(OpJournalDelete)
+				} else {
+					batchBuf.WriteByte(OpJournalSet)
+				}
+
+				// 3. Key Len (4 bytes)
+				binary.BigEndian.PutUint32(scratch[:4], uint32(keyLen))
+				batchBuf.Write(scratch[:4])
+
+				// 4. Key (keyLen bytes)
+				batchBuf.Write(readBuffer[kStart:kEnd])
+
+				// 5. Value Len (4 bytes)
+				binary.BigEndian.PutUint32(scratch[:4], uint32(valLen))
+				batchBuf.Write(scratch[:4])
+
+				// 6. Value (valLen bytes)
 				if !isDel {
 					vStart := kEnd
 					vEnd := vStart + int(valLen)
-					vCopy = make([]byte, int(valLen))
-					copy(vCopy, buffer[vStart:vEnd])
+					batchBuf.Write(readBuffer[vStart:vEnd])
 				}
 
-				pendingBatch = append(pendingBatch, LogEntry{
-					LSN: lsn,
-					OpType: func() uint8 {
-						if isDel {
-							return OpJournalDelete
-						}
-						return OpJournalSet
-					}(),
-					Key:   kCopy,
-					Value: vCopy,
-				})
+				batchCount++
+
+				// Flush if batch is large enough
+				if batchBuf.Len() >= MaxBatchSize {
+					if err := s.sendRawBatch(conn, batchBuf, batchCount); err != nil {
+						s.logger.Error("Failed to send batch", "err", err)
+						return
+					}
+					batchBuf.Reset()
+					batchCount = 0
+				}
 			}
 
 			parseOff += HeaderSize + payloadLen
@@ -214,31 +236,43 @@ func (s *Server) StreamReplication(conn net.Conn, replicaID string, startOffset 
 	}
 }
 
-// sendBatch serializes and writes a batch of log entries to the wire.
-func (s *Server) sendBatch(conn net.Conn, entries []LogEntry) error {
-	if len(entries) == 0 {
+// sendRawBatch writes the pre-serialized batch buffer to the connection.
+func (s *Server) sendRawBatch(conn net.Conn, buf *bytes.Buffer, count uint32) error {
+	if count == 0 {
 		return nil
 	}
 
-	var batchBuf bytes.Buffer
-	for _, entry := range entries {
-		binary.Write(&batchBuf, binary.BigEndian, entry.LSN)
-		batchBuf.WriteByte(entry.OpType)
-
-		kLen := uint32(len(entry.Key))
-		binary.Write(&batchBuf, binary.BigEndian, kLen)
-		batchBuf.Write(entry.Key)
-
-		vLen := uint32(len(entry.Value))
-		binary.Write(&batchBuf, binary.BigEndian, vLen)
-		batchBuf.Write(entry.Value)
+	// Update the write deadline for this specific batch.
+	if err := conn.SetWriteDeadline(time.Now().Add(60 * time.Second)); err != nil {
+		return err
 	}
 
-	payload := make([]byte, 4+batchBuf.Len())
-	binary.BigEndian.PutUint32(payload[0:4], uint32(len(entries)))
-	copy(payload[4:], batchBuf.Bytes())
+	// Calculate total payload length:
+	// 4 bytes (Batch Count) + Batch Data Length
+	payloadLen := 4 + buf.Len()
 
-	return s.writeBinaryResponse(conn, OpCodeReplBatch, payload)
+	// 1. Write Header: [OpCodeReplBatch][PayloadLen]
+	header := make([]byte, 5)
+	header[0] = OpCodeReplBatch
+	binary.BigEndian.PutUint32(header[1:], uint32(payloadLen))
+
+	if _, err := conn.Write(header); err != nil {
+		return err
+	}
+
+	// 2. Write Batch Count
+	countBuf := make([]byte, 4)
+	binary.BigEndian.PutUint32(countBuf, count)
+	if _, err := conn.Write(countBuf); err != nil {
+		return err
+	}
+
+	// 3. Write Batch Data
+	if _, err := conn.Write(buf.Bytes()); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // --- REPLICATION FOLLOWER LOGIC ---
