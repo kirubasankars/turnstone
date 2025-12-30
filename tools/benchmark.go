@@ -48,7 +48,7 @@ func main() {
 	}
 
 	fmt.Printf("--- TurnstoneDB Benchmark (Async Pipeline) ---\n")
-	fmt.Printf("Server:      %s\n", *addr)
+	fmt.Printf("Server:       %s\n", *addr)
 	fmt.Printf("Concurrency: %d clients\n", *concurrency)
 	fmt.Printf("Total Ops:   %d\n", *totalOps)
 	fmt.Printf("Pipeline:    %d tx/batch\n", *pipelineDepth)
@@ -137,6 +137,37 @@ func runWorkload(phase string, tlsConfig *tls.Config, payload []byte, readPct fl
 			defer conn.Close()
 
 			reader := bufio.NewReader(conn)
+
+			// --- Select Database 1 ---
+			dbName := []byte("1")
+			selBuf := appendHeader(make([]byte, 0, 5+len(dbName)), client.OpCodeSelect, len(dbName))
+			selBuf = append(selBuf, dbName...)
+			if _, err := conn.Write(selBuf); err != nil {
+				log.Printf("[Client %d] Select write failed: %v", clientID, err)
+				atomic.AddInt64(&failedOps, int64(opsPerClient))
+				return
+			}
+
+			// Read Select Response
+			selHead := make([]byte, 5)
+			if _, err := io.ReadFull(reader, selHead); err != nil {
+				log.Printf("[Client %d] Select read failed: %v", clientID, err)
+				atomic.AddInt64(&failedOps, int64(opsPerClient))
+				return
+			}
+			if selHead[0] != client.ResStatusOK {
+				log.Printf("[Client %d] Select failed status: 0x%x", clientID, selHead[0])
+				atomic.AddInt64(&failedOps, int64(opsPerClient))
+				return
+			}
+			// Discard body if present (unlikely for Select OK)
+			if sLen := binary.BigEndian.Uint32(selHead[1:]); sLen > 0 {
+				if _, err := reader.Discard(int(sLen)); err != nil {
+					return
+				}
+			}
+			// -------------------------
+
 			// Pre-allocate write buffer: (Header(5) + Max(Begin/Commit/Op)) * 3 * Depth
 			// Estimate roughly 4KB + payload per depth to be safe
 			writeBuf := make([]byte, 0, *pipelineDepth*(20+*valueSize+*keySize)*3)
