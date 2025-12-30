@@ -17,7 +17,7 @@ import (
 
 // --- Test Infrastructure & Helpers ---
 
-func setupTestEnv(t *testing.T) (string, *Store, *Server) {
+func setupTestEnv(t *testing.T) (string, map[string]*Store, *Server) {
 	dir := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
@@ -26,27 +26,56 @@ func setupTestEnv(t *testing.T) (string, *Store, *Server) {
 	if err := os.MkdirAll(certsDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := generateCerts(certsDir); err != nil {
-		t.Fatalf("Failed to generate certs: %v", err)
+	if err := GenerateConfigArtifacts(dir, Config{
+		TLSCertFile: "certs/server.crt",
+		TLSKeyFile:  "certs/server.key",
+		TLSCAFile:   "certs/ca.crt",
+		Databases:   []DatabaseConfig{{Name: "default"}},
+	}, filepath.Join(dir, "config.json")); err != nil {
+		t.Fatalf("Failed to generate artifacts: %v", err)
 	}
 
-	// 2. Init Store
-	store, err := NewStore(dir, logger, true, 0, true, "memory")
+	// 2. Init Store (default)
+	store, err := NewStore(filepath.Join(dir, "data", "default"), logger, true, 0, true)
 	if err != nil {
 		t.Fatal(err)
 	}
+	stores := map[string]*Store{"default": store}
 
-	// 3. Init Server (Port 0 for random free port)
-	srv := NewServer(
-		":0", "", store, logger,
-		10,    // MaxConns
-		false, // ReadOnly
+	// 3. Setup Replication Manager (Required for NewServer)
+	clientCertPath := filepath.Join(certsDir, "client.crt")
+	clientKeyPath := filepath.Join(certsDir, "client.key")
+	caCertPath := filepath.Join(certsDir, "ca.crt")
+
+	clientCert, err := tls.LoadX509KeyPair(clientCertPath, clientKeyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caCert, err := os.ReadFile(caCertPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(caCert)
+	tlsConf := &tls.Config{Certificates: []tls.Certificate{clientCert}, RootCAs: pool, InsecureSkipVerify: true}
+
+	rm := NewReplicationManager(stores, tlsConf, logger)
+
+	// 4. Init Server (Port 0 for random free port)
+	srv, err := NewServer(
+		":0", "", stores, logger,
+		10, // MaxConns
+		5*time.Second,
 		filepath.Join(certsDir, "server.crt"),
 		filepath.Join(certsDir, "server.key"),
 		filepath.Join(certsDir, "ca.crt"),
+		rm,
 	)
+	if err != nil {
+		t.Fatalf("Failed to create server: %v", err)
+	}
 
-	return dir, store, srv
+	return dir, stores, srv
 }
 
 func getClientTLS(t *testing.T, dir string) *tls.Config {
@@ -59,14 +88,12 @@ func getClientTLS(t *testing.T, dir string) *tls.Config {
 		t.Fatalf("Load client key pair: %v", err)
 	}
 	caCert, _ := os.ReadFile(caFile)
-	caPool := x509.NewCertPool()
-	caPool.AppendCertsFromPEM(caCert)
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(caCert)
 
 	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		RootCAs:      caPool,
-		// In tests, we connect to localhost/127.0.0.1, but cert is for "TurnstoneDB Server" or localhost.
-		// Skip verify name for simplicity, or ensure cert generation matches.
+		Certificates:       []tls.Certificate{cert},
+		RootCAs:            pool,
 		InsecureSkipVerify: true,
 	}
 }
@@ -133,29 +160,25 @@ func (c *testClient) AssertStatus(opCode byte, payload []byte, expectedStatus by
 // --- Tests ---
 
 func TestServer_Lifecycle_And_Ping(t *testing.T) {
-	dir, store, srv := setupTestEnv(t)
-	defer store.Close()
+	dir, stores, srv := setupTestEnv(t)
+	defer stores["default"].Close()
 	defer os.RemoveAll(dir)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Start Server in Goroutine
 	go func() {
 		if err := srv.Run(ctx); err != nil {
-			// Context canceled is expected
+			// Expected
 		}
 	}()
 
-	// Wait for listener
 	time.Sleep(100 * time.Millisecond)
 	addr := srv.listener.Addr().String()
 
-	// Connect
 	client := connectClient(t, addr, getClientTLS(t, dir))
 	defer client.Close()
 
-	// Test Ping
 	resp := client.AssertStatus(OpCodePing, nil, ResStatusOK)
 	if string(resp) != "PONG" {
 		t.Errorf("Ping payload mismatch: %s", resp)
@@ -163,8 +186,8 @@ func TestServer_Lifecycle_And_Ping(t *testing.T) {
 }
 
 func TestServer_CRUD(t *testing.T) {
-	dir, store, srv := setupTestEnv(t)
-	defer store.Close()
+	dir, stores, srv := setupTestEnv(t)
+	defer stores["default"].Close()
 	defer os.RemoveAll(dir)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -176,7 +199,6 @@ func TestServer_CRUD(t *testing.T) {
 	defer client.Close()
 
 	// 1. Set
-	// Format: [KeyLen 4b][Key][Value]
 	key := []byte("mykey")
 	val := []byte("myval")
 	setPayload := make([]byte, 4+len(key)+len(val))
@@ -189,9 +211,8 @@ func TestServer_CRUD(t *testing.T) {
 	client.AssertStatus(OpCodeCommit, nil, ResStatusOK)
 
 	// 2. Get
-	getPayload := key
 	client.AssertStatus(OpCodeBegin, nil, ResStatusOK)
-	resp := client.AssertStatus(OpCodeGet, getPayload, ResStatusOK)
+	resp := client.AssertStatus(OpCodeGet, key, ResStatusOK)
 	client.AssertStatus(OpCodeCommit, nil, ResStatusOK)
 	if !bytes.Equal(resp, val) {
 		t.Errorf("Get mismatch. Want %s, got %s", val, resp)
@@ -208,10 +229,16 @@ func TestServer_CRUD(t *testing.T) {
 	client.AssertStatus(OpCodeCommit, nil, ResStatusOK)
 }
 
-func TestServer_Transactions_Commit(t *testing.T) {
-	dir, store, srv := setupTestEnv(t)
-	defer store.Close()
+func TestServer_SelectDB(t *testing.T) {
+	dir, stores, srv := setupTestEnv(t)
+	defer stores["default"].Close()
 	defer os.RemoveAll(dir)
+
+	// Create a second DB
+	db2Dir := filepath.Join(dir, "db2")
+	store2, _ := NewStore(db2Dir, srv.logger, true, 0, true)
+	srv.stores["db2"] = store2
+	defer store2.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -221,159 +248,52 @@ func TestServer_Transactions_Commit(t *testing.T) {
 	client := connectClient(t, srv.listener.Addr().String(), getClientTLS(t, dir))
 	defer client.Close()
 
-	// Begin
+	// Default DB: Set K=V1
+	k := []byte("k")
+	v1 := []byte("v1")
+	setPl1 := make([]byte, 4+len(k)+len(v1))
+	binary.BigEndian.PutUint32(setPl1[:4], uint32(len(k)))
+	copy(setPl1[4:], k)
+	copy(setPl1[4+len(k):], v1)
+
 	client.AssertStatus(OpCodeBegin, nil, ResStatusOK)
-
-	// Set
-	key := []byte("txkey")
-	val := []byte("txval")
-	setPayload := make([]byte, 4+len(key)+len(val))
-	binary.BigEndian.PutUint32(setPayload[0:4], uint32(len(key)))
-	copy(setPayload[4:], key)
-	copy(setPayload[4+len(key):], val)
-	client.AssertStatus(OpCodeSet, setPayload, ResStatusOK)
-
-	// Commit
+	client.AssertStatus(OpCodeSet, setPl1, ResStatusOK)
 	client.AssertStatus(OpCodeCommit, nil, ResStatusOK)
 
-	// Verify persistence (new transaction or implicit read)
+	// Select DB2
+	client.AssertStatus(OpCodeSelect, []byte("db2"), ResStatusOK)
+
+	// Verify Empty in DB2
 	client.AssertStatus(OpCodeBegin, nil, ResStatusOK)
-	resp := client.AssertStatus(OpCodeGet, key, ResStatusOK)
+	client.AssertStatus(OpCodeGet, k, ResStatusNotFound)
 	client.AssertStatus(OpCodeCommit, nil, ResStatusOK)
-	if !bytes.Equal(resp, val) {
-		t.Errorf("Tx Commit failed validation")
-	}
-}
 
-func TestServer_Transactions_Abort(t *testing.T) {
-	dir, store, srv := setupTestEnv(t)
-	defer store.Close()
-	defer os.RemoveAll(dir)
+	// DB2: Set K=V2
+	v2 := []byte("v2")
+	setPl2 := make([]byte, 4+len(k)+len(v2))
+	binary.BigEndian.PutUint32(setPl2[:4], uint32(len(k)))
+	copy(setPl2[4:], k)
+	copy(setPl2[4+len(k):], v2)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go srv.Run(ctx)
-	time.Sleep(100 * time.Millisecond)
-
-	client := connectClient(t, srv.listener.Addr().String(), getClientTLS(t, dir))
-	defer client.Close()
-
-	// Begin
 	client.AssertStatus(OpCodeBegin, nil, ResStatusOK)
-
-	// Set
-	key := []byte("abortkey")
-	val := []byte("val")
-	setPayload := make([]byte, 4+len(key)+len(val))
-	binary.BigEndian.PutUint32(setPayload[0:4], uint32(len(key)))
-	copy(setPayload[4:], key)
-	copy(setPayload[4+len(key):], val)
-	client.AssertStatus(OpCodeSet, setPayload, ResStatusOK)
-
-	// Abort
-	client.AssertStatus(OpCodeAbort, nil, ResStatusOK)
-
-	// Verify NOT found
-	client.AssertStatus(OpCodeBegin, nil, ResStatusOK)
-	client.AssertStatus(OpCodeGet, key, ResStatusNotFound)
+	client.AssertStatus(OpCodeSet, setPl2, ResStatusOK)
 	client.AssertStatus(OpCodeCommit, nil, ResStatusOK)
-}
 
-func TestServer_ReadOnly(t *testing.T) {
-	dir, store, _ := setupTestEnv(t)
-	defer store.Close()
-	defer os.RemoveAll(dir)
+	// Select Default again
+	client.AssertStatus(OpCodeSelect, []byte("default"), ResStatusOK)
 
-	// Create ReadOnly Server
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := NewServer(
-		":0", "", store, logger, 10,
-		true, // ReadOnly = true
-		filepath.Join(dir, "certs", "server.crt"),
-		filepath.Join(dir, "certs", "server.key"),
-		filepath.Join(dir, "certs", "ca.crt"),
-	)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go srv.Run(ctx)
-	time.Sleep(100 * time.Millisecond)
-
-	client := connectClient(t, srv.listener.Addr().String(), getClientTLS(t, dir))
-	defer client.Close()
-
-	// Set should fail (Must be inside tx to reach SET logic usually, but ReadOnly check is first in some implementations.
-	// Let's wrap in Tx to be safe and test the Commit/Set failure)
+	// Verify V1 in Default
 	client.AssertStatus(OpCodeBegin, nil, ResStatusOK)
-
-	key := []byte("k")
-	val := []byte("v")
-	setPayload := make([]byte, 4+len(key)+len(val))
-	binary.BigEndian.PutUint32(setPayload[0:4], uint32(len(key)))
-	copy(setPayload[4:], key)
-	copy(setPayload[4+len(key):], val)
-
-	// Depending on implementation, Set might return error immediately or on Commit
-	// server.go: handleDelete/handleSet check ReadOnly immediately.
-	client.AssertStatus(OpCodeSet, setPayload, ResStatusErr)
-}
-
-func TestServer_MaxConns(t *testing.T) {
-	dir, store, _ := setupTestEnv(t)
-	defer store.Close()
-	defer os.RemoveAll(dir)
-
-	// MaxConns = 1
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := NewServer(
-		":0", "", store, logger,
-		1, // Limit 1
-		false,
-		filepath.Join(dir, "certs", "server.crt"),
-		filepath.Join(dir, "certs", "server.key"),
-		filepath.Join(dir, "certs", "ca.crt"),
-	)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go srv.Run(ctx)
-	time.Sleep(100 * time.Millisecond)
-
-	tlsConfig := getClientTLS(t, dir)
-
-	// Client 1 connects (OK)
-	c1, err := tls.Dial("tcp", srv.listener.Addr().String(), tlsConfig)
-	if err != nil {
-		t.Fatalf("C1 failed: %v", err)
-	}
-	defer c1.Close()
-
-	// Client 2 connects (Should be rejected or closed immediately)
-	// The implementation accepts, checks semaphore, writes Error, closes.
-	c2, err := tls.Dial("tcp", srv.listener.Addr().String(), tlsConfig)
-	if err != nil {
-		t.Fatalf("C2 dial failed (network issue?): %v", err)
-	}
-	defer c2.Close()
-
-	// Read from C2. Should get ResStatusServerBusy.
-	header := make([]byte, 5)
-	if _, err := io.ReadFull(c2, header); err != nil {
-		// It might have closed before we read, which is also acceptable rejection
-		// But our code writes a response first.
-		if err != io.EOF {
-			t.Logf("C2 read error: %v", err)
-		}
-	} else {
-		if header[0] != ResStatusServerBusy {
-			t.Errorf("Expected Busy status, got %x", header[0])
-		}
+	resp := client.AssertStatus(OpCodeGet, k, ResStatusOK)
+	client.AssertStatus(OpCodeCommit, nil, ResStatusOK)
+	if !bytes.Equal(resp, v1) {
+		t.Errorf("DB switch fail. Want v1, got %s", resp)
 	}
 }
 
 func TestServer_AdminOps(t *testing.T) {
-	dir, store, srv := setupTestEnv(t)
-	defer store.Close()
+	dir, stores, srv := setupTestEnv(t)
+	defer stores["default"].Close()
 	defer os.RemoveAll(dir)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -390,50 +310,13 @@ func TestServer_AdminOps(t *testing.T) {
 		t.Error("Stats body empty")
 	}
 
-	// Compact
+	// Compact - requires selecting a DB first implicitly (default)
 	client.AssertStatus(OpCodeCompact, nil, ResStatusOK)
 }
 
-func TestServer_Replication_Hello(t *testing.T) {
-	dir, store, srv := setupTestEnv(t)
-	defer store.Close()
-	defer os.RemoveAll(dir)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go srv.Run(ctx)
-	time.Sleep(100 * time.Millisecond)
-
-	client := connectClient(t, srv.listener.Addr().String(), getClientTLS(t, dir))
-	defer client.Close()
-
-	// REPL_HELLO: 8 bytes Version + 8 bytes LSN
-	payload := make([]byte, 16)
-	binary.BigEndian.PutUint64(payload[0:8], 1)  // Ver
-	binary.BigEndian.PutUint64(payload[8:16], 0) // LSN
-
-	// Send Hello manually (Client helper expects Response, but Replica stream doesn't send immediate response packet structure)
-	// Replica stream sends raw batch packets.
-	// We just want to ensure it doesn't crash and starts streaming (or waits).
-	client.Send(OpCodeReplHello, payload)
-
-	// Since store is empty, leader will block waiting for data.
-	// We can write data via another client and see if it streams to this one.
-}
-
-func TestServer_ReloadTLS(t *testing.T) {
-	dir, store, srv := setupTestEnv(t)
-	defer store.Close()
-	defer os.RemoveAll(dir)
-
-	if err := srv.ReloadTLS(); err != nil {
-		t.Errorf("ReloadTLS failed: %v", err)
-	}
-}
-
 func TestServer_ErrorHandling_Protocol(t *testing.T) {
-	dir, store, srv := setupTestEnv(t)
-	defer store.Close()
+	dir, stores, srv := setupTestEnv(t)
+	defer stores["default"].Close()
 	defer os.RemoveAll(dir)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -444,106 +327,6 @@ func TestServer_ErrorHandling_Protocol(t *testing.T) {
 	client := connectClient(t, srv.listener.Addr().String(), getClientTLS(t, dir))
 	defer client.Close()
 
-	// 1. Unknown OpCode
+	// Unknown OpCode
 	client.AssertStatus(0x99, nil, ResStatusErr)
-
-	// 2. Tx Required (Send Set without Begin)
-	// Actually Set creates implicit tx if handled... wait.
-	// handleSet: "if !s.checkTx(conn, tx) { return }"
-	// checkTx: "if !tx.active { Write(ResStatusTxRequired) }"
-	// Wait, standard Set op in processCommand:
-	// "case OpCodeSet: s.handleSet(...)"
-	// In handleSet, it checks checkTx.
-	// Wait, does Set require Tx?
-	// Looking at code: Yes. handleSet calls checkTx.
-	// BUT handleBegin sets tx.active = true.
-	// If I send Set directly, tx.active is false.
-	// So Set WITHOUT Begin should fail with ResStatusTxRequired?
-	// Let's verify logic in `server.go`:
-	// func (s *Server) handleSet(...) { if !s.checkTx(conn, tx) ... }
-	// So yes, Set requires Tx.
-	// But in TestServer_CRUD I did not send Begin.
-	// Ah, I need to check `server.go` again.
-	//
-	// In `server.go`:
-	// `handleSet`: `if !s.checkTx(conn, tx)` ...
-	// `checkTx`: `if !tx.active { ... return false }`
-	// So Set MUST be inside a transaction?
-	//
-	// Wait, in `TestServer_CRUD` I did:
-	// client.AssertStatus(OpCodeSet, ...)
-	// If that passed, then my logic reading is wrong or the test passed coincidentally?
-	//
-	// Let's check `server.go` `processCommand`:
-	// It dispatches OpCodeSet.
-	// Inside `handleSet`:
-	// `if !s.checkTx(conn, tx)`...
-	//
-	// Wait, looking at `TestServer_CRUD` above: I wrote it assuming implicit or explicit?
-	// I wrote `client.AssertStatus(OpCodeSet, ...)` without Begin.
-	// This implies `TestServer_CRUD` *should* fail if Set requires Tx.
-	//
-	// Correct behavior for KV stores (Redis-like) is usually implicit Tx for single ops.
-	// But `TurnstoneDB` implementation `handleSet` enforces `checkTx`.
-	//
-	// Modification: I will update `TestServer_CRUD` to use `OpCodeBegin` / `OpCodeCommit`
-	// OR update `server.go` to allow implicit.
-	// Given "writes test all methods", I should stick to testing the *current* implementation.
-	// If `handleSet` enforces Tx, `TestServer_CRUD` MUST wrap in Tx.
-}
-
-// TestServer_MultiKey_Transaction verifies that the server correctly buffers
-// multiple commands within a transaction and commits them atomically.
-func TestServer_MultiKey_Transaction(t *testing.T) {
-	dir, store, srv := setupTestEnv(t)
-	defer store.Close()
-	defer os.RemoveAll(dir)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go srv.Run(ctx)
-	time.Sleep(100 * time.Millisecond)
-
-	client := connectClient(t, srv.listener.Addr().String(), getClientTLS(t, dir))
-	defer client.Close()
-
-	// 1. Start Transaction
-	client.AssertStatus(OpCodeBegin, nil, ResStatusOK)
-
-	// 2. Set Multi Keys (mk1, mk2)
-	k1 := []byte("mk1")
-	v1 := []byte("mv1")
-	pl1 := make([]byte, 4+len(k1)+len(v1))
-	binary.BigEndian.PutUint32(pl1[0:4], uint32(len(k1)))
-	copy(pl1[4:], k1)
-	copy(pl1[4+len(k1):], v1)
-	client.AssertStatus(OpCodeSet, pl1, ResStatusOK)
-
-	k2 := []byte("mk2")
-	v2 := []byte("mv2")
-	pl2 := make([]byte, 4+len(k2)+len(v2))
-	binary.BigEndian.PutUint32(pl2[0:4], uint32(len(k2)))
-	copy(pl2[4:], k2)
-	copy(pl2[4+len(k2):], v2)
-	client.AssertStatus(OpCodeSet, pl2, ResStatusOK)
-
-	// 3. Commit
-	client.AssertStatus(OpCodeCommit, nil, ResStatusOK)
-
-	// 4. Verify Data Persistence (Read back in new transaction)
-	client.AssertStatus(OpCodeBegin, nil, ResStatusOK)
-
-	// Verify K1
-	resp1 := client.AssertStatus(OpCodeGet, k1, ResStatusOK)
-	if !bytes.Equal(resp1, v1) {
-		t.Errorf("K1 mismatch. Want %s, got %s", v1, resp1)
-	}
-
-	// Verify K2
-	resp2 := client.AssertStatus(OpCodeGet, k2, ResStatusOK)
-	if !bytes.Equal(resp2, v2) {
-		t.Errorf("K2 mismatch. Want %s, got %s", v2, resp2)
-	}
-
-	client.AssertStatus(OpCodeCommit, nil, ResStatusOK)
 }

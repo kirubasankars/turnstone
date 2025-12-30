@@ -12,7 +12,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"runtime/debug"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,114 +20,94 @@ import (
 	"time"
 )
 
-// Server represents the main network listener and connection manager.
-// It handles mTLS termination, concurrency limiting, and protocol parsing.
 type Server struct {
-	store       *Store
-	addr        string
-	metricsAddr string
-	logger      *slog.Logger
-	listener    net.Listener
-
-	// Concurrency Control
-	maxConns    int
-	readOnly    bool
-	sem         chan struct{}  // Semaphore to limit concurrent connections.
-	wg          sync.WaitGroup // WaitGroup to ensure graceful shutdown.
-	totalConns  uint64         // Metric: Total accepted connections.
-	activeConns int64          // Metric: Current active connections.
-	activeTxs   int64          // Metric: Current active transactions.
-
-	// TLS Configuration
+	stores           map[string]*Store
+	defaultDB        string
+	addr             string
+	metricsAddr      string
+	logger           *slog.Logger
+	listener         net.Listener
+	maxConns         int
+	sem              chan struct{}
+	wg               sync.WaitGroup
+	totalConns       uint64
+	activeConns      int64
+	activeTxs        int64
+	txDuration       time.Duration
 	tlsConfig        *tls.Config
 	tlsCertFile      string
 	tlsKeyFile       string
 	tlsCAFile        string
-	currentTLSConfig atomic.Value // Stores *tls.Config for atomic hot-reloading.
+	currentTLSConfig atomic.Value
+	replManager      *ReplicationManager
 }
 
-// NewServer initializes the server with mTLS configuration.
-func NewServer(addr string, metricsAddr string, store *Store, logger *slog.Logger, maxConns int, readOnly bool, tlsCert, tlsKey, tlsCA string) *Server {
+func NewServer(addr, metricsAddr string, stores map[string]*Store, logger *slog.Logger, maxConns int, txDuration time.Duration, tlsCert, tlsKey, tlsCA string, rm *ReplicationManager) (*Server, error) {
 	if tlsCert == "" || tlsKey == "" || tlsCA == "" {
-		logger.Error("Server requires TLS cert, key, and CA file for mTLS")
-		os.Exit(1)
+		return nil, fmt.Errorf("tls cert, key, and ca required")
+	}
+
+	var dbNames []string
+	for k := range stores {
+		dbNames = append(dbNames, k)
+	}
+	sort.Strings(dbNames)
+	defDB := ""
+	if len(dbNames) > 0 {
+		defDB = dbNames[0]
 	}
 
 	s := &Server{
 		addr:        addr,
 		metricsAddr: metricsAddr,
-		store:       store,
+		stores:      stores,
+		defaultDB:   defDB,
 		logger:      logger,
 		maxConns:    maxConns,
-		readOnly:    readOnly,
-		sem:         make(chan struct{}, maxConns), // Buffered channel acts as a semaphore.
+		txDuration:  txDuration,
+		sem:         make(chan struct{}, maxConns),
 		tlsCertFile: tlsCert,
 		tlsKeyFile:  tlsKey,
 		tlsCAFile:   tlsCA,
+		replManager: rm,
 	}
 
-	// Load initial TLS config
-	initialConfig, err := s.loadTLSConfig()
-	if err != nil {
-		logger.Error("Failed to load initial TLS config", "err", err)
-		os.Exit(1)
+	if err := s.ReloadTLS(); err != nil {
+		return nil, err
 	}
-	s.currentTLSConfig.Store(initialConfig)
 
-	// Use GetConfigForClient to allow hot-swapping certificates via SIGHUP.
 	s.tlsConfig = &tls.Config{
 		GetConfigForClient: func(hi *tls.ClientHelloInfo) (*tls.Config, error) {
 			return s.currentTLSConfig.Load().(*tls.Config), nil
 		},
+		MinVersion: tls.VersionTLS12,
+		ClientAuth: tls.RequireAndVerifyClientCert,
 	}
 
-	return s
+	return s, nil
 }
 
-// loadTLSConfig reads certs from disk and builds the TLS config.
-func (s *Server) loadTLSConfig() (*tls.Config, error) {
-	cert, err := tls.LoadX509KeyPair(s.tlsCertFile, s.tlsKeyFile)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load TLS keys: %w", err)
-	}
-
-	caCert, err := os.ReadFile(s.tlsCAFile)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load CA: %w", err)
-	}
-	caCertPool := x509.NewCertPool()
-	if ok := caCertPool.AppendCertsFromPEM(caCert); !ok {
-		return nil, fmt.Errorf("failed to append CA certs")
-	}
-
-	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		ClientCAs:    caCertPool,
-		ClientAuth:   tls.RequireAndVerifyClientCert, // Enforce mTLS
-		MinVersion:   tls.VersionTLS12,
-	}, nil
-}
-
-// ReloadTLS re-reads certificates from disk and updates the active configuration.
 func (s *Server) ReloadTLS() error {
-	newConfig, err := s.loadTLSConfig()
+	cert, err := tls.LoadX509KeyPair(s.tlsCertFile, s.tlsKeyFile)
 	if err != nil {
 		return err
 	}
-	s.currentTLSConfig.Store(newConfig)
+	caCert, err := os.ReadFile(s.tlsCAFile)
+	if err != nil {
+		return err
+	}
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(caCert)
+
+	s.currentTLSConfig.Store(&tls.Config{
+		Certificates: []tls.Certificate{cert},
+		ClientCAs:    pool,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		MinVersion:   tls.VersionTLS12,
+	})
 	return nil
 }
 
-// CloseAll performs a hard close on the storage engine.
-func (s *Server) CloseAll() {
-	if s.store != nil {
-		if err := s.store.Close(); err != nil {
-			s.logger.Error("Failed to close store", "err", err)
-		}
-	}
-}
-
-// Run starts the TCP listener and the main accept loop.
 func (s *Server) Run(ctx context.Context) error {
 	if s.metricsAddr != "" {
 		StartMetricsServer(s.metricsAddr, s, s.logger)
@@ -138,185 +118,148 @@ func (s *Server) Run(ctx context.Context) error {
 		return err
 	}
 	s.listener = ln
-	s.logger.Info("mTLS Server listening", "addr", s.addr, "readonly", s.readOnly, "mode", "wal-fsync")
+	s.logger.Info("Server listening", "addr", s.addr, "dbs", len(s.stores), "default", s.defaultDB)
 
-	// Setup signal handling for config reload
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGHUP)
+	go s.handleSignals(ctx)
 
-	// Goroutine for handling signals
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-sigChan:
-				s.logger.Info("Received SIGHUP. Reloading TLS certificates...")
-				if err := s.ReloadTLS(); err != nil {
-					s.logger.Error("Failed to reload TLS", "err", err)
-				} else {
-					s.logger.Info("TLS certificates reloaded successfully")
-				}
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			if strings.Contains(err.Error(), "closed") {
+				return nil
 			}
+			s.logger.Error("Accept error", "err", err)
+			continue
 		}
-	}()
 
-	acceptErr := make(chan error, 1)
-	go func() {
-		defer close(acceptErr)
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				if strings.Contains(err.Error(), "use of closed network connection") {
-					return
-				}
-				s.logger.Error("Accept error", "err", err)
-				continue
-			}
-			atomic.AddUint64(&s.totalConns, 1)
-
-			// Semaphore pattern to limit concurrency
-			select {
-			case s.sem <- struct{}{}:
-				atomic.AddInt64(&s.activeConns, 1)
-				s.wg.Add(1)
-				go s.handleConnection(ctx, conn)
-			default:
-				s.logger.Warn("Max connections reached")
-				_ = s.writeBinaryResponse(conn, ResStatusServerBusy, []byte("Max connections"))
-				_ = conn.Close()
-			}
+		atomic.AddUint64(&s.totalConns, 1)
+		select {
+		case s.sem <- struct{}{}:
+			atomic.AddInt64(&s.activeConns, 1)
+			s.wg.Add(1)
+			go s.handleConnection(ctx, conn)
+		default:
+			s.writeBinaryResponse(conn, ResStatusServerBusy, []byte("Max connections"))
+			conn.Close()
 		}
-	}()
-
-	<-ctx.Done()
-	s.logger.Info("Shutdown received, draining connections...")
-	_ = ln.Close()
-
-	done := make(chan struct{})
-	go func() {
-		s.wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		s.logger.Info("Connections drained")
-	case <-time.After(ShutdownTimeout):
-		s.logger.Warn("Shutdown timeout, forcing exit")
 	}
-	return nil
 }
 
-// handleConnection manages the lifecycle of a single client connection.
-// It acts as the protocol event loop.
-func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
-	tx := &txState{}
+func (s *Server) handleSignals(ctx context.Context) {
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGHUP)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-sig:
+			s.logger.Info("Reloading TLS...")
+			if err := s.ReloadTLS(); err != nil {
+				s.logger.Error("TLS reload failed", "err", err)
+			}
+		}
+	}
+}
 
+type connState struct {
+	dbName   string
+	db       *Store
+	active   bool
+	readOnly bool
+	deadline time.Time
+	readLSN  uint64
+	ops      []bufferedOp
+}
+
+func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 	defer func() {
-		if r := recover(); r != nil {
-			s.logger.Error("Panic", "stack", string(debug.Stack()))
-		}
-		if tx.active {
-			s.abortTx(tx)
-		}
 		conn.Close()
 		atomic.AddInt64(&s.activeConns, -1)
 		s.wg.Done()
 		<-s.sem
 	}()
 
+	state := &connState{
+		dbName: s.defaultDB,
+		db:     s.stores[s.defaultDB],
+	}
+
 	r := bufio.NewReader(conn)
-	headerBuf := make([]byte, ProtoHeaderSize)
+	header := make([]byte, ProtoHeaderSize)
 
 	for {
 		if ctx.Err() != nil {
 			return
 		}
+		conn.SetReadDeadline(time.Now().Add(IdleTimeout))
 
-		if err := conn.SetReadDeadline(time.Now().Add(IdleTimeout)); err != nil {
+		if _, err := io.ReadFull(r, header); err != nil {
 			return
 		}
 
-		if _, err := io.ReadFull(r, headerBuf); err != nil {
-			if err != io.EOF {
-				s.logger.Debug("Connection read error", "err", err)
-			}
-			return
-		}
-
-		opCode := headerBuf[0]
-		payloadLen := binary.BigEndian.Uint32(headerBuf[1:])
-
+		opCode := header[0]
+		payloadLen := binary.BigEndian.Uint32(header[1:])
 		if payloadLen > MaxCommandSize {
-			_ = s.writeBinaryResponse(conn, ResStatusEntityTooLarge, []byte("Payload too large"))
+			s.writeBinaryResponse(conn, ResStatusEntityTooLarge, nil)
 			return
 		}
 
-		var payload []byte
-		if payloadLen > 0 {
-			payload = make([]byte, payloadLen)
-			if _, err := io.ReadFull(r, payload); err != nil {
-				return
-			}
-		}
-
-		if err := conn.SetWriteDeadline(time.Now().Add(DefaultWriteTimeout)); err != nil {
+		payload := make([]byte, payloadLen)
+		if _, err := io.ReadFull(r, payload); err != nil {
 			return
 		}
 
-		shouldClose, err := s.processCommand(conn, r, opCode, payload, tx)
-		if err != nil {
-			s.logger.Error("Command processing error", "err", err)
-		}
-		if shouldClose {
+		conn.SetWriteDeadline(time.Now().Add(DefaultWriteTimeout))
+
+		if s.dispatchCommand(conn, r, opCode, payload, state) {
 			return
 		}
 	}
 }
 
-// processCommand dispatches the opcode to the specific handler.
-// IMPORTANT: We pass *bufio.Reader to ensure any buffered data (like ACKs in replication)
-// is not lost when switching handlers.
-func (s *Server) processCommand(conn net.Conn, r *bufio.Reader, opCode byte, payload []byte, tx *txState) (bool, error) {
-	if tx.active {
-		switch opCode {
-		case OpCodePing, OpCodeQuit, OpCodeStat, OpCodeReplHello:
-			_ = s.writeBinaryResponse(conn, ResStatusErr, []byte("Command not allowed in transaction"))
-			return false, nil
-		}
+func (s *Server) dispatchCommand(conn net.Conn, r *bufio.Reader, opCode byte, payload []byte, st *connState) bool {
+	// Guard active transactions
+	if st.active && !isTxAllowedOp(opCode) {
+		s.writeBinaryResponse(conn, ResStatusErr, []byte("Tx active"))
+		return false
 	}
 
 	switch opCode {
-	case OpCodeBegin:
-		s.handleBegin(conn, tx)
-	case OpCodeCommit:
-		s.handleEnd(conn, tx)
-	case OpCodeAbort:
-		s.handleAbort(conn, tx)
-	case OpCodeGet:
-		s.handleGet(conn, payload, tx)
-	case OpCodeSet:
-		s.handleSet(conn, payload, tx)
-	case OpCodeDel:
-		s.handleDelete(conn, payload, tx)
-	case OpCodeStat:
-		s.handleStat(conn, tx)
-	case OpCodeCompact:
-		s.handleCompact(conn)
-	case OpCodeReplHello:
-		// Pass the buffered reader to handle replication ACKs
-		s.HandleReplicaConnection(conn, r, payload)
-		return true, nil
 	case OpCodePing:
-		_ = s.writeBinaryResponse(conn, ResStatusOK, []byte("PONG"))
+		s.writeBinaryResponse(conn, ResStatusOK, []byte("PONG"))
 	case OpCodeQuit:
-		return true, nil
+		return true
+	case OpCodeSelect:
+		s.handleSelect(conn, payload, st)
+	case OpCodeBegin:
+		s.handleBegin(conn, st)
+	case OpCodeCommit:
+		s.handleCommit(conn, st)
+	case OpCodeAbort:
+		s.handleAbort(conn, st)
+	case OpCodeGet:
+		s.handleGet(conn, payload, st)
+	case OpCodeSet:
+		s.handleSet(conn, payload, st)
+	case OpCodeDel:
+		s.handleDel(conn, payload, st)
+	case OpCodeCompact:
+		s.handleCompact(conn, st)
+	case OpCodeStat:
+		s.handleStat(conn)
+	case OpCodeReplicaOf:
+		s.handleReplicaOf(conn, payload, st)
+	case OpCodeReplHello:
+		s.HandleReplicaConnection(conn, r, payload)
+		return true
 	default:
-		_ = s.writeBinaryResponse(conn, ResStatusErr, []byte("Unknown OpCode"))
+		s.writeBinaryResponse(conn, ResStatusErr, []byte("Unknown OpCode"))
 	}
+	return false
+}
 
-	return false, nil
+func isTxAllowedOp(op byte) bool {
+	return op == OpCodeGet || op == OpCodeSet || op == OpCodeDel || op == OpCodeCommit || op == OpCodeAbort
 }
 
 func (s *Server) writeBinaryResponse(w io.Writer, status byte, body []byte) error {
@@ -327,187 +270,260 @@ func (s *Server) writeBinaryResponse(w io.Writer, status byte, body []byte) erro
 		return err
 	}
 	if len(body) > 0 {
-		if _, err := w.Write(body); err != nil {
-			return err
-		}
+		_, err := w.Write(body)
+		return err
 	}
 	return nil
 }
 
-// checkTx ensures a transaction is active and not timed out.
-func (s *Server) checkTx(w io.Writer, tx *txState) bool {
-	if !tx.active {
-		_ = s.writeBinaryResponse(w, ResStatusTxRequired, []byte("Transaction required"))
-		return false
-	}
-	if time.Now().After(tx.deadline) {
-		s.abortTx(tx)
-		_ = s.writeBinaryResponse(w, ResStatusTxTimeout, []byte("Transaction timed out"))
-		return false
-	}
-	return true
-}
+// --- Handlers ---
 
-// abortTx rolls back the transaction state.
-func (s *Server) abortTx(tx *txState) {
-	if tx.active {
-		tx.active = false
-		atomic.AddInt64(&s.activeTxs, -1)
-		s.store.ReleaseSnapshot(tx.readLSN)
-		tx.ops = nil
+func (s *Server) handleSelect(w io.Writer, payload []byte, st *connState) {
+	name := string(payload)
+	if store, ok := s.stores[name]; ok {
+		st.dbName = name
+		st.db = store
+		s.writeBinaryResponse(w, ResStatusOK, nil)
+	} else {
+		s.writeBinaryResponse(w, ResStatusErr, []byte("DB not found"))
 	}
 }
 
-func (s *Server) handleBegin(w io.Writer, tx *txState) {
-	if tx.active {
-		s.abortTx(tx)
+func (s *Server) handleBegin(w io.Writer, st *connState) {
+	if st.db == nil {
+		s.writeBinaryResponse(w, ResStatusErr, []byte("No DB selected"))
+		return
 	}
-	tx.active = true
-	tx.readOnly = true
+	if st.active {
+		s.abortTx(st)
+	}
+	st.active = true
+	st.readOnly = true
+	st.deadline = time.Now().Add(s.txDuration)
+	st.readLSN = st.db.AcquireSnapshot()
+	st.ops = make([]bufferedOp, 0)
 	atomic.AddInt64(&s.activeTxs, 1)
-	tx.readLSN = s.store.AcquireSnapshot()
-	tx.deadline = time.Now().Add(MaxTxDuration)
-	tx.ops = make([]bufferedOp, 0)
-	_ = s.writeBinaryResponse(w, ResStatusOK, nil)
+	s.writeBinaryResponse(w, ResStatusOK, nil)
 }
 
-func (s *Server) handleEnd(w io.Writer, tx *txState) {
-	if !s.checkTx(w, tx) {
+func (s *Server) handleCommit(w io.Writer, st *connState) {
+	if !st.active {
+		s.writeBinaryResponse(w, ResStatusTxRequired, nil)
+		return
+	}
+	defer s.abortTx(st)
+
+	if time.Now().After(st.deadline) {
+		s.writeBinaryResponse(w, ResStatusTxTimeout, nil)
+		return
+	}
+	if st.readOnly || len(st.ops) == 0 {
+		s.writeBinaryResponse(w, ResStatusOK, nil)
 		return
 	}
 
-	if tx.readOnly || len(tx.ops) == 0 {
-		s.abortTx(tx)
-		_ = s.writeBinaryResponse(w, ResStatusOK, nil)
-		return
-	}
-
-	if s.readOnly {
-		s.abortTx(tx)
-		_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Server is read-only"))
-		return
-	}
-
-	if err := s.store.ApplyBatch(tx.ops, tx.readLSN); err != nil {
-		if err == ErrConflict {
-			_ = s.writeBinaryResponse(w, ResStatusTxConflict, []byte("Conflict detected"))
-		} else if err == ErrMemoryLimitExceeded {
-			_ = s.writeBinaryResponse(w, ResStatusMemoryLimit, []byte("Memory limit exceeded"))
-		} else {
-			_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Internal commit failure"))
+	// Prevent writes to System DB "0"
+	if st.dbName == "0" {
+		hasWrites := false
+		for _, op := range st.ops {
+			if op.opType == OpJournalSet || op.opType == OpJournalDelete {
+				hasWrites = true
+				break
+			}
 		}
-		s.abortTx(tx)
+		if hasWrites {
+			s.writeBinaryResponse(w, ResStatusErr, []byte("System DB '0' is read-only"))
+			return
+		}
+	}
+
+	if err := st.db.ApplyBatch(st.ops, st.readLSN); err != nil {
+		status := byte(ResStatusErr)
+		if err == ErrConflict {
+			status = ResStatusTxConflict
+		}
+		s.writeBinaryResponse(w, status, []byte(err.Error()))
 		return
 	}
-	s.abortTx(tx)
-	_ = s.writeBinaryResponse(w, ResStatusOK, nil)
+	s.writeBinaryResponse(w, ResStatusOK, nil)
 }
 
-func (s *Server) handleAbort(w io.Writer, tx *txState) {
-	if !s.checkTx(w, tx) {
-		return
+func (s *Server) abortTx(st *connState) {
+	if st.active {
+		if st.db != nil {
+			st.db.ReleaseSnapshot(st.readLSN)
+		}
+		st.active = false
+		st.ops = nil
+		atomic.AddInt64(&s.activeTxs, -1)
 	}
-	s.abortTx(tx)
-	_ = s.writeBinaryResponse(w, ResStatusOK, nil)
 }
 
-func (s *Server) handleGet(w io.Writer, payload []byte, tx *txState) {
-	if len(payload) == 0 {
-		_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Missing Key"))
+func (s *Server) handleAbort(w io.Writer, st *connState) {
+	s.abortTx(st)
+	s.writeBinaryResponse(w, ResStatusOK, nil)
+}
+
+func (s *Server) handleGet(w io.Writer, payload []byte, st *connState) {
+	if st.db == nil {
+		s.writeBinaryResponse(w, ResStatusErr, []byte("No DB selected"))
 		return
 	}
-	if !s.checkTx(w, tx) {
+	if !st.active {
+		s.writeBinaryResponse(w, ResStatusTxRequired, nil)
 		return
 	}
 	key := string(payload)
-	tx.ops = append(tx.ops, bufferedOp{opType: OpJournalGet, key: key})
+	st.ops = append(st.ops, bufferedOp{opType: OpJournalGet, key: key})
 
-	// Read-your-own-writes: Check transaction buffer first
-	for i := len(tx.ops) - 2; i >= 0; i-- {
-		op := tx.ops[i]
-		if op.key == key && op.opType != OpJournalGet {
-			if op.opType == OpJournalDelete {
-				_ = s.writeBinaryResponse(w, ResStatusNotFound, nil)
+	// Read-your-own-writes
+	for i := len(st.ops) - 2; i >= 0; i-- {
+		if st.ops[i].key == key && st.ops[i].opType != OpJournalGet {
+			if st.ops[i].opType == OpJournalDelete {
+				s.writeBinaryResponse(w, ResStatusNotFound, nil)
 			} else {
-				_ = s.writeBinaryResponse(w, ResStatusOK, op.val)
+				s.writeBinaryResponse(w, ResStatusOK, st.ops[i].val)
 			}
 			return
 		}
 	}
 
-	// Fetch from store using Snapshot Isolation
-	val, err := s.store.Get(key, tx.readLSN)
-	if err != nil {
-		if err == ErrKeyNotFound {
-			_ = s.writeBinaryResponse(w, ResStatusNotFound, nil)
-		} else if err == ErrConflict {
-			_ = s.writeBinaryResponse(w, ResStatusTxConflict, []byte("Snapshot lost"))
-			s.abortTx(tx)
-		} else {
-			_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Internal Error"))
-		}
-		return
+	val, err := st.db.Get(key, st.readLSN)
+	if err == ErrKeyNotFound {
+		s.writeBinaryResponse(w, ResStatusNotFound, nil)
+	} else if err != nil {
+		s.writeBinaryResponse(w, ResStatusErr, []byte(err.Error()))
+	} else {
+		s.writeBinaryResponse(w, ResStatusOK, val)
 	}
-	_ = s.writeBinaryResponse(w, ResStatusOK, val)
 }
 
-func (s *Server) handleSet(conn net.Conn, payload []byte, tx *txState) {
-	if s.readOnly {
-		_ = s.writeBinaryResponse(conn, ResStatusErr, []byte("Server is read-only"))
+func (s *Server) handleSet(w io.Writer, payload []byte, st *connState) {
+	if st.db == nil {
+		s.writeBinaryResponse(w, ResStatusErr, []byte("No DB selected"))
 		return
 	}
-	if !s.checkTx(conn, tx) {
+	if st.dbName == "0" {
+		s.writeBinaryResponse(w, ResStatusErr, []byte("System DB '0' is read-only"))
+		return
+	}
+	if !st.active {
+		s.writeBinaryResponse(w, ResStatusTxRequired, nil)
 		return
 	}
 	if len(payload) < 4 {
-		_ = s.writeBinaryResponse(conn, ResStatusErr, []byte("Bad format"))
+		s.writeBinaryResponse(w, ResStatusErr, nil)
 		return
 	}
-	keyLen := int(binary.BigEndian.Uint32(payload[0:4]))
-	if len(payload) < 4+keyLen {
-		_ = s.writeBinaryResponse(conn, ResStatusErr, []byte("Short Payload"))
-		return
-	}
-	key := string(payload[4 : 4+keyLen])
-	val := payload[4+keyLen:]
+	kLen := binary.BigEndian.Uint32(payload[:4])
+	key := string(payload[4 : 4+kLen])
+	val := payload[4+kLen:]
 
 	valCopy := make([]byte, len(val))
 	copy(valCopy, val)
-
-	tx.readOnly = false
-	tx.ops = append(tx.ops, bufferedOp{opType: OpJournalSet, key: key, val: valCopy})
-	_ = s.writeBinaryResponse(conn, ResStatusOK, nil)
+	st.ops = append(st.ops, bufferedOp{opType: OpJournalSet, key: key, val: valCopy})
+	st.readOnly = false
+	s.writeBinaryResponse(w, ResStatusOK, nil)
 }
 
-func (s *Server) handleDelete(w io.Writer, payload []byte, tx *txState) {
-	if s.readOnly {
-		_ = s.writeBinaryResponse(w, ResStatusErr, []byte("Server is read-only"))
+func (s *Server) handleDel(w io.Writer, payload []byte, st *connState) {
+	if st.db == nil {
+		s.writeBinaryResponse(w, ResStatusErr, []byte("No DB selected"))
 		return
 	}
-	if !s.checkTx(w, tx) {
+	if st.dbName == "0" {
+		s.writeBinaryResponse(w, ResStatusErr, []byte("System DB '0' is read-only"))
 		return
 	}
-	key := string(payload)
-	tx.readOnly = false
-	tx.ops = append(tx.ops, bufferedOp{opType: OpJournalDelete, key: key})
-	_ = s.writeBinaryResponse(w, ResStatusOK, nil)
+	if !st.active {
+		s.writeBinaryResponse(w, ResStatusTxRequired, nil)
+		return
+	}
+	st.ops = append(st.ops, bufferedOp{opType: OpJournalDelete, key: string(payload)})
+	st.readOnly = false
+	s.writeBinaryResponse(w, ResStatusOK, nil)
 }
 
-func (s *Server) handleCompact(w io.Writer) {
-	if err := s.store.Compact(); err != nil {
-		_ = s.writeBinaryResponse(w, ResStatusErr, []byte(err.Error()))
+func (s *Server) handleCompact(w io.Writer, st *connState) {
+	if st.db == nil {
+		s.writeBinaryResponse(w, ResStatusErr, []byte("No DB selected"))
 		return
 	}
-	_ = s.writeBinaryResponse(w, ResStatusOK, []byte("Compaction triggered"))
+	if err := st.db.Compact(); err != nil {
+		s.writeBinaryResponse(w, ResStatusErr, []byte(err.Error()))
+	} else {
+		s.writeBinaryResponse(w, ResStatusOK, nil)
+	}
 }
 
-func (s *Server) handleStat(w io.Writer, tx *txState) {
-	stats := s.store.Stats()
-	active := atomic.LoadInt64(&s.activeConns)
+func (s *Server) handleStat(w io.Writer) {
+	var sb strings.Builder
+	for name, db := range s.stores {
+		// Filter out System DB from stats to satisfy "excludes in config for database count" request
+		if name == "0" {
+			continue
+		}
+		stats := db.Stats()
+		sb.WriteString(fmt.Sprintf("[%s] Keys:%d Index:%d NextLSN:%d | ", name, stats.KeyCount, stats.IndexSizeBytes, stats.NextLSN))
+	}
+	s.writeBinaryResponse(w, ResStatusOK, []byte(sb.String()))
+}
 
-	msg := fmt.Sprintf("Keys:%d Uptime:%s Conns:%d PendingOps:%d IndexSize:%d Offset:%d LSN:%d Conflicts:%d Recovery:%s",
-		stats.KeyCount, stats.Uptime, active, stats.PendingOps, stats.IndexSizeBytes, stats.Offset, stats.NextLSN,
-		stats.ConflictCount, stats.RecoveryDuration)
+// handleReplicaOf handles the admin command to configure replication dynamically.
+// Payload format: [AddrLen(4)][AddrBytes][RemoteDBNameBytes]
+func (s *Server) handleReplicaOf(w io.Writer, payload []byte, st *connState) {
+	if s.replManager == nil {
+		s.writeBinaryResponse(w, ResStatusErr, []byte("Replication client not configured"))
+		return
+	}
+	if st.db == nil {
+		s.writeBinaryResponse(w, ResStatusErr, []byte("No DB selected"))
+		return
+	}
 
-	_ = s.writeBinaryResponse(w, ResStatusOK, []byte(msg))
+	if st.dbName == "0" {
+		s.writeBinaryResponse(w, ResStatusErr, []byte("System DB '0' cannot be replicated"))
+		return
+	}
+
+	if len(payload) < 4 {
+		s.writeBinaryResponse(w, ResStatusErr, []byte("Invalid payload"))
+		return
+	}
+
+	addrLen := binary.BigEndian.Uint32(payload[:4])
+	if len(payload) < 4+int(addrLen) {
+		s.writeBinaryResponse(w, ResStatusErr, []byte("Invalid payload length"))
+		return
+	}
+
+	addr := string(payload[4 : 4+addrLen])
+	remoteDB := string(payload[4+addrLen:])
+
+	// Empty Address signals STOP REPLICATION
+	if addr == "" {
+		s.replManager.StopReplication(st.dbName)
+		s.logger.Info("ReplicaOf Stop Command", "local_db", st.dbName)
+		s.writeBinaryResponse(w, ResStatusOK, []byte("Replication stopped"))
+		return
+	}
+
+	if remoteDB == "" {
+		s.writeBinaryResponse(w, ResStatusErr, []byte("Remote DB name required"))
+		return
+	}
+
+	s.logger.Info("ReplicaOf Command", "local_db", st.dbName, "remote_addr", addr, "remote_db", remoteDB)
+	s.replManager.AddReplica(st.dbName, addr, remoteDB)
+
+	s.writeBinaryResponse(w, ResStatusOK, []byte("Replication started"))
+}
+
+func (s *Server) CloseAll() {
+	if s.listener != nil {
+		s.listener.Close()
+	}
+	for _, store := range s.stores {
+		store.Close()
+	}
 }

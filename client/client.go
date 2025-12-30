@@ -26,16 +26,21 @@ const ProtoHeaderSize = 5
 // OpCodes define the available commands in the TurnstoneDB wire protocol.
 // These must match the server-side definitions in constants.go.
 const (
-	OpCodePing    = 0x01 // Health check. Expects "PONG".
-	OpCodeGet     = 0x02 // Retrieve a value. Payload: Key bytes.
-	OpCodeSet     = 0x03 // Store a value. Payload: [KeyLen(4)|Key|Value].
-	OpCodeDel     = 0x04 // Delete a value. Payload: Key bytes.
-	OpCodeBegin   = 0x10 // Start a new transaction context.
-	OpCodeCommit  = 0x11 // Commit the current transaction.
-	OpCodeAbort   = 0x12 // Rollback the current transaction.
-	OpCodeStat    = 0x20 // Retrieve server statistics.
-	OpCodeCompact = 0x31 // Trigger a background compaction job.
-	OpCodeQuit    = 0xFF // Gracefully close the connection.
+	OpCodePing      = 0x01 // Health check. Expects "PONG".
+	OpCodeGet       = 0x02 // Retrieve a value. Payload: Key bytes.
+	OpCodeSet       = 0x03 // Store a value. Payload: [KeyLen(4)|Key|Value].
+	OpCodeDel       = 0x04 // Delete a value. Payload: Key bytes.
+	OpCodeSelect    = 0x05 // Select the active database. Payload: DB Name bytes.
+	OpCodeBegin     = 0x10 // Start a new transaction context.
+	OpCodeCommit    = 0x11 // Commit the current transaction.
+	OpCodeAbort     = 0x12 // Rollback the current transaction.
+	OpCodeStat      = 0x20 // Retrieve server statistics.
+	OpCodeCompact   = 0x31 // Trigger a background compaction job.
+	OpCodeReplicaOf = 0x32 // Set replication source. Payload: [AddrLen][Addr][RemoteDB].
+	OpCodeReplHello = 0x50 // Replication Handshake (Internal).
+	OpCodeReplBatch = 0x51 // Replication Batch (Internal).
+	OpCodeReplAck   = 0x52 // Replication Ack (Internal).
+	OpCodeQuit      = 0xFF // Gracefully close the connection.
 )
 
 // Response Codes indicate the status of a request.
@@ -304,6 +309,28 @@ func (c *Client) roundTrip(op byte, payload []byte) ([]byte, error) {
 // Ping sends a health check request. Returns nil if the server responds "PONG".
 func (c *Client) Ping() error {
 	_, err := c.roundTrip(OpCodePing, nil)
+	return err
+}
+
+// Select changes the active database for the current connection.
+func (c *Client) Select(dbName string) error {
+	_, err := c.roundTrip(OpCodeSelect, []byte(dbName))
+	return err
+}
+
+// ReplicaOf configures the currently selected database to replicate from a remote source.
+// sourceAddr is "host:port", sourceDB is the name of the database on the remote server.
+func (c *Client) ReplicaOf(sourceAddr, sourceDB string) error {
+	// Protocol: [AddrLen(4)][AddrBytes][RemoteDBNameBytes]
+	addrBytes := []byte(sourceAddr)
+	dbBytes := []byte(sourceDB)
+	payload := make([]byte, 4+len(addrBytes)+len(dbBytes))
+
+	binary.BigEndian.PutUint32(payload[0:4], uint32(len(addrBytes)))
+	copy(payload[4:], addrBytes)
+	copy(payload[4+len(addrBytes):], dbBytes)
+
+	_, err := c.roundTrip(OpCodeReplicaOf, payload)
 	return err
 }
 

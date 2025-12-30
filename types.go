@@ -5,22 +5,31 @@ import (
 	"time"
 )
 
-// StoreStats holds a snapshot of internal metrics exposed via OpCodeStat.
+// Checkpoint maps a Log Sequence Number (LogID) to a physical WAL offset.
+type Checkpoint struct {
+	LogID  uint64 // The physical sequence number in the WAL.
+	Offset int64  // The byte offset in the file.
+}
+
+// ReplicaState tracks the progress of a connected follower.
+type ReplicaState struct {
+	LogID    uint64 // The last LogID acknowledged by the replica.
+	LastSeen time.Time
+}
+
+// StoreStats holds a snapshot of internal metrics.
 type StoreStats struct {
-	KeyCount         int
-	IndexSizeBytes   int64 // Estimated memory usage of the index.
-	Uptime           string
-	ActiveSnapshots  int // Number of active readers.
-	Offset           int64
-	NextLSN          uint64
-	ConflictCount    int64
-	RecoveryDuration time.Duration
-
-	// Backpressure Metrics
-	PendingOps    int // Current depth of the write queue.
-	QueueCapacity int // Max capacity of the write queue.
-
-	// Day 2 / Operational Metrics
+	KeyCount               int
+	IndexSizeBytes         int64
+	Uptime                 string
+	ActiveSnapshots        int
+	Offset                 int64
+	NextLSN                uint64
+	NextLogID              uint64
+	ConflictCount          int64
+	RecoveryDuration       time.Duration
+	PendingOps             int
+	QueueCapacity          int
 	BytesWritten           int64
 	BytesRead              int64
 	SlowOps                int64
@@ -35,26 +44,30 @@ type bufferedOp struct {
 	header [HeaderSize]byte // Pre-allocated header for serializing.
 }
 
-// request wraps a client's transaction for processing by the single-writer loop in Store.
+// request wraps a client's transaction for processing by the single-writer loop.
 type request struct {
-	ops           []bufferedOp // Contains ALL ops (Gets + Sets + Deletes).
-	resp          chan error   // Channel to return the result to the goroutine.
-	opLens        []int        // Calculated lengths of entries in the journal.
-	readLSN       uint64       // The snapshot LSN this transaction read from (for conflict checks).
-	cancelled     atomic.Bool  // Atomic flag to signal timeout/cancellation.
-	isCompaction  bool         // Flag to indicate this is a maintenance rewrite (preserve LSN).
-	isReplication bool         // Flag to indicate this is a replication batch (preserve LSN).
-
-	// accessMap is derived from ops.
-	// It is the set of ALL keys touched by the transaction (Read + Write) used for conflict detection.
-	accessMap map[string]struct{}
+	ops           []bufferedOp        // Contains ALL ops.
+	resp          chan error          // Channel to return result.
+	opLengths     []int               // Calculated lengths for serialization.
+	readLSN       uint64              // Snapshot LSN.
+	cancelled     atomic.Bool         // Cancellation flag.
+	isCompaction  bool                // Maintenance flag.
+	isReplication bool                // Replication flag.
+	accessMap     map[string]struct{} // Read/Write set for conflict detection.
 }
 
-// txState tracks the state of an active client transaction context.
-type txState struct {
-	active   bool
-	readOnly bool // If true, SET/DEL operations are forbidden.
-	deadline time.Time
-	readLSN  uint64
-	ops      []bufferedOp // The complete history of the transaction.
+// LogEntry is the logical op for replication transport.
+type LogEntry struct {
+	LogID  uint64
+	LSN    uint64
+	OpType uint8
+	Key    []byte
+	Value  []byte
+}
+
+// replPacket is an internal struct for multiplexing replication streams.
+type replPacket struct {
+	dbName string
+	data   []byte // Raw encoded batch
+	count  uint32
 }
