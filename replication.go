@@ -21,6 +21,7 @@ var ReplicaSendTimeout = 5 * time.Second
 func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []byte) {
 	// 1. Parse Hello: [Ver:4][NumDBs:4] ... [NameLen:4][Name][LogID:8]
 	if len(payload) < 8 {
+		s.logger.Error("HandleReplicaConnection: payload too short for header")
 		return
 	}
 	count := binary.BigEndian.Uint32(payload[4:8])
@@ -35,11 +36,13 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 
 	for i := 0; i < int(count); i++ {
 		if cursor+4 > len(payload) {
+			s.logger.Error("HandleReplicaConnection: payload truncated reading name len", "replica", replicaID)
 			return
 		}
 		nLen := int(binary.BigEndian.Uint32(payload[cursor : cursor+4]))
 		cursor += 4
 		if cursor+nLen+8 > len(payload) {
+			s.logger.Error("HandleReplicaConnection: payload truncated reading name/logID", "replica", replicaID)
 			return
 		}
 		name := string(payload[cursor : cursor+nLen])
@@ -49,8 +52,11 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 		subs = append(subs, subReq{name, logID})
 
 		if st, ok := s.stores[name]; ok {
+			s.logger.Info("Replica subscribed", "replica", replicaID, "db", name, "startLogID", logID)
 			st.RegisterReplica(replicaID, logID)
 			defer st.UnregisterReplica(replicaID)
+		} else {
+			s.logger.Warn("Replica requested unknown db", "replica", replicaID, "db", name)
 		}
 	}
 
@@ -73,6 +79,7 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 		go func(name string, st *Store, startLogID uint64) {
 			defer wg.Done()
 			if err := s.streamDB(name, st, startLogID, outCh, done); err != nil {
+				s.logger.Error("StreamDB failed", "db", name, "err", err)
 				// Non-blocking send to avoid hanging if main loop is gone
 				select {
 				case errCh <- err:
@@ -89,12 +96,16 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 		h := make([]byte, 5)
 		for {
 			if _, err := io.ReadFull(r, h); err != nil {
+				if err != io.EOF {
+					s.logger.Error("Replica ACK reader failed", "replica", replicaID, "err", err)
+				}
 				return
 			}
 			if h[0] == OpCodeReplAck {
 				ln := binary.BigEndian.Uint32(h[1:])
 				b := make([]byte, ln)
 				if _, err := io.ReadFull(r, b); err != nil {
+					s.logger.Error("Replica ACK body read failed", "replica", replicaID, "err", err)
 					return
 				}
 
@@ -104,6 +115,7 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 						dbName := string(b[4 : 4+nL])
 						logID := binary.BigEndian.Uint64(b[4+nL:])
 						if st, ok := s.stores[dbName]; ok {
+							s.logger.Debug("Received ACK", "replica", replicaID, "db", dbName, "logID", logID)
 							st.UpdateReplicaLogID(replicaID, logID)
 						}
 					}
@@ -120,6 +132,7 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 			return
 
 		case p := <-outCh:
+			s.logger.Debug("Sending batch to replica", "replica", replicaID, "db", p.dbName, "count", p.count, "bytes", len(p.data))
 			// Frame: [OpCodeReplBatch][TotalLen] [DBNameLen][DBName][Count][BatchData...]
 			totalLen := 4 + len(p.dbName) + 4 + len(p.data)
 			header := make([]byte, 5)
@@ -128,25 +141,30 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 
 			conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if _, err := conn.Write(header); err != nil {
+				s.logger.Error("Failed to write batch header", "replica", replicaID, "err", err)
 				return
 			}
 
 			nameH := make([]byte, 4)
 			binary.BigEndian.PutUint32(nameH, uint32(len(p.dbName)))
 			if _, err := conn.Write(nameH); err != nil {
+				s.logger.Error("Failed to write batch dbname len", "replica", replicaID, "err", err)
 				return
 			}
 			if _, err := conn.Write([]byte(p.dbName)); err != nil {
+				s.logger.Error("Failed to write batch dbname", "replica", replicaID, "err", err)
 				return
 			}
 
 			cntH := make([]byte, 4)
 			binary.BigEndian.PutUint32(cntH, p.count)
 			if _, err := conn.Write(cntH); err != nil {
+				s.logger.Error("Failed to write batch count", "replica", replicaID, "err", err)
 				return
 			}
 
 			if _, err := conn.Write(p.data); err != nil {
+				s.logger.Error("Failed to write batch data", "replica", replicaID, "err", err)
 				return
 			}
 		}
@@ -155,6 +173,7 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 
 func (s *Server) streamDB(name string, store *Store, minLogID uint64, outCh chan<- replPacket, done <-chan struct{}) error {
 	startOffset := store.FindOffsetForLogID(minLogID)
+	s.logger.Info("StreamDB started", "db", name, "minLogID", minLogID, "startOffset", startOffset)
 	curr := startOffset
 	buf := make([]byte, 1024*1024)
 	batchBuf := new(bytes.Buffer)
@@ -277,10 +296,15 @@ func (s *Server) streamDB(name string, store *Store, minLogID uint64, outCh chan
 
 // --- FOLLOWER SIDE (Manager) ---
 
+type ReplicaSource struct {
+	LocalDB  string
+	RemoteDB string
+}
+
 // ReplicationManager handles shared connections to upstream servers.
 type ReplicationManager struct {
 	mu         sync.Mutex
-	peers      map[string][]string // Address -> []DBName
+	peers      map[string][]ReplicaSource // Address -> []ReplicaSource
 	cancelFunc map[string]context.CancelFunc
 	stores     map[string]*Store
 	tlsConf    *tls.Config
@@ -289,7 +313,7 @@ type ReplicationManager struct {
 
 func NewReplicationManager(stores map[string]*Store, tlsConf *tls.Config, logger *slog.Logger) *ReplicationManager {
 	return &ReplicationManager{
-		peers:      make(map[string][]string),
+		peers:      make(map[string][]ReplicaSource),
 		cancelFunc: make(map[string]context.CancelFunc),
 		stores:     stores,
 		tlsConf:    tlsConf,
@@ -314,20 +338,20 @@ func (rm *ReplicationManager) AddReplica(dbName, sourceAddr, sourceDB string) {
 	dbs, _ := rm.peers[sourceAddr]
 	found := false
 	for _, db := range dbs {
-		if db == dbName {
+		if db.LocalDB == dbName {
 			found = true
 			break
 		}
 	}
 
 	if !found {
-		rm.peers[sourceAddr] = append(rm.peers[sourceAddr], dbName)
+		rm.peers[sourceAddr] = append(rm.peers[sourceAddr], ReplicaSource{LocalDB: dbName, RemoteDB: sourceDB})
 		// We need to restart the connection to update the subscription list.
 		if cancel, exists := rm.cancelFunc[sourceAddr]; exists {
 			cancel() // Stop existing loop
 		}
 		rm.spawnConnection(sourceAddr)
-		rm.logger.Info("Added replica source", "db", dbName, "source", sourceAddr)
+		rm.logger.Info("Added replica source", "db", dbName, "source", sourceAddr, "remote_db", sourceDB)
 	}
 }
 
@@ -337,10 +361,10 @@ func (rm *ReplicationManager) StopReplication(dbName string) {
 
 	// Iterate through all peers to find where this DB is being replicated from
 	for addr, dbs := range rm.peers {
-		newDBs := make([]string, 0, len(dbs))
+		newDBs := make([]ReplicaSource, 0, len(dbs))
 		changed := false
 		for _, db := range dbs {
-			if db != dbName {
+			if db.LocalDB != dbName {
 				newDBs = append(newDBs, db)
 			} else {
 				changed = true
@@ -390,7 +414,7 @@ func (rm *ReplicationManager) maintainConnection(ctx context.Context, addr strin
 			rm.mu.Unlock()
 			return
 		}
-		dbs := make([]string, len(rm.peers[addr]))
+		dbs := make([]ReplicaSource, len(rm.peers[addr]))
 		copy(dbs, rm.peers[addr])
 		rm.mu.Unlock()
 
@@ -412,7 +436,7 @@ func (rm *ReplicationManager) maintainConnection(ctx context.Context, addr strin
 	}
 }
 
-func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, dbs []string) error {
+func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, dbs []ReplicaSource) error {
 	dialer := net.Dialer{Timeout: 5 * time.Second}
 	conn, err := tls.DialWithDialer(&dialer, "tcp", addr, rm.tlsConf)
 	if err != nil {
@@ -425,19 +449,25 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 	}()
 	defer conn.Close()
 
-	rm.logger.Info("Connected to Leader", "addr", addr, "dbs", dbs)
+	rm.logger.Info("Connected to Leader for replication", "addr", addr, "count", len(dbs))
+
+	// Map RemoteDB -> []LocalDB
+	remoteToLocal := make(map[string][]string)
 
 	// Build Hello Payload
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.BigEndian, uint32(1))
 	binary.Write(buf, binary.BigEndian, uint32(len(dbs)))
 
-	for _, name := range dbs {
-		stats := rm.stores[name].Stats()
+	for _, cfg := range dbs {
+		stats := rm.stores[cfg.LocalDB].Stats()
 		logID := stats.NextLogID - 1
-		binary.Write(buf, binary.BigEndian, uint32(len(name)))
-		buf.WriteString(name)
+		binary.Write(buf, binary.BigEndian, uint32(len(cfg.RemoteDB)))
+		buf.WriteString(cfg.RemoteDB)
 		binary.Write(buf, binary.BigEndian, logID)
+		rm.logger.Debug("Sending Hello for DB", "remote_db", cfg.RemoteDB, "local_db", cfg.LocalDB, "startLogID", logID)
+
+		remoteToLocal[cfg.RemoteDB] = append(remoteToLocal[cfg.RemoteDB], cfg.LocalDB)
 	}
 
 	// Send Hello
@@ -469,29 +499,51 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 
 			// Decode: [DBNameLen][DBName][Count][Data]
 			cursor := 0
+			if cursor+4 > len(payload) {
+				return fmt.Errorf("malformed batch: no db len")
+			}
 			nLen := int(binary.BigEndian.Uint32(payload[cursor : cursor+4]))
 			cursor += 4
-			dbName := string(payload[cursor : cursor+nLen])
+			if cursor+nLen+4 > len(payload) {
+				return fmt.Errorf("malformed batch: no db name or count")
+			}
+			remoteDBName := string(payload[cursor : cursor+nLen])
 			cursor += nLen
 			count := binary.BigEndian.Uint32(payload[cursor : cursor+4])
 			cursor += 4
 			data := payload[cursor:]
 
-			if st, ok := rm.stores[dbName]; ok {
-				if maxID, err := applyReplicationBatch(st, count, data); err == nil {
-					// Send ACK
-					ackBuf := new(bytes.Buffer)
-					binary.Write(ackBuf, binary.BigEndian, uint32(len(dbName)))
-					ackBuf.WriteString(dbName)
-					binary.Write(ackBuf, binary.BigEndian, maxID)
+			localDBNames, ok := remoteToLocal[remoteDBName]
+			if !ok {
+				rm.logger.Warn("Received batch for unknown remote db", "remote_db", remoteDBName)
+				continue
+			}
 
-					h := make([]byte, 5)
-					h[0] = OpCodeReplAck
-					binary.BigEndian.PutUint32(h[1:], uint32(ackBuf.Len()))
-					conn.Write(h)
-					conn.Write(ackBuf.Bytes())
+			for _, localDBName := range localDBNames {
+				if st, ok := rm.stores[localDBName]; ok {
+					if maxID, err := applyReplicationBatch(st, count, data); err == nil {
+						// Send ACK with REMOTE DB Name, so leader knows which stream to update
+						ackBuf := new(bytes.Buffer)
+						binary.Write(ackBuf, binary.BigEndian, uint32(len(remoteDBName)))
+						ackBuf.WriteString(remoteDBName)
+						binary.Write(ackBuf, binary.BigEndian, maxID)
+
+						h := make([]byte, 5)
+						h[0] = OpCodeReplAck
+						binary.BigEndian.PutUint32(h[1:], uint32(ackBuf.Len()))
+						if _, err := conn.Write(h); err != nil {
+							return err
+						}
+						if _, err := conn.Write(ackBuf.Bytes()); err != nil {
+							return err
+						}
+					} else {
+						rm.logger.Error("Failed to apply replication batch", "local_db", localDBName, "err", err)
+					}
 				}
 			}
+		} else {
+			rm.logger.Warn("Unexpected OpCode in replication stream", "op", respHead[0])
 		}
 	}
 }
@@ -502,18 +554,37 @@ func applyReplicationBatch(store *Store, count uint32, data []byte) (uint64, err
 	var maxID uint64
 
 	for i := 0; i < int(count); i++ {
+		if cursor+17 > len(data) {
+			return 0, fmt.Errorf("malformed batch entry header")
+		}
 		lid := binary.BigEndian.Uint64(data[cursor : cursor+8])
 		lsn := binary.BigEndian.Uint64(data[cursor+8 : cursor+16])
 		op := data[cursor+16]
 		cursor += 17
+
+		if cursor+4 > len(data) {
+			return 0, fmt.Errorf("malformed batch entry key len")
+		}
 		kLen := int(binary.BigEndian.Uint32(data[cursor : cursor+4]))
 		cursor += 4
+
+		if cursor+kLen > len(data) {
+			return 0, fmt.Errorf("malformed batch entry key")
+		}
 		key := data[cursor : cursor+kLen]
 		cursor += kLen
+
+		if cursor+4 > len(data) {
+			return 0, fmt.Errorf("malformed batch entry val len")
+		}
 		vLen := int(binary.BigEndian.Uint32(data[cursor : cursor+4]))
 		cursor += 4
+
 		var val []byte
 		if op != OpJournalDelete {
+			if cursor+vLen > len(data) {
+				return 0, fmt.Errorf("malformed batch entry val")
+			}
 			val = data[cursor : cursor+vLen]
 			cursor += vLen
 		}

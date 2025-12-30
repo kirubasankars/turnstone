@@ -428,6 +428,7 @@ func (s *Store) flushBatch(pending []*request, buf *bytes.Buffer) {
 	// 3. Wait for Replication Quorum
 	batchMaxLogID := currentLogID - 1
 	if s.minReplicas > 0 && batchMaxLogID >= startBatchLogID {
+		s.logger.Debug("Batch requiring quorum", "startLogID", startBatchLogID, "endLogID", batchMaxLogID)
 		if err := s.WaitForQuorum(batchMaxLogID); err != nil {
 			s.logger.Error("Replication quorum failed", "err", err)
 		}
@@ -455,6 +456,10 @@ func (s *Store) flushBatch(pending []*request, buf *bytes.Buffer) {
 			entryLSN := reqLSN
 			if req.isCompaction || req.isReplication {
 				entryLSN = binary.BigEndian.Uint64(op.header[4:12])
+				// Ensure local clock advances to cover replicated LSNs so they are visible
+				if entryLSN >= indexLSN {
+					indexLSN = entryLSN + 1
+				}
 			}
 
 			if req.isCompaction {
@@ -835,6 +840,9 @@ func (s *Store) ReplicateBatch(entries []LogEntry) error {
 	default:
 	}
 
+	// Log that we are replicating a batch
+	s.logger.Debug("ReplicateBatch submitting request", "count", len(entries))
+
 	return s.submitReq(req)
 }
 
@@ -926,6 +934,7 @@ func (s *Store) WaitForQuorum(targetLogID uint64) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.logger.Debug("Waiting for quorum", "targetLogID", targetLogID, "minReplicas", s.minReplicas)
 	for {
 		if s.closing.Load() {
 			return ErrClosed
@@ -937,6 +946,7 @@ func (s *Store) WaitForQuorum(targetLogID uint64) error {
 			}
 		}
 		if acks >= s.minReplicas {
+			s.logger.Debug("Quorum met", "targetLogID", targetLogID, "acks", acks)
 			return nil
 		}
 		s.ackCond.Wait()

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -71,7 +72,24 @@ func main() {
 	if cfg.Debug {
 		lvl = slog.LevelDebug
 	}
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: lvl}))
+
+	// Ensure home directory exists
+	if err := os.MkdirAll(homeDir, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to ensure home directory exists: %v\n", err)
+		os.Exit(1)
+	}
+
+	logPath := filepath.Join(homeDir, "turnstone.log")
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to open log file %s: %v\n", logPath, err)
+		os.Exit(1)
+	}
+	defer logFile.Close()
+
+	// Write logs to both stdout and the file
+	multiWriter := io.MultiWriter(os.Stdout, logFile)
+	logger := slog.New(slog.NewTextHandler(multiWriter, &slog.HandlerOptions{Level: lvl}))
 
 	txDuration := MaxTxDuration
 	if *devMode {

@@ -403,6 +403,7 @@ func (s *Server) handleSet(w io.Writer, payload []byte, st *connState) {
 		s.writeBinaryResponse(w, ResStatusErr, []byte("No DB selected"))
 		return
 	}
+	// Explicitly check for read-only system database
 	if st.dbName == "0" {
 		s.writeBinaryResponse(w, ResStatusErr, []byte("System DB '0' is read-only"))
 		return
@@ -431,6 +432,7 @@ func (s *Server) handleDel(w io.Writer, payload []byte, st *connState) {
 		s.writeBinaryResponse(w, ResStatusErr, []byte("No DB selected"))
 		return
 	}
+	// Explicitly check for read-only system database
 	if st.dbName == "0" {
 		s.writeBinaryResponse(w, ResStatusErr, []byte("System DB '0' is read-only"))
 		return
