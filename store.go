@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"runtime/debug"
 	"sort"
 	"sync"
@@ -21,6 +23,8 @@ const (
 	ReplicationTimeout = 30 * time.Second
 	SlowOpThreshold    = 500 * time.Millisecond
 )
+
+var ErrSystemDBReadOnly = errors.New("system database is read-only")
 
 type Store struct {
 	// Synchronization & System
@@ -40,6 +44,7 @@ type Store struct {
 	minReplicas   int
 	fsyncEnabled  bool
 	dataDir       string
+	isSystemDB    bool
 
 	// Storage State (Protected by mu)
 	offset          int64
@@ -65,7 +70,6 @@ type Store struct {
 	// Operation Handling
 	opsChannel        chan *request
 	compactionChannel chan struct{}
-	reqPool           *sync.Pool
 }
 
 func NewStore(dataDir string, logger *slog.Logger, allowTruncate bool, minReplicas int, fsyncEnabled bool) (*Store, error) {
@@ -90,6 +94,7 @@ func NewStore(dataDir string, logger *slog.Logger, allowTruncate bool, minReplic
 		fsyncEnabled:      fsyncEnabled,
 		allowTruncate:     allowTruncate,
 		dataDir:           dataDir,
+		isSystemDB:        filepath.Base(dataDir) == "0",
 		startTime:         time.Now(),
 		logger:            logger,
 		opsChannel:        make(chan *request, 5000),
@@ -100,11 +105,6 @@ func NewStore(dataDir string, logger *slog.Logger, allowTruncate bool, minReplic
 		replicationSlots:  make(map[string]ReplicaState),
 		nextTxID:          1,
 		nextLogSeq:        1,
-		reqPool: &sync.Pool{
-			New: func() any {
-				return &request{resp: make(chan error, 1), opLengths: make([]int, 0, 16)}
-			},
-		},
 	}
 	s.ackCond = sync.NewCond(&s.mu)
 
@@ -119,12 +119,13 @@ func NewStore(dataDir string, logger *slog.Logger, allowTruncate bool, minReplic
 
 	// Initialize _id (GUID) if missing
 	// This write will proceed immediately because s.minReplicas is 0
-	if _, err := s.Get("_id", atomic.LoadUint64(&s.nextTxID)); err == ErrKeyNotFound {
+	// We use internal methods (get/applyBatch) to bypass system/reserved key checks
+	if _, err := s.get("_id", atomic.LoadUint64(&s.nextTxID)); err == ErrKeyNotFound {
 		uuid := make([]byte, 16)
 		if _, err := rand.Read(uuid); err == nil {
 			id := fmt.Sprintf("%x-%x-%x-%x-%x", uuid[0:4], uuid[4:6], uuid[6:8], uuid[8:10], uuid[10:])
 			// Write directly to store via internal batch
-			s.ApplyBatch([]bufferedOp{{
+			s.applyBatch([]bufferedOp{{
 				opType: OpJournalSet,
 				key:    "_id",
 				val:    []byte(id),
@@ -723,7 +724,15 @@ func (s *Store) recalcMinReadTxID() {
 	s.minReadTxID = min
 }
 
+// Get retrieves a key's value. Returns ErrSystemDBReadOnly if accessing database 0.
 func (s *Store) Get(key string, readTxID uint64) ([]byte, error) {
+	if s.isSystemDB {
+		return nil, ErrSystemDBReadOnly
+	}
+	return s.get(key, readTxID)
+}
+
+func (s *Store) get(key string, readTxID uint64) ([]byte, error) {
 	s.mu.RLock()
 	entry, ok := s.index.Get(key, readTxID)
 	safeLimit := s.offset
@@ -763,18 +772,24 @@ func (s *Store) Get(key string, readTxID uint64) ([]byte, error) {
 	return payload[keyLen:], nil
 }
 
+// ApplyBatch applies a set of operations. Enforces read-only system DB.
 func (s *Store) ApplyBatch(ops []bufferedOp, readTxID uint64) error {
-	req := s.reqPool.Get().(*request)
+	if s.isSystemDB {
+		return ErrSystemDBReadOnly
+	}
+	return s.applyBatch(ops, readTxID)
+}
 
-	if cap(req.ops) < len(ops) {
-		req.ops = make([]bufferedOp, len(ops))
-	} else {
-		req.ops = req.ops[:len(ops)]
+func (s *Store) applyBatch(ops []bufferedOp, readTxID uint64) error {
+	req := &request{
+		ops:       make([]bufferedOp, len(ops)),
+		resp:      make(chan error, 1),
+		opLengths: make([]int, 0, len(ops)),
+		readTxID:  readTxID,
+		accessMap: make(map[string]struct{}, len(ops)),
 	}
 	copy(req.ops, ops)
 
-	req.readTxID = readTxID
-	req.accessMap = make(map[string]struct{}, len(ops))
 	for i := range req.ops {
 		op := &req.ops[i]
 		req.accessMap[op.key] = struct{}{}
@@ -789,20 +804,12 @@ func (s *Store) ApplyBatch(ops []bufferedOp, readTxID uint64) error {
 		}
 	}
 	req.cancelled.Store(false)
-	// Simplified: Compaction doesn't run through this path
 	req.isReplication = false
-	req.opLengths = req.opLengths[:0]
-
-	select {
-	case <-req.resp:
-	default:
-	}
 
 	return s.submitReq(req)
 }
 
 func (s *Store) submitReq(req *request) error {
-	defer s.reqPool.Put(req)
 	timer := time.NewTimer(DefaultWriteTimeout)
 	defer timer.Stop()
 
@@ -827,14 +834,14 @@ func (s *Store) ReplicateBatch(entries []LogEntry) error {
 		return ErrMemoryLimitExceeded
 	}
 
-	ops := make([]bufferedOp, len(entries))
+	req := &request{
+		ops:           make([]bufferedOp, len(entries)),
+		resp:          make(chan error, 1),
+		opLengths:     make([]int, 0, len(entries)),
+		isReplication: true,
+	}
+
 	for i, entry := range entries {
-		ops[i] = bufferedOp{
-			opType: int(entry.OpType),
-			key:    string(entry.Key),
-			val:    entry.Value,
-		}
-		binary.BigEndian.PutUint64(ops[i].header[4:12], entry.TxID)
 		kLen := len(entry.Key)
 		vLen := len(entry.Value)
 		isDel := entry.OpType == OpJournalDelete
@@ -842,26 +849,17 @@ func (s *Store) ReplicateBatch(entries []LogEntry) error {
 			vLen = 0
 		}
 		packed := PackMeta(uint32(kLen), uint32(vLen), isDel)
-		binary.BigEndian.PutUint32(ops[i].header[0:4], packed)
-	}
 
-	req := s.reqPool.Get().(*request)
-	if cap(req.ops) < len(ops) {
-		req.ops = make([]bufferedOp, len(ops))
-	} else {
-		req.ops = req.ops[:len(ops)]
+		req.ops[i] = bufferedOp{
+			opType: int(entry.OpType),
+			key:    string(entry.Key),
+			val:    entry.Value,
+		}
+		binary.BigEndian.PutUint32(req.ops[i].header[0:4], packed)
+		binary.BigEndian.PutUint64(req.ops[i].header[4:12], entry.TxID)
 	}
-	copy(req.ops, ops)
 
 	req.cancelled.Store(false)
-	req.isReplication = true
-	// Simplified: Compaction doesn't run through this path
-	req.opLengths = req.opLengths[:0]
-
-	select {
-	case <-req.resp:
-	default:
-	}
 
 	// Log that we are replicating a batch
 	s.logger.Debug("ReplicateBatch submitting request", "count", len(entries))
