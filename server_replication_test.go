@@ -36,10 +36,10 @@ func TestServer_ReplicaOf_Integration(t *testing.T) {
 
 	// Generate shared certs once
 	cfg := Config{
-		TLSCertFile: "certs/server.crt",
-		TLSKeyFile:  "certs/server.key",
-		TLSCAFile:   "certs/ca.crt",
-		Databases:   []DatabaseConfig{{Name: "default"}},
+		TLSCertFile:       "certs/server.crt",
+		TLSKeyFile:        "certs/server.key",
+		TLSCAFile:         "certs/ca.crt",
+		NumberOfDatabases: 1,
 	}
 	if err := GenerateConfigArtifacts(baseDir, cfg, filepath.Join(baseDir, "config.json")); err != nil {
 		t.Fatal(err)
@@ -48,12 +48,12 @@ func TestServer_ReplicaOf_Integration(t *testing.T) {
 	// Helper to create a server instance sharing the certs
 	createSrv := func(subDir string) (*Server, string) {
 		dir := filepath.Join(baseDir, subDir)
-		dbPath := filepath.Join(dir, "data", "default")
+		dbPath := filepath.Join(dir, "data", "0")
 		store, err := NewStore(dbPath, logger, true, 0, true)
 		if err != nil {
 			t.Fatal(err)
 		}
-		stores := map[string]*Store{"default": store}
+		stores := map[string]*Store{"0": store}
 
 		// Setup RM
 		clientCert, _ := tls.LoadX509KeyPair(filepath.Join(certsDir, "client.crt"), filepath.Join(certsDir, "client.key"))
@@ -105,10 +105,10 @@ func TestServer_ReplicaOf_Integration(t *testing.T) {
 
 	// --- PHASE 1: START REPLICATION ---
 
-	// Send REPLICAOF LeaderAddr Default to Follower
+	// Send REPLICAOF LeaderAddr "0" to Follower
 	// Protocol: [AddrLen][Addr][DBName]
 	addrBytes := []byte(leaderAddr)
-	dbBytes := []byte("default")
+	dbBytes := []byte("0")
 	payload := make([]byte, 4+len(addrBytes)+len(dbBytes))
 	binary.BigEndian.PutUint32(payload[0:4], uint32(len(addrBytes)))
 	copy(payload[4:], addrBytes)
@@ -139,7 +139,7 @@ func TestServer_ReplicaOf_Integration(t *testing.T) {
 	// --- PHASE 2: STOP REPLICATION ---
 
 	// Send REPLICAOF NO ONE (Empty addr string)
-	// Payload: [0000][][default]
+	// Payload: [0000][][0]
 	stopPayload := make([]byte, 4+0+len(dbBytes))
 	binary.BigEndian.PutUint32(stopPayload[0:4], 0)
 	copy(stopPayload[4:], dbBytes)

@@ -297,15 +297,9 @@ func NewReplicationManager(stores map[string]*Store, tlsConf *tls.Config, logger
 	}
 }
 
-func (rm *ReplicationManager) Start(configs []DatabaseConfig) {
+func (rm *ReplicationManager) Start() {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
-
-	for _, db := range configs {
-		if db.Role == "follower" && db.ReplicaOf != "" && db.Name != "0" { // DB 0 is strictly local
-			rm.peers[db.ReplicaOf] = append(rm.peers[db.ReplicaOf], db.Name)
-		}
-	}
 
 	for addr := range rm.peers {
 		rm.spawnConnection(addr)

@@ -27,20 +27,20 @@ func setupTestEnv(t *testing.T) (string, map[string]*Store, *Server) {
 		t.Fatal(err)
 	}
 	if err := GenerateConfigArtifacts(dir, Config{
-		TLSCertFile: "certs/server.crt",
-		TLSKeyFile:  "certs/server.key",
-		TLSCAFile:   "certs/ca.crt",
-		Databases:   []DatabaseConfig{{Name: "default"}},
+		TLSCertFile:       "certs/server.crt",
+		TLSKeyFile:        "certs/server.key",
+		TLSCAFile:         "certs/ca.crt",
+		NumberOfDatabases: 1,
 	}, filepath.Join(dir, "config.json")); err != nil {
 		t.Fatalf("Failed to generate artifacts: %v", err)
 	}
 
-	// 2. Init Store (default)
-	store, err := NewStore(filepath.Join(dir, "data", "default"), logger, true, 0, true)
+	// 2. Init Store (using "0" as default)
+	store, err := NewStore(filepath.Join(dir, "data", "0"), logger, true, 0, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	stores := map[string]*Store{"default": store}
+	stores := map[string]*Store{"0": store}
 
 	// 3. Setup Replication Manager (Required for NewServer)
 	clientCertPath := filepath.Join(certsDir, "client.crt")
@@ -168,7 +168,7 @@ func (c *testClient) ReadStatus(opCode byte, payload []byte) ([]byte, byte) {
 
 func TestServer_Lifecycle_And_Ping(t *testing.T) {
 	dir, stores, srv := setupTestEnv(t)
-	defer stores["default"].Close()
+	defer stores["0"].Close()
 	defer os.RemoveAll(dir)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -194,7 +194,7 @@ func TestServer_Lifecycle_And_Ping(t *testing.T) {
 
 func TestServer_CRUD(t *testing.T) {
 	dir, stores, srv := setupTestEnv(t)
-	defer stores["default"].Close()
+	defer stores["0"].Close()
 	defer os.RemoveAll(dir)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -238,13 +238,13 @@ func TestServer_CRUD(t *testing.T) {
 
 func TestServer_SelectDB(t *testing.T) {
 	dir, stores, srv := setupTestEnv(t)
-	defer stores["default"].Close()
+	defer stores["0"].Close()
 	defer os.RemoveAll(dir)
 
-	// Create a second DB
-	db2Dir := filepath.Join(dir, "db2")
+	// Create a second DB "1"
+	db2Dir := filepath.Join(dir, "1")
 	store2, _ := NewStore(db2Dir, srv.logger, true, 0, true)
-	srv.stores["db2"] = store2
+	srv.stores["1"] = store2
 	defer store2.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -255,7 +255,7 @@ func TestServer_SelectDB(t *testing.T) {
 	client := connectClient(t, srv.listener.Addr().String(), getClientTLS(t, dir))
 	defer client.Close()
 
-	// Default DB: Set K=V1
+	// Default DB (0): Set K=V1
 	k := []byte("k")
 	v1 := []byte("v1")
 	setPl1 := make([]byte, 4+len(k)+len(v1))
@@ -267,15 +267,15 @@ func TestServer_SelectDB(t *testing.T) {
 	client.AssertStatus(OpCodeSet, setPl1, ResStatusOK)
 	client.AssertStatus(OpCodeCommit, nil, ResStatusOK)
 
-	// Select DB2
-	client.AssertStatus(OpCodeSelect, []byte("db2"), ResStatusOK)
+	// Select DB "1"
+	client.AssertStatus(OpCodeSelect, []byte("1"), ResStatusOK)
 
-	// Verify Empty in DB2
+	// Verify Empty in DB "1"
 	client.AssertStatus(OpCodeBegin, nil, ResStatusOK)
 	client.AssertStatus(OpCodeGet, k, ResStatusNotFound)
 	client.AssertStatus(OpCodeCommit, nil, ResStatusOK)
 
-	// DB2: Set K=V2
+	// DB "1": Set K=V2
 	v2 := []byte("v2")
 	setPl2 := make([]byte, 4+len(k)+len(v2))
 	binary.BigEndian.PutUint32(setPl2[:4], uint32(len(k)))
@@ -286,8 +286,8 @@ func TestServer_SelectDB(t *testing.T) {
 	client.AssertStatus(OpCodeSet, setPl2, ResStatusOK)
 	client.AssertStatus(OpCodeCommit, nil, ResStatusOK)
 
-	// Select Default again
-	client.AssertStatus(OpCodeSelect, []byte("default"), ResStatusOK)
+	// Select Default "0" again
+	client.AssertStatus(OpCodeSelect, []byte("0"), ResStatusOK)
 
 	// Verify V1 in Default
 	client.AssertStatus(OpCodeBegin, nil, ResStatusOK)
@@ -300,7 +300,7 @@ func TestServer_SelectDB(t *testing.T) {
 
 func TestServer_AdminOps(t *testing.T) {
 	dir, stores, srv := setupTestEnv(t)
-	defer stores["default"].Close()
+	defer stores["0"].Close()
 	defer os.RemoveAll(dir)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -323,7 +323,7 @@ func TestServer_AdminOps(t *testing.T) {
 
 func TestServer_ErrorHandling_Protocol(t *testing.T) {
 	dir, stores, srv := setupTestEnv(t)
-	defer stores["default"].Close()
+	defer stores["0"].Close()
 	defer os.RemoveAll(dir)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -340,7 +340,7 @@ func TestServer_ErrorHandling_Protocol(t *testing.T) {
 
 func TestServer_Backpressure(t *testing.T) {
 	dir, stores, _ := setupTestEnv(t)
-	defer stores["default"].Close()
+	defer stores["0"].Close()
 	defer os.RemoveAll(dir)
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))

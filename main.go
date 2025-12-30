@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 )
@@ -33,9 +34,7 @@ func main() {
 		Port: DefaultPort, MaxConns: 500, Fsync: true,
 		TLSCertFile: "certs/server.crt", TLSKeyFile: "certs/server.key", TLSCAFile: "certs/ca.crt",
 		TLSClientCertFile: "certs/client.crt", TLSClientKeyFile: "certs/client.key", MetricsAddr: ":9090",
-		Databases: []DatabaseConfig{
-			{Name: "default", Role: "leader"},
-		},
+		NumberOfDatabases: 16,
 	}
 
 	if *genConfig {
@@ -86,27 +85,17 @@ func main() {
 	}
 
 	// Initialize Stores
-	// Ensure "0" (System DB) always exists
-	hasSystemDB := false
-	for _, dbCfg := range cfg.Databases {
-		if dbCfg.Name == "0" {
-			hasSystemDB = true
-			break
-		}
-	}
-	if !hasSystemDB {
-		cfg.Databases = append(cfg.Databases, DatabaseConfig{Name: "0", Role: "leader"})
-	}
-
 	stores := make(map[string]*Store)
-	for _, dbCfg := range cfg.Databases {
-		dbPath := filepath.Join(homeDir, "data", dbCfg.Name)
-		store, err := NewStore(dbPath, logger, cfg.AllowRecoveryTruncate, dbCfg.MinReplicas, cfg.Fsync)
+	for i := 0; i < cfg.NumberOfDatabases; i++ {
+		dbName := strconv.Itoa(i)
+		dbPath := filepath.Join(homeDir, "data", dbName)
+		// MinReplicas defaulted to 0 since static config is removed.
+		store, err := NewStore(dbPath, logger, cfg.AllowRecoveryTruncate, 0, cfg.Fsync)
 		if err != nil {
-			logger.Error("Failed to init store", "db", dbCfg.Name, "err", err)
+			logger.Error("Failed to init store", "db", dbName, "err", err)
 			os.Exit(1)
 		}
-		stores[dbCfg.Name] = store
+		stores[dbName] = store
 	}
 
 	// Initialize Replication Manager (Follower Mode)
@@ -120,7 +109,7 @@ func main() {
 		tlsConf := &tls.Config{Certificates: []tls.Certificate{clientCert}, RootCAs: pool}
 
 		replManager = NewReplicationManager(stores, tlsConf, logger)
-		replManager.Start(cfg.Databases)
+		replManager.Start()
 	} else {
 		logger.Warn("Client certs not found, replication client disabled", "err", err)
 	}
