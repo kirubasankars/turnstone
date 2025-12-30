@@ -57,7 +57,7 @@ func waitForMetric(t *testing.T, srv *Server, metricName string, predicate func(
 
 func TestMetrics_Connections(t *testing.T) {
 	dir, stores, srv := setupTestEnv(t)
-	defer stores["default"].Close()
+	defer stores["0"].Close()
 	defer os.RemoveAll(dir)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -93,7 +93,7 @@ func TestMetrics_Connections(t *testing.T) {
 
 func TestMetrics_Transactions(t *testing.T) {
 	dir, stores, srv := setupTestEnv(t)
-	defer stores["default"].Close()
+	defer stores["0"].Close()
 	defer os.RemoveAll(dir)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -103,6 +103,9 @@ func TestMetrics_Transactions(t *testing.T) {
 
 	client := connectClient(t, srv.listener.Addr().String(), getClientTLS(t, dir))
 	defer client.Close()
+
+	// Select DB 1
+	client.AssertStatus(OpCodeSelect, []byte("1"), ResStatusOK)
 
 	// Start Tx
 	client.AssertStatus(OpCodeBegin, nil, ResStatusOK)
@@ -123,7 +126,7 @@ func TestMetrics_Transactions(t *testing.T) {
 
 func TestMetrics_StorageIO(t *testing.T) {
 	dir, stores, srv := setupTestEnv(t)
-	defer stores["default"].Close()
+	defer stores["0"].Close()
 	defer os.RemoveAll(dir)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -133,6 +136,9 @@ func TestMetrics_StorageIO(t *testing.T) {
 
 	client := connectClient(t, srv.listener.Addr().String(), getClientTLS(t, dir))
 	defer client.Close()
+
+	// Select DB 1
+	client.AssertStatus(OpCodeSelect, []byte("1"), ResStatusOK)
 
 	// Write Data
 	client.AssertStatus(OpCodeBegin, nil, ResStatusOK)
@@ -170,7 +176,7 @@ func TestMetrics_StorageIO(t *testing.T) {
 
 func TestMetrics_Conflicts(t *testing.T) {
 	dir, stores, srv := setupTestEnv(t)
-	defer stores["default"].Close()
+	defer stores["0"].Close()
 	defer os.RemoveAll(dir)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -182,6 +188,10 @@ func TestMetrics_Conflicts(t *testing.T) {
 	defer c1.Close()
 	c2 := connectClient(t, srv.listener.Addr().String(), getClientTLS(t, dir))
 	defer c2.Close()
+
+	// Select DB 1 for both
+	c1.AssertStatus(OpCodeSelect, []byte("1"), ResStatusOK)
+	c2.AssertStatus(OpCodeSelect, []byte("1"), ResStatusOK)
 
 	// Conflict Scenario
 	c1.AssertStatus(OpCodeBegin, nil, ResStatusOK)
@@ -210,7 +220,7 @@ func TestMetrics_Conflicts(t *testing.T) {
 
 func TestMetrics_Snapshots(t *testing.T) {
 	dir, stores, srv := setupTestEnv(t)
-	defer stores["default"].Close()
+	defer stores["0"].Close()
 	defer os.RemoveAll(dir)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -220,6 +230,9 @@ func TestMetrics_Snapshots(t *testing.T) {
 
 	client := connectClient(t, srv.listener.Addr().String(), getClientTLS(t, dir))
 	defer client.Close()
+
+	// Select DB 1
+	client.AssertStatus(OpCodeSelect, []byte("1"), ResStatusOK)
 
 	// Start Tx (Acquires snapshot)
 	client.AssertStatus(OpCodeBegin, nil, ResStatusOK)
@@ -240,7 +253,7 @@ func TestMetrics_Snapshots(t *testing.T) {
 
 func TestMetrics_Compaction(t *testing.T) {
 	dir, stores, srv := setupTestEnv(t)
-	defer stores["default"].Close()
+	defer stores["0"].Close()
 	defer os.RemoveAll(dir)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -250,6 +263,9 @@ func TestMetrics_Compaction(t *testing.T) {
 
 	client := connectClient(t, srv.listener.Addr().String(), getClientTLS(t, dir))
 	defer client.Close()
+
+	// Select DB 1
+	client.AssertStatus(OpCodeSelect, []byte("1"), ResStatusOK)
 
 	// Trigger Compaction
 	client.AssertStatus(OpCodeCompact, nil, ResStatusOK)
