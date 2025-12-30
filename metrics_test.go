@@ -41,6 +41,20 @@ func parseMetrics(mfs []*dto.MetricFamily) map[string]float64 {
 	return res
 }
 
+// waitForMetric polls until a metric matches the predicate or timeouts
+func waitForMetric(t *testing.T, srv *Server, metricName string, predicate func(float64) bool) {
+	timeout := 2 * time.Second
+	start := time.Now()
+	for time.Since(start) < timeout {
+		m := gatherMetrics(t, srv)
+		if val, ok := m[metricName]; ok && predicate(val) {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("Timeout waiting for metric %s to match predicate", metricName)
+}
+
 func TestMetrics_Connections(t *testing.T) {
 	dir, stores, srv := setupTestEnv(t)
 	defer stores["default"].Close()
@@ -70,13 +84,11 @@ func TestMetrics_Connections(t *testing.T) {
 
 	// Close Client
 	client.Close()
-	time.Sleep(50 * time.Millisecond) // Allow server to process close
 
-	// Check after close
-	m3 := gatherMetrics(t, srv)
-	if m3["turnstone_server_connections_active"] != initialActive {
-		t.Errorf("Active connections did not decrement")
-	}
+	// Check after close (Poll for update)
+	waitForMetric(t, srv, "turnstone_server_connections_active", func(val float64) bool {
+		return val == initialActive
+	})
 }
 
 func TestMetrics_Transactions(t *testing.T) {
@@ -241,15 +253,9 @@ func TestMetrics_Compaction(t *testing.T) {
 
 	// Trigger Compaction
 	client.AssertStatus(OpCodeCompact, nil, ResStatusOK)
-	time.Sleep(50 * time.Millisecond)
 
-	m := gatherMetrics(t, srv)
-	// Just verify the metric exists (>= 0), as duration might be 0 for empty DB
-	val, ok := m["turnstone_store_last_compaction_duration_seconds"]
-	if !ok {
-		t.Error("Compaction duration metric missing")
-	}
-	if val < 0 {
-		t.Errorf("Compaction duration negative: %v", val)
-	}
+	// Poll for compaction duration metric to appear/update
+	waitForMetric(t, srv, "turnstone_store_last_compaction_duration_seconds", func(val float64) bool {
+		return val >= 0
+	})
 }

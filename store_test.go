@@ -3,8 +3,11 @@ package main
 import (
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // TestStore_MinReadLSN verifies snapshot isolation pins MinReadLSN.
@@ -344,5 +347,223 @@ func TestStore_Recover_Basic(t *testing.T) {
 		if string(val) != expected {
 			t.Errorf("Key %s: expected %s, got %s", k, expected, val)
 		}
+	}
+}
+
+func TestStore_Recover_CRC_Corruption(t *testing.T) {
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	walPath := filepath.Join(dir, "values.log")
+
+	// 1. Create Store and write two entries
+	s1, err := NewStore(dir, logger, true, 0, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Write Entry 1 (Valid)
+	if err := s1.ApplyBatch([]bufferedOp{{opType: OpJournalSet, key: "key1", val: []byte("val1")}}, 0); err != nil {
+		t.Fatal(err)
+	}
+	// Write Entry 2 (To be corrupted)
+	if err := s1.ApplyBatch([]bufferedOp{{opType: OpJournalSet, key: "key2", val: []byte("val2")}}, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	s1.Close()
+
+	// 2. Corrupt the WAL manually
+	// Open file, flip the last byte. This modifies the payload of the last entry (key2),
+	// causing a CRC mismatch because the header's CRC won't match the modified payload.
+	f, err := os.OpenFile(walPath, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat, _ := f.Stat()
+	size := stat.Size()
+
+	// Read last byte
+	b := make([]byte, 1)
+	f.ReadAt(b, size-1)
+
+	// Flip bit
+	b[0] ^= 0xFF
+
+	// Write back
+	if _, err := f.WriteAt(b, size-1); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	// FORCE FULL RECOVERY:
+	// The previous Store (s1) persisted its index state on Close().
+	// Because the file size hasn't changed (we only flipped a bit), the new Store (s2)
+	// would otherwise think the persisted index state is valid and fast-forward, skipping
+	// the CRC check on the corrupted entry during startup.
+	// To test the WAL recovery/truncation logic specifically, we must invalidate the index
+	// so the store is forced to scan the WAL.
+	if err := os.RemoveAll(filepath.Join(dir, "index.ldb")); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Re-open Store (Should trigger truncate)
+	s2, err := NewStore(dir, logger, true, 0, true)
+	if err != nil {
+		t.Fatalf("Failed to recover store: %v", err)
+	}
+	defer s2.Close()
+
+	// 4. Verify Entry 1 exists
+	val, err := s2.Get("key1", s2.nextLSN)
+	if err != nil {
+		t.Errorf("Expected key1 to survive corruption, got error: %v", err)
+	}
+	if string(val) != "val1" {
+		t.Errorf("Expected val1, got %s", val)
+	}
+
+	// 5. Verify Entry 2 is gone
+	_, err = s2.Get("key2", s2.nextLSN)
+	if err != ErrKeyNotFound {
+		t.Errorf("Expected key2 to be dropped due to CRC failure, got: %v", err)
+	}
+
+	// 6. Verify Store Offset is truncated
+	// The file on disk might still be the full size until new writes happen or depending on truncate impl,
+	// but the internal store offset should point before the corrupted record.
+	// Actually, NewStore calls WAL.Truncate, so the file size should shrink.
+
+	// Calculate expected size: Header(24) + "key1"(4) + "val1"(4) = 32 bytes approx.
+	// NOTE: Serialization adds op headers etc. Let's just check it's smaller than original.
+
+	f2, _ := os.Open(walPath)
+	stat2, _ := f2.Stat()
+	f2.Close()
+
+	if stat2.Size() >= size {
+		t.Errorf("WAL file should have been truncated. Original: %d, New: %d", size, stat2.Size())
+	}
+}
+
+func TestStore_Recover_PartialWrite(t *testing.T) {
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	walPath := filepath.Join(dir, "values.log")
+
+	// 1. Create Store and write data
+	s1, err := NewStore(dir, logger, true, 0, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s1.ApplyBatch([]bufferedOp{{opType: OpJournalSet, key: "key1", val: []byte("val1")}}, 0)
+	s1.Close()
+
+	// 2. Append garbage (partial header)
+	f, err := os.OpenFile(walPath, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Append 10 bytes (less than HeaderSize 24)
+	if _, err := f.Write(make([]byte, 10)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	// 3. Re-open
+	s2, err := NewStore(dir, logger, true, 0, true)
+	if err != nil {
+		t.Fatalf("Recovery failed on partial write: %v", err)
+	}
+	defer s2.Close()
+
+	// 4. Verify Valid Data remains
+	if _, err := s2.Get("key1", s2.nextLSN); err != nil {
+		t.Error("key1 lost during partial write recovery")
+	}
+}
+
+func TestStore_Replication_Quorum(t *testing.T) {
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	// 1. Create Store with MinReplicas = 1
+	// This ensures that any write operation must wait for at least 1 replica to acknowledge.
+	s, err := NewStore(dir, logger, true, 1, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// 2. Perform Write (Should Block)
+	// We run this in a goroutine because ApplyBatch is synchronous and will block until quorum is met.
+	done := make(chan error)
+	go func() {
+		done <- s.ApplyBatch([]bufferedOp{{opType: OpJournalSet, key: "k", val: []byte("v")}}, 0)
+	}()
+
+	// 3. Verify it's blocked
+	// We wait a short duration to ensure the write hasn't completed immediately (which would be a bug).
+	select {
+	case <-done:
+		t.Fatal("Write returned before quorum was met")
+	case <-time.After(100 * time.Millisecond):
+		// Expected behavior: timeout because write is blocked
+	}
+
+	// 4. Register Replica and Ack
+	// The write above generates a LogID. Since it's the first write, LogID should be 1.
+	// We simulate a replica connecting and acknowledging LogID 1.
+	s.RegisterReplica("replica-1", 0)
+	s.UpdateReplicaLogID("replica-1", 1)
+
+	// 5. Verify Unblock
+	// Now that quorum is met, the write should complete successfully.
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Write failed: %v", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("Write timed out after quorum met")
+	}
+}
+
+func TestStore_Replication_ApplyBatch(t *testing.T) {
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	// Follower store (MinReplicas=0 because followers typically don't require downstream quorum)
+	s, err := NewStore(dir, logger, true, 0, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// Simulate incoming batch from Leader
+	entries := []LogEntry{
+		{LogID: 100, LSN: 50, OpType: OpJournalSet, Key: []byte("k1"), Value: []byte("v1")},
+		{LogID: 101, LSN: 51, OpType: OpJournalSet, Key: []byte("k2"), Value: []byte("v2")},
+	}
+
+	if err := s.ReplicateBatch(entries); err != nil {
+		t.Fatalf("ReplicateBatch failed: %v", err)
+	}
+
+	// Verify Data is readable
+	// We use a high LSN (60) to ensure we are reading a snapshot that includes the replicated data (LSN 50, 51).
+	val, err := s.Get("k1", 60)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(val) != "v1" {
+		t.Errorf("Want v1, got %s", val)
+	}
+
+	val2, err := s.Get("k2", 60)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(val2) != "v2" {
+		t.Errorf("Want v2, got %s", val2)
 	}
 }
