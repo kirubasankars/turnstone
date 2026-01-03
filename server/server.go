@@ -27,7 +27,7 @@ import (
 
 type Server struct {
 	stores           map[string]*store.Store
-	defaultDB        string
+	defaultPartition string
 	addr             string
 	logger           *slog.Logger
 	listener         net.Listener
@@ -51,28 +51,28 @@ func NewServer(addr string, stores map[string]*store.Store, logger *slog.Logger,
 		return nil, fmt.Errorf("tls cert, key, and ca required")
 	}
 
-	var dbNames []string
+	var partitionNames []string
 	for k := range stores {
-		dbNames = append(dbNames, k)
+		partitionNames = append(partitionNames, k)
 	}
-	sort.Strings(dbNames)
-	defDB := ""
-	if len(dbNames) > 0 {
-		defDB = dbNames[0]
+	sort.Strings(partitionNames)
+	defPartition := ""
+	if len(partitionNames) > 0 {
+		defPartition = partitionNames[0]
 	}
 
 	s := &Server{
-		addr:        addr,
-		stores:      stores,
-		defaultDB:   defDB,
-		logger:      logger,
-		maxConns:    maxConns,
-		txDuration:  txDuration,
-		sem:         make(chan struct{}, maxConns),
-		tlsCertFile: tlsCert,
-		tlsKeyFile:  tlsKey,
-		tlsCAFile:   tlsCA,
-		replManager: rm,
+		addr:             addr,
+		stores:           stores,
+		defaultPartition: defPartition,
+		logger:           logger,
+		maxConns:         maxConns,
+		txDuration:       txDuration,
+		sem:              make(chan struct{}, maxConns),
+		tlsCertFile:      tlsCert,
+		tlsKeyFile:       tlsKey,
+		tlsCAFile:        tlsCA,
+		replManager:      rm,
 	}
 
 	if err := s.ReloadTLS(); err != nil {
@@ -117,7 +117,7 @@ func (s *Server) Run(ctx context.Context) error {
 		return err
 	}
 	s.listener = ln
-	s.logger.Info("Server listening", "addr", s.addr, "dbs", len(s.stores), "default", s.defaultDB)
+	s.logger.Info("Server listening", "addr", s.addr, "partitions", len(s.stores), "default", s.defaultPartition)
 
 	go s.handleSignals(ctx)
 
@@ -138,8 +138,8 @@ func (s *Server) Run(ctx context.Context) error {
 			s.wg.Add(1)
 			go s.handleConnection(ctx, conn)
 		default:
-			s.writeBinaryResponse(conn, protocol.ResStatusServerBusy, []byte("Max connections"))
-			conn.Close()
+			_ = s.writeBinaryResponse(conn, protocol.ResStatusServerBusy, []byte("Max connections"))
+			_ = conn.Close()
 		}
 	}
 }
@@ -161,23 +161,23 @@ func (s *Server) handleSignals(ctx context.Context) {
 }
 
 type connState struct {
-	dbName string
-	db     *store.Store
-	active bool
-	ops    []protocol.LogEntry
+	partitionName string
+	partition     *store.Store
+	active        bool
+	ops           []protocol.LogEntry
 }
 
 func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 	defer func() {
-		conn.Close()
+		_ = conn.Close()
 		atomic.AddInt64(&s.activeConns, -1)
 		s.wg.Done()
 		<-s.sem
 	}()
 
 	state := &connState{
-		dbName: s.defaultDB,
-		db:     s.stores[s.defaultDB],
+		partitionName: s.defaultPartition,
+		partition:     s.stores[s.defaultPartition],
 	}
 
 	r := bufio.NewReader(conn)
@@ -187,8 +187,8 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 		if ctx.Err() != nil {
 			return
 		}
-		conn.SetReadDeadline(time.Now().Add(protocol.IdleTimeout))
-
+		_ = conn.SetReadDeadline(time.Now().Add(protocol.IdleTimeout))
+		// TODO: is it safe. does it overflow
 		if _, err := io.ReadFull(r, header); err != nil {
 			return
 		}
@@ -196,7 +196,7 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 		opCode := header[0]
 		payloadLen := binary.BigEndian.Uint32(header[1:])
 		if payloadLen > protocol.MaxCommandSize {
-			s.writeBinaryResponse(conn, protocol.ResStatusEntityTooLarge, nil)
+			_ = s.writeBinaryResponse(conn, protocol.ResStatusEntityTooLarge, nil)
 			return
 		}
 
@@ -205,7 +205,7 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 			return
 		}
 
-		conn.SetWriteDeadline(time.Now().Add(protocol.DefaultWriteTimeout))
+		_ = conn.SetWriteDeadline(time.Now().Add(protocol.DefaultWriteTimeout))
 
 		if s.dispatchCommand(conn, r, opCode, payload, state) {
 			return
@@ -215,13 +215,13 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 
 func (s *Server) dispatchCommand(conn net.Conn, r *bufio.Reader, opCode uint8, payload []byte, st *connState) bool {
 	if st.active && !isTxAllowedOp(opCode) {
-		s.writeBinaryResponse(conn, protocol.ResStatusErr, []byte("Tx active"))
+		_ = s.writeBinaryResponse(conn, protocol.ResStatusErr, []byte("Tx active"))
 		return false
 	}
 
 	switch opCode {
 	case protocol.OpCodePing:
-		s.writeBinaryResponse(conn, protocol.ResStatusOK, []byte("PONG"))
+		_ = s.writeBinaryResponse(conn, protocol.ResStatusOK, []byte("PONG"))
 	case protocol.OpCodeQuit:
 		return true
 	case protocol.OpCodeSelect:
@@ -246,7 +246,7 @@ func (s *Server) dispatchCommand(conn net.Conn, r *bufio.Reader, opCode uint8, p
 		s.HandleReplicaConnection(conn, r, payload)
 		return true
 	default:
-		s.writeBinaryResponse(conn, protocol.ResStatusErr, []byte("Unknown OpCode"))
+		_ = s.writeBinaryResponse(conn, protocol.ResStatusErr, []byte("Unknown OpCode"))
 	}
 	return false
 }
@@ -271,18 +271,18 @@ func (s *Server) writeBinaryResponse(w io.Writer, status byte, body []byte) erro
 
 func (s *Server) handleSelect(w io.Writer, payload []byte, st *connState) {
 	name := string(payload)
-	if db, ok := s.stores[name]; ok { // Renamed 'store' to 'db' to avoid shadowing package
-		st.dbName = name
-		st.db = db
-		s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
+	if partition, ok := s.stores[name]; ok {
+		st.partitionName = name
+		st.partition = partition
+		_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
 	} else {
-		s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("DB not found"))
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Partition not found"))
 	}
 }
 
 func (s *Server) handleBegin(w io.Writer, st *connState) {
-	if st.db == nil {
-		s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No DB selected"))
+	if st.partition == nil {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Partition selected"))
 		return
 	}
 	if st.active {
@@ -291,35 +291,35 @@ func (s *Server) handleBegin(w io.Writer, st *connState) {
 	st.active = true
 	st.ops = make([]protocol.LogEntry, 0)
 	atomic.AddInt64(&s.activeTxs, 1)
-	s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
+	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
 }
 
 func (s *Server) handleCommit(w io.Writer, st *connState) {
 	if !st.active {
-		s.writeBinaryResponse(w, protocol.ResStatusTxRequired, nil)
+		_ = s.writeBinaryResponse(w, protocol.ResStatusTxRequired, nil)
 		return
 	}
 	defer s.abortTx(st)
 
 	if len(st.ops) == 0 {
-		s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
+		_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
 		return
 	}
 
-	if st.dbName == "0" {
+	if st.partitionName == "0" {
 		for _, op := range st.ops {
 			if op.OpCode == protocol.OpJournalSet || op.OpCode == protocol.OpJournalDelete {
-				s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("System DB '0' is read-only"))
+				_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("System Partition '0' is read-only"))
 				return
 			}
 		}
 	}
 
-	if err := st.db.ApplyBatch(st.ops); err != nil {
-		s.writeBinaryResponse(w, protocol.ResStatusErr, []byte(err.Error()))
+	if err := st.partition.ApplyBatch(st.ops); err != nil {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte(err.Error()))
 		return
 	}
-	s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
+	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
 }
 
 func (s *Server) abortTx(st *connState) {
@@ -332,61 +332,66 @@ func (s *Server) abortTx(st *connState) {
 
 func (s *Server) handleAbort(w io.Writer, st *connState) {
 	s.abortTx(st)
-	s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
+	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
 }
 
 func (s *Server) handleGet(w io.Writer, payload []byte, st *connState) {
-	if st.db == nil {
-		s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No DB selected"))
+	if st.partition == nil {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Partition selected"))
 		return
 	}
 	if !st.active {
-		s.writeBinaryResponse(w, protocol.ResStatusTxRequired, nil)
+		_ = s.writeBinaryResponse(w, protocol.ResStatusTxRequired, nil)
 		return
 	}
 
 	key := string(payload)
+	if !isASCII(key) {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Key must be ASCII"))
+		return
+	}
+
 	for i := len(st.ops) - 1; i >= 0; i-- {
 		if string(st.ops[i].Key) == key {
 			if st.ops[i].OpCode == protocol.OpJournalDelete {
-				s.writeBinaryResponse(w, protocol.ResStatusNotFound, nil)
+				_ = s.writeBinaryResponse(w, protocol.ResStatusNotFound, nil)
 			} else {
-				s.writeBinaryResponse(w, protocol.ResStatusOK, st.ops[i].Value)
+				_ = s.writeBinaryResponse(w, protocol.ResStatusOK, st.ops[i].Value)
 			}
 			return
 		}
 	}
 
-	val, err := st.db.Get(key)
+	val, err := st.partition.Get(key)
 	if err == protocol.ErrKeyNotFound {
-		s.writeBinaryResponse(w, protocol.ResStatusNotFound, nil)
+		_ = s.writeBinaryResponse(w, protocol.ResStatusNotFound, nil)
 	} else if err != nil {
-		s.writeBinaryResponse(w, protocol.ResStatusErr, []byte(err.Error()))
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte(err.Error()))
 	} else {
-		s.writeBinaryResponse(w, protocol.ResStatusOK, val)
+		_ = s.writeBinaryResponse(w, protocol.ResStatusOK, val)
 	}
 }
 
 func (s *Server) handleSet(w io.Writer, payload []byte, st *connState) {
-	if st.db == nil {
-		s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No DB selected"))
+	if st.partition == nil {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Partition selected"))
 		return
 	}
-	if st.dbName == "0" {
-		s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("System DB '0' is read-only"))
+	if st.partitionName == "0" {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("System Partition '0' is read-only"))
 		return
 	}
-	if s.replManager != nil && s.replManager.IsReplica(st.dbName) {
-		s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Replica database is read-only"))
+	if s.replManager != nil && s.replManager.IsReplica(st.partitionName) {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Replica partition is read-only"))
 		return
 	}
 
 	if !st.active {
-		s.writeBinaryResponse(w, protocol.ResStatusTxRequired, nil)
+		_ = s.writeBinaryResponse(w, protocol.ResStatusTxRequired, nil)
 		return
 	}
 	if len(payload) < 4 {
-		s.writeBinaryResponse(w, protocol.ResStatusErr, nil)
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, nil)
 		return
 	}
 	kLen := binary.BigEndian.Uint32(payload[:4])
@@ -395,130 +400,151 @@ func (s *Server) handleSet(w io.Writer, payload []byte, st *connState) {
 	val := make([]byte, len(payload[4+kLen:]))
 	copy(val, payload[4+kLen:])
 
+	if !isASCII(string(key)) {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Key must be ASCII"))
+		return
+	}
+
 	if strings.HasPrefix(string(key), "_") {
-		s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Key starting with '_' is read-only"))
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Key starting with '_' is read-only"))
 		return
 	}
 
 	st.ops = append(st.ops, protocol.LogEntry{OpCode: protocol.OpJournalSet, Key: key, Value: val})
-	s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
+	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
 }
 
 func (s *Server) handleDel(w io.Writer, payload []byte, st *connState) {
-	if st.db == nil {
-		s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No DB selected"))
+	if st.partition == nil {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Partition selected"))
 		return
 	}
-	if st.dbName == "0" {
-		s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("System DB '0' is read-only"))
+	if st.partitionName == "0" {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("System Partition '0' is read-only"))
 		return
 	}
-	if s.replManager != nil && s.replManager.IsReplica(st.dbName) {
-		s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Replica database is read-only"))
+	if s.replManager != nil && s.replManager.IsReplica(st.partitionName) {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Replica partition is read-only"))
 		return
 	}
 
 	if !st.active {
-		s.writeBinaryResponse(w, protocol.ResStatusTxRequired, nil)
+		_ = s.writeBinaryResponse(w, protocol.ResStatusTxRequired, nil)
 		return
 	}
 
 	key := make([]byte, len(payload))
 	copy(key, payload)
 
+	if !isASCII(string(key)) {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Key must be ASCII"))
+		return
+	}
+
 	if strings.HasPrefix(string(key), "_") {
-		s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Key starting with '_' is read-only"))
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Key starting with '_' is read-only"))
 		return
 	}
 
 	st.ops = append(st.ops, protocol.LogEntry{OpCode: protocol.OpJournalDelete, Key: key})
-	s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
+	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
+}
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] > 127 {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Server) handleStat(w io.Writer, st *connState) {
-	if st.db == nil {
-		s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No DB selected"))
+	if st.partition == nil {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Partition selected"))
 		return
 	}
-	stats := st.db.Stats()
-	msg := fmt.Sprintf("[%s] Keys:%d Mem:%d LogSeq:%d", st.dbName, stats.KeyCount, stats.MemorySizeBytes, stats.NextLogSeq)
-	s.writeBinaryResponse(w, protocol.ResStatusOK, []byte(msg))
+	stats := st.partition.Stats()
+	msg := fmt.Sprintf("[%s] Keys:%d Mem:%d LogSeq:%d", st.partitionName, stats.KeyCount, stats.MemorySizeBytes, stats.NextLogSeq)
+	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, []byte(msg))
 }
 
 func (s *Server) handleReplicaOf(w io.Writer, payload []byte, st *connState) {
 	if s.replManager == nil {
-		s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Replication client not configured"))
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Replication client not configured"))
 		return
 	}
-	if st.db == nil {
-		s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No DB selected"))
+	if st.partition == nil {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Partition selected"))
 		return
 	}
 
-	if st.dbName == "0" {
-		s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("System DB '0' cannot be replicated"))
+	if st.partitionName == "0" {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("System Partition '0' cannot be replicated"))
 		return
 	}
 
 	if len(payload) < 4 {
-		s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Invalid payload"))
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Invalid payload"))
 		return
 	}
 
 	addrLen := binary.BigEndian.Uint32(payload[:4])
 	if len(payload) < 4+int(addrLen) {
-		s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Invalid payload length"))
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Invalid payload length"))
 		return
 	}
 
 	addr := string(payload[4 : 4+addrLen])
-	remoteDB := string(payload[4+addrLen:])
+	remotePartition := string(payload[4+addrLen:])
 
 	if addr == "" {
-		s.replManager.StopReplication(st.dbName)
-		s.logger.Info("ReplicaOf Stop Command", "local_db", st.dbName)
-		s.writeBinaryResponse(w, protocol.ResStatusOK, []byte("Replication stopped"))
+		s.replManager.StopReplication(st.partitionName)
+		s.logger.Info("ReplicaOf Stop Command", "local_partition", st.partitionName)
+		_ = s.writeBinaryResponse(w, protocol.ResStatusOK, []byte("Replication stopped"))
 		return
 	}
 
-	if remoteDB == "" {
-		s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Remote DB name required"))
+	if remotePartition == "" {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Remote Partition name required"))
 		return
 	}
 
-	s.logger.Info("ReplicaOf Command", "local_db", st.dbName, "remote_addr", addr, "remote_db", remoteDB)
-	s.replManager.AddReplica(st.dbName, addr, remoteDB)
+	s.logger.Info("ReplicaOf Command", "local_partition", st.partitionName, "remote_addr", addr, "remote_partition", remotePartition)
+	s.replManager.AddReplica(st.partitionName, addr, remotePartition)
 
-	s.writeBinaryResponse(w, protocol.ResStatusOK, []byte("Replication started"))
+	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, []byte("Replication started"))
 }
 
 func (s *Server) CloseAll() {
 	if s.listener != nil {
-		s.listener.Close()
+		_ = s.listener.Close()
 	}
 	for _, store := range s.stores {
-		store.Close()
+		_ = store.Close()
 	}
 }
 
-// Stats Accessors for Metrics
+// ActiveConns returns number of activeConns
 func (s *Server) ActiveConns() int64 {
 	return atomic.LoadInt64(&s.activeConns)
 }
 
+// TotalConns returns number of totalConns
 func (s *Server) TotalConns() uint64 {
 	return atomic.LoadUint64(&s.totalConns)
 }
 
+// ActiveTxs return number of active transactions
 func (s *Server) ActiveTxs() int64 {
 	return atomic.LoadInt64(&s.activeTxs)
 }
 
 // --- Replication Multiplexer ---
 type replPacket struct {
-	dbName string
-	data   []byte
-	count  uint32
+	partitionName string
+	data          []byte
+	count         uint32
 }
 
 func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []byte) {
@@ -530,8 +556,8 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 
 	cursor := 8
 	type subReq struct {
-		name   string
-		logSeq uint64
+		partitionName string
+		logSeq        uint64
 	}
 	var subs []subReq
 	replicaID := conn.RemoteAddr().String()
@@ -554,11 +580,11 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 		subs = append(subs, subReq{name, logSeq})
 
 		if st, ok := s.stores[name]; ok {
-			s.logger.Info("Replica subscribed", "replica", replicaID, "db", name, "startLogSeq", logSeq)
+			s.logger.Info("Replica subscribed", "replica", replicaID, "partition", name, "startLogSeq", logSeq)
 			st.RegisterReplica(replicaID, logSeq)
 			defer st.UnregisterReplica(replicaID)
 		} else {
-			s.logger.Warn("Replica requested unknown db", "replica", replicaID, "db", name)
+			s.logger.Warn("Replica requested unknown partition", "replica", replicaID, "partition", name)
 		}
 	}
 
@@ -569,7 +595,7 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 
 	var wg sync.WaitGroup
 	for _, req := range subs {
-		db, ok := s.stores[req.name] // Renamed 'store' to 'db'
+		partition, ok := s.stores[req.partitionName]
 		if !ok {
 			continue
 		}
@@ -577,13 +603,13 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 		go func(name string, st *store.Store, startLogSeq uint64) {
 			defer wg.Done()
 			if err := s.streamDB(name, st, startLogSeq, outCh, done); err != nil {
-				s.logger.Error("StreamDB failed", "db", name, "err", err)
+				s.logger.Error("StreamDB failed", "partition", name, "err", err)
 				select {
 				case errCh <- err:
 				default:
 				}
 			}
-		}(req.name, db, req.logSeq)
+		}(req.partitionName, partition, req.logSeq)
 	}
 
 	go func() {
@@ -601,9 +627,9 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 				if len(b) > 4 {
 					nL := binary.BigEndian.Uint32(b[:4])
 					if len(b) >= 4+int(nL)+8 {
-						dbName := string(b[4 : 4+nL])
+						partitionName := string(b[4 : 4+nL])
 						logSeq := binary.BigEndian.Uint64(b[4+nL:])
-						if st, ok := s.stores[dbName]; ok {
+						if st, ok := s.stores[partitionName]; ok {
 							st.UpdateReplicaLogSeq(replicaID, logSeq)
 						}
 					}
@@ -619,22 +645,22 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 			return
 
 		case p := <-outCh:
-			totalLen := 4 + len(p.dbName) + 4 + len(p.data)
+			totalLen := 4 + len(p.partitionName) + 4 + len(p.data)
 			header := make([]byte, 5)
 			header[0] = protocol.OpCodeReplBatch
 			binary.BigEndian.PutUint32(header[1:], uint32(totalLen))
 
-			conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if _, err := conn.Write(header); err != nil {
 				return
 			}
 
 			nameH := make([]byte, 4)
-			binary.BigEndian.PutUint32(nameH, uint32(len(p.dbName)))
+			binary.BigEndian.PutUint32(nameH, uint32(len(p.partitionName)))
 			if _, err := conn.Write(nameH); err != nil {
 				return
 			}
-			if _, err := conn.Write([]byte(p.dbName)); err != nil {
+			if _, err := conn.Write([]byte(p.partitionName)); err != nil {
 				return
 			}
 
@@ -650,7 +676,7 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 	}
 }
 
-func (s *Server) streamDB(name string, st *store.Store, minLogSeq uint64, outCh chan<- replPacket, done <-chan struct{}) error {
+func (s *Server) streamDB(partitionName string, st *store.Store, minLogSeq uint64, outCh chan<- replPacket, done <-chan struct{}) error {
 	startOffset := st.FindOffsetForLogSeq(minLogSeq)
 	curr := startOffset
 	buf := make([]byte, 1024*1024)
@@ -663,9 +689,9 @@ func (s *Server) streamDB(name string, st *store.Store, minLogSeq uint64, outCh 
 			data := make([]byte, batchBuf.Len())
 			copy(data, batchBuf.Bytes())
 			select {
-			case outCh <- replPacket{dbName: name, data: data, count: count}:
+			case outCh <- replPacket{partitionName: partitionName, data: data, count: count}:
 			case <-time.After(protocol.ReplicationTimeout):
-				return fmt.Errorf("replication send timeout for db %s", name)
+				return fmt.Errorf("replication send timeout for partition %s", partitionName)
 			case <-done:
 				return nil
 			}

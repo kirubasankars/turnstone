@@ -29,7 +29,7 @@ type Config struct {
 	TLSClientCertFile     string `json:"tls_client_cert_file"`
 	TLSClientKeyFile      string `json:"tls_client_key_file"`
 	MetricsAddr           string `json:"metrics_addr"`
-	NumberOfDatabases     int    `json:"number_of_databases"`
+	NumberOfPartitions    int    `json:"number_of_partitions"`
 }
 
 // ResolvePath returns an absolute path relative to the home directory if strictly necessary.
@@ -63,11 +63,11 @@ func GenerateConfigArtifacts(homeDir string, defaultCfg Config, configPath strin
 		}
 	}
 
-	for i := 0; i < defaultCfg.NumberOfDatabases; i++ {
-		dbName := strconv.Itoa(i)
-		dbPath := filepath.Join("data", dbName)
-		if err := os.MkdirAll(ResolvePath(homeDir, dbPath), 0o755); err != nil {
-			return fmt.Errorf("failed to create data directory for %s: %w", dbName, err)
+	for i := 0; i < defaultCfg.NumberOfPartitions; i++ {
+		partName := strconv.Itoa(i)
+		partPath := filepath.Join("data", partName)
+		if err := os.MkdirAll(ResolvePath(homeDir, partPath), 0o755); err != nil {
+			return fmt.Errorf("failed to create data directory for %s: %w", partName, err)
 		}
 	}
 
