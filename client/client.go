@@ -30,12 +30,12 @@ const (
 	OpCodeGet       = 0x02 // Retrieve a value. Payload: Key bytes.
 	OpCodeSet       = 0x03 // Store a value. Payload: [KeyLen(4)|Key|Value].
 	OpCodeDel       = 0x04 // Delete a value. Payload: Key bytes.
-	OpCodeSelect    = 0x05 // Select the active database. Payload: DB Name bytes.
+	OpCodeSelect    = 0x05 // Select the active partition. Payload: Partition Name bytes.
 	OpCodeBegin     = 0x10 // Start a new transaction context.
 	OpCodeCommit    = 0x11 // Commit the current transaction.
 	OpCodeAbort     = 0x12 // Rollback the current transaction.
 	OpCodeStat      = 0x20 // Retrieve server statistics.
-	OpCodeReplicaOf = 0x32 // Set replication source. Payload: [AddrLen][Addr][RemoteDB].
+	OpCodeReplicaOf = 0x32 // Set replication source. Payload: [AddrLen][Addr][RemotePartition].
 	OpCodeReplHello = 0x50 // Replication Handshake (Internal).
 	OpCodeReplBatch = 0x51 // Replication Batch (Internal).
 	OpCodeReplAck   = 0x52 // Replication Ack (Internal).
@@ -61,6 +61,8 @@ const (
 var (
 	// ErrNotFound is returned when a requested key does not exist.
 	ErrNotFound = errors.New("key not found")
+	// ErrInvalidKey is returned when the key contains non-ASCII characters.
+	ErrInvalidKey = errors.New("key must contain only ASCII characters")
 	// ErrTxRequired is returned when attempting a read/write without calling Begin().
 	ErrTxRequired = errors.New("transaction required for this operation")
 	// ErrTxTimeout is returned when the transaction exceeds the server's MaxTxDuration.
@@ -311,23 +313,23 @@ func (c *Client) Ping() error {
 	return err
 }
 
-// Select changes the active database for the current connection.
-func (c *Client) Select(dbName string) error {
-	_, err := c.roundTrip(OpCodeSelect, []byte(dbName))
+// Select changes the active partition for the current connection.
+func (c *Client) Select(partitionName string) error {
+	_, err := c.roundTrip(OpCodeSelect, []byte(partitionName))
 	return err
 }
 
-// ReplicaOf configures the currently selected database to replicate from a remote source.
-// sourceAddr is "host:port", sourceDB is the name of the database on the remote server.
-func (c *Client) ReplicaOf(sourceAddr, sourceDB string) error {
-	// Protocol: [AddrLen(4)][AddrBytes][RemoteDBNameBytes]
+// ReplicaOf configures the currently selected partition to replicate from a remote source.
+// sourceAddr is "host:port", sourcePartition is the name of the partition on the remote server.
+func (c *Client) ReplicaOf(sourceAddr, sourcePartition string) error {
+	// Protocol: [AddrLen(4)][AddrBytes][RemotePartitionNameBytes]
 	addrBytes := []byte(sourceAddr)
-	dbBytes := []byte(sourceDB)
-	payload := make([]byte, 4+len(addrBytes)+len(dbBytes))
+	partBytes := []byte(sourcePartition)
+	payload := make([]byte, 4+len(addrBytes)+len(partBytes))
 
 	binary.BigEndian.PutUint32(payload[0:4], uint32(len(addrBytes)))
 	copy(payload[4:], addrBytes)
-	copy(payload[4+len(addrBytes):], dbBytes)
+	copy(payload[4+len(addrBytes):], partBytes)
 
 	_, err := c.roundTrip(OpCodeReplicaOf, payload)
 	return err
@@ -336,12 +338,18 @@ func (c *Client) ReplicaOf(sourceAddr, sourceDB string) error {
 // Get retrieves the value for a given key.
 // Requires an active transaction (call Begin() first).
 func (c *Client) Get(key string) ([]byte, error) {
+	if !isASCII(key) {
+		return nil, ErrInvalidKey
+	}
 	return c.roundTrip(OpCodeGet, []byte(key))
 }
 
 // Set creates or updates a key-value pair.
 // Requires an active transaction.
 func (c *Client) Set(key string, value []byte) error {
+	if !isASCII(key) {
+		return ErrInvalidKey
+	}
 	kBytes := []byte(key)
 	// Protocol format for SET:
 	// [ 4 bytes KeyLen ] [ Key Bytes ] [ Value Bytes ]
@@ -357,8 +365,20 @@ func (c *Client) Set(key string, value []byte) error {
 // Del removes a key.
 // Requires an active transaction.
 func (c *Client) Del(key string) error {
+	if !isASCII(key) {
+		return ErrInvalidKey
+	}
 	_, err := c.roundTrip(OpCodeDel, []byte(key))
 	return err
+}
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] > 127 {
+			return false
+		}
+	}
+	return true
 }
 
 // --- Transaction Support ---

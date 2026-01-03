@@ -1,0 +1,305 @@
+package store
+
+import (
+	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"turnstone/protocol"
+)
+
+// NOTE: Isolation tests (Snapshot Isolation, Write Skew, etc.) have been removed
+// because the Store API currently abstracts away the internal Engine's transaction
+// handles (AcquireSnapshot/ReleaseSnapshot). The Store exposes atomic Batch application
+// and Latest-Committed reads.
+
+// TestStore_Recover_Basic verifies that the store can recover data from the WAL.
+func TestStore_Recover_Basic(t *testing.T) {
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	// 1. Initialize Store and write data
+	s1, err := NewStore(dir, logger, true, 0, true)
+	if err != nil {
+		t.Fatalf("Failed to create initial store: %v", err)
+	}
+
+	keys := []string{"alpha", "beta", "gamma"}
+
+	for _, k := range keys {
+		entry := protocol.LogEntry{
+			OpCode: protocol.OpJournalSet,
+			Key:    []byte(k),
+			Value:  []byte("val-" + k),
+		}
+		if err := s1.ApplyBatch([]protocol.LogEntry{entry}); err != nil {
+			t.Fatalf("ApplyBatch failed for key %s: %v", k, err)
+		}
+	}
+
+	if err := s1.Close(); err != nil {
+		t.Fatalf("Failed to close store 1: %v", err)
+	}
+
+	// 2. Re-open Store
+	s2, err := NewStore(dir, logger, true, 0, true)
+	if err != nil {
+		t.Fatalf("Failed to create recovered store: %v", err)
+	}
+	defer s2.Close()
+
+	// 3. Verify Data
+	stats := s2.Stats()
+	// Expect 3 user keys. _sys_logseq is stored in the engine but might not be counted
+	// depending on engine implementation details (engine.KeyCount usually skips _sys_ prefix).
+	// Let's assume standard behavior: 3 keys.
+	if stats.KeyCount < 3 {
+		t.Errorf("Expected at least 3 keys, got %d", stats.KeyCount)
+	}
+
+	for _, k := range keys {
+		val, err := s2.Get(k)
+		if err != nil {
+			t.Errorf("Failed to get key %s: %v", k, err)
+		}
+		expected := "val-" + k
+		if string(val) != expected {
+			t.Errorf("Key %s: expected %s, got %s", k, expected, val)
+		}
+	}
+}
+
+func TestStore_Recover_CRC_Corruption(t *testing.T) {
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	walPath := filepath.Join(dir, "values.log")
+
+	// 1. Create Store and write two entries
+	s1, err := NewStore(dir, logger, true, 0, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Write Entry 1 (Valid)
+	if err := s1.ApplyBatch([]protocol.LogEntry{{OpCode: protocol.OpJournalSet, Key: []byte("key1"), Value: []byte("val1")}}); err != nil {
+		t.Fatal(err)
+	}
+	// Write Entry 2 (To be corrupted)
+	if err := s1.ApplyBatch([]protocol.LogEntry{{OpCode: protocol.OpJournalSet, Key: []byte("key2"), Value: []byte("val2")}}); err != nil {
+		t.Fatal(err)
+	}
+
+	s1.Close()
+
+	// 2. Corrupt the WAL manually
+	// Open file, flip the last byte. This modifies the payload of the last entry (key2),
+	// causing a CRC mismatch because the header's CRC won't match the modified payload.
+	f, err := os.OpenFile(walPath, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat, _ := f.Stat()
+	size := stat.Size()
+
+	// Read last byte
+	b := make([]byte, 1)
+	if _, err := f.ReadAt(b, size-1); err != nil {
+		t.Fatal(err)
+	}
+
+	// Flip bit
+	b[0] ^= 0xFF
+
+	// Write back
+	if _, err := f.WriteAt(b, size-1); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	// FORCE FULL RECOVERY:
+	// We want to test WAL recovery logic. Since s1.Close() flushed data to the engine's
+	// internal storage (.vlog files), simply reopening would load key2 from there.
+	// We must wipe the engine state completely to force the store to replay from the WAL.
+	if err := os.RemoveAll(filepath.Join(dir, "stone")); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Re-open Store (Should trigger truncate)
+	s2, err := NewStore(dir, logger, true, 0, true)
+	if err != nil {
+		t.Fatalf("Failed to recover store: %v", err)
+	}
+	defer s2.Close()
+
+	// 4. Verify Entry 1 exists
+	val, err := s2.Get("key1")
+	if err != nil {
+		t.Errorf("Expected key1 to survive corruption, got error: %v", err)
+	}
+	if string(val) != "val1" {
+		t.Errorf("Expected val1, got %s", val)
+	}
+
+	// 5. Verify Entry 2 is gone
+	_, err = s2.Get("key2")
+	if err != protocol.ErrKeyNotFound {
+		t.Errorf("Expected key2 to be dropped due to CRC failure, got: %v", err)
+	}
+
+	// 6. Verify Store Offset is truncated (checking file size is tricky as new store might append,
+	// but stats.Offset should reflect valid data)
+	stats := s2.Stats()
+	if stats.Offset >= size {
+		t.Errorf("Offset should be less than corrupted size. Original: %d, New Offset: %d", size, stats.Offset)
+	}
+}
+
+func TestStore_Recover_PartialWrite(t *testing.T) {
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	walPath := filepath.Join(dir, "values.log")
+
+	// 1. Create Store and write data
+	s1, err := NewStore(dir, logger, true, 0, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s1.ApplyBatch([]protocol.LogEntry{{OpCode: protocol.OpJournalSet, Key: []byte("key1"), Value: []byte("val1")}})
+	s1.Close()
+
+	// 2. Append garbage (partial header)
+	f, err := os.OpenFile(walPath, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Append 10 bytes (less than HeaderSize 16)
+	if _, err := f.Write(make([]byte, 10)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	// 3. Re-open
+	s2, err := NewStore(dir, logger, true, 0, true)
+	if err != nil {
+		t.Fatalf("Recovery failed on partial write: %v", err)
+	}
+	defer s2.Close()
+
+	// 4. Verify Valid Data remains
+	if _, err := s2.Get("key1"); err != nil {
+		t.Error("key1 lost during partial write recovery")
+	}
+}
+
+func TestStore_Replication_Quorum(t *testing.T) {
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	// 1. Create Store with MinReplicas = 1
+	// This ensures that any write operation must wait for at least 1 replica to acknowledge.
+	s, err := NewStore(dir, logger, true, 1, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// 2. Perform Write (Should Block)
+	// We run this in a goroutine because ApplyBatch is synchronous and will block until quorum is met.
+	done := make(chan error)
+	go func() {
+		done <- s.ApplyBatch([]protocol.LogEntry{{OpCode: protocol.OpJournalSet, Key: []byte("k"), Value: []byte("v")}})
+	}()
+
+	// 3. Verify it's blocked
+	select {
+	case <-done:
+		t.Fatal("Write returned before quorum was met")
+	case <-time.After(100 * time.Millisecond):
+		// Expected behavior: timeout because write is blocked
+	}
+
+	// 4. Register Replica and Ack
+	// The write above generates a LogSeq.
+	// Since we started fresh, nextLogSeq was 1. The write used LogSeq 1.
+	// We acknowledge 1 to ensure the write is unblocked.
+	s.RegisterReplica("replica-1", 0)
+	s.UpdateReplicaLogSeq("replica-1", 1)
+
+	// 5. Verify Unblock
+	// Now that quorum is met, the write should complete successfully.
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Write failed: %v", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("Write timed out after quorum met")
+	}
+}
+
+func TestStore_Replication_ApplyBatch(t *testing.T) {
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	// Replica store (MinReplicas=0 because replicas typically don't require downstream quorum)
+	s, err := NewStore(dir, logger, true, 0, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// Simulate incoming batch from Primary
+	entries := []protocol.LogEntry{
+		{LogSeq: 100, OpCode: protocol.OpJournalSet, Key: []byte("k1"), Value: []byte("v1")},
+		{LogSeq: 101, OpCode: protocol.OpJournalSet, Key: []byte("k2"), Value: []byte("v2")},
+	}
+
+	if err := s.ReplicateBatch(entries); err != nil {
+		t.Fatalf("ReplicateBatch failed: %v", err)
+	}
+
+	// Verify Data is readable
+	val, err := s.Get("k1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(val) != "v1" {
+		t.Errorf("Want v1, got %s", val)
+	}
+
+	val2, err := s.Get("k2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(val2) != "v2" {
+		t.Errorf("Want v2, got %s", val2)
+	}
+}
+
+func TestStore_ReadOnlySystemPartition(t *testing.T) {
+	// Create a store named "0" (System Partition)
+	dir := filepath.Join(t.TempDir(), "0")
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	s, err := NewStore(dir, logger, true, 0, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// Attempt Write
+	err = s.ApplyBatch([]protocol.LogEntry{{OpCode: protocol.OpJournalSet, Key: []byte("k"), Value: []byte("v")}})
+	if err != protocol.ErrSystemPartitionReadOnly {
+		t.Errorf("Expected system partition read-only error, got %v", err)
+	}
+
+	// Attempt Read (Also restricted by default in current store implementation, or allowed?
+	// store.go says: if s.isSystemPartition { return nil, protocol.ErrSystemPartitionReadOnly } for Get too)
+	_, err = s.Get("any")
+	if err != protocol.ErrSystemPartitionReadOnly {
+		t.Errorf("Expected system partition read-only error on Get, got %v", err)
+	}
+}

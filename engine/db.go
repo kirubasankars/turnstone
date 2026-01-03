@@ -314,6 +314,12 @@ func (tx *Transaction) Delete(key string) {
 	tx.Entries = append(tx.Entries, entry)
 }
 
+func (tx *Transaction) Abort() {
+	tx.db.activeTxMu.Lock()
+	delete(tx.db.activeTxns, tx.ID)
+	tx.db.activeTxMu.Unlock()
+}
+
 func (tx *Transaction) Commit() error {
 	return tx.db.CommitTx(tx)
 }
@@ -347,6 +353,27 @@ func (db *StoneDB) CommitTx(tx *Transaction) error {
 
 	if db.closed {
 		return protocol.ErrClosed
+	}
+
+	// Conflict Detection (OCC)
+	iter := db.ldb.NewIterator(nil, nil)
+	defer iter.Release()
+
+	for _, e := range entries {
+		if e.ExpectedVersion > 0 {
+			prefix := encodeKeyPrefix(e.Key)
+			// Seek to the latest version of the key (since keys are stored as prefix + ^TxID)
+			if iter.Seek(prefix) && bytes.HasPrefix(iter.Key(), prefix) {
+				ptr := decodeValuePointer(iter.Value())
+				if ptr.TxID != e.ExpectedVersion {
+					// The key has been updated since we read it
+					return ErrVersionConflict
+				}
+			} else {
+				// Key should exist but doesn't
+				return ErrVersionConflict
+			}
+		}
 	}
 
 	if db.activeMem.Len()+totalLen > vlogMaxFileSize {
