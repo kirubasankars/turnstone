@@ -53,7 +53,7 @@ func main() {
 	defer cl.Close()
 
 	fmt.Println("Connected.")
-	fmt.Println("Commands: select <db>, replicaof <host:port> <remote_db>, get <k>, set <k> <v>, del <k>, begin, commit, abort, stat, compact, clear, quit")
+	fmt.Println("Commands: select <db>, replicaof <host:port> <remote_db>, get <k>, set <k> <v>, del <k>, begin, commit, abort, stat, clear, quit")
 	fmt.Print("> ")
 
 	// 2. Interactive Loop
@@ -130,12 +130,6 @@ func handleCommand(cl *client.Client, cmd string, parts []string) {
 			if err == nil {
 				fmt.Printf("Replication started from %s/%s\n", parts[1], parts[2])
 			}
-		}
-
-	case "compact":
-		err = cl.Compact()
-		if err == nil {
-			fmt.Println("Compaction triggered")
 		}
 
 	case "begin":

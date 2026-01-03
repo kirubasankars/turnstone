@@ -32,13 +32,16 @@ var (
 	keySize       = flag.Int("k", 32, "Minimum key size in bytes (padded if shorter)")
 	readRatio     = flag.Float64("ratio", -1.0, "Read ratio (0.0 to 1.0). If set, runs a mixed workload")
 	pipelineDepth = flag.Int("depth", 1, "Pipeline depth (transactions per network round-trip)")
+	batchSize     = flag.Int("batch", 1, "Batch size (operations per transaction)")
+	dbNum         = flag.Int("db", 1, "Database number to use (DB 0 is typically read-only)")
+	keyPrefix     = flag.String("prefix", "bench", "Key prefix to avoid collisions between concurrent benchmark runs")
 )
 
 func main() {
 	flag.Parse()
 
-	if *totalOps <= 0 || *concurrency <= 0 || *pipelineDepth <= 0 {
-		log.Fatal("Invalid -n, -c, or -depth values. Must be > 0")
+	if *totalOps <= 0 || *concurrency <= 0 || *pipelineDepth <= 0 || *batchSize <= 0 {
+		log.Fatal("Invalid -n, -c, -depth, or -batch values. Must be > 0")
 	}
 
 	// Prepare payload once
@@ -49,16 +52,19 @@ func main() {
 
 	fmt.Printf("--- TurnstoneDB Benchmark (Async Pipeline) ---\n")
 	fmt.Printf("Server:       %s\n", *addr)
-	fmt.Printf("Concurrency: %d clients\n", *concurrency)
-	fmt.Printf("Total Ops:   %d\n", *totalOps)
-	fmt.Printf("Pipeline:    %d tx/batch\n", *pipelineDepth)
-	fmt.Printf("Payload:     %d bytes\n", *valueSize)
+	fmt.Printf("Database:     %d\n", *dbNum)
+	fmt.Printf("Concurrency:  %d clients\n", *concurrency)
+	fmt.Printf("Total Ops:    %d\n", *totalOps)
+	fmt.Printf("Pipeline:     %d tx/batch (inflight)\n", *pipelineDepth)
+	fmt.Printf("Batch Size:   %d ops/tx\n", *batchSize)
+	fmt.Printf("Payload:      %d bytes\n", *valueSize)
+	fmt.Printf("Key Prefix:   %s\n", *keyPrefix)
 
 	mode := "Sequential (Write -> Read)"
 	if *readRatio >= 0.0 && *readRatio <= 1.0 {
 		mode = fmt.Sprintf("Mixed (%.0f%% Read / %.0f%% Write)", *readRatio*100, (1.0-*readRatio)*100)
 	}
-	fmt.Printf("Mode:        %s\n", mode)
+	fmt.Printf("Mode:         %s\n", mode)
 	fmt.Println("--------------------------------------------------")
 
 	tlsConfig, err := loadTLSConfig()
@@ -94,7 +100,7 @@ func loadTLSConfig() (*tls.Config, error) {
 }
 
 func generateKey(clientID, index int) string {
-	baseKey := fmt.Sprintf("bench-%d-%d", clientID, index)
+	baseKey := fmt.Sprintf("%s-%d-%d", *keyPrefix, clientID, index)
 	if len(baseKey) < *keySize {
 		return baseKey + strings.Repeat("x", *keySize-len(baseKey))
 	}
@@ -110,12 +116,18 @@ func runWorkload(phase string, tlsConfig *tls.Config, payload []byte, readPct fl
 	var notFoundOps int64
 	var totalDuration int64
 
+	// Adjust calculations for batch size
 	opsPerClient := *totalOps / *concurrency
-	// Adjust ops to be a multiple of depth for simplicity
-	if opsPerClient < *pipelineDepth {
-		opsPerClient = *pipelineDepth
+	txsPerClient := opsPerClient / *batchSize
+	if txsPerClient == 0 {
+		txsPerClient = 1
 	}
-	batchesPerClient := opsPerClient / *pipelineDepth
+
+	// batchesOfPipeline is how many times we fill the pipeline depth
+	batchesOfPipeline := txsPerClient / *pipelineDepth
+	if batchesOfPipeline == 0 {
+		batchesOfPipeline = 1
+	}
 
 	startTotal := time.Now()
 
@@ -138,8 +150,8 @@ func runWorkload(phase string, tlsConfig *tls.Config, payload []byte, readPct fl
 
 			reader := bufio.NewReader(conn)
 
-			// --- Select Database 1 ---
-			dbName := []byte("1")
+			// --- Select Database ---
+			dbName := []byte(fmt.Sprintf("%d", *dbNum))
 			selBuf := appendHeader(make([]byte, 0, 5+len(dbName)), client.OpCodeSelect, len(dbName))
 			selBuf = append(selBuf, dbName...)
 			if _, err := conn.Write(selBuf); err != nil {
@@ -160,7 +172,6 @@ func runWorkload(phase string, tlsConfig *tls.Config, payload []byte, readPct fl
 				atomic.AddInt64(&failedOps, int64(opsPerClient))
 				return
 			}
-			// Discard body if present (unlikely for Select OK)
 			if sLen := binary.BigEndian.Uint32(selHead[1:]); sLen > 0 {
 				if _, err := reader.Discard(int(sLen)); err != nil {
 					return
@@ -168,101 +179,101 @@ func runWorkload(phase string, tlsConfig *tls.Config, payload []byte, readPct fl
 			}
 			// -------------------------
 
-			// Pre-allocate write buffer: (Header(5) + Max(Begin/Commit/Op)) * 3 * Depth
-			// Estimate roughly 4KB + payload per depth to be safe
-			writeBuf := make([]byte, 0, *pipelineDepth*(20+*valueSize+*keySize)*3)
+			// Buffer sizing: Depth * (Begin(20) + Commit(20) + BatchSize * OpSize)
+			estOpSize := 20 + *valueSize + *keySize
+			writeBuf := make([]byte, 0, *pipelineDepth*(40+(*batchSize*estOpSize)))
 			headerBuf := make([]byte, 5)
 
-			for b := 0; b < batchesPerClient; b++ {
+			txCount := 0
+			for b := 0; b < batchesOfPipeline; b++ {
 				writeBuf = writeBuf[:0]
 				startBatch := time.Now()
 
-				// 1. Build Pipeline Request
+				// 1. Build Pipeline Request (Depth = Number of parallel Transactions)
 				for d := 0; d < *pipelineDepth; d++ {
-					// Determine Op
-					isRead := false
-					if phase == "READ " {
-						isRead = true
-					} else if phase == "WRITE" {
-						isRead = false
-					} else {
-						isRead = r.Float64() < readPct
-					}
-
-					// Key selection
-					keyIndex := b*(*pipelineDepth) + d
-					if phase == "MIXED" {
-						keyIndex = r.Intn(opsPerClient)
-					}
-					key := generateKey(clientID, keyIndex)
-
 					// Append BEGIN
 					writeBuf = appendHeader(writeBuf, client.OpCodeBegin, 0)
 
-					// Append OP
-					if isRead {
-						writeBuf = appendHeader(writeBuf, client.OpCodeGet, len(key))
-						writeBuf = append(writeBuf, key...)
-					} else {
-						// Set Format: [4b KeyLen][Key][Val]
-						kLen := len(key)
-						vLen := len(payload)
-						totalLen := 4 + kLen + vLen
-						writeBuf = appendHeader(writeBuf, client.OpCodeSet, totalLen)
+					// Append Batch of OPs
+					for k := 0; k < *batchSize; k++ {
+						// Determine Op Type
+						isRead := false
+						if phase == "READ " {
+							isRead = true
+						} else if phase == "WRITE" {
+							isRead = false
+						} else {
+							isRead = r.Float64() < readPct
+						}
 
-						// We need to append 4-byte key length
-						var lenBytes [4]byte
-						binary.BigEndian.PutUint32(lenBytes[:], uint32(kLen))
-						writeBuf = append(writeBuf, lenBytes[:]...)
-						writeBuf = append(writeBuf, key...)
-						writeBuf = append(writeBuf, payload...)
+						// Key selection
+						keyIndex := (txCount * *batchSize) + k
+						if phase == "MIXED" {
+							keyIndex = r.Intn(opsPerClient)
+						}
+						key := generateKey(clientID, keyIndex)
+
+						if isRead {
+							writeBuf = appendHeader(writeBuf, client.OpCodeGet, len(key))
+							writeBuf = append(writeBuf, key...)
+						} else {
+							kLen := len(key)
+							totalLen := 4 + kLen + len(payload)
+							writeBuf = appendHeader(writeBuf, client.OpCodeSet, totalLen)
+							var lenBytes [4]byte
+							binary.BigEndian.PutUint32(lenBytes[:], uint32(kLen))
+							writeBuf = append(writeBuf, lenBytes[:]...)
+							writeBuf = append(writeBuf, key...)
+							writeBuf = append(writeBuf, payload...)
+						}
 					}
 
 					// Append COMMIT
 					writeBuf = appendHeader(writeBuf, client.OpCodeCommit, 0)
+					txCount++
 				}
 
 				// 2. Flush Write
 				if _, err := conn.Write(writeBuf); err != nil {
-					atomic.AddInt64(&failedOps, int64(*pipelineDepth))
-					return // Connection dead
+					atomic.AddInt64(&failedOps, int64(*pipelineDepth**batchSize))
+					return
 				}
 
-				// 3. Read Responses (3 per transaction * depth)
+				// 3. Read Responses
+				// Expect: Depth * (1 Begin + BatchSize Ops + 1 Commit)
+				expectedResps := *pipelineDepth * (2 + *batchSize)
 				batchFailed := false
-				for d := 0; d < *pipelineDepth*3; d++ {
+
+				for i := 0; i < expectedResps; i++ {
 					if _, err := io.ReadFull(reader, headerBuf); err != nil {
-						atomic.AddInt64(&failedOps, int64(*pipelineDepth))
+						atomic.AddInt64(&failedOps, int64(*pipelineDepth**batchSize))
 						return
 					}
 					status := headerBuf[0]
 					length := binary.BigEndian.Uint32(headerBuf[1:])
 
-					// Skip body
 					if length > 0 {
 						if _, err := reader.Discard(int(length)); err != nil {
-							atomic.AddInt64(&failedOps, int64(*pipelineDepth))
+							atomic.AddInt64(&failedOps, int64(*pipelineDepth**batchSize))
 							return
 						}
 					}
 
-					// Check status
 					if status != client.ResStatusOK && status != client.ResStatusNotFound {
 						batchFailed = true
 					}
 					if status == client.ResStatusNotFound {
-						atomic.AddInt64(&notFoundOps, 1) // Count per op roughly
+						atomic.AddInt64(&notFoundOps, 1)
 					}
 				}
 
 				latency := time.Since(startBatch).Nanoseconds()
 
-				// In pipeline mode, we amortize latency across the batch
-				// This isn't perfect per-op latency but gives good throughput indication
+				opsInBatch := int64(*pipelineDepth * *batchSize)
 				if batchFailed {
-					atomic.AddInt64(&failedOps, int64(*pipelineDepth))
+					atomic.AddInt64(&failedOps, opsInBatch)
 				} else {
-					atomic.AddInt64(&completedOps, int64(*pipelineDepth))
+					atomic.AddInt64(&completedOps, opsInBatch)
 					atomic.AddInt64(&totalDuration, latency)
 				}
 			}
@@ -283,17 +294,12 @@ func appendHeader(buf []byte, op byte, length int) []byte {
 
 func printStats(phase string, elapsed time.Duration, success, failed, notFound int64, totalLatencyNs int64) {
 	tps := float64(success) / elapsed.Seconds()
-
-	// Since latency was tracked per batch, we need to adjust
-	// But simply: totalDuration is sum of batch latencies.
-	// Average Op Latency = (Total Batch Latencies) / (Number of Batches) / Depth?
-	// Actually: (Sum of Batch Durations) / Total Ops isn't quite right for "Per Op Latency"
-	// because ops happened in parallel on the wire.
-	// However, usually in pipeline bench, Latency = BatchRTT / Depth.
-
 	avgLatency := float64(0)
+
+	// Note: Latency calculation here is "Latency per Network Round Trip" (Pipeline Batch)
+	// It is roughly (Network RTT / (Depth * BatchSize)) if we amortize,
+	// but strictly speaking, it's the time the client waited for the whole batch.
 	if success > 0 {
-		// Calculate average time per operation roughly
 		avgLatency = (float64(totalLatencyNs) / float64(success)) / 1e6
 	}
 
@@ -304,6 +310,6 @@ func printStats(phase string, elapsed time.Duration, success, failed, notFound i
 	fmt.Printf("  Not Found:   %d\n", notFound)
 	fmt.Printf("  Failed:      %d\n", failed)
 	fmt.Printf("  Throughput:  %.2f TPS\n", tps)
-	fmt.Printf("  Avg Latency: %.3f ms (Amortized)\n", avgLatency)
+	fmt.Printf("  Avg Latency: %.3f ms (Amortized per Op)\n", avgLatency)
 	fmt.Println("--------------------------------------------------")
 }

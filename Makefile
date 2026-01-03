@@ -5,7 +5,6 @@ build:
 
 build-tools:
 	mkdir -p ./bin
-	go build -o ./bin/turnstone_debugger    ./tools/debugger.go
 	go build -o ./bin/turnstone_benchmark   ./tools/benchmark.go
 
 clean:
