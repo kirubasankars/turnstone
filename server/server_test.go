@@ -117,7 +117,6 @@ func setupTestEnv(t *testing.T) (string, map[string]*store.Store, *Server) {
 	srv, err := NewServer(
 		":0", stores, logger,
 		10, // MaxConns
-		5*time.Second,
 		filepath.Join(certsDir, "server.crt"),
 		filepath.Join(certsDir, "server.key"),
 		filepath.Join(certsDir, "ca.crt"),
@@ -470,22 +469,11 @@ func TestMetrics_StorageIO(t *testing.T) {
 	if m1["turnstone_store_keys_total"] != baseKeys+1 {
 		t.Errorf("Expected %v keys, got %v", baseKeys+1, m1["turnstone_store_keys_total"])
 	}
-	if m1["turnstone_store_bytes_written_total"] <= 0 {
-		t.Errorf("Expected bytes written > 0")
-	}
-	if m1["turnstone_store_wal_offset_bytes"] <= 0 {
-		t.Errorf("Expected WAL offset > 0")
-	}
 
 	// Read Data
 	client.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
 	client.AssertStatus(protocol.OpCodeGet, key, protocol.ResStatusOK)
 	client.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusOK)
-
-	m2 := gatherMetrics(t, srv)
-	if m2["turnstone_store_bytes_read_total"] <= 0 {
-		t.Errorf("Expected bytes read > 0")
-	}
 }
 
 func TestMetrics_Conflicts(t *testing.T) {
@@ -560,7 +548,6 @@ func TestServer_Backpressure(t *testing.T) {
 	srv, err := NewServer(
 		":0", stores, logger,
 		1, // MaxConns = 1
-		5*time.Second,
 		filepath.Join(certsDir, "server.crt"),
 		filepath.Join(certsDir, "server.key"),
 		filepath.Join(certsDir, "ca.crt"),

@@ -29,7 +29,7 @@ import (
 	"github.com/syndtr/goleveldb/leveldb/iterator"
 )
 
-// Transaction represents a running transaction (formerly Txn)
+// Transaction represents a running transaction.
 type Transaction struct {
 	db         *DB
 	pendingOps map[string]*PendingOp
@@ -41,20 +41,17 @@ type Transaction struct {
 }
 
 // Discard cleans up the transaction resources and unregisters it.
-// Must be called for both Commit and Rollback (usually via defer).
 func (tx *Transaction) Discard() {
 	if tx.finished {
 		return
 	}
 	tx.finished = true
 
-	// Release iterator if it exists
 	if tx.iter != nil {
 		tx.iter.Release()
 		tx.iter = nil
 	}
 
-	// Unregister from active transactions (Fast O(1) delete)
 	tx.db.activeTxnsMu.Lock()
 	delete(tx.db.activeTxns, tx)
 	tx.db.activeTxnsMu.Unlock()
@@ -80,7 +77,7 @@ func (tx *Transaction) Delete(key []byte) error {
 }
 
 func (tx *Transaction) Get(key []byte) ([]byte, error) {
-	// 1. Check local pending ops
+	// 1. Check local pending ops (Read-Your-Own-Writes)
 	if op, ok := tx.pendingOps[string(key)]; ok {
 		if op.IsDelete {
 			return nil, ErrKeyNotFound
@@ -94,7 +91,6 @@ func (tx *Transaction) Get(key []byte) ([]byte, error) {
 	}
 
 	// 3. Search Index
-	// Lazily initialize iterator for reuse within transaction
 	if tx.iter == nil {
 		tx.iter = tx.db.ldb.NewIterator(nil, nil)
 	}
@@ -106,11 +102,10 @@ func (tx *Transaction) Get(key []byte) ([]byte, error) {
 			foundKey := tx.iter.Key()
 			uKey, version, err := decodeIndexKey(foundKey)
 			if err != nil || !bytes.Equal(uKey, key) {
-				// Different key or invalid, so we stop
 				break
 			}
 
-			// MVCC: Visible version must be <= readTxID
+			// MVCC Check
 			if version <= tx.readTxID {
 				meta, err := decodeEntryMeta(tx.iter.Value())
 				if err != nil {
@@ -120,9 +115,9 @@ func (tx *Transaction) Get(key []byte) ([]byte, error) {
 					return nil, ErrKeyNotFound
 				}
 
-				return tx.db.valueLog.ReadValue(meta.FileID, meta.ValueOffset, meta.ValueLen)
+				val, err := tx.db.valueLog.ReadValue(meta.FileID, meta.ValueOffset, meta.ValueLen)
+				return val, err
 			}
-			// If version > readTxID, check next version (older)
 			tx.iter.Next()
 		}
 	}
@@ -131,7 +126,6 @@ func (tx *Transaction) Get(key []byte) ([]byte, error) {
 
 // Commit submits the transaction to the Group Commit pipeline.
 func (tx *Transaction) Commit() error {
-	// Ensure cleanup happens even if we return early
 	defer tx.Discard()
 
 	if !tx.update {
@@ -144,70 +138,11 @@ func (tx *Transaction) Commit() error {
 		return nil
 	}
 
-	// Submit to Group Commit Channel
 	req := commitRequest{
 		tx:   tx,
 		resp: make(chan error, 1),
 	}
 
-	// Send request (blocking if channel full)
 	tx.db.commitCh <- req
-
-	// Wait for response
 	return <-req.resp
-}
-
-// checkConflicts verifies that none of the keys read OR written by this transaction
-// have been modified by another transaction that committed after this transaction started.
-// This enforces Snapshot Isolation (First-Committer-Wins) and Serializability (Stale Read Protection).
-func (tx *Transaction) checkConflicts() error {
-	if len(tx.readSet) == 0 && len(tx.pendingOps) == 0 {
-		return nil
-	}
-
-	iter := tx.db.ldb.NewIterator(nil, nil)
-	defer iter.Release()
-
-	// Helper to check a single key against the index
-	check := func(k string) error {
-		keyBytes := []byte(k)
-		// Search for the latest committed version of this key
-		seekKey := encodeIndexKey(keyBytes, math.MaxUint64)
-
-		if iter.Seek(seekKey) {
-			foundKey := iter.Key()
-			uKey, version, err := decodeIndexKey(foundKey)
-
-			if err == nil && bytes.Equal(uKey, keyBytes) {
-				// If the latest version in DB is newer than our snapshot (readTxID),
-				// it means someone else committed a change concurrently.
-				if version > tx.readTxID {
-					return ErrWriteConflict
-				}
-			}
-		}
-		return nil
-	}
-
-	// 1. Validate Read Set (Prevent Stale Reads / Write Skew)
-	for k := range tx.readSet {
-		if err := check(k); err != nil {
-			return err
-		}
-	}
-
-	// 2. Validate Write Set (Prevent Lost Updates / First-Committer-Wins)
-	// We must ensure that we are not overwriting a value committed by a concurrent transaction,
-	// even if we didn't read it (Blind Writes).
-	for k := range tx.pendingOps {
-		// Optimization: if k in readSet, we already checked it above.
-		if _, ok := tx.readSet[k]; ok {
-			continue
-		}
-		if err := check(k); err != nil {
-			return err
-		}
-	}
-
-	return nil
 }

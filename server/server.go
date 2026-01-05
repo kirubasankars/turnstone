@@ -374,6 +374,10 @@ func (s *Server) handleSet(w io.Writer, payload []byte, st *connState) {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Partition selected"))
 		return
 	}
+	if st.partitionName == "0" {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Partition 0 is read-only"))
+		return
+	}
 	if st.tx == nil {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusTxRequired, nil)
 		return
@@ -408,6 +412,10 @@ func (s *Server) handleSet(w io.Writer, payload []byte, st *connState) {
 func (s *Server) handleDel(w io.Writer, payload []byte, st *connState) {
 	if st.partition == nil {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Partition selected"))
+		return
+	}
+	if st.partitionName == "0" {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Partition 0 is read-only"))
 		return
 	}
 	if st.tx == nil {
@@ -494,7 +502,11 @@ func (s *Server) TotalConns() uint64 {
 	return atomic.LoadUint64(&s.totalConns)
 }
 
-// ActiveTxs return number of active transactions (only those with open txn objects)
+// ActiveTxs return number of active transactions aggregated from all stores
 func (s *Server) ActiveTxs() int64 {
-	return 0
+	var total int64
+	for _, st := range s.stores {
+		total += int64(st.ActiveTransactionCount())
+	}
+	return total
 }

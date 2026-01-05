@@ -84,7 +84,7 @@ func TestGenerateConfigArtifacts(t *testing.T) {
 		TLSCertFile:        "certs/server.crt", // Relative paths
 		TLSKeyFile:         "certs/server.key",
 		TLSCAFile:          "certs/ca.crt",
-		NumberOfPartitions: 1,
+		NumberOfPartitions: 1, // Should create partition 0 and 1
 	}
 
 	// Execute
@@ -93,9 +93,15 @@ func TestGenerateConfigArtifacts(t *testing.T) {
 	}
 
 	// 1. Verify Directories
+	// Partition 0 (Internal)
 	if _, err := os.Stat(filepath.Join(tmpDir, "data", "0")); os.IsNotExist(err) {
 		t.Error("Data directory for partition '0' not created")
 	}
+	// Partition 1 (User)
+	if _, err := os.Stat(filepath.Join(tmpDir, "data", "1")); os.IsNotExist(err) {
+		t.Error("Data directory for partition '1' not created")
+	}
+
 	if _, err := os.Stat(filepath.Join(tmpDir, "certs")); os.IsNotExist(err) {
 		t.Error("Certs directory not created")
 	}
