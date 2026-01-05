@@ -1,12 +1,9 @@
-/*
-Package main acts as the entry point for the TurnstoneDB server.
-It handles command-line flag parsing, configuration loading, security initialization,
-and starts the main server and storage engine.
-*/
 package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -15,13 +12,14 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 )
 
 func main() {
 	var homeDir string
-	flag.StringVar(&homeDir, "home", "", "Home directory for configuration, data, and certificates (Required)")
-	genConfig := flag.Bool("generate-config", false, "Generate a sample configuration file and certificates")
-
+	flag.StringVar(&homeDir, "home", "", "Home directory (Required)")
+	genConfig := flag.Bool("generate-config", false, "Generate configuration artifacts")
+	devMode := flag.Bool("dev", false, "Dev Mode (TxTimeout=120s)")
 	flag.Parse()
 
 	if homeDir == "" {
@@ -30,90 +28,118 @@ func main() {
 		os.Exit(1)
 	}
 
-	resolvedConfigPath := filepath.Join(homeDir, "config.json")
-
-	// Set reasonable defaults
+	configPath := filepath.Join(homeDir, "config.json")
 	defaultCfg := Config{
-		Port:                  DefaultPort,
-		Debug:                 false,
-		MaxConns:              500,
-		Fsync:                 true,
-		AllowRecoveryTruncate: false,
-		Role:                  "leader",
-		MinReplicas:           0,
-		IndexType:             "leveldb",
-		TLSCertFile:           "certs/server.crt",
-		TLSKeyFile:            "certs/server.key",
-		TLSCAFile:             "certs/ca.crt",
-		TLSClientCertFile:     "certs/client.crt",
-		TLSClientKeyFile:      "certs/client.key",
-		MetricsAddr:           ":9090",
+		Port: DefaultPort, MaxConns: 500, Fsync: true,
+		TLSCertFile: "certs/server.crt", TLSKeyFile: "certs/server.key", TLSCAFile: "certs/ca.crt",
+		TLSClientCertFile: "certs/client.crt", TLSClientKeyFile: "certs/client.key", MetricsAddr: ":9090",
+		Databases: []DatabaseConfig{
+			{Name: "default", Role: "leader"},
+		},
 	}
 
-	// Generate artifacts if requested
 	if *genConfig {
-		generateConfigArtifacts(homeDir, defaultCfg, resolvedConfigPath)
+		if err := GenerateConfigArtifacts(homeDir, defaultCfg, configPath); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to generate config: %v\n", err)
+			os.Exit(1)
+		}
 		return
 	}
 
-	// Load configuration
+	// Load Config
 	cfg := defaultCfg
-	if fileData, err := os.ReadFile(resolvedConfigPath); err == nil {
-		if err := json.Unmarshal(fileData, &cfg); err != nil {
-			fmt.Fprintf(os.Stderr, "Error parsing config file: %v\n", err)
+	if data, err := os.ReadFile(configPath); err == nil {
+		if err := json.Unmarshal(data, &cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "Config parse error: %v\n", err)
 			os.Exit(1)
 		}
 	} else if !os.IsNotExist(err) {
-		fmt.Fprintf(os.Stderr, "Error reading config file: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Config read error: %v\n", err)
 		os.Exit(1)
 	} else {
-		// Config file doesn't exist, create the home dir just in case
 		_ = os.MkdirAll(homeDir, 0o755)
 	}
 
-	// Normalize paths relative to homeDir
+	// Resolve absolute paths
 	cfg.TLSCertFile = ResolvePath(homeDir, cfg.TLSCertFile)
 	cfg.TLSKeyFile = ResolvePath(homeDir, cfg.TLSKeyFile)
 	cfg.TLSCAFile = ResolvePath(homeDir, cfg.TLSCAFile)
 	cfg.TLSClientCertFile = ResolvePath(homeDir, cfg.TLSClientCertFile)
 	cfg.TLSClientKeyFile = ResolvePath(homeDir, cfg.TLSClientKeyFile)
 
-	// Setup Logging
+	// Logging
 	lvl := slog.LevelInfo
 	if cfg.Debug {
 		lvl = slog.LevelDebug
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: lvl}))
 
-	validateSecurityConfig(cfg, logger)
+	txDuration := MaxTxDuration
+	if *devMode {
+		logger.Info("DEV MODE Enabled")
+		txDuration = 120 * time.Second
+	}
 
-	// Setup Signal Handling for graceful shutdown
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	// Initialize Storage Engine (using fixed "data" directory)
-	dataDir := ResolvePath(homeDir, "data")
-	store, err := NewStore(dataDir, logger, cfg.AllowRecoveryTruncate, cfg.MinReplicas, cfg.Fsync, cfg.IndexType)
-	if err != nil {
-		logger.Error("Failed to init store", "err", err)
+	if err := ValidateSecurityConfig(cfg); err != nil {
+		logger.Error("Config invalid", "err", err)
 		os.Exit(1)
 	}
 
-	// Start Replication Client if configured (Follower Mode)
-	if cfg.ReplicaOf != "" {
-		logger.Info("Starting in FOLLOWER mode", "leader", cfg.ReplicaOf)
-		StartReplicationClient(cfg.ReplicaOf, cfg.TLSClientCertFile, cfg.TLSClientKeyFile, cfg.TLSCAFile, store, logger)
+	// Initialize Stores
+	// Ensure "0" (System DB) always exists
+	hasSystemDB := false
+	for _, dbCfg := range cfg.Databases {
+		if dbCfg.Name == "0" {
+			hasSystemDB = true
+			break
+		}
+	}
+	if !hasSystemDB {
+		cfg.Databases = append(cfg.Databases, DatabaseConfig{Name: "0", Role: "leader"})
 	}
 
-	// Start TCP Server
-	srv := NewServer(cfg.Port, cfg.MetricsAddr, store, logger, cfg.MaxConns, false, cfg.TLSCertFile, cfg.TLSKeyFile, cfg.TLSCAFile)
+	stores := make(map[string]*Store)
+	for _, dbCfg := range cfg.Databases {
+		dbPath := filepath.Join(homeDir, "data", dbCfg.Name)
+		store, err := NewStore(dbPath, logger, cfg.AllowRecoveryTruncate, dbCfg.MinReplicas, cfg.Fsync)
+		if err != nil {
+			logger.Error("Failed to init store", "db", dbCfg.Name, "err", err)
+			os.Exit(1)
+		}
+		stores[dbCfg.Name] = store
+	}
+
+	// Initialize Replication Manager (Follower Mode)
+	// We init RM if client certs are valid, regardless of initial config, to allow dynamic commands
+	var replManager *ReplicationManager
+	clientCert, err := tls.LoadX509KeyPair(cfg.TLSClientCertFile, cfg.TLSClientKeyFile)
+	if err == nil {
+		caCert, _ := os.ReadFile(cfg.TLSCAFile)
+		pool := x509.NewCertPool()
+		pool.AppendCertsFromPEM(caCert)
+		tlsConf := &tls.Config{Certificates: []tls.Certificate{clientCert}, RootCAs: pool}
+
+		replManager = NewReplicationManager(stores, tlsConf, logger)
+		replManager.Start(cfg.Databases)
+	} else {
+		logger.Warn("Client certs not found, replication client disabled", "err", err)
+	}
+
+	srv, err := NewServer(cfg.Port, cfg.MetricsAddr, stores, logger, cfg.MaxConns, txDuration, cfg.TLSCertFile, cfg.TLSKeyFile, cfg.TLSCAFile, replManager)
+	if err != nil {
+		logger.Error("Server init failed", "err", err)
+		os.Exit(1)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	go func() {
 		if err := srv.Run(ctx); err != nil {
 			logger.Error("Server stopped", "err", err)
 		}
-		srv.CloseAll()
 	}()
 
 	<-ctx.Done()
+	srv.CloseAll()
 }

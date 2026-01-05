@@ -8,145 +8,76 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"runtime/debug" // Added for stack trace logging
+	"runtime/debug"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-// CheckpointInterval defines how often we persist an LSN->Offset mapping.
-const CheckpointInterval = 512 * 1024 * 1024
+const (
+	CheckpointInterval = 512 * 1024 * 1024
+	ReplicationTimeout = 30 * time.Second
+	SlowOpThreshold    = 500 * time.Millisecond
+)
 
-// ReplicationTimeout defines when a follower is considered dead and dropped.
-const ReplicationTimeout = 30 * time.Second
-
-// SlowOpThreshold defines the duration after which an operation is logged as slow.
-const SlowOpThreshold = 500 * time.Millisecond
-
-// Checkpoint maps a Logical Sequence Number to a physical WAL offset.
-type Checkpoint struct {
-	LSN    uint64
-	Offset int64
-}
-
-// ReplicaState tracks the progress of a connected follower.
-type ReplicaState struct {
-	LSN      uint64
-	LastSeen time.Time
-}
-
-// Store is the core storage engine.
-// It orchestrates the WAL, the Hybrid Index, and the single-writer concurrency model.
 type Store struct {
+	// Synchronization & System
 	mu        sync.RWMutex
-	wal       *WAL
-	index     Index // Interface to Index backend
+	wg        sync.WaitGroup
+	done      chan struct{}
+	closing   atomic.Bool
 	startTime time.Time
 	logger    *slog.Logger
 
+	// Components
+	wal   *WAL
+	index Index
+
 	// Configuration
 	allowTruncate bool
-	minReplicas   int // Synchronous replication requirement.
+	minReplicas   int
 	fsyncEnabled  bool
+	dataDir       string
 
-	// State
-	offset          int64        // Current physical write offset in the WAL.
-	nextLSN         uint64       // Next sequence number to be assigned.
-	minReadLSN      uint64       // The oldest active snapshot LSN (for GC).
-	compactedOffset int64        // The offset up to which the WAL has been compacted/punched.
-	checkpoints     []Checkpoint // In-memory cache of checkpoints for fast seeking.
+	// Storage State (Protected by mu)
+	offset          int64
+	nextLSN         uint64
+	nextLogID       uint64
+	minReadLSN      uint64
+	compactedOffset int64
+	checkpoints     []Checkpoint
+	activeSnapshots map[uint64]int
 
-	// Metrics (Day 2 Operations)
+	// Replication State
+	replicationSlots map[string]ReplicaState
+	ackCond          *sync.Cond
+
+	// Metrics
 	conflictCount          int64
 	recoveryDuration       time.Duration
-	bytesWritten           int64         // Atomic: Total bytes written to WAL.
-	bytesRead              int64         // Atomic: Total bytes read from WAL.
-	slowOps                int64         // Atomic: Count of ops exceeding SlowOpThreshold.
-	lastCompactionDuration time.Duration // Protected by mu.
-	offloadInProgress      atomic.Bool   // Atomic: Prevents concurrent maintenance jobs.
+	bytesWritten           int64
+	bytesRead              int64
+	slowOps                int64
+	lastCompactionDuration time.Duration
 
-	// Concurrency Channels
-	opsChannel        chan *request // The main write queue.
+	// Operation Handling
+	opsChannel        chan *request
 	compactionChannel chan struct{}
-	done              chan struct{}
-	wg                sync.WaitGroup
-
-	// Object Pooling
-	reqPool *sync.Pool
-
-	// Replication & MVCC State
-	activeSnapshots  map[uint64]int          // Reference count of active readers per LSN.
-	replicationSlots map[string]ReplicaState // Map of follower ID -> State.
-	ackCond          *sync.Cond              // Condition variable to wake up writers waiting for replication.
-
-	dataDir string
+	reqPool           *sync.Pool
 }
 
-// FindOffsetForLSN uses binary search on checkpoints to find the approximate
-// WAL offset for a given LSN. Used to quickly start replication.
-func (s *Store) FindOffsetForLSN(lsn uint64) int64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	idx := sort.Search(len(s.checkpoints), func(i int) bool {
-		return s.checkpoints[i].LSN > lsn
-	})
-
-	var hintOffset int64
-	if idx == 0 {
-		hintOffset = 0
-	} else {
-		hintOffset = s.checkpoints[idx-1].Offset
-	}
-
-	if hintOffset < s.compactedOffset {
-		return s.compactedOffset
-	}
-	return hintOffset
-}
-
-// hasConflict checks if the current request conflicts with any pending requests
-// or if the data has changed since the transaction's snapshot.
-func (s *Store) hasConflict(req *request, pending []*request) bool {
-	// 1. Check against pending batch (Write-Write Conflict)
-	for _, pReq := range pending {
-		for _, op := range pReq.ops {
-			if _, exists := req.accessMap[op.key]; exists {
-				return true
-			}
-		}
-	}
-
-	// 2. Check against committed data (Read-Write Conflict)
-	// CRITICAL FIX: We must hold RLock because concurrent maintenance tasks (OffloadColdKeys)
-	// might be modifying the index (especially for MemoryIndex map).
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	for key := range req.accessMap {
-		latest, exists := s.index.GetHead(key)
-		if exists && latest.LSN > req.readLSN {
-			return true
-		}
-	}
-	return false
-}
-
-// NewStore initializes the storage engine, opens files, and performs recovery.
-func NewStore(dataDir string, logger *slog.Logger, allowTruncate bool, minReplicas int, fsyncEnabled bool, indexType string) (*Store, error) {
+func NewStore(dataDir string, logger *slog.Logger, allowTruncate bool, minReplicas int, fsyncEnabled bool) (*Store, error) {
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		return nil, fmt.Errorf("failed to init data dir: %w", err)
 	}
-
-	logger.Info("Opening store", "fsync", fsyncEnabled, "min_replicas", minReplicas, "index", indexType)
 
 	wal, err := OpenWAL(dataDir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open WAL: %w", err)
 	}
 
-	idx, err := NewIndex(dataDir, indexType)
+	idx, err := NewIndex(dataDir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open index: %w", err)
 	}
@@ -156,23 +87,21 @@ func NewStore(dataDir string, logger *slog.Logger, allowTruncate bool, minReplic
 		index:             idx,
 		minReplicas:       minReplicas,
 		fsyncEnabled:      fsyncEnabled,
-		checkpoints:       make([]Checkpoint, 0),
-		activeSnapshots:   make(map[uint64]int),
-		replicationSlots:  make(map[string]ReplicaState),
+		allowTruncate:     allowTruncate,
+		dataDir:           dataDir,
 		startTime:         time.Now(),
 		logger:            logger,
-		allowTruncate:     allowTruncate,
 		opsChannel:        make(chan *request, 5000),
 		compactionChannel: make(chan struct{}, 1),
 		done:              make(chan struct{}),
-		dataDir:           dataDir,
+		checkpoints:       make([]Checkpoint, 0),
+		activeSnapshots:   make(map[uint64]int),
+		replicationSlots:  make(map[string]ReplicaState),
 		nextLSN:           1,
+		nextLogID:         1,
 		reqPool: &sync.Pool{
 			New: func() any {
-				return &request{
-					resp:   make(chan error, 1),
-					opLens: make([]int, 0, 16),
-				}
+				return &request{resp: make(chan error, 1), opLengths: make([]int, 0, 16)}
 			},
 		},
 	}
@@ -190,284 +119,26 @@ func NewStore(dataDir string, logger *slog.Logger, allowTruncate bool, minReplic
 	return s, nil
 }
 
-// recalcMinReadLSN updates the global minimum LSN needed by readers or replicas.
-// Data older than this can be safely garbage collected.
-func (s *Store) recalcMinReadLSN() {
-	min := s.nextLSN - 1
-	// 1. Check active transactions
-	for lsn := range s.activeSnapshots {
-		if lsn < min {
-			min = lsn
-		}
-	}
-	// 2. Check active replicas
-	for _, state := range s.replicationSlots {
-		if state.LSN < min {
-			min = state.LSN
-		}
-	}
-	s.minReadLSN = min
-}
-
-// RegisterReplica adds a new follower to track for garbage collection safety.
-func (s *Store) RegisterReplica(id string, startLSN uint64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.replicationSlots[id] = ReplicaState{LSN: startLSN, LastSeen: time.Now()}
-	s.recalcMinReadLSN()
-}
-
-// UnregisterReplica removes a follower.
-func (s *Store) UnregisterReplica(id string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.replicationSlots, id)
-	s.recalcMinReadLSN()
-	s.ackCond.Broadcast()
-}
-
-// UpdateReplicaLSN updates the progress of a follower.
-func (s *Store) UpdateReplicaLSN(id string, lsn uint64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.replicationSlots[id] = ReplicaState{LSN: lsn, LastSeen: time.Now()}
-	s.recalcMinReadLSN()
-	s.ackCond.Broadcast()
-}
-
-// PruneStaleReplicas removes followers that haven't sent ACKs recently.
-func (s *Store) PruneStaleReplicas() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	now := time.Now()
-	changed := false
-	for id, state := range s.replicationSlots {
-		if now.Sub(state.LastSeen) > ReplicationTimeout {
-			s.logger.Warn("Dropping stale replica", "id", id, "last_seen", state.LastSeen)
-			delete(s.replicationSlots, id)
-			changed = true
-		}
-	}
-
-	if changed {
-		s.recalcMinReadLSN()
-		s.ackCond.Broadcast()
-	}
-}
-
-// WaitForQuorum blocks until enough replicas have acknowledged the targetLSN.
-func (s *Store) WaitForQuorum(targetLSN uint64) error {
-	if s.minReplicas <= 0 {
-		return nil
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	for {
-		acks := 0
-		for _, state := range s.replicationSlots {
-			if state.LSN >= targetLSN {
-				acks++
-			}
-		}
-
-		if acks >= s.minReplicas {
-			return nil
-		}
-		s.ackCond.Wait()
-	}
-}
-
-// recover rebuilds the index by scanning the WAL from the beginning.
-func (s *Store) recover() error {
-	start := time.Now()
-	defer func() {
-		s.mu.Lock()
-		s.recoveryDuration = time.Since(start)
-		s.mu.Unlock()
-	}()
-
-	size := s.wal.Size()
-	s.logger.Info("Recovering index...", "file_size", size)
-
-	ckptMap, err := s.index.GetCheckpoints()
-	if err == nil && len(ckptMap) > 0 {
-		for lsn, off := range ckptMap {
-			s.checkpoints = append(s.checkpoints, Checkpoint{LSN: lsn, Offset: off})
-		}
-		sort.Slice(s.checkpoints, func(i, j int) bool {
-			return s.checkpoints[i].LSN < s.checkpoints[j].LSN
-		})
-		s.logger.Info("Loaded checkpoints", "count", len(s.checkpoints))
-	}
-
-	var offset int64 = 0
-	var maxLSN uint64 = 0
-
-	// RECOVERY OPTIMIZATION: Try to load persistent state from LevelDB
-	stateLSN, stateOffset, err := s.index.GetState()
-	if err == nil && stateOffset > 0 {
-		s.logger.Info("Fast recovery: Found persistent state", "next_lsn", stateLSN, "offset", stateOffset)
-		// We can skip the WAL up to stateOffset.
-		// NOTE: stateOffset points to where we should WRITE next.
-		// However, the loop below iterates over existing data.
-		// If we set offset = stateOffset, we assume everything before it is already indexed.
-		if stateOffset <= size {
-			offset = stateOffset
-			// If persistent state says NextLSN is X, then max applied LSN was X-1.
-			if stateLSN > 0 {
-				maxLSN = stateLSN - 1
-			}
-		} else {
-			s.logger.Warn("Persistent state offset is larger than WAL size, falling back to full scan", "state_offset", stateOffset, "wal_size", size)
-		}
-	}
-
-	header := make([]byte, HeaderSize)
-	count := 0
-	var lastCheckpointOffset int64 = 0
-	if len(s.checkpoints) > 0 {
-		lastCheckpointOffset = s.checkpoints[len(s.checkpoints)-1].Offset
-	}
-
-	for offset < size {
-		n, err := s.wal.ReadAt(header, offset)
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			if !s.allowTruncate {
-				return fmt.Errorf("read error at %d: %w", offset, err)
-			}
-			s.wal.Truncate(offset)
-			break
-		}
-
-		// Check for hole (zero block)
-		isZero := true
-		for _, b := range header {
-			if b != 0 {
-				isZero = false
-				break
-			}
-		}
-		if isZero {
-			nextBlock := (offset/4096 + 1) * 4096
-			if nextBlock > size {
-				break
-			}
-			offset = nextBlock
-			continue
-		}
-
-		packed := binary.BigEndian.Uint32(header[0:4])
-		keyLen, valLen, isDel := UnpackMeta(packed)
-		entryLSN := binary.BigEndian.Uint64(header[4:12])
-		storedCrc := binary.BigEndian.Uint32(header[12:16])
-
-		var payloadLen int
-		if isDel {
-			payloadLen = int(keyLen)
-		} else {
-			payloadLen = int(keyLen) + int(valLen)
-		}
-
-		if payloadLen < 0 || payloadLen > MaxValueSize+MaxKeySize {
-			s.wal.Truncate(offset)
-			break
-		}
-
-		payload := make([]byte, payloadLen)
-		n, err = s.wal.ReadAt(payload, offset+HeaderSize)
-		if err != nil {
-			s.wal.Truncate(offset)
-			break
-		}
-		if n < int(payloadLen) {
-			s.wal.Truncate(offset)
-			break
-		}
-
-		digest := crc32.New(crc32Table)
-		digest.Write(header[0:12])
-		digest.Write(payload)
-		if digest.Sum32() != storedCrc {
-			s.logger.Warn("CRC mismatch", "offset", offset)
-			s.wal.Truncate(offset)
-			break
-		}
-
-		key := string(payload[:int(keyLen)])
-		entrySize := int64(HeaderSize) + int64(payloadLen)
-
-		// Fix recovery using strict Set semantics to ensure sorted history
-		s.index.Set(key, offset, entrySize, entryLSN, isDel, 0)
-
-		if entryLSN > maxLSN {
-			maxLSN = entryLSN
-		}
-		if count == 0 {
-			s.compactedOffset = offset
-		}
-
-		if offset-lastCheckpointOffset >= CheckpointInterval {
-			s.checkpoints = append(s.checkpoints, Checkpoint{LSN: entryLSN, Offset: offset})
-			if err := s.index.PutCheckpoint(entryLSN, offset); err != nil {
-				s.logger.Error("Failed to save checkpoint", "err", err)
-			}
-			lastCheckpointOffset = offset
-		}
-
-		offset += entrySize
-		count++
-	}
-
-	s.logger.Info("Recovery complete", "entries_scanned", count, "offset", offset, "checkpoints", len(s.checkpoints))
-	s.offset = offset
-	s.nextLSN = maxLSN + 1
-
-	// CRITICAL FIX: Persist state at end of recovery.
-	// This ensures that even if we don't write new data, the next startup is fast.
-	if err := s.index.PutState(s.nextLSN, s.offset); err != nil {
-		s.logger.Warn("Failed to persist state after recovery", "err", err)
-	}
-
-	return nil
-}
-
-// Close gracefully shuts down the store, waiting for pending operations.
 func (s *Store) Close() error {
+	s.closing.Store(true)
+	s.mu.Lock()
+	s.ackCond.Broadcast()
+	s.mu.Unlock()
 	close(s.done)
 	s.wg.Wait()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.index.Close()
 	return s.wal.Close()
 }
 
-// Compact triggers the WiscKey background compaction job.
-func (s *Store) Compact() error {
-	select {
-	case s.compactionChannel <- struct{}{}:
-		return nil
-	default:
-		return ErrCompactionInProgress
-	}
-}
-
-// runLoop is the single-writer goroutine.
-// It serializes all write requests from opsChannel to ensure consistency without row-level locks.
+// runLoop implements the Single Writer Principle.
 func (s *Store) runLoop() {
 	defer s.wg.Done()
-
-	// CRITICAL FIX: If this loop panics (e.g., LevelDB mmap fail), the server hangs.
-	// We must recover and force a process exit to restart.
 	defer func() {
 		if r := recover(); r != nil {
-			s.logger.Error("CRITICAL: Storage loop panicked (possible mmap/disk failure)", "err", r, "stack", string(debug.Stack()))
-			// Force exit to prevent zombie state where clients wait forever.
+			s.logger.Error("CRITICAL: Storage loop panicked", "err", r, "stack", string(debug.Stack()))
 			os.Exit(1)
 		}
 	}()
@@ -475,10 +146,9 @@ func (s *Store) runLoop() {
 	var batchBuf bytes.Buffer
 	pending := make([]*request, 0, MaxBatchSize)
 	batchTicker := time.NewTicker(BatchDelay)
+	maintTicker := time.NewTicker(10 * time.Second)
 	defer batchTicker.Stop()
-
-	maintenanceTicker := time.NewTicker(10 * time.Second)
-	defer maintenanceTicker.Stop()
+	defer maintTicker.Stop()
 
 	flush := func() {
 		if len(pending) > 0 {
@@ -498,14 +168,7 @@ func (s *Store) runLoop() {
 			if req.cancelled.Load() {
 				continue
 			}
-
-			activePending := make([]*request, 0, len(pending))
-			for _, p := range pending {
-				if !p.cancelled.Load() {
-					activePending = append(activePending, p)
-				}
-			}
-			if s.hasConflict(req, activePending) {
+			if s.hasConflict(req, pending) {
 				atomic.AddInt64(&s.conflictCount, 1)
 				req.resp <- ErrConflict
 				continue
@@ -519,48 +182,41 @@ func (s *Store) runLoop() {
 		case <-batchTicker.C:
 			flush()
 
-		case <-maintenanceTicker.C:
-			s.PruneStaleReplicas()
-
-			// Launch offload in background to avoid blocking the write loop.
-			if s.offloadInProgress.CompareAndSwap(false, true) {
-				go func() {
-					defer s.offloadInProgress.Store(false)
-
-					s.mu.RLock()
-					safeLSN := s.minReadLSN
-					s.mu.RUnlock()
-
-					// CRITICAL FIX: MemoryIndex map modification needs exclusive lock
-					// because hasConflict reads it concurrently (now protected by RLock).
-					s.mu.Lock()
-					count, err := s.index.OffloadColdKeys(safeLSN)
-					s.mu.Unlock()
-
-					if err != nil {
-						s.logger.Error("Offload failed", "err", err)
-					} else if count > 0 {
-						s.logger.Info("Offloaded cold keys", "count", count, "safeLSN", safeLSN)
-					}
-				}()
-			}
+		case <-maintTicker.C:
+			s.handleMaintenance()
 
 		case <-s.compactionChannel:
 			flush()
-			go s.doCompactionJob()
+			s.compactLogSync()
 		}
 	}
 }
 
-// doCompactionJob reads old WAL regions, moves valid live data to the head,
-// and punches holes in the file to reclaim space (Linux only).
-func (s *Store) doCompactionJob() {
-	start := time.Now()
-	s.logger.Info("Starting Compaction...")
+func (s *Store) handleMaintenance() {
+	s.PruneStaleReplicas()
+
 	s.mu.RLock()
+	safeLSN := s.minReadLSN
+	s.mu.RUnlock()
+
+	count, err := s.index.OffloadColdKeys(safeLSN)
+	if err != nil {
+		s.logger.Error("Offload failed", "err", err)
+	} else if count > 0 {
+		s.logger.Debug("Offloaded cold keys", "count", count)
+	}
+}
+
+// compactLogSync performs Stop-the-World compaction.
+func (s *Store) compactLogSync() {
+	s.logger.Info("Starting Stop-the-World Compaction...")
+	start := time.Now()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	safeEndOffset := s.offset - (10 * 1024 * 1024)
 	startOffset := s.compactedOffset
-	s.mu.RUnlock()
 
 	if safeEndOffset <= startOffset {
 		s.logger.Info("Not enough data to compact")
@@ -570,13 +226,14 @@ func (s *Store) doCompactionJob() {
 	chunkSize := int64(4 * 1024 * 1024)
 	buffer := make([]byte, chunkSize)
 	currentRead := startOffset
-	var moves []bufferedOp
+	var moves []IndexUpdate
+	var walBuffer bytes.Buffer
 	var bytesReclaimed int64
 
 	for currentRead < safeEndOffset {
 		n, err := s.wal.ReadAt(buffer, currentRead)
 		if err != nil && err != io.EOF {
-			s.logger.Error("Compaction read failed", "err", err)
+			s.logger.Error("Compaction Read Error", "err", err)
 			return
 		}
 		if n == 0 {
@@ -584,114 +241,133 @@ func (s *Store) doCompactionJob() {
 		}
 
 		parseOff := 0
-		moves = moves[:0]
-
 		for parseOff < n {
-			if parseOff+4 > n {
+			if parseOff+HeaderSize > n {
 				break
 			}
-			// Skip existing holes
-			if buffer[parseOff] == 0 && buffer[parseOff+1] == 0 && buffer[parseOff+2] == 0 && buffer[parseOff+3] == 0 {
+			// Skip Holes
+			if buffer[parseOff] == 0 && buffer[parseOff+1] == 0 && buffer[parseOff+2] == 0 {
 				aligned := (parseOff/4096 + 1) * 4096
 				if aligned >= n {
 					break
 				}
-				bytesReclaimed += int64(aligned - parseOff)
 				parseOff = aligned
 				continue
-			}
-			if parseOff+HeaderSize > n {
-				break
 			}
 
 			packed := binary.BigEndian.Uint32(buffer[parseOff : parseOff+4])
 			keyLen, valLen, isDel := UnpackMeta(packed)
-			var payloadLen int
-			if isDel {
-				payloadLen = int(keyLen)
-			} else {
-				payloadLen = int(keyLen) + int(valLen)
+			payloadLen := int(keyLen)
+			if !isDel {
+				payloadLen += int(valLen)
 			}
 			if parseOff+HeaderSize+payloadLen > n {
 				break
 			}
 
-			key := string(buffer[parseOff+HeaderSize : parseOff+HeaderSize+int(keyLen)])
+			key := string(buffer[parseOff+24 : parseOff+24+int(keyLen)])
 			originalOffset := currentRead + int64(parseOff)
 
-			// Check if this is still the live version
 			latest, exists := s.index.GetLatest(key)
 			if exists && latest.Offset == originalOffset {
-				valStart := parseOff + HeaderSize + int(keyLen)
-				val := buffer[valStart : valStart+int(valLen)]
-				op := bufferedOp{opType: OpJournalSet, key: key, val: make([]byte, len(val))}
-				if isDel {
-					op.opType = OpJournalDelete
-				}
-				copy(op.val, val)
-				// Preserve ORIGINAL LSN
-				copy(op.header[:], buffer[parseOff:parseOff+HeaderSize])
-				moves = append(moves, op)
+				oldLSN := binary.BigEndian.Uint64(buffer[parseOff+4 : parseOff+12])
+				entryData := buffer[parseOff : parseOff+HeaderSize+payloadLen]
+
+				// Re-stamp LogID
+				binary.BigEndian.PutUint64(entryData[12:20], s.nextLogID)
+				s.nextLogID++
+
+				crc := crc32.Checksum(entryData[:20], crc32Table)
+				crc = crc32.Update(crc, crc32Table, entryData[24:])
+				binary.BigEndian.PutUint32(entryData[20:24], crc)
+
+				newOffset := s.offset + int64(walBuffer.Len())
+
+				moves = append(moves, IndexUpdate{
+					Key:     key,
+					Offset:  newOffset,
+					Length:  int64(len(entryData)),
+					LSN:     oldLSN,
+					Deleted: isDel,
+				})
+
+				walBuffer.Write(entryData)
 			} else {
 				bytesReclaimed += int64(HeaderSize + payloadLen)
 			}
 			parseOff += HeaderSize + payloadLen
 		}
-
-		if len(moves) > 0 {
-			errChan := make(chan error, 1)
-			gcReq := &request{ops: moves, resp: errChan, isCompaction: true, accessMap: make(map[string]struct{})}
-			s.opsChannel <- gcReq
-			<-errChan
-		}
-
-		punchSize := (int64(parseOff) / 4096) * 4096
-		if punchSize > 0 {
-			s.wal.PunchHole(currentRead, punchSize)
-		}
-
-		s.mu.Lock()
-		s.compactedOffset = currentRead + punchSize
-		s.lastCompactionDuration = time.Since(start)
-		s.mu.Unlock()
 		currentRead += chunkSize
 	}
-	s.logger.Info("Compaction job done", "duration", time.Since(start), "reclaimed_bytes", bytesReclaimed)
+
+	if walBuffer.Len() > 0 {
+		data := walBuffer.Bytes()
+		_, err := s.wal.Write(data)
+		if err != nil {
+			s.logger.Error("Compaction Write Error", "err", err)
+			return
+		}
+
+		if s.fsyncEnabled {
+			s.wal.Sync()
+		}
+
+		s.offset += int64(len(data))
+		s.bytesWritten += int64(len(data))
+
+		if err := s.index.SetBatch(moves); err != nil {
+			s.logger.Error("CRITICAL: Compaction Index Update Failed", "err", err)
+		}
+	}
+
+	punchSize := currentRead - startOffset
+	if punchSize > 0 {
+		s.wal.PunchHole(startOffset, punchSize)
+		s.compactedOffset = currentRead
+	}
+
+	s.lastCompactionDuration = time.Since(start)
+	s.logger.Info("Compaction done", "reclaimed", bytesReclaimed, "moved_entries", len(moves), "duration", s.lastCompactionDuration)
 }
 
-// flushBatch writes the buffered operations to the WAL, Syncs, and updates the Index.
 func (s *Store) flushBatch(pending []*request, buf *bytes.Buffer) {
 	start := time.Now()
-	activeReqs := pending[:0]
+	hasCancelled := false
 	for _, req := range pending {
 		if req.cancelled.Load() {
-			continue
+			hasCancelled = true
+			break
 		}
-		activeReqs = append(activeReqs, req)
 	}
+
+	var activeReqs []*request
+	if hasCancelled {
+		activeReqs = make([]*request, 0, len(pending))
+		buf.Reset()
+		for _, req := range pending {
+			if !req.cancelled.Load() {
+				activeReqs = append(activeReqs, req)
+				req.opLengths = req.opLengths[:0]
+				s.serializeBatch(req, buf)
+			}
+		}
+	} else {
+		activeReqs = pending
+	}
+
 	if len(activeReqs) == 0 {
 		buf.Reset()
 		return
 	}
 
-	defer func() {
-		dur := time.Since(start)
-		if dur > SlowOpThreshold {
-			atomic.AddInt64(&s.slowOps, 1)
-			s.logger.Warn("Slow Batch Write", "ops", len(activeReqs), "duration", dur)
-		}
-	}()
-
-	// Phase 1: Write to Disk (Hold Lock)
 	s.mu.Lock()
-
 	currentLSN := s.nextLSN
-	startBatchLSN := currentLSN
-	minVer := s.getMinReadLSN()
-
+	currentLogID := s.nextLogID
+	startBatchLogID := currentLogID
 	bufBytes := buf.Bytes()
 	bufPtr := 0
 
+	// 1. Stamp LSNs and CRCs
 	for _, req := range activeReqs {
 		commitLSN := currentLSN
 		if !req.isCompaction && !req.isReplication {
@@ -703,23 +379,25 @@ func (s *Store) flushBatch(pending []*request, buf *bytes.Buffer) {
 			if op.opType == OpJournalGet {
 				continue
 			}
-			opLen := req.opLens[i]
-
+			opLen := req.opLengths[i]
 			lsnToWrite := commitLSN
 			if req.isCompaction || req.isReplication {
 				lsnToWrite = binary.BigEndian.Uint64(op.header[4:12])
 			}
 
-			// Patch LSN and CRC into buffer
 			binary.BigEndian.PutUint64(bufBytes[bufPtr+4:bufPtr+12], lsnToWrite)
-			digest := crc32.New(crc32Table)
-			digest.Write(bufBytes[bufPtr : bufPtr+12])
-			digest.Write(bufBytes[bufPtr+16 : bufPtr+opLen])
-			binary.BigEndian.PutUint32(bufBytes[bufPtr+12:bufPtr+16], digest.Sum32())
+			binary.BigEndian.PutUint64(bufBytes[bufPtr+12:bufPtr+20], currentLogID)
+			currentLogID++
+
+			crc := crc32.Checksum(bufBytes[bufPtr:bufPtr+20], crc32Table)
+			crc = crc32.Update(crc, crc32Table, bufBytes[bufPtr+24:bufPtr+opLen])
+			binary.BigEndian.PutUint32(bufBytes[bufPtr+20:bufPtr+24], crc)
+
 			bufPtr += opLen
 		}
 	}
 
+	// 2. Write to Disk
 	writeOffset, err := s.wal.Write(bufBytes)
 	if err != nil {
 		s.mu.Unlock()
@@ -738,68 +416,60 @@ func (s *Store) flushBatch(pending []*request, buf *bytes.Buffer) {
 		}
 	}
 
-	// Update Checkpoints if necessary
-	var lastCkptOffset int64 = 0
+	var lastCkptOffset int64
 	if len(s.checkpoints) > 0 {
 		lastCkptOffset = s.checkpoints[len(s.checkpoints)-1].Offset
 	}
 	if writeOffset-lastCkptOffset >= CheckpointInterval {
-		s.checkpoints = append(s.checkpoints, Checkpoint{LSN: startBatchLSN, Offset: writeOffset})
-		if err := s.index.PutCheckpoint(startBatchLSN, writeOffset); err != nil {
-			s.logger.Error("Failed to persist checkpoint", "err", err)
-		}
+		s.checkpoints = append(s.checkpoints, Checkpoint{LogID: startBatchLogID, Offset: writeOffset})
 	}
-
-	// Phase 2: Replication (Release Lock)
 	s.mu.Unlock()
 
-	batchMaxLSN := currentLSN - 1
-	if s.minReplicas > 0 && batchMaxLSN >= startBatchLSN {
-		err := s.WaitForQuorum(batchMaxLSN)
-		if err != nil {
+	// 3. Wait for Replication Quorum
+	batchMaxLogID := currentLogID - 1
+	if s.minReplicas > 0 && batchMaxLogID >= startBatchLogID {
+		if err := s.WaitForQuorum(batchMaxLogID); err != nil {
 			s.logger.Error("Replication quorum failed", "err", err)
 		}
 	}
 
-	// Phase 3: Index Update (Re-acquire Lock)
+	// 4. Update Index (Read View)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	currentOffset := writeOffset
 	indexLSN := s.nextLSN
-	maxReplicationLSN := uint64(0)
+	var indexUpdates []IndexUpdate
 
 	for _, req := range activeReqs {
 		reqLSN := indexLSN
 		if !req.isCompaction && !req.isReplication {
 			indexLSN++
 		}
-
 		for i := range req.ops {
 			op := &req.ops[i]
 			if op.opType == OpJournalGet {
 				continue
 			}
-			opLen := req.opLens[i]
-			reqOffset := currentOffset
-			currentOffset += int64(opLen)
-			isDel := op.opType == OpJournalDelete
-
-			var entryLSN uint64
+			opLen := req.opLengths[i]
+			entryLSN := reqLSN
 			if req.isCompaction || req.isReplication {
 				entryLSN = binary.BigEndian.Uint64(op.header[4:12])
-				if req.isReplication && entryLSN > maxReplicationLSN {
-					maxReplicationLSN = entryLSN
-				}
-			} else {
-				entryLSN = reqLSN
 			}
 
 			if req.isCompaction {
-				s.index.UpdateHead(op.key, reqOffset, int64(opLen), entryLSN)
+				s.index.UpdateHead(op.key, currentOffset, int64(opLen), entryLSN)
 			} else {
-				s.index.Set(op.key, reqOffset, int64(opLen), entryLSN, isDel, minVer)
+				isDel := op.opType == OpJournalDelete
+				indexUpdates = append(indexUpdates, IndexUpdate{
+					Key:     op.key,
+					Offset:  currentOffset,
+					Length:  int64(opLen),
+					LSN:     entryLSN,
+					Deleted: isDel,
+				})
 			}
+			currentOffset += int64(opLen)
 		}
 		select {
 		case req.resp <- nil:
@@ -807,23 +477,27 @@ func (s *Store) flushBatch(pending []*request, buf *bytes.Buffer) {
 		}
 	}
 
-	if maxReplicationLSN >= s.nextLSN {
-		s.nextLSN = maxReplicationLSN + 1
-	} else {
-		s.nextLSN = currentLSN
+	if len(indexUpdates) > 0 {
+		if err := s.index.SetBatch(indexUpdates); err != nil {
+			s.logger.Error("Index batch update failed", "err", err)
+		}
 	}
 
+	s.nextLSN = indexLSN
+	s.nextLogID = currentLogID
 	s.offset = currentOffset
 	s.recalcMinReadLSN()
 
-	// PERSISTENCE OPTIMIZATION:
-	// Save the global state (NextLSN + Offset) to the index.
-	// This enables fast recovery by skipping the already-processed WAL.
-	if err := s.index.PutState(s.nextLSN, s.offset); err != nil {
+	// Persist state including the current KeyCount to allow fast recovery of stats
+	if err := s.index.PutState(s.nextLSN, s.nextLogID, s.offset, int64(s.index.Len())); err != nil {
 		s.logger.Warn("Failed to persist state", "err", err)
 	}
 
 	buf.Reset()
+	if dur := time.Since(start); dur > SlowOpThreshold {
+		atomic.AddInt64(&s.slowOps, 1)
+		s.logger.Warn("Slow Batch Write", "ops", len(activeReqs), "duration", dur)
+	}
 }
 
 func (s *Store) failBatch(reqs []*request, err error) {
@@ -835,12 +509,158 @@ func (s *Store) failBatch(reqs []*request, err error) {
 	}
 }
 
-func (s *Store) getMinReadLSN() uint64 {
-	return s.minReadLSN
+func (s *Store) hasConflict(req *request, pending []*request) bool {
+	for _, pReq := range pending {
+		if !pReq.cancelled.Load() {
+			for _, op := range pReq.ops {
+				if _, exists := req.accessMap[op.key]; exists {
+					return true
+				}
+			}
+		}
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for key := range req.accessMap {
+		latest, exists := s.index.GetHead(key)
+		if exists && latest.LSN > req.readLSN {
+			return true
+		}
+	}
+	return false
 }
 
-// AcquireSnapshot grabs the current LSN for a read transaction.
-// It increments a reference counter to prevent GC of this LSN.
+func (s *Store) recover() error {
+	start := time.Now()
+	defer func() {
+		s.mu.Lock()
+		s.recoveryDuration = time.Since(start)
+		s.mu.Unlock()
+	}()
+
+	size := s.wal.Size()
+	s.logger.Info("Recovering index...", "file_size", size)
+
+	var offset int64
+	var maxLSN, maxLogID uint64
+
+	// Optimization: Try to fast-forward using state persisted in LevelDB
+	stateLSN, stateLogID, stateOffset, _, err := s.index.GetState()
+	if err == nil && stateOffset <= size {
+		s.logger.Info("Fast recovery engaged", "offset", stateOffset, "lsn", stateLSN, "logID", stateLogID)
+		offset = stateOffset
+		if stateLSN > 0 {
+			maxLSN = stateLSN - 1
+		}
+		if stateLogID > 0 {
+			maxLogID = stateLogID - 1
+		}
+	} else {
+		s.logger.Info("Performing full recovery scan", "reason", err)
+		offset = 0
+	}
+
+	var batch []IndexUpdate
+	const recoveryBatchSize = 10000
+
+	header := make([]byte, HeaderSize)
+	for offset < size {
+		if _, err := s.wal.ReadAt(header, offset); err != nil {
+			if err == io.EOF {
+				break
+			}
+			if !s.allowTruncate {
+				return fmt.Errorf("read error at %d: %w", offset, err)
+			}
+			s.wal.Truncate(offset)
+			break
+		}
+
+		isZero := true
+		for _, b := range header {
+			if b != 0 {
+				isZero = false
+				break
+			}
+		}
+		if isZero {
+			offset = (offset/4096 + 1) * 4096
+			continue
+		}
+
+		packed := binary.BigEndian.Uint32(header[0:4])
+		keyLen, valLen, isDel := UnpackMeta(packed)
+		entryLSN := binary.BigEndian.Uint64(header[4:12])
+		entryLogID := binary.BigEndian.Uint64(header[12:20])
+		storedCrc := binary.BigEndian.Uint32(header[20:24])
+
+		payloadLen := int(keyLen)
+		if !isDel {
+			payloadLen += int(valLen)
+		}
+
+		if payloadLen < 0 || int64(offset+HeaderSize+int64(payloadLen)) > size {
+			s.wal.Truncate(offset)
+			break
+		}
+
+		payload := make([]byte, payloadLen)
+		if _, err := s.wal.ReadAt(payload, offset+HeaderSize); err != nil {
+			s.wal.Truncate(offset)
+			break
+		}
+
+		crc := crc32.Checksum(header[:20], crc32Table)
+		crc = crc32.Update(crc, crc32Table, payload)
+		if crc != storedCrc {
+			s.logger.Warn("CRC mismatch", "offset", offset)
+			s.wal.Truncate(offset)
+			break
+		}
+
+		key := string(payload[:keyLen])
+		entrySize := int64(HeaderSize) + int64(payloadLen)
+
+		batch = append(batch, IndexUpdate{
+			Key:     key,
+			Offset:  offset,
+			Length:  entrySize,
+			LSN:     entryLSN,
+			Deleted: isDel,
+		})
+
+		if len(batch) >= recoveryBatchSize {
+			if err := s.index.SetBatch(batch); err != nil {
+				return fmt.Errorf("batch index error at offset %d: %w", offset, err)
+			}
+			batch = batch[:0]
+		}
+
+		if entryLSN > maxLSN {
+			maxLSN = entryLSN
+		}
+		if entryLogID > maxLogID {
+			maxLogID = entryLogID
+		}
+
+		if len(s.checkpoints) == 0 || offset-s.checkpoints[len(s.checkpoints)-1].Offset >= CheckpointInterval {
+			s.checkpoints = append(s.checkpoints, Checkpoint{LogID: entryLogID, Offset: offset})
+		}
+		offset += entrySize
+	}
+
+	if len(batch) > 0 {
+		if err := s.index.SetBatch(batch); err != nil {
+			return fmt.Errorf("final batch index error: %w", err)
+		}
+	}
+
+	s.offset = offset
+	s.nextLSN = maxLSN + 1
+	s.nextLogID = maxLogID + 1
+	return nil
+}
+
 func (s *Store) AcquireSnapshot() uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -853,7 +673,6 @@ func (s *Store) AcquireSnapshot() uint64 {
 	return lsn
 }
 
-// ReleaseSnapshot decrements the reference counter for a snapshot.
 func (s *Store) ReleaseSnapshot(readLSN uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -866,25 +685,115 @@ func (s *Store) ReleaseSnapshot(readLSN uint64) {
 	}
 }
 
-func (s *Store) serializeBatch(req *request, buf *bytes.Buffer) {
+func (s *Store) recalcMinReadLSN() {
+	min := s.nextLSN - 1
+	for lsn := range s.activeSnapshots {
+		if lsn < min {
+			min = lsn
+		}
+	}
+	s.minReadLSN = min
+}
+
+func (s *Store) Get(key string, readLSN uint64) ([]byte, error) {
+	s.mu.RLock()
+	entry, ok := s.index.Get(key, readLSN)
+	safeLimit := s.offset
+	s.mu.RUnlock()
+
+	if !ok || entry.Offset >= safeLimit {
+		return nil, ErrKeyNotFound
+	}
+
+	headerBuf := make([]byte, HeaderSize)
+	n1, err := s.wal.ReadAt(headerBuf, entry.Offset)
+	if err != nil {
+		return nil, err
+	}
+
+	packed := binary.BigEndian.Uint32(headerBuf[0:4])
+	keyLen, valLen, isDel := UnpackMeta(packed)
+	payloadLen := int(keyLen)
+	if !isDel {
+		payloadLen += int(valLen)
+	}
+
+	payload := make([]byte, payloadLen)
+	n2, err := s.wal.ReadAt(payload, entry.Offset+HeaderSize)
+	if err != nil {
+		return nil, err
+	}
+
+	atomic.AddInt64(&s.bytesRead, int64(n1+n2))
+
+	crc := crc32.Checksum(headerBuf[:20], crc32Table)
+	crc = crc32.Update(crc, crc32Table, payload)
+	if crc != binary.BigEndian.Uint32(headerBuf[20:24]) {
+		return nil, ErrCrcMismatch
+	}
+
+	return payload[keyLen:], nil
+}
+
+func (s *Store) ApplyBatch(ops []bufferedOp, readLSN uint64) error {
+	req := s.reqPool.Get().(*request)
+
+	if cap(req.ops) < len(ops) {
+		req.ops = make([]bufferedOp, len(ops))
+	} else {
+		req.ops = req.ops[:len(ops)]
+	}
+	copy(req.ops, ops)
+
+	req.readLSN = readLSN
+	req.accessMap = make(map[string]struct{}, len(ops))
 	for i := range req.ops {
 		op := &req.ops[i]
-		if op.opType == OpJournalGet {
-			req.opLens = append(req.opLens, 0)
-			continue
+		req.accessMap[op.key] = struct{}{}
+		if op.opType != OpJournalGet {
+			kL := len(op.key)
+			vL := len(op.val)
+			isDel := op.opType == OpJournalDelete
+			if isDel {
+				vL = 0
+			}
+			binary.BigEndian.PutUint32(op.header[0:4], PackMeta(uint32(kL), uint32(vL), isDel))
 		}
-		startLen := buf.Len()
-		buf.Write(op.header[:])
-		buf.WriteString(op.key)
-		if op.opType == OpJournalSet {
-			buf.Write(op.val)
+	}
+	req.cancelled.Store(false)
+	req.isCompaction = false
+	req.isReplication = false
+	req.opLengths = req.opLengths[:0]
+
+	select {
+	case <-req.resp:
+	default:
+	}
+
+	return s.submitReq(req)
+}
+
+func (s *Store) submitReq(req *request) error {
+	defer s.reqPool.Put(req)
+	timer := time.NewTimer(DefaultWriteTimeout)
+	defer timer.Stop()
+
+	select {
+	case s.opsChannel <- req:
+		select {
+		case err := <-req.resp:
+			return err
+		case <-timer.C:
+			req.cancelled.Store(true)
+			return ErrTransactionTimeout
 		}
-		length := buf.Len() - startLen
-		req.opLens = append(req.opLens, length)
+	case <-timer.C:
+		return ErrBusy
+	case <-s.done:
+		return ErrClosed
 	}
 }
 
-// ReplicateBatch applies a batch of LogEntry items received from a leader.
 func (s *Store) ReplicateBatch(entries []LogEntry) error {
 	if s.index.SizeBytes() >= MaxIndexBytes {
 		return ErrMemoryLimitExceeded
@@ -897,118 +806,52 @@ func (s *Store) ReplicateBatch(entries []LogEntry) error {
 			key:    string(entry.Key),
 			val:    entry.Value,
 		}
-		// Pack LSN into header for flushBatch to retrieve
 		binary.BigEndian.PutUint64(ops[i].header[4:12], entry.LSN)
-
-		keyLen := len(entry.Key)
-		valLen := len(entry.Value)
+		kLen := len(entry.Key)
+		vLen := len(entry.Value)
 		isDel := entry.OpType == OpJournalDelete
 		if isDel {
-			valLen = 0
+			vLen = 0
 		}
-
-		packed := PackMeta(uint32(keyLen), uint32(valLen), isDel)
+		packed := PackMeta(uint32(kLen), uint32(vLen), isDel)
 		binary.BigEndian.PutUint32(ops[i].header[0:4], packed)
 	}
 
 	req := s.reqPool.Get().(*request)
-	req.ops = ops
+	if cap(req.ops) < len(ops) {
+		req.ops = make([]bufferedOp, len(ops))
+	} else {
+		req.ops = req.ops[:len(ops)]
+	}
+	copy(req.ops, ops)
+
 	req.cancelled.Store(false)
 	req.isReplication = true
 	req.isCompaction = false
-	req.opLens = req.opLens[:0]
-
-	shouldPool := false
-	defer func() {
-		if shouldPool {
-			s.reqPool.Put(req)
-		}
-	}()
-
-	timer := time.NewTimer(DefaultWriteTimeout * 2)
-	defer timer.Stop()
+	req.opLengths = req.opLengths[:0]
 
 	select {
-	case s.opsChannel <- req:
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
-		select {
-		case err := <-req.resp:
-			shouldPool = true
-			return err
-		case <-s.done:
-			shouldPool = true
-			return ErrClosed
-		}
-	case <-s.done:
-		shouldPool = true
-		return ErrClosed
+	case <-req.resp:
+	default:
 	}
+
+	return s.submitReq(req)
 }
 
-// ApplyBatch submits a transaction buffer to the write queue.
-func (s *Store) ApplyBatch(ops []bufferedOp, readLSN uint64) error {
-	if s.index.SizeBytes() >= MaxIndexBytes {
-		return ErrMemoryLimitExceeded
-	}
-	accessMap := make(map[string]struct{}, len(ops))
-	for i := range ops {
-		op := &ops[i]
-		accessMap[op.key] = struct{}{}
-		if op.opType != OpJournalGet {
-			keyLen := len(op.key)
-			valLen := uint32(len(op.val))
-			isDel := false
-			if op.opType == OpJournalDelete {
-				valLen = 0
-				isDel = true
-			}
-			packed := PackMeta(uint32(keyLen), valLen, isDel)
-			binary.BigEndian.PutUint32(op.header[0:4], packed)
+func (s *Store) serializeBatch(req *request, buf *bytes.Buffer) {
+	for i := range req.ops {
+		op := &req.ops[i]
+		if op.opType == OpJournalGet {
+			req.opLengths = append(req.opLengths, 0)
+			continue
 		}
-	}
-	req := s.reqPool.Get().(*request)
-	req.ops = ops
-	req.readLSN = readLSN
-	req.accessMap = accessMap
-	req.cancelled.Store(false)
-	req.isCompaction = false
-	req.opLens = req.opLens[:0]
-	shouldPool := false
-	defer func() {
-		if shouldPool {
-			s.reqPool.Put(req)
+		startLen := buf.Len()
+		buf.Write(op.header[:])
+		buf.WriteString(op.key)
+		if op.opType == OpJournalSet {
+			buf.Write(op.val)
 		}
-	}()
-	timer := time.NewTimer(DefaultWriteTimeout)
-	defer timer.Stop()
-	select {
-	case s.opsChannel <- req:
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
-		timer.Reset(DefaultWriteTimeout)
-		select {
-		case err := <-req.resp:
-			shouldPool = true
-			return err
-		case <-timer.C:
-			req.cancelled.Store(true)
-			return ErrTransactionTimeout
-		}
-	case <-timer.C:
-		shouldPool = true
-		return ErrBusy
-	case <-s.done:
-		shouldPool = true
-		return ErrClosed
+		req.opLengths = append(req.opLengths, buf.Len()-startLen)
 	}
 }
 
@@ -1026,63 +869,89 @@ func (s *Store) drainChannels() {
 	}
 }
 
-// Get retrieves a value from the store using Snapshot Isolation.
-func (s *Store) Get(key string, readLSN uint64) ([]byte, error) {
-	start := time.Now()
-	defer func() {
-		dur := time.Since(start)
-		if dur > SlowOpThreshold {
-			atomic.AddInt64(&s.slowOps, 1)
-			s.logger.Warn("Slow Read", "key", key, "duration", dur)
-		}
-	}()
-
-	s.mu.RLock()
-	entry, ok := s.index.Get(key, readLSN)
-	safeLimit := s.offset
-	s.mu.RUnlock()
-
-	if !ok {
-		return nil, ErrKeyNotFound
-	}
-	if entry.Offset >= safeLimit {
-		return nil, ErrKeyNotFound
-	}
-
-	rawBuf := make([]byte, entry.Length)
-	if _, err := s.wal.ReadAt(rawBuf, entry.Offset); err != nil {
-		return nil, fmt.Errorf("read error: %w", err)
-	}
-	atomic.AddInt64(&s.bytesRead, int64(len(rawBuf)))
-
-	allZeros := true
-	for _, b := range rawBuf {
-		if b != 0 {
-			allZeros = false
-			break
-		}
-	}
-	if allZeros {
-		return nil, ErrKeyNotFound
-	}
-
-	packed := binary.BigEndian.Uint32(rawBuf[0:4])
-	keyLen, _, _ := UnpackMeta(packed)
-	storedCrc := binary.BigEndian.Uint32(rawBuf[12:16])
-	digest := crc32.New(crc32Table)
-	digest.Write(rawBuf[0:12])
-	digest.Write(rawBuf[16:])
-	if digest.Sum32() != storedCrc {
-		return nil, ErrCrcMismatch
-	}
-	valStart := 16 + int(keyLen)
-	val := rawBuf[valStart:]
-	valCopy := make([]byte, len(val))
-	copy(valCopy, val)
-	return valCopy, nil
+func (s *Store) RegisterReplica(id string, startLogID uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.replicationSlots[id] = ReplicaState{LogID: startLogID, LastSeen: time.Now()}
+	s.ackCond.Broadcast()
 }
 
-// Stats returns a snapshot of the internal store metrics.
+func (s *Store) UnregisterReplica(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.replicationSlots, id)
+	s.ackCond.Broadcast()
+}
+
+func (s *Store) UpdateReplicaLogID(id string, logID uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.replicationSlots[id] = ReplicaState{LogID: logID, LastSeen: time.Now()}
+	s.ackCond.Broadcast()
+}
+
+func (s *Store) FindOffsetForLogID(logID uint64) int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	idx := sort.Search(len(s.checkpoints), func(i int) bool {
+		return s.checkpoints[i].LogID > logID
+	})
+	var hintOffset int64
+	if idx == 0 {
+		hintOffset = 0
+	} else {
+		hintOffset = s.checkpoints[idx-1].Offset
+	}
+	if hintOffset < s.compactedOffset {
+		return s.compactedOffset
+	}
+	return hintOffset
+}
+
+func (s *Store) PruneStaleReplicas() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	for id, state := range s.replicationSlots {
+		if now.Sub(state.LastSeen) > ReplicationTimeout {
+			delete(s.replicationSlots, id)
+			s.ackCond.Broadcast()
+		}
+	}
+}
+
+func (s *Store) WaitForQuorum(targetLogID uint64) error {
+	if s.minReplicas <= 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for {
+		if s.closing.Load() {
+			return ErrClosed
+		}
+		acks := 0
+		for _, state := range s.replicationSlots {
+			if state.LogID >= targetLogID {
+				acks++
+			}
+		}
+		if acks >= s.minReplicas {
+			return nil
+		}
+		s.ackCond.Wait()
+	}
+}
+
+func (s *Store) Compact() error {
+	select {
+	case s.compactionChannel <- struct{}{}:
+		return nil
+	default:
+		return ErrCompactionInProgress
+	}
+}
+
 func (s *Store) Stats() StoreStats {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1093,6 +962,7 @@ func (s *Store) Stats() StoreStats {
 		ActiveSnapshots:        len(s.activeSnapshots),
 		Offset:                 s.offset,
 		NextLSN:                atomic.LoadUint64(&s.nextLSN),
+		NextLogID:              atomic.LoadUint64(&s.nextLogID),
 		ConflictCount:          atomic.LoadInt64(&s.conflictCount),
 		RecoveryDuration:       s.recoveryDuration,
 		PendingOps:             len(s.opsChannel),

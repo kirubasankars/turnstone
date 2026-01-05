@@ -2,10 +2,7 @@ package main
 
 import (
 	"encoding/json"
-	"io"
-	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"testing"
 )
@@ -67,24 +64,19 @@ func TestGenerateConfigArtifacts(t *testing.T) {
 		TLSCertFile: "certs/server.crt", // Relative paths
 		TLSKeyFile:  "certs/server.key",
 		TLSCAFile:   "certs/ca.crt",
+		Databases: []DatabaseConfig{
+			{Name: "testdb"},
+		},
 	}
 
-	// Capture stdout/stderr to avoid polluting test logs
-	oldStdout := os.Stdout
-	oldStderr := os.Stderr
-	os.Stdout, _ = os.Open(os.DevNull)
-	os.Stderr, _ = os.Open(os.DevNull)
-	defer func() {
-		os.Stdout = oldStdout
-		os.Stderr = oldStderr
-	}()
-
 	// Execute
-	generateConfigArtifacts(tmpDir, defaultCfg, configPath)
+	if err := GenerateConfigArtifacts(tmpDir, defaultCfg, configPath); err != nil {
+		t.Fatalf("GenerateConfigArtifacts failed: %v", err)
+	}
 
 	// 1. Verify Directories
-	if _, err := os.Stat(filepath.Join(tmpDir, "data")); os.IsNotExist(err) {
-		t.Error("Data directory not created")
+	if _, err := os.Stat(filepath.Join(tmpDir, "data", "testdb")); os.IsNotExist(err) {
+		t.Error("Data directory for testdb not created")
 	}
 	if _, err := os.Stat(filepath.Join(tmpDir, "certs")); os.IsNotExist(err) {
 		t.Error("Certs directory not created")
@@ -101,6 +93,9 @@ func TestGenerateConfigArtifacts(t *testing.T) {
 	}
 	if loadedCfg.Port != ":9999" {
 		t.Errorf("Config mismatch. Want :9999, got %s", loadedCfg.Port)
+	}
+	if len(loadedCfg.Databases) != 1 || loadedCfg.Databases[0].Name != "testdb" {
+		t.Error("Database config mismatch")
 	}
 
 	// 3. Verify Certificates
@@ -124,39 +119,25 @@ func TestGenerateConfigArtifacts(t *testing.T) {
 
 // TestValidateSecurityConfig verifies that valid configs pass silently.
 func TestValidateSecurityConfig_Success(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	validCfg := Config{
 		TLSCertFile: "cert",
 		TLSKeyFile:  "key",
 		TLSCAFile:   "ca",
 	}
-	// Should not panic or exit
-	validateSecurityConfig(validCfg, logger)
+	if err := ValidateSecurityConfig(validCfg); err != nil {
+		t.Errorf("Expected success, got error: %v", err)
+	}
 }
 
-// TestValidateSecurityConfig_Exit verifies that the application exits with status 1
+// TestValidateSecurityConfig_Error verifies that the function returns an error
 // if critical security config is missing.
-// We use a subprocess to test os.Exit.
-func TestValidateSecurityConfig_Exit(t *testing.T) {
-	if os.Getenv("BE_CRASHER") == "1" {
-		logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-		badCfg := Config{
-			TLSCertFile: "", // Missing
-			TLSKeyFile:  "key",
-			TLSCAFile:   "ca",
-		}
-		validateSecurityConfig(badCfg, logger)
-		return
+func TestValidateSecurityConfig_Error(t *testing.T) {
+	badCfg := Config{
+		TLSCertFile: "", // Missing
+		TLSKeyFile:  "key",
+		TLSCAFile:   "ca",
 	}
-
-	// Re-run the test process with the special environment variable
-	cmd := exec.Command(os.Args[0], "-test.run=TestValidateSecurityConfig_Exit")
-	cmd.Env = append(os.Environ(), "BE_CRASHER=1")
-	err := cmd.Run()
-
-	// Check exit code
-	if e, ok := err.(*exec.ExitError); ok && !e.Success() {
-		return // Success: the process exited with non-zero code
+	if err := ValidateSecurityConfig(badCfg); err == nil {
+		t.Error("Expected error for missing cert file, got nil")
 	}
-	t.Fatalf("Process ran with err %v, expected exit status 1", err)
 }
