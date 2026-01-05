@@ -4,6 +4,7 @@
 package client
 
 import (
+	"bytes"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
@@ -36,10 +37,15 @@ const (
 	OpCodeAbort     = 0x12 // Rollback the current transaction.
 	OpCodeStat      = 0x20 // Retrieve server statistics.
 	OpCodeReplicaOf = 0x32 // Set replication source. Payload: [AddrLen][Addr][RemotePartition].
-	OpCodeReplHello = 0x50 // Replication Handshake (Internal).
-	OpCodeReplBatch = 0x51 // Replication Batch (Internal).
-	OpCodeReplAck   = 0x52 // Replication Ack (Internal).
+	OpCodeReplHello = 0x50 // Replication Handshake (Internal/Client CDC).
+	OpCodeReplBatch = 0x51 // Replication Batch (Internal/Client CDC).
+	OpCodeReplAck   = 0x52 // Replication Ack (Internal/Client CDC).
 	OpCodeQuit      = 0xFF // Gracefully close the connection.
+)
+
+const (
+	OpJournalSet    = 1
+	OpJournalDelete = 2
 )
 
 // Response Codes indicate the status of a request.
@@ -410,4 +416,161 @@ func (c *Client) Abort() error {
 func (c *Client) Stat() (string, error) {
 	resp, err := c.roundTrip(OpCodeStat, nil)
 	return string(resp), err
+}
+
+// --- CDC / Replication Consumer ---
+
+// Change represents a single data modification event from the CDC stream.
+type Change struct {
+	LogSeq   uint64 // The global operation sequence number
+	TxID     uint64 // The transaction ID this change belongs to
+	Key      []byte
+	Value    []byte // nil if IsDelete is true
+	IsDelete bool
+}
+
+// Subscribe connects to the server and starts listening for changes on the specified partition.
+// This function blocks until the connection is closed or an error occurs.
+// It invokes 'handler' for every change received.
+// Note: This method consumes the Client connection. You should create a dedicated Client instance for CDC.
+func (c *Client) Subscribe(partition string, startSeq uint64, handler func(Change) error) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.conn == nil {
+		return ErrConnection
+	}
+
+	// 1. Send Hello Handshake
+	// Format: [Ver:4][NumDBs:4] ... [NameLen:4][Name][LogID:8]
+	buf := new(bytes.Buffer)
+	binary.Write(buf, binary.BigEndian, uint32(1)) // Version
+	binary.Write(buf, binary.BigEndian, uint32(1)) // Count (1 DB)
+
+	binary.Write(buf, binary.BigEndian, uint32(len(partition)))
+	buf.WriteString(partition)
+	binary.Write(buf, binary.BigEndian, startSeq)
+
+	// Send Header
+	reqHeader := make([]byte, ProtoHeaderSize)
+	reqHeader[0] = OpCodeReplHello
+	binary.BigEndian.PutUint32(reqHeader[1:], uint32(buf.Len()))
+
+	if _, err := c.conn.Write(reqHeader); err != nil {
+		return err
+	}
+	// Send Body
+	if _, err := c.conn.Write(buf.Bytes()); err != nil {
+		return err
+	}
+
+	// 2. Loop Read
+	respHeader := make([]byte, ProtoHeaderSize)
+	for {
+		// Read Header
+		if _, err := io.ReadFull(c.conn, respHeader); err != nil {
+			return err
+		}
+
+		opCode := respHeader[0]
+		length := binary.BigEndian.Uint32(respHeader[1:])
+
+		// Read Payload
+		payload := make([]byte, length)
+		if _, err := io.ReadFull(c.conn, payload); err != nil {
+			return err
+		}
+
+		if opCode == OpCodeReplBatch {
+			// Parse Batch: [DBNameLen][DBName][Count][Data...]
+			cursor := 0
+			if cursor+4 > len(payload) {
+				return fmt.Errorf("malformed batch: short header")
+			}
+			nLen := int(binary.BigEndian.Uint32(payload[cursor : cursor+4]))
+			cursor += 4
+			if cursor+nLen > len(payload) {
+				return fmt.Errorf("malformed batch: short name")
+			}
+			// dbName := string(payload[cursor : cursor+nLen]) // verify partition match?
+			cursor += nLen
+
+			if cursor+4 > len(payload) {
+				return fmt.Errorf("malformed batch: short count")
+			}
+			count := binary.BigEndian.Uint32(payload[cursor : cursor+4])
+			cursor += 4
+
+			data := payload[cursor:]
+			dCursor := 0
+			var maxLogSeq uint64
+
+			for i := 0; i < int(count); i++ {
+				// Entry: [LogID(8)][TxID(8)][Op(1)][KLen(4)][Key][VLen(4)][Val]
+				if dCursor+17 > len(data) {
+					return fmt.Errorf("malformed entry header")
+				}
+				logSeq := binary.BigEndian.Uint64(data[dCursor : dCursor+8])
+				txID := binary.BigEndian.Uint64(data[dCursor+8 : dCursor+16])
+				opType := data[dCursor+16]
+				dCursor += 17
+
+				kLen := int(binary.BigEndian.Uint32(data[dCursor : dCursor+4]))
+				dCursor += 4
+				if dCursor+kLen > len(data) {
+					return fmt.Errorf("malformed entry key")
+				}
+				key := data[dCursor : dCursor+kLen]
+				dCursor += kLen
+
+				vLen := int(binary.BigEndian.Uint32(data[dCursor : dCursor+4]))
+				dCursor += 4
+				if dCursor+vLen > len(data) {
+					return fmt.Errorf("malformed entry val")
+				}
+				val := data[dCursor : dCursor+vLen]
+				dCursor += vLen
+
+				change := Change{
+					LogSeq:   logSeq,
+					TxID:     txID,
+					Key:      key,
+					Value:    val,
+					IsDelete: opType == OpJournalDelete,
+				}
+
+				if err := handler(change); err != nil {
+					return err
+				}
+
+				if logSeq > maxLogSeq {
+					maxLogSeq = logSeq
+				}
+			}
+
+			// Send ACK
+			// ACK Format: [DBNameLen][DBName][LogID]
+			ackBuf := new(bytes.Buffer)
+			binary.Write(ackBuf, binary.BigEndian, uint32(len(partition)))
+			ackBuf.WriteString(partition)
+			binary.Write(ackBuf, binary.BigEndian, maxLogSeq)
+
+			ackHeader := make([]byte, ProtoHeaderSize)
+			ackHeader[0] = OpCodeReplAck
+			binary.BigEndian.PutUint32(ackHeader[1:], uint32(ackBuf.Len()))
+
+			if _, err := c.conn.Write(ackHeader); err != nil {
+				return err
+			}
+			if _, err := c.conn.Write(ackBuf.Bytes()); err != nil {
+				return err
+			}
+
+		} else {
+			// Ignore other opcodes or handle error/quit
+			if opCode == ResStatusErr {
+				return &ServerError{Message: string(payload)}
+			}
+		}
+	}
 }
