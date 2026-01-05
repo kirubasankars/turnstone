@@ -469,10 +469,6 @@ func TestMetrics_StorageIO(t *testing.T) {
 }
 
 func TestMetrics_Conflicts(t *testing.T) {
-	// Blind writes succeed in the current architecture (last write wins unless version is checked).
-	// This test previously expected a conflict on blind write, which is incorrect for this implementation.
-	// We updated it to verify that both succeed (last one persists), or at least no conflict error is returned.
-
 	dir, stores, srv := setupTestEnv(t)
 	defer stores["0"].Close()
 	defer os.RemoveAll(dir)
@@ -487,28 +483,50 @@ func TestMetrics_Conflicts(t *testing.T) {
 	c2 := connectClient(t, srv.listener.Addr().String(), getClientTLS(t, dir))
 	defer c2.Close()
 
-	// Select Partition 1 for both
 	c1.AssertStatus(protocol.OpCodeSelect, []byte("1"), protocol.ResStatusOK)
 	c2.AssertStatus(protocol.OpCodeSelect, []byte("1"), protocol.ResStatusOK)
 
-	// Concurrent Transactions
-	c1.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
-	c2.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
+	// Initial key setup
+	setupTx := connectClient(t, srv.listener.Addr().String(), getClientTLS(t, dir))
+	setupTx.AssertStatus(protocol.OpCodeSelect, []byte("1"), protocol.ResStatusOK)
+	setupTx.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
 
 	key := []byte("conflict")
-	val := []byte("val")
+	val := []byte("initial")
 	pl := make([]byte, 4+len(key)+len(val))
 	binary.BigEndian.PutUint32(pl[0:4], uint32(len(key)))
 	copy(pl[4:], key)
 	copy(pl[4+len(key):], val)
 
-	// C1 writes & commits
-	c1.AssertStatus(protocol.OpCodeSet, pl, protocol.ResStatusOK)
-	c1.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusOK)
+	setupTx.AssertStatus(protocol.OpCodeSet, pl, protocol.ResStatusOK)
+	setupTx.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusOK)
+	setupTx.Close()
 
-	// C2 writes & commits (Expected to SUCCEED as Blind Write)
-	c2.AssertStatus(protocol.OpCodeSet, pl, protocol.ResStatusOK)
-	c2.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusOK) // Changed expected status from ResStatusTxConflict to ResStatusOK
+	// C1 Starts and Reads (Snapshot established at version 1)
+	c1.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
+	c1.AssertStatus(protocol.OpCodeGet, key, protocol.ResStatusOK)
+
+	// C2 Starts, Updates, Commits (Version 1 -> 2)
+	c2.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
+	val2 := []byte("new_val")
+	pl2 := make([]byte, 4+len(key)+len(val2))
+	binary.BigEndian.PutUint32(pl2[0:4], uint32(len(key)))
+	copy(pl2[4:], key)
+	copy(pl2[4+len(key):], val2)
+	c2.AssertStatus(protocol.OpCodeSet, pl2, protocol.ResStatusOK)
+	c2.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusOK)
+
+	// C1 Updates. Since C1 read "initial", it expects Version 1.
+	// But C2 moved it to Version 2. This creates a Write Conflict on Commit.
+	c1.AssertStatus(protocol.OpCodeSet, pl2, protocol.ResStatusOK)
+
+	// C1 Commit -> Should Fail with Conflict
+	c1.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusTxConflict)
+
+	// Verify Metric
+	waitForMetric(t, srv, "turnstone_store_conflicts_total", func(val float64) bool {
+		return val >= 1
+	})
 }
 
 func TestServer_Backpressure(t *testing.T) {
