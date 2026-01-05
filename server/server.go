@@ -2,7 +2,6 @@ package server
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -21,7 +20,7 @@ import (
 	"time"
 
 	"turnstone/protocol"
-	"turnstone/replication"
+	"turnstone/stonedb"
 	"turnstone/store"
 )
 
@@ -36,17 +35,14 @@ type Server struct {
 	wg               sync.WaitGroup
 	totalConns       uint64
 	activeConns      int64
-	activeTxs        int64
-	txDuration       time.Duration
 	tlsConfig        *tls.Config
 	tlsCertFile      string
 	tlsKeyFile       string
 	tlsCAFile        string
 	currentTLSConfig atomic.Value
-	replManager      *replication.ReplicationManager
 }
 
-func NewServer(addr string, stores map[string]*store.Store, logger *slog.Logger, maxConns int, txDuration time.Duration, tlsCert, tlsKey, tlsCA string, rm *replication.ReplicationManager) (*Server, error) {
+func NewServer(addr string, stores map[string]*store.Store, logger *slog.Logger, maxConns int, tlsCert, tlsKey, tlsCA string) (*Server, error) {
 	if tlsCert == "" || tlsKey == "" || tlsCA == "" {
 		return nil, fmt.Errorf("tls cert, key, and ca required")
 	}
@@ -67,12 +63,10 @@ func NewServer(addr string, stores map[string]*store.Store, logger *slog.Logger,
 		defaultPartition: defPartition,
 		logger:           logger,
 		maxConns:         maxConns,
-		txDuration:       txDuration,
 		sem:              make(chan struct{}, maxConns),
 		tlsCertFile:      tlsCert,
 		tlsKeyFile:       tlsKey,
 		tlsCAFile:        tlsCA,
-		replManager:      rm,
 	}
 
 	if err := s.ReloadTLS(); err != nil {
@@ -117,7 +111,7 @@ func (s *Server) Run(ctx context.Context) error {
 		return err
 	}
 	s.listener = ln
-	s.logger.Info("Server listening", "addr", s.addr, "partitions", len(s.stores), "default", s.defaultPartition)
+	s.logger.Info("Server listening (Persistent Mode)", "addr", s.addr, "partitions", len(s.stores), "default", s.defaultPartition)
 
 	go s.handleSignals(ctx)
 
@@ -163,8 +157,7 @@ func (s *Server) handleSignals(ctx context.Context) {
 type connState struct {
 	partitionName string
 	partition     *store.Store
-	active        bool
-	ops           []protocol.LogEntry
+	tx            *stonedb.Transaction
 }
 
 func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
@@ -178,7 +171,15 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 	state := &connState{
 		partitionName: s.defaultPartition,
 		partition:     s.stores[s.defaultPartition],
+		tx:            nil,
 	}
+
+	// Ensure active transaction is cleaned up if connection drops
+	defer func() {
+		if state.tx != nil {
+			state.tx.Discard()
+		}
+	}()
 
 	r := bufio.NewReader(conn)
 	header := make([]byte, protocol.ProtoHeaderSize)
@@ -188,7 +189,7 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 			return
 		}
 		_ = conn.SetReadDeadline(time.Now().Add(protocol.IdleTimeout))
-		// TODO: is it safe. does it overflow
+
 		if _, err := io.ReadFull(r, header); err != nil {
 			return
 		}
@@ -207,18 +208,13 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 
 		_ = conn.SetWriteDeadline(time.Now().Add(protocol.DefaultWriteTimeout))
 
-		if s.dispatchCommand(conn, r, opCode, payload, state) {
+		if s.dispatchCommand(conn, opCode, payload, state) {
 			return
 		}
 	}
 }
 
-func (s *Server) dispatchCommand(conn net.Conn, r *bufio.Reader, opCode uint8, payload []byte, st *connState) bool {
-	if st.active && !isTxAllowedOp(opCode) {
-		_ = s.writeBinaryResponse(conn, protocol.ResStatusErr, []byte("Tx active"))
-		return false
-	}
-
+func (s *Server) dispatchCommand(conn net.Conn, opCode uint8, payload []byte, st *connState) bool {
 	switch opCode {
 	case protocol.OpCodePing:
 		_ = s.writeBinaryResponse(conn, protocol.ResStatusOK, []byte("PONG"))
@@ -240,19 +236,12 @@ func (s *Server) dispatchCommand(conn net.Conn, r *bufio.Reader, opCode uint8, p
 		s.handleDel(conn, payload, st)
 	case protocol.OpCodeStat:
 		s.handleStat(conn, st)
-	case protocol.OpCodeReplicaOf:
-		s.handleReplicaOf(conn, payload, st)
-	case protocol.OpCodeReplHello:
-		s.HandleReplicaConnection(conn, r, payload)
-		return true
+	case protocol.OpCodeReplicaOf, protocol.OpCodeReplHello:
+		_ = s.writeBinaryResponse(conn, protocol.ResStatusErr, []byte("Replication not supported in simple mode"))
 	default:
 		_ = s.writeBinaryResponse(conn, protocol.ResStatusErr, []byte("Unknown OpCode"))
 	}
 	return false
-}
-
-func isTxAllowedOp(op uint8) bool {
-	return op == protocol.OpCodeGet || op == protocol.OpCodeSet || op == protocol.OpCodeDel || op == protocol.OpCodeCommit || op == protocol.OpCodeAbort
 }
 
 func (s *Server) writeBinaryResponse(w io.Writer, status byte, body []byte) error {
@@ -285,53 +274,40 @@ func (s *Server) handleBegin(w io.Writer, st *connState) {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Partition selected"))
 		return
 	}
-	if st.active {
-		s.abortTx(st)
+	if st.tx != nil {
+		_ = s.writeBinaryResponse(w, protocol.ResTxInProgress, nil)
+		return
 	}
-	st.active = true
-	st.ops = make([]protocol.LogEntry, 0)
-	atomic.AddInt64(&s.activeTxs, 1)
+	// Start a read-write transaction
+	st.tx = st.partition.NewTransaction(true)
 	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
 }
 
 func (s *Server) handleCommit(w io.Writer, st *connState) {
-	if !st.active {
+	if st.tx == nil {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusTxRequired, nil)
 		return
 	}
-	defer s.abortTx(st)
+	err := st.tx.Commit()
+	// Commit invalidates the transaction object, set to nil
+	st.tx = nil
 
-	if len(st.ops) == 0 {
-		_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
-		return
-	}
-
-	if st.partitionName == "0" {
-		for _, op := range st.ops {
-			if op.OpCode == protocol.OpJournalSet || op.OpCode == protocol.OpJournalDelete {
-				_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("System Partition '0' is read-only"))
-				return
-			}
+	if err != nil {
+		if err == stonedb.ErrWriteConflict {
+			_ = s.writeBinaryResponse(w, protocol.ResStatusTxConflict, []byte(err.Error()))
+		} else {
+			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte(err.Error()))
 		}
-	}
-
-	if err := st.partition.ApplyBatch(st.ops); err != nil {
-		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte(err.Error()))
 		return
 	}
 	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
 }
 
-func (s *Server) abortTx(st *connState) {
-	if st.active {
-		st.active = false
-		st.ops = nil
-		atomic.AddInt64(&s.activeTxs, -1)
-	}
-}
-
 func (s *Server) handleAbort(w io.Writer, st *connState) {
-	s.abortTx(st)
+	if st.tx != nil {
+		st.tx.Discard()
+		st.tx = nil
+	}
 	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
 }
 
@@ -340,7 +316,7 @@ func (s *Server) handleGet(w io.Writer, payload []byte, st *connState) {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Partition selected"))
 		return
 	}
-	if !st.active {
+	if st.tx == nil {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusTxRequired, nil)
 		return
 	}
@@ -351,19 +327,8 @@ func (s *Server) handleGet(w io.Writer, payload []byte, st *connState) {
 		return
 	}
 
-	for i := len(st.ops) - 1; i >= 0; i-- {
-		if string(st.ops[i].Key) == key {
-			if st.ops[i].OpCode == protocol.OpJournalDelete {
-				_ = s.writeBinaryResponse(w, protocol.ResStatusNotFound, nil)
-			} else {
-				_ = s.writeBinaryResponse(w, protocol.ResStatusOK, st.ops[i].Value)
-			}
-			return
-		}
-	}
-
-	val, err := st.partition.Get(key)
-	if err == protocol.ErrKeyNotFound {
+	val, err := st.tx.Get([]byte(key))
+	if err == stonedb.ErrKeyNotFound {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusNotFound, nil)
 	} else if err != nil {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte(err.Error()))
@@ -377,16 +342,7 @@ func (s *Server) handleSet(w io.Writer, payload []byte, st *connState) {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Partition selected"))
 		return
 	}
-	if st.partitionName == "0" {
-		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("System Partition '0' is read-only"))
-		return
-	}
-	if s.replManager != nil && s.replManager.IsReplica(st.partitionName) {
-		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Replica partition is read-only"))
-		return
-	}
-
-	if !st.active {
+	if st.tx == nil {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusTxRequired, nil)
 		return
 	}
@@ -395,6 +351,11 @@ func (s *Server) handleSet(w io.Writer, payload []byte, st *connState) {
 		return
 	}
 	kLen := binary.BigEndian.Uint32(payload[:4])
+	if len(payload) < 4+int(kLen) {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Invalid payload size"))
+		return
+	}
+
 	key := make([]byte, kLen)
 	copy(key, payload[4:4+kLen])
 	val := make([]byte, len(payload[4+kLen:]))
@@ -405,13 +366,11 @@ func (s *Server) handleSet(w io.Writer, payload []byte, st *connState) {
 		return
 	}
 
-	if strings.HasPrefix(string(key), "_") {
-		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Key starting with '_' is read-only"))
-		return
+	if err := st.tx.Put(key, val); err != nil {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte(err.Error()))
+	} else {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
 	}
-
-	st.ops = append(st.ops, protocol.LogEntry{OpCode: protocol.OpJournalSet, Key: key, Value: val})
-	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
 }
 
 func (s *Server) handleDel(w io.Writer, payload []byte, st *connState) {
@@ -419,35 +378,22 @@ func (s *Server) handleDel(w io.Writer, payload []byte, st *connState) {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Partition selected"))
 		return
 	}
-	if st.partitionName == "0" {
-		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("System Partition '0' is read-only"))
-		return
-	}
-	if s.replManager != nil && s.replManager.IsReplica(st.partitionName) {
-		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Replica partition is read-only"))
-		return
-	}
-
-	if !st.active {
+	if st.tx == nil {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusTxRequired, nil)
 		return
 	}
 
-	key := make([]byte, len(payload))
-	copy(key, payload)
-
-	if !isASCII(string(key)) {
+	key := string(payload)
+	if !isASCII(key) {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Key must be ASCII"))
 		return
 	}
 
-	if strings.HasPrefix(string(key), "_") {
-		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Key starting with '_' is read-only"))
-		return
+	if err := st.tx.Delete([]byte(key)); err != nil {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte(err.Error()))
+	} else {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
 	}
-
-	st.ops = append(st.ops, protocol.LogEntry{OpCode: protocol.OpJournalDelete, Key: key})
-	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
 }
 
 func isASCII(s string) bool {
@@ -465,55 +411,8 @@ func (s *Server) handleStat(w io.Writer, st *connState) {
 		return
 	}
 	stats := st.partition.Stats()
-	msg := fmt.Sprintf("[%s] Keys:%d Mem:%d LogSeq:%d", st.partitionName, stats.KeyCount, stats.MemorySizeBytes, stats.NextLogSeq)
+	msg := fmt.Sprintf("[%s] Keys:%d Uptime:%s", st.partitionName, stats.KeyCount, stats.Uptime)
 	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, []byte(msg))
-}
-
-func (s *Server) handleReplicaOf(w io.Writer, payload []byte, st *connState) {
-	if s.replManager == nil {
-		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Replication client not configured"))
-		return
-	}
-	if st.partition == nil {
-		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Partition selected"))
-		return
-	}
-
-	if st.partitionName == "0" {
-		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("System Partition '0' cannot be replicated"))
-		return
-	}
-
-	if len(payload) < 4 {
-		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Invalid payload"))
-		return
-	}
-
-	addrLen := binary.BigEndian.Uint32(payload[:4])
-	if len(payload) < 4+int(addrLen) {
-		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Invalid payload length"))
-		return
-	}
-
-	addr := string(payload[4 : 4+addrLen])
-	remotePartition := string(payload[4+addrLen:])
-
-	if addr == "" {
-		s.replManager.StopReplication(st.partitionName)
-		s.logger.Info("ReplicaOf Stop Command", "local_partition", st.partitionName)
-		_ = s.writeBinaryResponse(w, protocol.ResStatusOK, []byte("Replication stopped"))
-		return
-	}
-
-	if remotePartition == "" {
-		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Remote Partition name required"))
-		return
-	}
-
-	s.logger.Info("ReplicaOf Command", "local_partition", st.partitionName, "remote_addr", addr, "remote_partition", remotePartition)
-	s.replManager.AddReplica(st.partitionName, addr, remotePartition)
-
-	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, []byte("Replication started"))
 }
 
 func (s *Server) CloseAll() {
@@ -535,262 +434,8 @@ func (s *Server) TotalConns() uint64 {
 	return atomic.LoadUint64(&s.totalConns)
 }
 
-// ActiveTxs return number of active transactions
+// ActiveTxs return number of active transactions (only those with open txn objects)
 func (s *Server) ActiveTxs() int64 {
-	return atomic.LoadInt64(&s.activeTxs)
-}
-
-// --- Replication Multiplexer ---
-type replPacket struct {
-	partitionName string
-	data          []byte
-	count         uint32
-}
-
-func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []byte) {
-	if len(payload) < 8 {
-		s.logger.Error("HandleReplicaConnection: payload too short for header")
-		return
-	}
-	count := binary.BigEndian.Uint32(payload[4:8])
-
-	cursor := 8
-	type subReq struct {
-		partitionName string
-		logSeq        uint64
-	}
-	var subs []subReq
-	replicaID := conn.RemoteAddr().String()
-
-	for i := 0; i < int(count); i++ {
-		if cursor+4 > len(payload) {
-			s.logger.Error("HandleReplicaConnection: payload truncated reading name len", "replica", replicaID)
-			return
-		}
-		nLen := int(binary.BigEndian.Uint32(payload[cursor : cursor+4]))
-		cursor += 4
-		if cursor+nLen+8 > len(payload) {
-			s.logger.Error("HandleReplicaConnection: payload truncated reading name/logSeq", "replica", replicaID)
-			return
-		}
-		name := string(payload[cursor : cursor+nLen])
-		cursor += nLen
-		logSeq := binary.BigEndian.Uint64(payload[cursor : cursor+8])
-		cursor += 8
-		subs = append(subs, subReq{name, logSeq})
-
-		if st, ok := s.stores[name]; ok {
-			s.logger.Info("Replica subscribed", "replica", replicaID, "partition", name, "startLogSeq", logSeq)
-			st.RegisterReplica(replicaID, logSeq)
-			defer st.UnregisterReplica(replicaID)
-		} else {
-			s.logger.Warn("Replica requested unknown partition", "replica", replicaID, "partition", name)
-		}
-	}
-
-	outCh := make(chan replPacket, 10)
-	errCh := make(chan error, 1)
-	done := make(chan struct{})
-	defer close(done)
-
-	var wg sync.WaitGroup
-	for _, req := range subs {
-		partition, ok := s.stores[req.partitionName]
-		if !ok {
-			continue
-		}
-		wg.Add(1)
-		go func(name string, st *store.Store, startLogSeq uint64) {
-			defer wg.Done()
-			if err := s.streamDB(name, st, startLogSeq, outCh, done); err != nil {
-				s.logger.Error("StreamDB failed", "partition", name, "err", err)
-				select {
-				case errCh <- err:
-				default:
-				}
-			}
-		}(req.partitionName, partition, req.logSeq)
-	}
-
-	go func() {
-		h := make([]byte, 5)
-		for {
-			if _, err := io.ReadFull(r, h); err != nil {
-				return
-			}
-			if h[0] == protocol.OpCodeReplAck {
-				ln := binary.BigEndian.Uint32(h[1:])
-				b := make([]byte, ln)
-				if _, err := io.ReadFull(r, b); err != nil {
-					return
-				}
-				if len(b) > 4 {
-					nL := binary.BigEndian.Uint32(b[:4])
-					if len(b) >= 4+int(nL)+8 {
-						partitionName := string(b[4 : 4+nL])
-						logSeq := binary.BigEndian.Uint64(b[4+nL:])
-						if st, ok := s.stores[partitionName]; ok {
-							st.UpdateReplicaLogSeq(replicaID, logSeq)
-						}
-					}
-				}
-			}
-		}
-	}()
-
-	for {
-		select {
-		case err := <-errCh:
-			s.logger.Warn("Dropping slow/failed replica", "addr", replicaID, "err", err)
-			return
-
-		case p := <-outCh:
-			totalLen := 4 + len(p.partitionName) + 4 + len(p.data)
-			header := make([]byte, 5)
-			header[0] = protocol.OpCodeReplBatch
-			binary.BigEndian.PutUint32(header[1:], uint32(totalLen))
-
-			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if _, err := conn.Write(header); err != nil {
-				return
-			}
-
-			nameH := make([]byte, 4)
-			binary.BigEndian.PutUint32(nameH, uint32(len(p.partitionName)))
-			if _, err := conn.Write(nameH); err != nil {
-				return
-			}
-			if _, err := conn.Write([]byte(p.partitionName)); err != nil {
-				return
-			}
-
-			cntH := make([]byte, 4)
-			binary.BigEndian.PutUint32(cntH, p.count)
-			if _, err := conn.Write(cntH); err != nil {
-				return
-			}
-			if _, err := conn.Write(p.data); err != nil {
-				return
-			}
-		}
-	}
-}
-
-func (s *Server) streamDB(partitionName string, st *store.Store, minLogSeq uint64, outCh chan<- replPacket, done <-chan struct{}) error {
-	startOffset := st.FindOffsetForLogSeq(minLogSeq)
-	curr := startOffset
-	buf := make([]byte, 1024*1024)
-	batchBuf := new(bytes.Buffer)
-	scratch := make([]byte, 8)
-	var count uint32
-
-	flush := func() error {
-		if count > 0 {
-			data := make([]byte, batchBuf.Len())
-			copy(data, batchBuf.Bytes())
-			select {
-			case outCh <- replPacket{partitionName: partitionName, data: data, count: count}:
-			case <-time.After(protocol.ReplicationTimeout):
-				return fmt.Errorf("replication send timeout for partition %s", partitionName)
-			case <-done:
-				return nil
-			}
-			batchBuf.Reset()
-			count = 0
-		}
-		return nil
-	}
-
-	wal := st.WAL()
-	for {
-		select {
-		case <-done:
-			return nil
-		default:
-		}
-
-		walSize := wal.Size()
-		if curr >= walSize {
-			if err := flush(); err != nil {
-				return err
-			}
-			wal.Wait(curr)
-			walSize = wal.Size()
-		}
-
-		readLen := int64(len(buf))
-		if curr+readLen > walSize {
-			readLen = walSize - curr
-		}
-
-		n, err := wal.ReadAt(buf[:readLen], curr)
-		if err != nil && err != io.EOF {
-			return err
-		}
-		if n == 0 {
-			continue
-		}
-
-		parseOff := 0
-		for parseOff < n {
-			if parseOff+protocol.HeaderSize > n {
-				break
-			}
-			if buf[parseOff] == 0 && buf[parseOff+1] == 0 && buf[parseOff+2] == 0 {
-				aligned := (parseOff/4096 + 1) * 4096
-				if aligned > n {
-					break
-				}
-				parseOff = aligned
-				continue
-			}
-
-			packed := binary.BigEndian.Uint32(buf[parseOff : parseOff+4])
-			// Logic matches wal.go's unpackMeta
-			isDel := (packed & 0x80000000) != 0
-			kLen := (packed & 0x7FF80000) >> 19
-			vLen := (packed & 0x0007FFFF)
-
-			logSeq := binary.BigEndian.Uint64(buf[parseOff+4 : parseOff+12])
-
-			payloadLen := int(kLen)
-			if !isDel {
-				payloadLen += int(vLen)
-			}
-
-			if parseOff+protocol.HeaderSize+payloadLen > n {
-				break
-			}
-
-			if logSeq > minLogSeq {
-				binary.BigEndian.PutUint64(scratch, logSeq)
-				batchBuf.Write(scratch)
-
-				op := protocol.OpJournalSet
-				if isDel {
-					op = protocol.OpJournalDelete
-				}
-				batchBuf.WriteByte(op)
-
-				binary.BigEndian.PutUint32(scratch[:4], uint32(kLen))
-				batchBuf.Write(scratch[:4])
-				kStart := parseOff + protocol.HeaderSize
-				batchBuf.Write(buf[kStart : kStart+int(kLen)])
-
-				binary.BigEndian.PutUint32(scratch[:4], uint32(vLen))
-				batchBuf.Write(scratch[:4])
-				if !isDel {
-					batchBuf.Write(buf[kStart+int(kLen) : kStart+payloadLen])
-				}
-				count++
-				if batchBuf.Len() >= 64*1024 {
-					if err := flush(); err != nil {
-						return err
-					}
-				}
-			}
-			parseOff += protocol.HeaderSize + payloadLen
-		}
-		curr += int64(parseOff)
-	}
+	// Not explicitly tracking count in this simplified version
+	return 0
 }

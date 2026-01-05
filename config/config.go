@@ -12,24 +12,22 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"strconv"
 	"time"
 )
 
 // Config represents the server configuration.
+// Simplified for in-memory mode.
 type Config struct {
-	Port                  string `json:"port"`
-	Debug                 bool   `json:"debug"`
-	MaxConns              int    `json:"max_conns"`
-	Fsync                 bool   `json:"fsync"`
-	AllowRecoveryTruncate bool   `json:"allow_recovery_truncate"`
-	TLSCertFile           string `json:"tls_cert_file"`
-	TLSKeyFile            string `json:"tls_key_file"`
-	TLSCAFile             string `json:"tls_ca_file"`
-	TLSClientCertFile     string `json:"tls_client_cert_file"`
-	TLSClientKeyFile      string `json:"tls_client_key_file"`
-	MetricsAddr           string `json:"metrics_addr"`
-	NumberOfPartitions    int    `json:"number_of_partitions"`
+	Port               string `json:"port"`
+	Debug              bool   `json:"debug"`
+	MaxConns           int    `json:"max_conns"`
+	TLSCertFile        string `json:"tls_cert_file"`
+	TLSKeyFile         string `json:"tls_key_file"`
+	TLSCAFile          string `json:"tls_ca_file"`
+	TLSClientCertFile  string `json:"tls_client_cert_file"`
+	TLSClientKeyFile   string `json:"tls_client_key_file"`
+	MetricsAddr        string `json:"metrics_addr"`
+	NumberOfPartitions int    `json:"number_of_partitions"`
 }
 
 // ResolvePath returns an absolute path relative to the home directory if strictly necessary.
@@ -60,14 +58,6 @@ func GenerateConfigArtifacts(homeDir string, defaultCfg Config, configPath strin
 	for _, d := range []string{"certs"} {
 		if err := os.MkdirAll(ResolvePath(homeDir, d), 0o755); err != nil {
 			return fmt.Errorf("failed to create %s directory: %w", d, err)
-		}
-	}
-
-	for i := 0; i < defaultCfg.NumberOfPartitions; i++ {
-		partName := strconv.Itoa(i)
-		partPath := filepath.Join("data", partName)
-		if err := os.MkdirAll(ResolvePath(homeDir, partPath), 0o755); err != nil {
-			return fmt.Errorf("failed to create data directory for %s: %w", partName, err)
 		}
 	}
 
