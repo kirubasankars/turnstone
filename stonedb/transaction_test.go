@@ -48,6 +48,51 @@ func TestIsolation_WriteWriteConflict(t *testing.T) {
 	}
 }
 
+// TestIsolation_BlindWriteConflict verifies that Snapshot Isolation rules apply
+// even if the transactions do NOT read the key before writing it.
+// Tx1: Put(A) -> Commit
+// Tx2: Put(A) -> Commit (Concurrent with Tx1)
+// Expect: Tx2 fails if Tx1 committed first.
+func TestIsolation_BlindWriteConflict(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	key := []byte("blind_key")
+
+	// Setup: Key exists at version 1
+	txInit := db.NewTransaction(true)
+	txInit.Put(key, []byte("v1"))
+	txInit.Commit()
+
+	// 1. Start TxA (Snapshot at v1)
+	txA := db.NewTransaction(true)
+
+	// 2. Start TxB (Snapshot at v1)
+	txB := db.NewTransaction(true)
+
+	// 3. TxA writes (No Read)
+	txA.Put(key, []byte("v2-A"))
+
+	// 4. TxB writes (No Read)
+	txB.Put(key, []byte("v2-B"))
+
+	// 5. TxA Commits -> Success. Version becomes 2.
+	if err := txA.Commit(); err != nil {
+		t.Fatalf("TxA failed commit: %v", err)
+	}
+
+	// 6. TxB Commits -> Should Fail.
+	// TxB's snapshot is v1. The key is now at v2 (committed by TxA).
+	// Under Snapshot Isolation, writing to a key that changed after start time is a conflict.
+	if err := txB.Commit(); err != ErrWriteConflict {
+		t.Errorf("TxB Blind Write expected ErrWriteConflict, got: %v", err)
+	}
+}
+
 // TestIsolation_ReadWriteConflict verifies that if Tx1 reads a key,
 // and Tx2 updates that key and commits, Tx1 cannot commit.
 // This enforces Serializability/OCC (preventing Stale Reads).

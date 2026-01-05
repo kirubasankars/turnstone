@@ -266,13 +266,44 @@ func (db *DB) commitGroup(requests []commitRequest) {
 	currentTxID := atomic.LoadUint64(&db.transactionID)
 	currentOpID := atomic.LoadUint64(&db.operationID)
 
+	// Intra-batch Conflict Detection
+	// We must track keys written by accepted transactions in this batch
+	// to prevent conflicts within the batch itself.
+	batchWrites := make(map[string]uint64) // Key -> TxID that wrote it (reserved TxID)
+
 	// Phase 1: Validation & Preparation
 	for _, req := range requests {
 		tx := req.tx
 
-		// Conflict Detection
+		// 1. Check against DB history (Standard Conflict Detection)
 		if err := tx.checkConflicts(); err != nil {
 			req.resp <- err
+			continue
+		}
+
+		// 2. Check against previous transactions in this batch (Intra-batch Isolation)
+		intraBatchConflict := false
+
+		// Check Read Set against Batch Writes
+		for k := range tx.readSet {
+			if _, exists := batchWrites[k]; exists {
+				intraBatchConflict = true
+				break
+			}
+		}
+
+		// Check Write Set against Batch Writes (Blind Write conflict check)
+		if !intraBatchConflict {
+			for k := range tx.pendingOps {
+				if _, exists := batchWrites[k]; exists {
+					intraBatchConflict = true
+					break
+				}
+			}
+		}
+
+		if intraBatchConflict {
+			req.resp <- ErrWriteConflict
 			continue
 		}
 
@@ -281,6 +312,11 @@ func (db *DB) commitGroup(requests []commitRequest) {
 		startOpID := currentOpID + 1
 		opsCount := uint64(len(tx.pendingOps))
 		currentOpID += opsCount
+
+		// Register writes for subsequent intra-batch checks
+		for k := range tx.pendingOps {
+			batchWrites[k] = currentTxID
+		}
 
 		// Serialize to WAL buffer
 		var walBuf bytes.Buffer
