@@ -132,7 +132,7 @@ func startServerNode(t *testing.T, baseDir, name string, sharedTLS *tls.Config) 
 	// Create Server using shared certs
 	certsDir := filepath.Join(baseDir, "certs")
 	srv, err := NewServer(
-		":0", stores, logger, 10, 5*time.Second,
+		":0", stores, logger, 10,
 		filepath.Join(certsDir, "server.crt"),
 		filepath.Join(certsDir, "server.key"),
 		filepath.Join(certsDir, "ca.crt"),

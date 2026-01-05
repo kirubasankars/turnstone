@@ -46,6 +46,10 @@ type TurnstoneCollector struct {
 	keys        *prometheus.Desc
 	activeConns *prometheus.Desc
 	totalConns  *prometheus.Desc
+	activeTxs   *prometheus.Desc
+
+	// Storage Metrics
+	conflicts *prometheus.Desc
 }
 
 func NewTurnstoneCollector(stores map[string]*store.Store, stats ServerStatsProvider) *TurnstoneCollector {
@@ -55,6 +59,8 @@ func NewTurnstoneCollector(stores map[string]*store.Store, stats ServerStatsProv
 		keys:        newDesc("store", "keys_total", "Total keys"),
 		activeConns: newDesc("server", "connections_active", "Active connections"),
 		totalConns:  newDesc("server", "connections_accepted_total", "Total connections"),
+		activeTxs:   newDesc("server", "transactions_active", "Active transactions"),
+		conflicts:   newDesc("store", "conflicts_total", "Total transaction conflicts"),
 	}
 }
 
@@ -66,21 +72,27 @@ func (c *TurnstoneCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.keys
 	ch <- c.activeConns
 	ch <- c.totalConns
+	ch <- c.activeTxs
+	ch <- c.conflicts
 }
 
 func (c *TurnstoneCollector) Collect(ch chan<- prometheus.Metric) {
 	var keys float64
+	var conflicts float64
 
 	for _, db := range c.stores {
 		stats := db.Stats()
 		keys += float64(stats.KeyCount)
+		conflicts += float64(stats.Conflicts)
 	}
 
 	ch <- prometheus.MustNewConstMetric(c.keys, prometheus.GaugeValue, keys)
+	ch <- prometheus.MustNewConstMetric(c.conflicts, prometheus.CounterValue, conflicts)
 
 	if c.serverStats != nil {
 		ch <- prometheus.MustNewConstMetric(c.activeConns, prometheus.GaugeValue, float64(c.serverStats.ActiveConns()))
 		ch <- prometheus.MustNewConstMetric(c.totalConns, prometheus.CounterValue, float64(c.serverStats.TotalConns()))
+		ch <- prometheus.MustNewConstMetric(c.activeTxs, prometheus.GaugeValue, float64(c.serverStats.ActiveTxs()))
 	}
 }
 

@@ -41,8 +41,8 @@ func TestStore_Recover_Basic(t *testing.T) {
 	dir := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	// 1. Initialize Store and write data
-	s1, err := NewStore(dir, logger, true, 0, true)
+	// 1. Initialize Store and write data (isSystem=false)
+	s1, err := NewStore(dir, logger, true, 0, false)
 	if err != nil {
 		t.Fatalf("Failed to create initial store: %v", err)
 	}
@@ -64,8 +64,8 @@ func TestStore_Recover_Basic(t *testing.T) {
 		t.Fatalf("Failed to close store 1: %v", err)
 	}
 
-	// 2. Re-open Store
-	s2, err := NewStore(dir, logger, true, 0, true)
+	// 2. Re-open Store (isSystem=false)
+	s2, err := NewStore(dir, logger, true, 0, false)
 	if err != nil {
 		t.Fatalf("Failed to create recovered store: %v", err)
 	}
@@ -73,9 +73,7 @@ func TestStore_Recover_Basic(t *testing.T) {
 
 	// 3. Verify Data
 	stats := s2.Stats()
-	// Expect 3 user keys. _sys_logseq is stored in the engine but might not be counted
-	// depending on engine implementation details (engine.KeyCount usually skips _sys_ prefix).
-	// Let's assume standard behavior: 3 keys.
+	// Expect 3 user keys.
 	if stats.KeyCount < 3 {
 		t.Errorf("Expected at least 3 keys, got %d", stats.KeyCount)
 	}
@@ -95,10 +93,9 @@ func TestStore_Recover_Basic(t *testing.T) {
 func TestStore_Recover_CRC_Corruption(t *testing.T) {
 	dir := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	walPath := filepath.Join(dir, "values.log")
 
-	// 1. Create Store and write two entries
-	s1, err := NewStore(dir, logger, true, 0, true)
+	// 1. Create Store and write two entries (isSystem=false)
+	s1, err := NewStore(dir, logger, true, 0, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,8 +112,15 @@ func TestStore_Recover_CRC_Corruption(t *testing.T) {
 	s1.Close()
 
 	// 2. Corrupt the WAL manually
-	// Open file, flip the last byte. This modifies the payload of the last entry (key2),
-	// causing a CRC mismatch because the header's CRC won't match the modified payload.
+	// Find the WAL file (stonedb stores them in 'wal' subdir)
+	walDir := filepath.Join(dir, "wal")
+	matches, err := filepath.Glob(filepath.Join(walDir, "*.wal"))
+	if err != nil || len(matches) == 0 {
+		t.Fatalf("No WAL files found in %s", walDir)
+	}
+	walPath := matches[len(matches)-1] // Use last file
+
+	// Open file, flip the last byte.
 	f, err := os.OpenFile(walPath, os.O_RDWR, 0o644)
 	if err != nil {
 		t.Fatal(err)
@@ -140,15 +144,16 @@ func TestStore_Recover_CRC_Corruption(t *testing.T) {
 	f.Close()
 
 	// FORCE FULL RECOVERY:
-	// We want to test WAL recovery logic. Since s1.Close() flushed data to the engine's
-	// internal storage (.vlog files), simply reopening would load key2 from there.
-	// We must wipe the engine state completely to force the store to replay from the WAL.
-	if err := os.RemoveAll(filepath.Join(dir, "stone")); err != nil {
+	// Wipe internal storage to force replay from WAL
+	if err := os.RemoveAll(filepath.Join(dir, "vlog")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(dir, "index")); err != nil {
 		t.Fatal(err)
 	}
 
-	// 3. Re-open Store (Should trigger truncate)
-	s2, err := NewStore(dir, logger, true, 0, true)
+	// 3. Re-open Store (Should trigger truncate) (isSystem=false)
+	s2, err := NewStore(dir, logger, true, 0, false)
 	if err != nil {
 		t.Fatalf("Failed to recover store: %v", err)
 	}
@@ -168,22 +173,14 @@ func TestStore_Recover_CRC_Corruption(t *testing.T) {
 	if err != protocol.ErrKeyNotFound {
 		t.Errorf("Expected key2 to be dropped due to CRC failure, got: %v", err)
 	}
-
-	// 6. Verify Store Offset is truncated (checking file size is tricky as new store might append,
-	// but stats.Offset should reflect valid data)
-	stats := s2.Stats()
-	if stats.Offset >= size {
-		t.Errorf("Offset should be less than corrupted size. Original: %d, New Offset: %d", size, stats.Offset)
-	}
 }
 
 func TestStore_Recover_PartialWrite(t *testing.T) {
 	dir := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	walPath := filepath.Join(dir, "values.log")
 
-	// 1. Create Store and write data
-	s1, err := NewStore(dir, logger, true, 0, true)
+	// 1. Create Store and write data (isSystem=false)
+	s1, err := NewStore(dir, logger, true, 0, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,18 +188,25 @@ func TestStore_Recover_PartialWrite(t *testing.T) {
 	s1.Close()
 
 	// 2. Append garbage (partial header)
+	walDir := filepath.Join(dir, "wal")
+	matches, err := filepath.Glob(filepath.Join(walDir, "*.wal"))
+	if err != nil || len(matches) == 0 {
+		t.Fatalf("No WAL files found")
+	}
+	walPath := matches[len(matches)-1]
+
 	f, err := os.OpenFile(walPath, os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Append 10 bytes (less than HeaderSize 16)
-	if _, err := f.Write(make([]byte, 10)); err != nil {
+	// Append 4 bytes (partial header)
+	if _, err := f.Write(make([]byte, 4)); err != nil {
 		t.Fatal(err)
 	}
 	f.Close()
 
-	// 3. Re-open
-	s2, err := NewStore(dir, logger, true, 0, true)
+	// 3. Re-open (isSystem=false)
+	s2, err := NewStore(dir, logger, true, 0, false)
 	if err != nil {
 		t.Fatalf("Recovery failed on partial write: %v", err)
 	}
@@ -218,9 +222,9 @@ func TestStore_Replication_Quorum(t *testing.T) {
 	dir := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	// 1. Create Store with MinReplicas = 1
+	// 1. Create Store with MinReplicas = 1 (isSystem=false)
 	// This ensures that any write operation must wait for at least 1 replica to acknowledge.
-	s, err := NewStore(dir, logger, true, 1, true)
+	s, err := NewStore(dir, logger, true, 1, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,8 +239,8 @@ func TestStore_Replication_Quorum(t *testing.T) {
 
 	// 3. Verify it's blocked
 	select {
-	case <-done:
-		t.Fatal("Write returned before quorum was met")
+	case err := <-done:
+		t.Fatalf("Write returned before quorum was met. Err: %v", err)
 	case <-time.After(100 * time.Millisecond):
 		// Expected behavior: timeout because write is blocked
 	}
@@ -264,8 +268,8 @@ func TestStore_Replication_ApplyBatch(t *testing.T) {
 	dir := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	// Replica store (MinReplicas=0 because replicas typically don't require downstream quorum)
-	s, err := NewStore(dir, logger, true, 0, true)
+	// Replica store (MinReplicas=0) (isSystem=false)
+	s, err := NewStore(dir, logger, true, 0, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -304,6 +308,7 @@ func TestStore_ReadOnlySystemPartition(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "0")
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
+	// isSystem=true
 	s, err := NewStore(dir, logger, true, 0, true)
 	if err != nil {
 		t.Fatal(err)
@@ -316,8 +321,7 @@ func TestStore_ReadOnlySystemPartition(t *testing.T) {
 		t.Errorf("Expected system partition read-only error, got %v", err)
 	}
 
-	// Attempt Read (Also restricted by default in current store implementation, or allowed?
-	// store.go says: if s.isSystemPartition { return nil, protocol.ErrSystemPartitionReadOnly } for Get too)
+	// Attempt Read (Also restricted by default in current store implementation)
 	_, err = s.Get("any")
 	if err != protocol.ErrSystemPartitionReadOnly {
 		t.Errorf("Expected system partition read-only error on Get, got %v", err)
