@@ -20,6 +20,11 @@ import (
 	"github.com/syndtr/goleveldb/leveldb/util"
 )
 
+type commitRequest struct {
+	tx   *Transaction
+	resp chan error
+}
+
 // DB is the main database struct (formerly Store)
 type DB struct {
 	dir                string
@@ -52,11 +57,6 @@ type DB struct {
 	// Config
 	minGarbageThreshold int64
 	checksumInterval    time.Duration
-}
-
-type commitRequest struct {
-	tx   *Transaction
-	resp chan error
 }
 
 // Open initializes the DB
@@ -176,9 +176,6 @@ func Open(dir string, opts Options) (*DB, error) {
 		fmt.Printf("Warning: failed to load garbage stats: %v\n", err)
 	}
 
-	// REMOVED: initialization of operationID to 1.
-	// Group commit logic pre-increments, so starting at 0 gives ID 1 for first op.
-
 	// 8. Initialize Auto-Checkpoint, Compaction & Checksumming
 	db.lastCkptOpID = db.operationID
 
@@ -197,6 +194,29 @@ func Open(dir string, opts Options) (*DB, error) {
 	}
 
 	return db, nil
+}
+
+// KeyCount returns the approximate number of keys in the database.
+func (db *DB) KeyCount() (int64, error) {
+	count := int64(0)
+	// Guard against nil LDB if called during partial Open/Close
+	if db.ldb == nil {
+		return 0, nil
+	}
+	iter := db.ldb.NewIterator(nil, nil)
+	defer iter.Release()
+	for iter.Next() {
+		// Filter out system keys
+		if !bytes.HasPrefix(iter.Key(), []byte("!sys!")) {
+			count++
+		}
+	}
+	return count, nil
+}
+
+// LastOpID returns the most recent committed Operation ID.
+func (db *DB) LastOpID() uint64 {
+	return atomic.LoadUint64(&db.operationID)
 }
 
 // runGroupCommits aggregates concurrent commits into batches to amortize fsync cost.
@@ -491,6 +511,7 @@ func (db *DB) NewTransaction(update bool) *Transaction {
 		update:     update,
 	}
 
+	// Register in the active transactions map (Fast O(1) insert)
 	db.activeTxnsMu.Lock()
 	db.activeTxns[tx] = readTxID
 	db.activeTxnsMu.Unlock()
