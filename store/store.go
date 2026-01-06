@@ -12,6 +12,7 @@ import (
 // StoreStats holds basic metrics.
 type StoreStats struct {
 	KeyCount  int
+	ActiveTxs int
 	Uptime    string
 	Offset    int64 // Represents the WAL/VLog offset or similar metric
 	Conflicts uint64
@@ -145,6 +146,7 @@ func (s *Store) Stats() StoreStats {
 	count, _ := s.DB.KeyCount()
 	return StoreStats{
 		KeyCount:  int(count),
+		ActiveTxs: s.DB.ActiveTransactionCount(),
 		Uptime:    time.Since(s.startTime).Round(time.Second).String(),
 		Offset:    int64(s.DB.LastOpID()),
 		Conflicts: s.DB.GetConflicts(),

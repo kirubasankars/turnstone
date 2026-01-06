@@ -39,14 +39,21 @@ func (db *DB) RunCompaction() error {
 
 	// 2. Rewrite valid entries
 	var validEntries []ValueLogEntry
+	currentBatchSize := 0
+	// Limit batch size to ~2MB or 1000 entries to control memory usage during compaction
+	const maxBatchBytes = 2 * 1024 * 1024
+	const maxBatchCount = 1000
 
 	err := db.valueLog.IterateFile(bestFid, func(e ValueLogEntry, _ EntryMeta) error {
 		validEntries = append(validEntries, e)
-		if len(validEntries) >= 100 {
+		currentBatchSize += len(e.Key) + len(e.Value) + ValueLogHeaderSize
+
+		if currentBatchSize >= maxBatchBytes || len(validEntries) >= maxBatchCount {
 			if err := db.rewriteBatch(validEntries); err != nil {
 				return err
 			}
 			validEntries = validEntries[:0]
+			currentBatchSize = 0
 		}
 		return nil
 	})

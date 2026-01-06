@@ -31,6 +31,7 @@ type replPacket struct {
 
 // HandleReplicaConnection multiplexes streams from multiple partitions onto one connection.
 func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []byte) {
+	conn.SetReadDeadline(time.Time{})
 	// 1. Parse Hello: [Ver:4][NumPartitions:4] ... [NameLen:4][Name][LogID:8]
 	if len(payload) < 8 {
 		s.logger.Error("HandleReplicaConnection: payload too short for header")

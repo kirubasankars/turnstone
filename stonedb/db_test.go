@@ -390,3 +390,70 @@ func TestWAL_AppendBatch_Direct(t *testing.T) {
 		t.Error("Did not find appended batch in WAL")
 	}
 }
+
+func TestDB_KeyCount(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer db.Close()
+
+	// 1. Initial count should be 0
+	count, err := db.KeyCount()
+	if err != nil {
+		t.Fatalf("KeyCount failed: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("Expected 0 keys, got %d", count)
+	}
+
+	// 2. Insert 2 new keys
+	tx := db.NewTransaction(true)
+	tx.Put([]byte("k1"), []byte("v1"))
+	tx.Put([]byte("k2"), []byte("v2"))
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	count, _ = db.KeyCount()
+	if count != 2 {
+		t.Errorf("Expected 2 keys, got %d", count)
+	}
+
+	// 3. Update existing key (should not increase count)
+	tx = db.NewTransaction(true)
+	tx.Put([]byte("k1"), []byte("v1-updated"))
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	count, _ = db.KeyCount()
+	if count != 2 {
+		t.Errorf("Expected 2 keys after update, got %d", count)
+	}
+
+	// 4. Delete key (should decrease count)
+	tx = db.NewTransaction(true)
+	tx.Delete([]byte("k2"))
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	count, _ = db.KeyCount()
+	if count != 1 {
+		t.Errorf("Expected 1 key after delete, got %d", count)
+	}
+
+	// 5. Re-insert deleted key (should increase count)
+	tx = db.NewTransaction(true)
+	tx.Put([]byte("k2"), []byte("v2-new"))
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	count, _ = db.KeyCount()
+	if count != 2 {
+		t.Errorf("Expected 2 keys after re-insert, got %d", count)
+	}
+}

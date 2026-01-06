@@ -20,83 +20,45 @@ import (
 	"turnstone/store"
 )
 
-// --- Helpers ---
+// --- Replication Helpers ---
 
-// waitForConditionOrTimeout is a helper to poll for a condition until timeout.
-func waitForConditionOrTimeout(t *testing.T, timeout time.Duration, check func() bool, errMsg string) {
-	start := time.Now()
-	for time.Since(start) < timeout {
-		if check() {
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	t.Fatal(errMsg)
-}
-
-// createTestLogger creates a logger that writes to both stdout and a log file in the test directory.
-func createTestLogger(t *testing.T, baseDir string) *slog.Logger {
-	logPath := filepath.Join(baseDir, "turnstone.log")
-	// Use Append so multiple nodes/tests writing to the same file don't truncate each other
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
-		t.Fatalf("Failed to open log file for node: %v", err)
-	}
-	// We rely on OS cleanup or specific test cleanup, but to be safe we can register a cleanup.
-	t.Cleanup(func() { logFile.Close() })
-
-	multiWriter := io.MultiWriter(os.Stdout, logFile)
-	return slog.New(slog.NewTextHandler(multiWriter, &slog.HandlerOptions{Level: slog.LevelDebug}))
-}
-
-// setupSharedCertEnv creates a temporary directory with a shared CA and certificates
-// to be used by multiple server instances in an integration test.
+// setupSharedCertEnv creates a temporary directory with a shared CA and certificates.
+// This mirrors setupTestEnv but returns just the dir and config for manual node spawning.
 func setupSharedCertEnv(t *testing.T) (string, *tls.Config) {
-	// Use MkdirTemp to persist artifacts
-	baseDir, err := os.MkdirTemp("", "turnstone-replication-test-*")
+	dir, err := os.MkdirTemp("", "turnstone-repl-test-*")
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("Test Artifacts Directory: %s", baseDir)
+	t.Logf("Test Artifacts Directory: %s", dir)
 
-	certsDir := filepath.Join(baseDir, "certs")
-
-	// Generate config and artifacts (certs) once
-	cfg := config.Config{
+	// Generate artifacts (including admin certs)
+	if err := config.GenerateConfigArtifacts(dir, config.Config{
 		TLSCertFile:        "certs/server.crt",
 		TLSKeyFile:         "certs/server.key",
 		TLSCAFile:          "certs/ca.crt",
-		NumberOfPartitions: 4, // Need 0 (System), 1 (User), 2 (Target), 3 (Cascade)
-		Debug:              false,
-	}
-	if err := config.GenerateConfigArtifacts(baseDir, cfg, filepath.Join(baseDir, "config.json")); err != nil {
-		t.Fatal(err)
+		NumberOfPartitions: 4,
+	}, filepath.Join(dir, "config.json")); err != nil {
+		t.Fatalf("Failed to generate artifacts: %v", err)
 	}
 
-	// Create client TLS config
-	clientCert, _ := tls.LoadX509KeyPair(filepath.Join(certsDir, "client.crt"), filepath.Join(certsDir, "client.key"))
-	caCert, _ := os.ReadFile(filepath.Join(certsDir, "ca.crt"))
-	pool := x509.NewCertPool()
-	pool.AppendCertsFromPEM(caCert)
-
-	tlsConfig := &tls.Config{
-		Certificates:       []tls.Certificate{clientCert},
-		RootCAs:            pool,
-		InsecureSkipVerify: true,
-	}
-
-	return baseDir, tlsConfig
+	// Load default client cert (role: client)
+	return dir, getClientTLS(t, dir)
 }
 
 // startServerNode starts a single TurnstoneDB server instance within the shared environment.
 func startServerNode(t *testing.T, baseDir, name string, sharedTLS *tls.Config) (*Server, string, context.CancelFunc) {
 	// Create a logger that writes to the shared log file
-	logger := createTestLogger(t, baseDir).With("node", name)
+	logPath := filepath.Join(baseDir, "turnstone.log")
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		t.Fatalf("Failed to open log file for node: %v", err)
+	}
+
+	// Create node-specific logger
+	logger := slog.New(slog.NewTextHandler(io.MultiWriter(os.Stdout, logFile), &slog.HandlerOptions{Level: slog.LevelDebug})).With("node", name)
 
 	nodeDir := filepath.Join(baseDir, name)
-
 	stores := make(map[string]*store.Store)
-	// Initialize Stores 0, 1, 2, and 3
 	for _, partitionName := range []string{"0", "1", "2", "3"} {
 		partPath := filepath.Join(nodeDir, "data", partitionName)
 		st, err := store.NewStore(partPath, logger, true, 0, true)
@@ -106,11 +68,17 @@ func startServerNode(t *testing.T, baseDir, name string, sharedTLS *tls.Config) 
 		stores[partitionName] = st
 	}
 
-	// Create Replication Manager
-	rm := replication.NewReplicationManager(stores, sharedTLS, logger)
-
-	// Create Server using shared certs
+	// Replication Manager needs SERVER certs to connect to upstream masters
+	// We load them from the shared certs dir
 	certsDir := filepath.Join(baseDir, "certs")
+	serverCert, _ := tls.LoadX509KeyPair(filepath.Join(certsDir, "server.crt"), filepath.Join(certsDir, "server.key"))
+	caCert, _ := os.ReadFile(filepath.Join(certsDir, "ca.crt"))
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(caCert)
+	replTLS := &tls.Config{Certificates: []tls.Certificate{serverCert}, RootCAs: pool, InsecureSkipVerify: true}
+
+	rm := replication.NewReplicationManager(stores, replTLS, logger)
+
 	srv, err := NewServer(
 		":0", stores, logger, 10,
 		filepath.Join(certsDir, "server.crt"),
@@ -125,94 +93,288 @@ func startServerNode(t *testing.T, baseDir, name string, sharedTLS *tls.Config) 
 	ctx, cancel := context.WithCancel(context.Background())
 	go srv.Run(ctx)
 
-	// Wait for listener to accept connections
+	// Wait for listener
 	time.Sleep(50 * time.Millisecond)
 	return srv, srv.listener.Addr().String(), cancel
 }
 
+// connectReplClient is a local helper similar to connectClient in server_test.go
+// but adapted for the replication tests context.
+func connectReplClient(t *testing.T, addr string, tlsConfig *tls.Config) *replTestClient {
+	conn, err := tls.Dial("tcp", addr, tlsConfig)
+	if err != nil {
+		t.Fatalf("Failed to dial server: %v", err)
+	}
+	return &replTestClient{conn: conn, t: t}
+}
+
+type replTestClient struct {
+	conn net.Conn
+	t    *testing.T
+}
+
+func (c *replTestClient) Close() {
+	c.conn.Close()
+}
+
+func (c *replTestClient) Send(opCode byte, payload []byte) {
+	header := make([]byte, 5)
+	header[0] = opCode
+	binary.BigEndian.PutUint32(header[1:], uint32(len(payload)))
+	if _, err := c.conn.Write(header); err != nil {
+		c.t.Fatalf("Write header failed: %v", err)
+	}
+	if len(payload) > 0 {
+		if _, err := c.conn.Write(payload); err != nil {
+			c.t.Fatalf("Write payload failed: %v", err)
+		}
+	}
+}
+
+func (c *replTestClient) Read() (byte, []byte) {
+	header := make([]byte, 5)
+	if _, err := io.ReadFull(c.conn, header); err != nil {
+		c.t.Fatalf("Read response header failed: %v", err)
+	}
+	length := binary.BigEndian.Uint32(header[1:])
+	var body []byte
+	if length > 0 {
+		body = make([]byte, length)
+		if _, err := io.ReadFull(c.conn, body); err != nil {
+			c.t.Fatalf("Read response body failed: %v", err)
+		}
+	}
+	return header[0], body
+}
+
+func (c *replTestClient) AssertStatus(opCode byte, payload []byte, expectedStatus byte) []byte {
+	c.Send(opCode, payload)
+	status, body := c.Read()
+	if status != expectedStatus {
+		c.t.Fatalf("Op 0x%x: Expected status 0x%x, got 0x%x. Body: %s", opCode, expectedStatus, status, body)
+	}
+	return body
+}
+
+// selectPartition switches the client's active partition.
+func selectPartition(t *testing.T, c *replTestClient, partitionName string) {
+	c.AssertStatus(protocol.OpCodeSelect, []byte(partitionName), protocol.ResStatusOK)
+}
+
+// configureReplication sends the REPLICAOF command.
+func configureReplication(t *testing.T, c *replTestClient, targetAddr, targetPartition string) {
+	addrBytes := []byte(targetAddr)
+	partBytes := []byte(targetPartition)
+	payload := make([]byte, 4+len(addrBytes)+len(partBytes))
+	binary.BigEndian.PutUint32(payload[0:4], uint32(len(addrBytes)))
+	copy(payload[4:], addrBytes)
+	copy(payload[4+len(addrBytes):], partBytes)
+
+	c.AssertStatus(protocol.OpCodeReplicaOf, payload, protocol.ResStatusOK)
+}
+
+// writeKeyVal performs a Set operation within a transaction.
+func writeKeyVal(t *testing.T, c *replTestClient, k, v string) {
+	key := []byte(k)
+	val := []byte(v)
+	payload := make([]byte, 4+len(key)+len(val))
+	binary.BigEndian.PutUint32(payload[0:4], uint32(len(key)))
+	copy(payload[4:], key)
+	copy(payload[4+len(key):], val)
+
+	c.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
+	c.AssertStatus(protocol.OpCodeSet, payload, protocol.ResStatusOK)
+	c.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusOK)
+}
+
+// readKey performs a Get operation within a transaction.
+func readKey(t *testing.T, c *replTestClient, k string) []byte {
+	c.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
+	c.Send(protocol.OpCodeGet, []byte(k))
+	status, body := c.Read()
+	c.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusOK)
+	if status == protocol.ResStatusNotFound {
+		return nil
+	}
+	return body
+}
+
+// waitForConditionOrTimeout is a helper to poll for a condition until timeout.
+func waitForConditionOrTimeout(t *testing.T, timeout time.Duration, check func() bool, errMsg string) {
+	start := time.Now()
+	for time.Since(start) < timeout {
+		if check() {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal(errMsg)
+}
+
 // --- Tests ---
 
-// TestReplication_FanOut tests a single primary with multiple direct replicas.
-// Topology: Primary -> (Replica1, Replica2)
-func TestReplication_FanOut(t *testing.T) {
-	baseDir, tlsConfig := setupSharedCertEnv(t)
+// TestServer_ReplicaOf_Integration verifies that a replica can replicate from a primary
+// and that 'replicaof no one' stops the replication.
+func TestServer_ReplicaOf_Integration(t *testing.T) {
+	// Reusing the shared setup for consistency
+	baseDir, clientTLS := setupSharedCertEnv(t)
+	// Admin TLS needed for ReplicaOf command
+	adminTLS := getRoleTLS(t, baseDir, "admin")
 
 	// Start Primary
-	_, primaryAddr, cancelPrimary := startServerNode(t, baseDir, "primary", tlsConfig)
+	_, primaryAddr, cancelPrimary := startServerNode(t, baseDir, "primary_int", clientTLS)
 	defer cancelPrimary()
 
-	// Start Replica 1
-	_, r1Addr, cancelR1 := startServerNode(t, baseDir, "replica1", tlsConfig)
-	defer cancelR1()
+	// Start Replica
+	_, replicaAddr, cancelReplica := startServerNode(t, baseDir, "replica_int", clientTLS)
+	defer cancelReplica()
 
-	// Start Replica 2
-	_, r2Addr, cancelR2 := startServerNode(t, baseDir, "replica2", tlsConfig)
-	defer cancelR2()
-
-	// Connect Clients
-	clientPrimary := connectReplClient(t, primaryAddr, tlsConfig)
+	// Clients
+	clientPrimary := connectReplClient(t, primaryAddr, clientTLS)
 	defer clientPrimary.Close()
 	selectPartition(t, clientPrimary, "1")
 
-	clientR1 := connectReplClient(t, r1Addr, tlsConfig)
+	// IMPORTANT: Connect to Replica as ADMIN to configure replication
+	clientReplicaAdmin := connectReplClient(t, replicaAddr, adminTLS)
+	defer clientReplicaAdmin.Close()
+	selectPartition(t, clientReplicaAdmin, "1")
+
+	// Connect as Client to Replica for Reading
+	clientReplicaRead := connectReplClient(t, replicaAddr, clientTLS)
+	defer clientReplicaRead.Close()
+	selectPartition(t, clientReplicaRead, "1")
+
+	// --- PHASE 1: START REPLICATION ---
+	// Configure Replica -> Primary (Partition 1) using ADMIN connection
+	configureReplication(t, clientReplicaAdmin, primaryAddr, "1")
+
+	// Write to Primary using CLIENT connection
+	writeKeyVal(t, clientPrimary, "k1", "v1")
+
+	// Verify K1 on Replica using CLIENT connection (Reads allowed)
+	waitForConditionOrTimeout(t, 2*time.Second, func() bool {
+		val := readKey(t, clientReplicaRead, "k1")
+		return string(val) == "v1"
+	}, "Replication failed for K1")
+
+	// --- PHASE 2: STOP REPLICATION ---
+	// Send REPLICAOF NO ONE using ADMIN connection
+	// Payload: [0][][PartitionName] (AddrLen=0 implies stop)
+	partBytes := []byte("1")
+	stopPayload := make([]byte, 4+0+len(partBytes))
+	binary.BigEndian.PutUint32(stopPayload[0:4], 0)
+	copy(stopPayload[4:], partBytes)
+	clientReplicaAdmin.AssertStatus(protocol.OpCodeReplicaOf, stopPayload, protocol.ResStatusOK)
+
+	// Write K2 to Primary
+	writeKeyVal(t, clientPrimary, "k2", "v2")
+
+	// Wait a bit to ensure it DOESN'T replicate
+	time.Sleep(300 * time.Millisecond)
+
+	// Verify K2 is NOT on Replica
+	val := readKey(t, clientReplicaRead, "k2")
+	if val != nil {
+		t.Fatalf("Replication did not stop, found k2: %s", val)
+	}
+}
+
+// TestReplication_FanOut tests a single primary with multiple direct replicas.
+func TestReplication_FanOut(t *testing.T) {
+	baseDir, clientTLS := setupSharedCertEnv(t)
+	adminTLS := getRoleTLS(t, baseDir, "admin")
+
+	_, primaryAddr, cancelPrimary := startServerNode(t, baseDir, "primary", clientTLS)
+	defer cancelPrimary()
+
+	_, r1Addr, cancelR1 := startServerNode(t, baseDir, "replica1", clientTLS)
+	defer cancelR1()
+
+	_, r2Addr, cancelR2 := startServerNode(t, baseDir, "replica2", clientTLS)
+	defer cancelR2()
+
+	// Connect Clients
+	clientPrimary := connectReplClient(t, primaryAddr, clientTLS)
+	defer clientPrimary.Close()
+	selectPartition(t, clientPrimary, "1")
+
+	clientR1 := connectReplClient(t, r1Addr, clientTLS)
 	defer clientR1.Close()
 	selectPartition(t, clientR1, "1")
 
-	clientR2 := connectReplClient(t, r2Addr, tlsConfig)
+	clientR2 := connectReplClient(t, r2Addr, clientTLS)
 	defer clientR2.Close()
 	selectPartition(t, clientR2, "1")
 
-	// Configure Replication: R1 -> Primary (Partition 1)
-	configureReplication(t, clientR1, primaryAddr, "1")
-	// Configure Replication: R2 -> Primary (Partition 1)
-	configureReplication(t, clientR2, primaryAddr, "1")
+	// Admin clients for configuration
+	adminR1 := connectReplClient(t, r1Addr, adminTLS)
+	defer adminR1.Close()
+	selectPartition(t, adminR1, "1")
 
-	// Write to Primary (Partition 1)
+	adminR2 := connectReplClient(t, r2Addr, adminTLS)
+	defer adminR2.Close()
+	selectPartition(t, adminR2, "1")
+
+	// Configure
+	configureReplication(t, adminR1, primaryAddr, "1")
+	configureReplication(t, adminR2, primaryAddr, "1")
+
+	// Write to Primary
 	writeKeyVal(t, clientPrimary, "fanKey", "fanVal")
 
-	// Verify both replicas received the data
+	// Verify
 	waitForConditionOrTimeout(t, 10*time.Second, func() bool {
 		v1 := readKey(t, clientR1, "fanKey")
 		v2 := readKey(t, clientR2, "fanKey")
 		return string(v1) == "fanVal" && string(v2) == "fanVal"
-	}, "Fan-out replication failed: Data not found on one or both replicas")
+	}, "Fan-out replication failed")
 }
 
 // TestReplication_Cascading tests chained replication.
 // Topology: NodeA (Primary) -> NodeB (Replica/Primary) -> NodeC (Replica)
 func TestReplication_Cascading(t *testing.T) {
-	baseDir, tlsConfig := setupSharedCertEnv(t)
+	baseDir, clientTLS := setupSharedCertEnv(t)
+	adminTLS := getRoleTLS(t, baseDir, "admin")
 
 	// Start Node A (Primary)
-	_, addrA, cancelA := startServerNode(t, baseDir, "nodeA", tlsConfig)
+	_, addrA, cancelA := startServerNode(t, baseDir, "nodeA", clientTLS)
 	defer cancelA()
 
 	// Start Node B (Replica of A, Primary for C)
-	_, addrB, cancelB := startServerNode(t, baseDir, "nodeB", tlsConfig)
+	_, addrB, cancelB := startServerNode(t, baseDir, "nodeB", clientTLS)
 	defer cancelB()
 
 	// Start Node C (Replica of B)
-	_, addrC, cancelC := startServerNode(t, baseDir, "nodeC", tlsConfig)
+	_, addrC, cancelC := startServerNode(t, baseDir, "nodeC", clientTLS)
 	defer cancelC()
 
 	// Clients
-	clientA := connectReplClient(t, addrA, tlsConfig)
+	clientA := connectReplClient(t, addrA, clientTLS)
 	defer clientA.Close()
 	selectPartition(t, clientA, "1")
 
-	clientB := connectReplClient(t, addrB, tlsConfig)
+	clientB := connectReplClient(t, addrB, clientTLS)
 	defer clientB.Close()
 	selectPartition(t, clientB, "1")
 
-	clientC := connectReplClient(t, addrC, tlsConfig)
+	clientC := connectReplClient(t, addrC, clientTLS)
 	defer clientC.Close()
 	selectPartition(t, clientC, "1")
 
+	// Admins for config
+	adminB := connectReplClient(t, addrB, adminTLS)
+	defer adminB.Close()
+	selectPartition(t, adminB, "1")
+
+	adminC := connectReplClient(t, addrC, adminTLS)
+	defer adminC.Close()
+	selectPartition(t, adminC, "1")
+
 	// Configure B -> A (Partition 1)
-	configureReplication(t, clientB, addrA, "1")
+	configureReplication(t, adminB, addrA, "1")
 
 	// Configure C -> B (Partition 1)
-	configureReplication(t, clientC, addrB, "1")
+	configureReplication(t, adminC, addrB, "1")
 
 	// Write to A (Partition 1)
 	writeKeyVal(t, clientA, "cascadeKey", "cascadeVal")
@@ -227,14 +389,18 @@ func TestReplication_Cascading(t *testing.T) {
 // TestReplication_SameServer_Loopback tests replication between two partitions on the SAME server.
 // Topology: NodeA(Partition 1) -> NodeA(Partition 2)
 func TestReplication_SameServer_Loopback(t *testing.T) {
-	baseDir, tlsConfig := setupSharedCertEnv(t)
+	baseDir, clientTLS := setupSharedCertEnv(t)
+	adminTLS := getRoleTLS(t, baseDir, "admin")
 
 	// Start Single Node
-	_, addr, cancel := startServerNode(t, baseDir, "loopback", tlsConfig)
+	_, addr, cancel := startServerNode(t, baseDir, "loopback", clientTLS)
 	defer cancel()
 
-	client := connectReplClient(t, addr, tlsConfig)
+	client := connectReplClient(t, addr, clientTLS)
 	defer client.Close()
+
+	adminClient := connectReplClient(t, addr, adminTLS)
+	defer adminClient.Close()
 
 	// 1. Write data to Source Partition "1"
 	selectPartition(t, client, "1")
@@ -242,7 +408,8 @@ func TestReplication_SameServer_Loopback(t *testing.T) {
 
 	// 2. Select Target Partition "2" and configure replication from Partition "1" on the SAME address
 	selectPartition(t, client, "2")
-	configureReplication(t, client, addr, "1")
+	selectPartition(t, adminClient, "2") // Admin also needs to be on target partition
+	configureReplication(t, adminClient, addr, "1")
 
 	// 3. Verify data appears in Partition "2"
 	waitForConditionOrTimeout(t, 10*time.Second, func() bool {
@@ -260,13 +427,14 @@ func TestReplication_SlowConsumer_Dropped(t *testing.T) {
 	defer func() { protocol.ReplicationTimeout = originalTimeout }()
 
 	// 2. Setup Single Node Environment
-	baseDir, tlsConfig := setupSharedCertEnv(t)
-	_, addr, cancel := startServerNode(t, baseDir, "slow_consumer", tlsConfig)
+	baseDir, clientTLS := setupSharedCertEnv(t)
+	_, addr, cancel := startServerNode(t, baseDir, "slow_consumer", clientTLS)
 	defer cancel()
 
-	// 3. Connect "Slow" Replica manually
-	// We use a raw connection so we can control exactly what we read (or don't read).
-	conn, err := tls.Dial("tcp", addr, tlsConfig)
+	// 3. Connect "Slow" Replica manually using CDC role credentials
+	// Note: We use CDC role because this simulates a replication handshake which uses OpCodeReplHello
+	cdcTLS := getRoleTLS(t, baseDir, "cdc")
+	conn, err := tls.Dial("tcp", addr, cdcTLS)
 	if err != nil {
 		t.Fatalf("Failed to dial: %v", err)
 	}
@@ -295,10 +463,8 @@ func TestReplication_SlowConsumer_Dropped(t *testing.T) {
 	}
 
 	// 5. Generate Load on Primary
-	// We use a raw connection loop here instead of replTestClient to avoid
-	// t.Fatalf() when the connection is closed during test teardown.
 	go func() {
-		genConn, err := tls.Dial("tcp", addr, tlsConfig)
+		genConn, err := tls.Dial("tcp", addr, clientTLS)
 		if err != nil {
 			return
 		}
@@ -381,169 +547,4 @@ func TestReplication_SlowConsumer_Dropped(t *testing.T) {
 			return
 		}
 	}
-}
-
-// TestServer_ReplicaOf_Integration verifies that a replica can replicate from a primary
-// and that 'replicaof no one' stops the replication.
-func TestServer_ReplicaOf_Integration(t *testing.T) {
-	// Reusing the shared setup for consistency
-	baseDir, tlsConfig := setupSharedCertEnv(t)
-
-	// Start Primary
-	_, primaryAddr, cancelPrimary := startServerNode(t, baseDir, "primary_int", tlsConfig)
-	defer cancelPrimary()
-
-	// Start Replica
-	_, replicaAddr, cancelReplica := startServerNode(t, baseDir, "replica_int", tlsConfig)
-	defer cancelReplica()
-
-	// Clients
-	clientPrimary := connectReplClient(t, primaryAddr, tlsConfig)
-	defer clientPrimary.Close()
-	selectPartition(t, clientPrimary, "1")
-
-	clientReplica := connectReplClient(t, replicaAddr, tlsConfig)
-	defer clientReplica.Close()
-	selectPartition(t, clientReplica, "1")
-
-	// --- PHASE 1: START REPLICATION ---
-	configureReplication(t, clientReplica, primaryAddr, "1")
-
-	// Write to Primary
-	writeKeyVal(t, clientPrimary, "k1", "v1")
-
-	// Verify K1 on Replica
-	waitForConditionOrTimeout(t, 2*time.Second, func() bool {
-		val := readKey(t, clientReplica, "k1")
-		return string(val) == "v1"
-	}, "Replication failed for K1")
-
-	// --- PHASE 2: STOP REPLICATION ---
-	// Send REPLICAOF NO ONE
-	// Payload: [0][][PartitionName] (AddrLen=0 implies stop)
-	partBytes := []byte("1")
-	stopPayload := make([]byte, 4+0+len(partBytes))
-	binary.BigEndian.PutUint32(stopPayload[0:4], 0)
-	copy(stopPayload[4:], partBytes)
-	clientReplica.AssertStatus(protocol.OpCodeReplicaOf, stopPayload, protocol.ResStatusOK)
-
-	// Write K2 to Primary
-	writeKeyVal(t, clientPrimary, "k2", "v2")
-
-	// Wait a bit to ensure it DOESN'T replicate
-	time.Sleep(300 * time.Millisecond)
-
-	// Verify K2 is NOT on Replica
-	val := readKey(t, clientReplica, "k2")
-	if val != nil {
-		t.Fatalf("Replication did not stop, found k2: %s", val)
-	}
-}
-
-// --- Client Helpers (Renamed to avoid conflict with server_test.go if in same package) ---
-
-type replTestClient struct {
-	conn net.Conn
-	t    *testing.T
-}
-
-func (c *replTestClient) Close() {
-	c.conn.Close()
-}
-
-func (c *replTestClient) Send(opCode byte, payload []byte) {
-	header := make([]byte, 5)
-	header[0] = opCode
-	binary.BigEndian.PutUint32(header[1:], uint32(len(payload)))
-
-	if _, err := c.conn.Write(header); err != nil {
-		c.t.Fatalf("Write header failed: %v", err)
-	}
-	if len(payload) > 0 {
-		if _, err := c.conn.Write(payload); err != nil {
-			c.t.Fatalf("Write payload failed: %v", err)
-		}
-	}
-}
-
-func (c *replTestClient) Read() (status byte, body []byte) {
-	header := make([]byte, 5)
-	if _, err := io.ReadFull(c.conn, header); err != nil {
-		c.t.Fatalf("Read response header failed: %v", err)
-	}
-	status = header[0]
-	length := binary.BigEndian.Uint32(header[1:])
-
-	if length > 0 {
-		body = make([]byte, length)
-		if _, err := io.ReadFull(c.conn, body); err != nil {
-			c.t.Fatalf("Read response body failed: %v", err)
-		}
-	}
-	return
-}
-
-func (c *replTestClient) AssertStatus(opCode byte, payload []byte, expectedStatus byte) []byte {
-	c.Send(opCode, payload)
-	status, body := c.Read()
-	if status != expectedStatus {
-		c.t.Fatalf("Op 0x%x: Expected status 0x%x, got 0x%x. Body: %s", opCode, expectedStatus, status, body)
-	}
-	return body
-}
-
-func (c *replTestClient) ReadStatus(opCode byte, payload []byte) ([]byte, byte) {
-	c.Send(opCode, payload)
-	status, body := c.Read()
-	return body, status
-}
-
-func connectReplClient(t *testing.T, addr string, tlsConfig *tls.Config) *replTestClient {
-	conn, err := tls.Dial("tcp", addr, tlsConfig)
-	if err != nil {
-		t.Fatalf("Failed to dial server: %v", err)
-	}
-	return &replTestClient{conn: conn, t: t}
-}
-
-// selectPartition switches the client's active partition.
-func selectPartition(t *testing.T, c *replTestClient, partitionName string) {
-	c.AssertStatus(protocol.OpCodeSelect, []byte(partitionName), protocol.ResStatusOK)
-}
-
-// configureReplication sends the REPLICAOF command to a server.
-func configureReplication(t *testing.T, c *replTestClient, targetAddr, targetPartition string) {
-	addrBytes := []byte(targetAddr)
-	partBytes := []byte(targetPartition)
-	payload := make([]byte, 4+len(addrBytes)+len(partBytes))
-	binary.BigEndian.PutUint32(payload[0:4], uint32(len(addrBytes)))
-	copy(payload[4:], addrBytes)
-	copy(payload[4+len(addrBytes):], partBytes)
-
-	c.AssertStatus(protocol.OpCodeReplicaOf, payload, protocol.ResStatusOK)
-}
-
-// writeKeyVal performs a Set operation within a transaction.
-func writeKeyVal(t *testing.T, c *replTestClient, k, v string) {
-	key := []byte(k)
-	val := []byte(v)
-	payload := make([]byte, 4+len(key)+len(val))
-	binary.BigEndian.PutUint32(payload[0:4], uint32(len(key)))
-	copy(payload[4:], key)
-	copy(payload[4+len(key):], val)
-
-	c.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
-	c.AssertStatus(protocol.OpCodeSet, payload, protocol.ResStatusOK)
-	c.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusOK)
-}
-
-// readKey performs a Get operation within a transaction.
-func readKey(t *testing.T, c *replTestClient, k string) []byte {
-	c.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
-	val, status := c.ReadStatus(protocol.OpCodeGet, []byte(k))
-	c.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusOK)
-	if status == protocol.ResStatusNotFound {
-		return nil
-	}
-	return val
 }

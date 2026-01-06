@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -27,7 +28,7 @@ import (
 
 // --- Test Infrastructure & Helpers ---
 
-func setupTestEnv(t *testing.T) (string, map[string]*store.Store, *Server) {
+func setupTestEnv(t *testing.T) (string, map[string]*store.Store, *Server, func()) {
 	// Use MkdirTemp to keep files (t.TempDir deletes them)
 	dir, err := os.MkdirTemp("", "turnstone-server-test-*")
 	if err != nil {
@@ -41,6 +42,7 @@ func setupTestEnv(t *testing.T) (string, map[string]*store.Store, *Server) {
 	if err != nil {
 		t.Fatalf("Failed to open log file: %v", err)
 	}
+	// Ensure log file is closed even if cleanup isn't called due to panic
 	t.Cleanup(func() {
 		logFile.Close()
 	})
@@ -54,6 +56,7 @@ func setupTestEnv(t *testing.T) (string, map[string]*store.Store, *Server) {
 		t.Fatal(err)
 	}
 	// Generate config with multiple partitions to support testing Partition 1, 2, 3
+	// This will now generate admin and cdc certs as well due to the change in config.go
 	if err := config.GenerateConfigArtifacts(dir, config.Config{
 		TLSCertFile:        "certs/server.crt",
 		TLSKeyFile:         "certs/server.key",
@@ -75,15 +78,12 @@ func setupTestEnv(t *testing.T) (string, map[string]*store.Store, *Server) {
 	}
 
 	// 3. Setup Replication Manager (Required for NewServer)
-	clientCertPath := filepath.Join(certsDir, "client.crt")
-	clientKeyPath := filepath.Join(certsDir, "client.key")
-	caCertPath := filepath.Join(certsDir, "ca.crt")
-
-	clientCert, err := tls.LoadX509KeyPair(clientCertPath, clientKeyPath)
+	// The replication manager acts as a "Server" role when connecting to other nodes upstream
+	clientCert, err := tls.LoadX509KeyPair(filepath.Join(certsDir, "server.crt"), filepath.Join(certsDir, "server.key"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	caCert, err := os.ReadFile(caCertPath)
+	caCert, err := os.ReadFile(filepath.Join(certsDir, "ca.crt"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,17 +106,23 @@ func setupTestEnv(t *testing.T) (string, map[string]*store.Store, *Server) {
 		t.Fatalf("Failed to create server: %v", err)
 	}
 
-	return dir, stores, srv
+	// cleanup ensures a clean shutdown of the server (which closes all stores) and removes artifacts.
+	cleanup := func() {
+		srv.CloseAll()
+		os.RemoveAll(dir)
+	}
+
+	return dir, stores, srv, cleanup
 }
 
-func getClientTLS(t *testing.T, dir string) *tls.Config {
-	certFile := filepath.Join(dir, "certs", "client.crt")
-	keyFile := filepath.Join(dir, "certs", "client.key")
+func getRoleTLS(t *testing.T, dir, role string) *tls.Config {
+	certFile := filepath.Join(dir, "certs", role+".crt")
+	keyFile := filepath.Join(dir, "certs", role+".key")
 	caFile := filepath.Join(dir, "certs", "ca.crt")
 
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
-		t.Fatalf("Load client key pair: %v", err)
+		t.Fatalf("Load %s key pair: %v", role, err)
 	}
 	caCert, _ := os.ReadFile(caFile)
 	pool := x509.NewCertPool()
@@ -127,6 +133,10 @@ func getClientTLS(t *testing.T, dir string) *tls.Config {
 		RootCAs:            pool,
 		InsecureSkipVerify: true,
 	}
+}
+
+func getClientTLS(t *testing.T, dir string) *tls.Config {
+	return getRoleTLS(t, dir, "client")
 }
 
 // connectClient establishes an mTLS connection to the server
@@ -220,7 +230,9 @@ func parseMetrics(mfs []*dto.MetricFamily) map[string]float64 {
 			} else if m.Counter != nil {
 				val = *m.Counter.Value
 			}
-			res[*mf.Name] = val
+			// Aggregate metric values if multiple metrics (labels) exist for the same name
+			// This allows tests to check total counts across all partitions easily
+			res[*mf.Name] += val
 		}
 	}
 	return res
@@ -242,10 +254,64 @@ func waitForMetric(t *testing.T, srv *Server, metricName string, predicate func(
 
 // --- Tests ---
 
+func TestServer_RBAC(t *testing.T) {
+	dir, _, srv, cleanup := setupTestEnv(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.Run(ctx)
+	time.Sleep(100 * time.Millisecond)
+
+	addr := srv.listener.Addr().String()
+
+	// 1. Client Role Tests
+	t.Run("Client", func(t *testing.T) {
+		client := connectClient(t, addr, getClientTLS(t, dir))
+		defer client.Close()
+
+		// Allowed: KV Ops
+		client.AssertStatus(protocol.OpCodeSelect, []byte("1"), protocol.ResStatusOK)
+		client.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
+		client.AssertStatus(protocol.OpCodeSet, append([]byte{0, 0, 0, 1}, []byte("k")...), protocol.ResStatusOK)
+		client.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusOK)
+
+		// Denied: Admin Ops
+		client.AssertStatus(protocol.OpCodeStat, nil, protocol.ResStatusErr)
+		client.AssertStatus(protocol.OpCodeReplicaOf, []byte("dummy"), protocol.ResStatusErr)
+	})
+
+	// 2. CDC Role Tests
+	t.Run("CDC", func(t *testing.T) {
+		cdc := connectClient(t, addr, getRoleTLS(t, dir, "cdc"))
+		defer cdc.Close()
+
+		// Allowed: Replication Handshake
+		// We'll just check it doesn't return immediate error for permission
+		// (It might return error for malformed payload, but status shouldn't be generic Err "Permission Denied")
+		// Actually, let's send Ping first.
+		cdc.AssertStatus(protocol.OpCodePing, nil, protocol.ResStatusOK)
+
+		// Denied: KV Ops
+		cdc.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusErr)
+	})
+
+	// 3. Admin Role Tests
+	t.Run("Admin", func(t *testing.T) {
+		admin := connectClient(t, addr, getRoleTLS(t, dir, "admin"))
+		defer admin.Close()
+
+		admin.AssertStatus(protocol.OpCodeSelect, []byte("1"), protocol.ResStatusOK)
+		// Allowed: KV Ops
+		admin.AssertStatus(protocol.OpCodePing, nil, protocol.ResStatusOK)
+		// Allowed: Stat
+		admin.AssertStatus(protocol.OpCodeStat, nil, protocol.ResStatusOK)
+	})
+}
+
 func TestServer_Lifecycle_And_Ping(t *testing.T) {
-	dir, stores, srv := setupTestEnv(t)
-	defer stores["0"].Close()
-	defer os.RemoveAll(dir)
+	dir, _, srv, cleanup := setupTestEnv(t)
+	defer cleanup()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -271,9 +337,8 @@ func TestServer_Lifecycle_And_Ping(t *testing.T) {
 }
 
 func TestServer_ReadOnlySystemPartition(t *testing.T) {
-	dir, stores, srv := setupTestEnv(t)
-	defer stores["0"].Close()
-	defer os.RemoveAll(dir)
+	dir, _, srv, cleanup := setupTestEnv(t)
+	defer cleanup()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -298,9 +363,8 @@ func TestServer_ReadOnlySystemPartition(t *testing.T) {
 }
 
 func TestServer_CRUD(t *testing.T) {
-	dir, stores, srv := setupTestEnv(t)
-	defer stores["0"].Close()
-	defer os.RemoveAll(dir)
+	dir, _, srv, cleanup := setupTestEnv(t)
+	defer cleanup()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -345,9 +409,8 @@ func TestServer_CRUD(t *testing.T) {
 }
 
 func TestMetrics_Connections(t *testing.T) {
-	dir, stores, srv := setupTestEnv(t)
-	defer stores["0"].Close()
-	defer os.RemoveAll(dir)
+	dir, _, srv, cleanup := setupTestEnv(t)
+	defer cleanup()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -381,9 +444,8 @@ func TestMetrics_Connections(t *testing.T) {
 }
 
 func TestMetrics_Transactions(t *testing.T) {
-	dir, stores, srv := setupTestEnv(t)
-	defer stores["0"].Close()
-	defer os.RemoveAll(dir)
+	dir, _, srv, cleanup := setupTestEnv(t)
+	defer cleanup()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -414,9 +476,8 @@ func TestMetrics_Transactions(t *testing.T) {
 }
 
 func TestMetrics_StorageIO(t *testing.T) {
-	dir, stores, srv := setupTestEnv(t)
-	defer stores["0"].Close()
-	defer os.RemoveAll(dir)
+	dir, _, srv, cleanup := setupTestEnv(t)
+	defer cleanup()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -431,7 +492,8 @@ func TestMetrics_StorageIO(t *testing.T) {
 
 	// Capture baseline metrics (accounts for system keys)
 	m0 := gatherMetrics(t, srv)
-	baseKeys := m0["turnstone_store_keys_total"]
+	// Updated metric name to new partition-labeled name
+	baseKeys := m0["turnstone_partition_keys"]
 
 	// Write Data
 	client.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
@@ -446,8 +508,8 @@ func TestMetrics_StorageIO(t *testing.T) {
 
 	m1 := gatherMetrics(t, srv)
 
-	if m1["turnstone_store_keys_total"] != baseKeys+1 {
-		t.Errorf("Expected %v keys, got %v", baseKeys+1, m1["turnstone_store_keys_total"])
+	if m1["turnstone_partition_keys"] != baseKeys+1 {
+		t.Errorf("Expected %v keys, got %v", baseKeys+1, m1["turnstone_partition_keys"])
 	}
 
 	// Read Data
@@ -457,9 +519,8 @@ func TestMetrics_StorageIO(t *testing.T) {
 }
 
 func TestMetrics_Conflicts(t *testing.T) {
-	dir, stores, srv := setupTestEnv(t)
-	defer stores["0"].Close()
-	defer os.RemoveAll(dir)
+	dir, _, srv, cleanup := setupTestEnv(t)
+	defer cleanup()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -511,20 +572,22 @@ func TestMetrics_Conflicts(t *testing.T) {
 	// C1 Commit -> Should Fail with Conflict
 	c1.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusTxConflict)
 
-	// Verify Metric
-	waitForMetric(t, srv, "turnstone_store_conflicts_total", func(val float64) bool {
+	// Verify Metric (updated name)
+	waitForMetric(t, srv, "turnstone_partition_conflicts_total", func(val float64) bool {
 		return val >= 1
 	})
 }
 
 func TestServer_Backpressure(t *testing.T) {
-	dir, stores, _ := setupTestEnv(t)
-	defer stores["0"].Close()
+	dir, stores, _, cleanup := setupTestEnv(t)
+	// We defer cleanup of the env, which closes the ORIGINAL server (S1) and stores.
+	defer cleanup()
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	certsDir := filepath.Join(dir, "certs")
 
-	// Initialize server with MaxConns = 1 manually to override setupTestEnv default
+	// Initialize a NEW server (S2) with MaxConns = 1 manually.
+	// Note: It reuses the same 'stores' map.
 	srv, err := NewServer(
 		":0", stores, logger,
 		1, // MaxConns = 1
@@ -536,6 +599,9 @@ func TestServer_Backpressure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create server: %v", err)
 	}
+	// IMPORTANT: We must close S2 separately.
+	// Calling CloseAll on S2 will close the stores again, which is idempotent and safe.
+	defer srv.CloseAll()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -595,5 +661,111 @@ func TestServer_Backpressure(t *testing.T) {
 
 	if !success {
 		t.Fatal("Failed to connect after releasing capacity")
+	}
+}
+
+func TestServer_Transaction_Abort(t *testing.T) {
+	dir, _, srv, cleanup := setupTestEnv(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.Run(ctx)
+	time.Sleep(100 * time.Millisecond)
+
+	client := connectClient(t, srv.listener.Addr().String(), getClientTLS(t, dir))
+	defer client.Close()
+
+	client.AssertStatus(protocol.OpCodeSelect, []byte("1"), protocol.ResStatusOK)
+
+	// 1. Begin -> Set -> Abort
+	key := []byte("abort_key")
+	val := []byte("abort_val")
+	client.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
+
+	setPayload := make([]byte, 4+len(key)+len(val))
+	binary.BigEndian.PutUint32(setPayload[0:4], uint32(len(key)))
+	copy(setPayload[4:], key)
+	copy(setPayload[4+len(key):], val)
+
+	client.AssertStatus(protocol.OpCodeSet, setPayload, protocol.ResStatusOK)
+	client.AssertStatus(protocol.OpCodeAbort, nil, protocol.ResStatusOK)
+
+	// 2. Verify Key does NOT exist
+	client.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
+	client.AssertStatus(protocol.OpCodeGet, key, protocol.ResStatusNotFound)
+	client.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusOK)
+}
+
+func TestServer_Command_Validation(t *testing.T) {
+	dir, _, srv, cleanup := setupTestEnv(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.Run(ctx)
+	time.Sleep(100 * time.Millisecond)
+
+	client := connectClient(t, srv.listener.Addr().String(), getClientTLS(t, dir))
+	defer client.Close()
+
+	client.AssertStatus(protocol.OpCodeSelect, []byte("1"), protocol.ResStatusOK)
+
+	// 1. Set without Begin -> Error
+	key := []byte("k")
+	val := []byte("v")
+	setPayload := make([]byte, 4+len(key)+len(val))
+	binary.BigEndian.PutUint32(setPayload[0:4], uint32(len(key)))
+	copy(setPayload[4:], key)
+	copy(setPayload[4+len(key):], val)
+	client.AssertStatus(protocol.OpCodeSet, setPayload, protocol.ResStatusTxRequired)
+
+	// 2. Get without Begin -> Error
+	client.AssertStatus(protocol.OpCodeGet, key, protocol.ResStatusTxRequired)
+
+	// 3. Del without Begin -> Error
+	client.AssertStatus(protocol.OpCodeDel, key, protocol.ResStatusTxRequired)
+
+	// 4. Commit without Begin -> Error
+	client.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusTxRequired)
+
+	// 5. Nested Begin -> Error (TxInProgress)
+	client.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
+	client.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResTxInProgress)
+	// Clean up
+	client.AssertStatus(protocol.OpCodeAbort, nil, protocol.ResStatusOK)
+}
+
+func TestServer_Stat_IncludesActiveTxs(t *testing.T) {
+	dir, _, srv, cleanup := setupTestEnv(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.Run(ctx)
+	time.Sleep(100 * time.Millisecond)
+
+	client := connectClient(t, srv.listener.Addr().String(), getClientTLS(t, dir))
+	defer client.Close()
+
+	client.AssertStatus(protocol.OpCodeSelect, []byte("1"), protocol.ResStatusOK)
+
+	// 1. Start a transaction to have 1 active
+	client.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
+
+	// 2. Open another connection to query Stat (since client is in Tx)
+	// IMPORTANT: Stat is now an ADMIN command, so we must use admin certs.
+	statClient := connectClient(t, srv.listener.Addr().String(), getRoleTLS(t, dir, "admin"))
+	defer statClient.Close()
+	statClient.AssertStatus(protocol.OpCodeSelect, []byte("1"), protocol.ResStatusOK)
+
+	body, status := statClient.ReadStatus(protocol.OpCodeStat, nil)
+	if status != protocol.ResStatusOK {
+		t.Errorf("Stat failed: %x", status)
+	}
+
+	msg := string(body)
+	if !strings.Contains(msg, "ActiveTxs:1") {
+		t.Errorf("Stat output missing active tx count. Got: %s", msg)
 	}
 }

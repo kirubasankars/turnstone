@@ -25,6 +25,14 @@ import (
 	"turnstone/store"
 )
 
+// Roles
+const (
+	RoleClient = "client"
+	RoleAdmin  = "admin"
+	RoleCDC    = "cdc"
+	RoleServer = "server" // usually implies admin-like privileges for internal replication
+)
+
 type Server struct {
 	stores           map[string]*store.Store
 	defaultPartition string
@@ -166,6 +174,7 @@ type connState struct {
 	partitionName string
 	partition     *store.Store
 	tx            *stonedb.Transaction
+	role          string
 }
 
 func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
@@ -176,10 +185,32 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 		<-s.sem
 	}()
 
+	// Identify Role from Certificate
+	role := RoleClient // Default
+	if tlsConn, ok := conn.(*tls.Conn); ok {
+		// Handshake already happened in Accept but we might need to ensure it's complete to get certs.
+		// Since we use RequireAndVerifyClientCert, the handshake completes on Accept for the listener side usually,
+		// or lazily. Accessing ConnectionState should trigger it if needed or return empty if not done.
+		if err := tlsConn.Handshake(); err == nil {
+			state := tlsConn.ConnectionState()
+			if len(state.PeerCertificates) > 0 {
+				cert := state.PeerCertificates[0]
+				// Use Organization as Role: "TurnstoneDB admin" -> "admin"
+				if len(cert.Subject.Organization) > 0 {
+					org := cert.Subject.Organization[0]
+					if strings.HasPrefix(org, "TurnstoneDB ") {
+						role = strings.TrimPrefix(org, "TurnstoneDB ")
+					}
+				}
+			}
+		}
+	}
+
 	state := &connState{
 		partitionName: s.defaultPartition,
 		partition:     s.stores[s.defaultPartition],
 		tx:            nil,
+		role:          role,
 	}
 
 	// Ensure active transaction is cleaned up if connection drops
@@ -223,6 +254,12 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 }
 
 func (s *Server) dispatchCommand(conn net.Conn, r io.Reader, opCode uint8, payload []byte, st *connState) bool {
+	// Access Control Check
+	if !s.isOpAllowed(st.role, opCode) {
+		_ = s.writeBinaryResponse(conn, protocol.ResStatusErr, []byte("Permission Denied for role: "+st.role))
+		return false
+	}
+
 	switch opCode {
 	case protocol.OpCodePing:
 		_ = s.writeBinaryResponse(conn, protocol.ResStatusOK, []byte("PONG"))
@@ -253,6 +290,37 @@ func (s *Server) dispatchCommand(conn net.Conn, r io.Reader, opCode uint8, paylo
 	default:
 		_ = s.writeBinaryResponse(conn, protocol.ResStatusErr, []byte("Unknown OpCode"))
 	}
+	return false
+}
+
+func (s *Server) isOpAllowed(role string, opCode uint8) bool {
+	// Admin and Server roles can do everything
+	if role == RoleAdmin || role == RoleServer {
+		return true
+	}
+
+	// Client Role
+	if role == RoleClient {
+		switch opCode {
+		case protocol.OpCodePing, protocol.OpCodeQuit,
+			protocol.OpCodeSelect, protocol.OpCodeBegin, protocol.OpCodeCommit, protocol.OpCodeAbort,
+			protocol.OpCodeGet, protocol.OpCodeSet, protocol.OpCodeDel:
+			return true
+		default:
+			return false
+		}
+	}
+
+	// CDC Role
+	if role == RoleCDC {
+		switch opCode {
+		case protocol.OpCodePing, protocol.OpCodeQuit, protocol.OpCodeReplHello:
+			return true
+		default:
+			return false
+		}
+	}
+
 	return false
 }
 
@@ -422,7 +490,7 @@ func (s *Server) handleStat(w io.Writer, st *connState) {
 		return
 	}
 	stats := st.partition.Stats()
-	msg := fmt.Sprintf("[%s] Keys:%d Uptime:%s", st.partitionName, stats.KeyCount, stats.Uptime)
+	msg := fmt.Sprintf("[%s] Keys:%d ActiveTxs:%d Uptime:%s", st.partitionName, stats.KeyCount, stats.ActiveTxs, stats.Uptime)
 	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, []byte(msg))
 }
 
