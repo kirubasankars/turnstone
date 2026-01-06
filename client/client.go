@@ -1,6 +1,3 @@
-// Package client provides a thread-safe, mTLS-aware TCP client for TurnstoneDB.
-// It maps the binary wire protocol to idiomatic Go methods and handles
-// connection lifecycle, timeouts, and error mapping.
 package client
 
 import (
@@ -57,9 +54,10 @@ const (
 	ResStatusTxRequired     = 0x03 // Operation requires an active transaction.
 	ResStatusTxTimeout      = 0x04 // Transaction exceeded MaxTxDuration.
 	ResStatusTxConflict     = 0x05 // Write conflict or snapshot invalidation.
-	ResStatusServerBusy     = 0x06 // Server reached MaxConns.
-	ResStatusEntityTooLarge = 0x07 // Payload exceeds MaxCommandSize.
-	ResStatusMemoryLimit    = 0x08 // Server OOM protection triggered.
+	ResStatusTxInProgress   = 0x06 // Transaction is already active.
+	ResStatusServerBusy     = 0x07 // Server reached MaxConns.
+	ResStatusEntityTooLarge = 0x08 // Payload exceeds MaxCommandSize.
+	ResStatusMemoryLimit    = 0x09 // Server OOM protection triggered.
 )
 
 // --- Errors ---
@@ -75,6 +73,8 @@ var (
 	ErrTxTimeout = errors.New("transaction timed out")
 	// ErrTxConflict is returned when an Optimistic Concurrency Control conflict occurs.
 	ErrTxConflict = errors.New("transaction conflict detected")
+	// ErrTxInProgress is returned when trying to Begin a transaction while one is already active.
+	ErrTxInProgress = errors.New("transaction already in progress")
 	// ErrServerBusy is returned when the server is at maximum capacity.
 	ErrServerBusy = errors.New("server is busy")
 	// ErrEntityTooLarge is returned when the payload exceeds the server's buffer limits.
@@ -110,6 +110,8 @@ func mapStatusToError(status byte, body []byte) error {
 		return ErrTxTimeout
 	case ResStatusTxConflict:
 		return ErrTxConflict
+	case ResStatusTxInProgress:
+		return ErrTxInProgress
 	case ResStatusServerBusy:
 		return ErrServerBusy
 	case ResStatusEntityTooLarge:

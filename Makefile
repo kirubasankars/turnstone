@@ -1,8 +1,10 @@
 build:
 	mkdir -p ./bin
 	go build -o bin/turnstone       cmd/turnstone/main.go
-	go build -o bin/turnstone_cli   cmd/turnstone_cli/main.go
-	go build -o bin/turnstone_bench cmd/turnstone_bench/main.go
+	go build -o bin/turnstone-cli   cmd/turnstone-cli/main.go
+	go build -o bin/turnstone-bench cmd/turnstone-bench/main.go
+	go build -o bin/turnstone-load  cmd/turnstone-load/main.go
+	cd cmd/turnstone-duck && go mod tidy && go build -o ../../bin/turnstone-duck
 
 clean:
 	rm -rf ./bin

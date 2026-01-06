@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"syscall"
+	"time"
 
 	"turnstone/config"
 	"turnstone/metrics"
@@ -40,8 +41,9 @@ func main() {
 	}
 
 	// Setup Logging
+	// Write logs to Stderr so Stdout is clean for CDC stream piping/parsing
 	logLevel := slog.LevelInfo
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel}))
 
 	// 2. CDC Client Mode
 	if *mode == "cdc" {
@@ -77,15 +79,19 @@ func runInit(home string) error {
 	cdcCfg := struct {
 		Host        string `json:"host"`
 		Partition   string `json:"partition"`
-		StartSeq    uint64 `json:"start_seq"`
 		StateFile   string `json:"state_file"`
 		MetricsAddr string `json:"metrics_addr"`
+		TLSCertFile string `json:"tls_cert_file"`
+		TLSKeyFile  string `json:"tls_key_file"`
+		TLSCAFile   string `json:"tls_ca_file"`
 	}{
 		Host:        "localhost:6379",
 		Partition:   "1",
-		StartSeq:    0,
 		StateFile:   "cdc.state",
 		MetricsAddr: ":9091",
+		TLSCertFile: "certs/cdc.crt",
+		TLSKeyFile:  "certs/cdc.key",
+		TLSCAFile:   "certs/ca.crt",
 	}
 
 	cdcBytes, err := json.MarshalIndent(cdcCfg, "", "  ")
@@ -117,7 +123,7 @@ func runServer(logger *slog.Logger) {
 	}
 
 	if cfg.Debug {
-		logger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	}
 
 	// Resolve Paths
@@ -202,7 +208,6 @@ func runCDC(logger *slog.Logger) {
 		Host:        "localhost:6379",
 		Home:        *homeDir,
 		Partition:   "1",
-		StartID:     0,
 		StateFile:   "cdc.state",
 		TextMode:    true,
 		MetricsAddr: ":9091",
@@ -217,9 +222,11 @@ func runCDC(logger *slog.Logger) {
 		var jsonCfg struct {
 			Host        string `json:"host"`
 			Partition   string `json:"partition"`
-			StartSeq    uint64 `json:"start_seq"`
 			StateFile   string `json:"state_file"`
 			MetricsAddr string `json:"metrics_addr"`
+			TLSCertFile string `json:"tls_cert_file"`
+			TLSKeyFile  string `json:"tls_key_file"`
+			TLSCAFile   string `json:"tls_ca_file"`
 		}
 
 		if err := json.Unmarshal(data, &jsonCfg); err != nil {
@@ -233,21 +240,48 @@ func runCDC(logger *slog.Logger) {
 		if jsonCfg.Partition != "" {
 			cfg.Partition = jsonCfg.Partition
 		}
-		if jsonCfg.StartSeq != 0 {
-			cfg.StartID = jsonCfg.StartSeq
-		}
 		if jsonCfg.StateFile != "" {
 			cfg.StateFile = jsonCfg.StateFile
 		}
 		if jsonCfg.MetricsAddr != "" {
 			cfg.MetricsAddr = jsonCfg.MetricsAddr
 		}
+		if jsonCfg.TLSCertFile != "" {
+			cfg.CertFile = jsonCfg.TLSCertFile
+		}
+		if jsonCfg.TLSKeyFile != "" {
+			cfg.KeyFile = jsonCfg.TLSKeyFile
+		}
+		if jsonCfg.TLSCAFile != "" {
+			cfg.CAFile = jsonCfg.TLSCAFile
+		}
 	} else if !os.IsNotExist(err) {
 		logger.Warn("Could not read CDC config file", "path", configPath, "err", err)
 	}
 
 	logger.Info("Starting CDC Client", "host", cfg.Host, "partition", cfg.Partition)
-	replication.StartCDC(cfg)
+
+	// Wrap StartCDC in a loop to handle panics gracefully (e.g. nil pointers on conn errors)
+	for {
+		panicked := true
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Error("CDC client panicked (restarting)", "panic", r)
+					time.Sleep(1 * time.Second)
+					// panicked remains true
+				}
+			}()
+			replication.StartCDC(cfg)
+			panicked = false
+		}()
+		// If StartCDC returns normally (not panic), it typically means
+		// fatal error (os.Exit inside) or clean shutdown/signal.
+		// We break the loop to exit the process.
+		if !panicked {
+			break
+		}
+	}
 }
 
 // loadClientTLS loads the client certificate and key, and the CA certificate.

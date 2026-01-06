@@ -28,6 +28,10 @@ func TestRunInit(t *testing.T) {
 		"certs/server.key",
 		"certs/client.crt",
 		"certs/client.key",
+		"certs/admin.crt",
+		"certs/admin.key",
+		"certs/cdc.crt",
+		"certs/cdc.key",
 		"certs/ca.crt",
 		// Data Partitions (0=System, 16=Last User Partition in default config)
 		"data/0",
@@ -81,11 +85,14 @@ func TestGeneratedConfigsValidity(t *testing.T) {
 
 		// Structure matches the anonymous struct in main.go runCDC
 		var jsonCfg struct {
-			Host        string `json:"host"`
-			Partition   string `json:"partition"`
-			StartSeq    uint64 `json:"start_seq"`
+			Host      string `json:"host"`
+			Partition string `json:"partition"`
+			// StartSeq was removed
 			StateFile   string `json:"state_file"`
 			MetricsAddr string `json:"metrics_addr"`
+			TLSCertFile string `json:"tls_cert_file"`
+			TLSKeyFile  string `json:"tls_key_file"`
+			TLSCAFile   string `json:"tls_ca_file"`
 		}
 
 		if err := json.Unmarshal(data, &jsonCfg); err != nil {
@@ -97,6 +104,13 @@ func TestGeneratedConfigsValidity(t *testing.T) {
 		}
 		if jsonCfg.MetricsAddr != ":9091" {
 			t.Errorf("Unexpected CDC metrics addr: %s", jsonCfg.MetricsAddr)
+		}
+		// Verify new certificate fields
+		if jsonCfg.TLSCertFile != "certs/cdc.crt" {
+			t.Errorf("Unexpected CDC cert file: %s", jsonCfg.TLSCertFile)
+		}
+		if jsonCfg.TLSKeyFile != "certs/cdc.key" {
+			t.Errorf("Unexpected CDC key file: %s", jsonCfg.TLSKeyFile)
 		}
 	})
 }

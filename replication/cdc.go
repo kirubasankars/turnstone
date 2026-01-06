@@ -23,11 +23,14 @@ type CDCConfig struct {
 	Host        string
 	Home        string
 	Partition   string
-	StartID     uint64
 	StateFile   string
 	TextMode    bool
 	MetricsAddr string
 	Logger      *slog.Logger
+	// Custom TLS paths (relative to Home or absolute)
+	CertFile string
+	KeyFile  string
+	CAFile   string
 }
 
 // Event defines the JSON structure for CDC events.
@@ -46,13 +49,15 @@ var currentSeq atomic.Uint64
 // It handles state resumption, signal handling, and automatic retries.
 func StartCDC(cfg CDCConfig) {
 	// 1. Resume State
-	lastSeq := cfg.StartID
+	lastSeq := uint64(0)
 	if content, err := os.ReadFile(cfg.StateFile); err == nil {
 		if val, err := strconv.ParseUint(string(content), 10, 64); err == nil {
 			lastSeq = val
 			currentSeq.Store(lastSeq)
 			fmt.Fprintf(os.Stderr, "Resuming from LogID %d (found in %s)\n", lastSeq, cfg.StateFile)
 		}
+	} else {
+		fmt.Fprintf(os.Stderr, "Starting from LogID 0 (no state file %s)\n", cfg.StateFile)
 	}
 
 	// 2. Start Metrics Server
@@ -130,11 +135,24 @@ func runCDCStream(ctx context.Context, cfg CDCConfig, startID uint64, encoder *j
 	var cl *client.Client
 	var err error
 
-	caPath := filepath.Join(cfg.Home, "certs", "ca.crt")
-	certPath := filepath.Join(cfg.Home, "certs", "client.crt")
-	keyPath := filepath.Join(cfg.Home, "certs", "client.key")
+	// Helper to resolve paths relative to Home if necessary
+	resolve := func(path, def string) string {
+		if path == "" {
+			path = def
+		}
+		// If path is relative and Home is set, join them.
+		if path != "" && !filepath.IsAbs(path) && cfg.Home != "" {
+			return filepath.Join(cfg.Home, path)
+		}
+		return path
+	}
 
-	if _, err := os.Stat(caPath); err == nil {
+	// Use configured certs or fall back to standard locations
+	caPath := resolve(cfg.CAFile, "certs/ca.crt")
+	certPath := resolve(cfg.CertFile, "certs/client.crt")
+	keyPath := resolve(cfg.KeyFile, "certs/client.key")
+
+	if _, statErr := os.Stat(caPath); statErr == nil {
 		cl, err = client.NewMTLSClientHelper(cfg.Host, caPath, certPath, keyPath, cfg.Logger)
 	} else {
 		cl, err = client.NewClient(client.Config{Address: cfg.Host, ConnectTimeout: 5 * time.Second, Logger: cfg.Logger})
@@ -150,6 +168,30 @@ func runCDCStream(ctx context.Context, cfg CDCConfig, startID uint64, encoder *j
 	go func() {
 		<-ctx.Done()
 		cl.Close()
+	}()
+
+	// State persistence optimization
+	// We track the latest offset seen in this session locally, and only flush to disk periodically.
+	var latestPersistedSeq uint64 = startID
+	var latestSeenSeq uint64 = startID
+	lastFlushTime := time.Now()
+	const flushInterval = 500 * time.Millisecond
+
+	// Persistence Helper
+	flushState := func(seq uint64) {
+		if seq <= latestPersistedSeq {
+			return
+		}
+		tmpFile := cfg.StateFile + ".tmp"
+		if err := os.WriteFile(tmpFile, []byte(strconv.FormatUint(seq, 10)), 0o644); err == nil {
+			_ = os.Rename(tmpFile, cfg.StateFile)
+			latestPersistedSeq = seq
+		}
+	}
+
+	// Ensure we flush the very last seen state when we exit (e.g. connection drop or shutdown)
+	defer func() {
+		flushState(latestSeenSeq)
 	}()
 
 	return cl.Subscribe(cfg.Partition, startID, func(c client.Change) error {
@@ -171,12 +213,14 @@ func runCDCStream(ctx context.Context, cfg CDCConfig, startID uint64, encoder *j
 			return err
 		}
 
+		// Update in-memory trackers
+		latestSeenSeq = c.LogSeq
 		onProgress(c.LogSeq)
 
-		// Atomic State Update
-		tmpFile := cfg.StateFile + ".tmp"
-		if err := os.WriteFile(tmpFile, []byte(strconv.FormatUint(c.LogSeq, 10)), 0o644); err == nil {
-			_ = os.Rename(tmpFile, cfg.StateFile)
+		// Debounced Flush: Only write to disk if enough time has passed
+		if time.Since(lastFlushTime) > flushInterval {
+			flushState(c.LogSeq)
+			lastFlushTime = time.Now()
 		}
 		return nil
 	})
