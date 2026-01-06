@@ -249,11 +249,6 @@ func (idx *LevelDBIndex) GetState() (uint64, uint64, int64, int64, error) {
 	if err != nil {
 		return 0, 0, 0, 0, err
 	}
-	if len(val) == 16 || len(val) == 24 {
-		// Legacy state format detected. Return error to trigger full scan,
-		// which will correctly recalculate count and upgrade state format on next write.
-		return 0, 0, 0, 0, fmt.Errorf("legacy state format (%d bytes), requires full scan", len(val))
-	}
 	if len(val) != 32 {
 		return 0, 0, 0, 0, fmt.Errorf("corrupted state length: %d", len(val))
 	}
