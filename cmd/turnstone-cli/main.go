@@ -19,6 +19,12 @@ func main() {
 	host := flag.String("host", "localhost:6379", "Server address")
 	home := flag.String("home", ".", "Path to home directory containing certs/")
 	debug := flag.Bool("debug", false, "Enable debug logging")
+
+	// Identity selection
+	asAdmin := flag.Bool("admin", false, "Connect using admin certificate (certs/admin.crt)")
+	// -client is implicit default, but adding for completeness if user wants to be explicit
+	_ = flag.Bool("client", true, "Connect using client certificate (default)")
+
 	flag.Parse()
 
 	// Setup Logger
@@ -34,13 +40,18 @@ func main() {
 
 	// 1. Connection Setup
 	// Resolve certificate paths relative to home directory
+	certRole := "client"
+	if *asAdmin {
+		certRole = "admin"
+	}
+
 	caPath := filepath.Join(*home, "certs", "ca.crt")
-	certPath := filepath.Join(*home, "certs", "client.crt")
-	keyPath := filepath.Join(*home, "certs", "client.key")
+	certPath := filepath.Join(*home, "certs", certRole+".crt")
+	keyPath := filepath.Join(*home, "certs", certRole+".key")
 
 	// Check if certificates exist to determine connection mode
 	if _, err := os.Stat(caPath); err == nil {
-		fmt.Printf("Connecting to %s via mTLS (Home: %s)...\n", *host, *home)
+		fmt.Printf("Connecting to %s via mTLS as %s (Home: %s)...\n", *host, strings.ToUpper(certRole), *home)
 		cl, err = client.NewMTLSClientHelper(*host, caPath, certPath, keyPath, logger)
 	} else {
 		// Fallback to insecure if certs are missing in the expected location

@@ -2,11 +2,13 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"math/rand"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -22,6 +24,7 @@ type DevicePayload struct {
 	LastSeen      int64   `json:"last_seen"`
 	AppsInstalled int     `json:"number_of_apps_installed"`
 	GPS           GPSInfo `json:"gps_coords"`
+	Padding       string  `json:"padding,omitempty"` // Used to bloat size
 }
 
 type GPSInfo struct {
@@ -34,6 +37,9 @@ func main() {
 	workers := flag.Int("workers", 10, "Number of concurrent workers")
 	duration := flag.Duration("duration", 10*time.Second, "Test duration")
 	addr := flag.String("target", "localhost:6379", "Target address")
+	batchSize := flag.Int("batch", 1, "Number of operations per transaction (Batch Size)")
+	keyCount := flag.Int("keys", 1_000_000, "Total number of unique device keys (Cardinality)")
+	paddingSize := flag.Int("padding", 0, "Additional bytes of padding per value to stress memory/throughput")
 	flag.Parse()
 
 	// Setup Cert Paths
@@ -41,14 +47,26 @@ func main() {
 	certFile := filepath.Join(*home, "certs/client.crt")
 	keyFile := filepath.Join(*home, "certs/client.key")
 
+	// Pre-calculate padding string once
+	padStr := ""
+	if *paddingSize > 0 {
+		padStr = strings.Repeat("x", *paddingSize)
+	}
+
 	fmt.Printf("Starting Load Generator\n")
 	fmt.Printf("Target: %s (Partition 1)\n", *addr)
 	fmt.Printf("Duration: %v\n", *duration)
 	fmt.Printf("Workers: %d\n", *workers)
-	fmt.Printf("Device Pool: 1,000,000\n\n")
+	fmt.Printf("Batch Size: %d\n", *batchSize)
+	fmt.Printf("Device Pool: %d keys\n", *keyCount)
+	if *paddingSize > 0 {
+		fmt.Printf("Payload Padding: %d bytes\n", *paddingSize)
+	}
+	fmt.Println("")
 
 	var ops int64
 	var errCount int64
+	var conflictCount int64
 
 	// Error Tracking
 	errorMap := make(map[string]int)
@@ -97,6 +115,13 @@ func main() {
 				return
 			}
 
+			// Pre-allocate batch buffer
+			type batchOp struct {
+				key string
+				val []byte
+			}
+			currentBatch := make([]batchOp, 0, *batchSize)
+
 			for {
 				select {
 				case <-done:
@@ -104,50 +129,89 @@ func main() {
 				default:
 				}
 
-				// Pick random device from 1M pool
-				devID := rng.Intn(1_000_000)
-				key := fmt.Sprintf("device-%d", devID)
+				// 1. Generate Batch Data
+				currentBatch = currentBatch[:0]
+				for b := 0; b < *batchSize; b++ {
+					// Pick random device from the configurable pool
+					devID := rng.Intn(*keyCount)
+					key := fmt.Sprintf("device-%d", devID)
 
-				// Deterministically pick type based on ID so a specific device doesn't change types randomly
-				typeIdx := devID % len(deviceTypes)
-				dType := deviceTypes[typeIdx]
+					// Deterministically pick type based on ID
+					typeIdx := devID % len(deviceTypes)
+					dType := deviceTypes[typeIdx]
 
-				// Create fake device data
-				data := DevicePayload{
-					DeviceID:      key,
-					DeviceType:    dType,
-					FriendlyName:  fmt.Sprintf("%s-unit-%d", dType, devID),
-					LastSeen:      time.Now().Unix(),
-					AppsInstalled: 42 + (devID % 20), // Deterministic variation based on ID
-					GPS: GPSInfo{
-						Lat: 37.7749 + (rng.Float64() * 0.01), // Small random jitter
-						Lon: -122.4194 + (rng.Float64() * 0.01),
-					},
+					// Create fake device data
+					data := DevicePayload{
+						DeviceID:      key,
+						DeviceType:    dType,
+						FriendlyName:  fmt.Sprintf("%s-unit-%d", dType, devID),
+						LastSeen:      time.Now().Unix(),
+						AppsInstalled: 42 + (devID % 20),
+						GPS: GPSInfo{
+							Lat: 37.7749 + (rng.Float64() * 0.01),
+							Lon: -122.4194 + (rng.Float64() * 0.01),
+						},
+						Padding: padStr,
+					}
+
+					val, err := json.Marshal(data)
+					if err != nil {
+						recordError(fmt.Errorf("json marshal failed: %v", err))
+						continue
+					}
+					currentBatch = append(currentBatch, batchOp{key: key, val: val})
 				}
 
-				val, err := json.Marshal(data)
-				if err != nil {
-					recordError(fmt.Errorf("json marshal failed: %v", err))
+				if len(currentBatch) == 0 {
 					continue
 				}
 
-				// Operation: Set
-				if err := cli.Begin(); err != nil {
+				// 2. Execute Transaction with Retry
+				maxRetries := 5
+				for attempt := 0; attempt < maxRetries; attempt++ {
+					if err := cli.Begin(); err != nil {
+						recordError(err)
+						break // Fatal error for this op (likely connection issue)
+					}
+
+					// Queue all sets in batch
+					txErr := func() error {
+						for _, op := range currentBatch {
+							if err := cli.Set(op.key, op.val); err != nil {
+								return err
+							}
+						}
+						return nil
+					}()
+
+					if txErr != nil {
+						cli.Abort()
+						recordError(txErr)
+						break
+					}
+
+					// Commit
+					err := cli.Commit()
+					if err == nil {
+						// Success
+						atomic.AddInt64(&ops, int64(len(currentBatch)))
+						break
+					}
+
+					// Check for Conflict
+					if errors.Is(err, client.ErrTxConflict) {
+						atomic.AddInt64(&conflictCount, 1)
+						// Exponential backoff + Jitter
+						backoff := time.Duration(1<<attempt) * time.Millisecond
+						jitter := time.Duration(rng.Intn(10)) * time.Millisecond
+						time.Sleep(backoff + jitter)
+						continue // Retry loop
+					}
+
+					// Other errors
 					recordError(err)
-					continue
+					break
 				}
-				if err := cli.Set(key, val); err != nil {
-					// If Set fails, we must Abort (or close), but usually we just count it
-					cli.Abort()
-					recordError(err)
-					continue
-				}
-				if err := cli.Commit(); err != nil {
-					recordError(err)
-					continue
-				}
-
-				atomic.AddInt64(&ops, 1)
 			}
 		}(i)
 	}
@@ -159,11 +223,11 @@ func main() {
 	fmt.Println("--- Results ---")
 	fmt.Printf("Total Operations: %d\n", ops)
 	fmt.Printf("Total Errors:     %d\n", errCount)
+	fmt.Printf("Total Conflicts:  %d (Retried)\n", conflictCount)
 	fmt.Printf("Throughput:       %.2f ops/sec\n", float64(ops)/elapsed.Seconds())
 
 	if len(errorMap) > 0 {
 		fmt.Println("\n--- Error Breakdown ---")
-		// Sort errors by count for readability
 		type errStat struct {
 			msg   string
 			count int
