@@ -5,12 +5,15 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"sync"
 	"time"
 )
+
+var ReplicaSendTimeout = 5 * time.Second
 
 // --- LEADER SIDE (Multiplexer) ---
 
@@ -53,6 +56,7 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 
 	// 2. Start Multiplexer
 	outCh := make(chan replPacket, 10)
+	errCh := make(chan error, 1) // Signal channel for slow/failed streams
 	done := make(chan struct{})
 	defer close(done)
 
@@ -68,7 +72,13 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 		wg.Add(1)
 		go func(name string, st *Store, startLogID uint64) {
 			defer wg.Done()
-			s.streamDB(name, st, startLogID, outCh, done)
+			if err := s.streamDB(name, st, startLogID, outCh, done); err != nil {
+				// Non-blocking send to avoid hanging if main loop is gone
+				select {
+				case errCh <- err:
+				default:
+				}
+			}
 		}(req.name, store, req.logID)
 	}
 
@@ -103,33 +113,47 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 	}()
 
 	// Central Writer
-	for p := range outCh {
-		// Frame: [OpCodeReplBatch][TotalLen] [DBNameLen][DBName][Count][BatchData...]
-		totalLen := 4 + len(p.dbName) + 4 + len(p.data)
-		header := make([]byte, 5)
-		header[0] = OpCodeReplBatch
-		binary.BigEndian.PutUint32(header[1:], uint32(totalLen))
-
-		conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		if _, err := conn.Write(header); err != nil {
+	for {
+		select {
+		case err := <-errCh:
+			s.logger.Warn("Dropping slow/failed replica", "addr", replicaID, "err", err)
 			return
+
+		case p := <-outCh:
+			// Frame: [OpCodeReplBatch][TotalLen] [DBNameLen][DBName][Count][BatchData...]
+			totalLen := 4 + len(p.dbName) + 4 + len(p.data)
+			header := make([]byte, 5)
+			header[0] = OpCodeReplBatch
+			binary.BigEndian.PutUint32(header[1:], uint32(totalLen))
+
+			conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if _, err := conn.Write(header); err != nil {
+				return
+			}
+
+			nameH := make([]byte, 4)
+			binary.BigEndian.PutUint32(nameH, uint32(len(p.dbName)))
+			if _, err := conn.Write(nameH); err != nil {
+				return
+			}
+			if _, err := conn.Write([]byte(p.dbName)); err != nil {
+				return
+			}
+
+			cntH := make([]byte, 4)
+			binary.BigEndian.PutUint32(cntH, p.count)
+			if _, err := conn.Write(cntH); err != nil {
+				return
+			}
+
+			if _, err := conn.Write(p.data); err != nil {
+				return
+			}
 		}
-
-		nameH := make([]byte, 4)
-		binary.BigEndian.PutUint32(nameH, uint32(len(p.dbName)))
-		conn.Write(nameH)
-		conn.Write([]byte(p.dbName))
-
-		cntH := make([]byte, 4)
-		binary.BigEndian.PutUint32(cntH, p.count)
-		conn.Write(cntH)
-
-		conn.Write(p.data)
 	}
-	wg.Wait()
 }
 
-func (s *Server) streamDB(name string, store *Store, minLogID uint64, outCh chan<- replPacket, done <-chan struct{}) {
+func (s *Server) streamDB(name string, store *Store, minLogID uint64, outCh chan<- replPacket, done <-chan struct{}) error {
 	startOffset := store.FindOffsetForLogID(minLogID)
 	curr := startOffset
 	buf := make([]byte, 1024*1024)
@@ -137,29 +161,38 @@ func (s *Server) streamDB(name string, store *Store, minLogID uint64, outCh chan
 	scratch := make([]byte, 8)
 	var count uint32
 
-	flush := func() {
+	flush := func() error {
 		if count > 0 {
 			data := make([]byte, batchBuf.Len())
 			copy(data, batchBuf.Bytes())
 			select {
 			case outCh <- replPacket{dbName: name, data: data, count: count}:
+				// Success
+			case <-time.After(ReplicaSendTimeout):
+				// Timeout - Consumer too slow
+				return fmt.Errorf("replication send timeout for db %s", name)
 			case <-done:
+				// Connection closed
+				return nil
 			}
 			batchBuf.Reset()
 			count = 0
 		}
+		return nil
 	}
 
 	for {
 		select {
 		case <-done:
-			return
+			return nil
 		default:
 		}
 
 		walSize := store.wal.Size()
 		if curr >= walSize {
-			flush()
+			if err := flush(); err != nil {
+				return err
+			}
 			store.wal.Wait(curr)
 			walSize = store.wal.Size()
 		}
@@ -171,7 +204,7 @@ func (s *Server) streamDB(name string, store *Store, minLogID uint64, outCh chan
 
 		n, err := store.wal.ReadAt(buf[:readLen], curr)
 		if err != nil && err != io.EOF {
-			return
+			return err
 		}
 		if n == 0 {
 			continue
@@ -231,7 +264,9 @@ func (s *Server) streamDB(name string, store *Store, minLogID uint64, outCh chan
 				}
 				count++
 				if batchBuf.Len() >= 64*1024 {
-					flush()
+					if err := flush(); err != nil {
+						return err
+					}
 				}
 			}
 			parseOff += HeaderSize + payloadLen

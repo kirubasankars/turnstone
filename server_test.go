@@ -157,6 +157,13 @@ func (c *testClient) AssertStatus(opCode byte, payload []byte, expectedStatus by
 	return body
 }
 
+// ReadStatus is like AssertStatus but returns the status instead of failing, useful for polling
+func (c *testClient) ReadStatus(opCode byte, payload []byte) ([]byte, byte) {
+	c.Send(opCode, payload)
+	status, body := c.Read()
+	return body, status
+}
+
 // --- Tests ---
 
 func TestServer_Lifecycle_And_Ping(t *testing.T) {
@@ -329,4 +336,87 @@ func TestServer_ErrorHandling_Protocol(t *testing.T) {
 
 	// Unknown OpCode
 	client.AssertStatus(0x99, nil, ResStatusErr)
+}
+
+func TestServer_Backpressure(t *testing.T) {
+	dir, stores, _ := setupTestEnv(t)
+	defer stores["default"].Close()
+	defer os.RemoveAll(dir)
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	certsDir := filepath.Join(dir, "certs")
+
+	// Initialize server with MaxConns = 1 manually to override setupTestEnv default
+	srv, err := NewServer(
+		":0", "", stores, logger,
+		1, // MaxConns = 1
+		5*time.Second,
+		filepath.Join(certsDir, "server.crt"),
+		filepath.Join(certsDir, "server.key"),
+		filepath.Join(certsDir, "ca.crt"),
+		nil, // No Replication Manager needed for this test
+	)
+	if err != nil {
+		t.Fatalf("Failed to create server: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.Run(ctx)
+	time.Sleep(100 * time.Millisecond)
+
+	tlsConfig := getClientTLS(t, dir)
+	addr := srv.listener.Addr().String()
+
+	// 1. Fill Capacity (1/1)
+	c1 := connectClient(t, addr, tlsConfig)
+	defer c1.Close()
+	c1.AssertStatus(OpCodePing, nil, ResStatusOK)
+
+	// 2. Reject Overflow (2/1)
+	// We use raw Dial here because connectClient expects success/handshake
+	conn2, err := tls.Dial("tcp", addr, tlsConfig)
+	if err != nil {
+		t.Fatalf("Dial failed: %v", err)
+	}
+	defer conn2.Close()
+
+	// Expect server to write error and close
+	header := make([]byte, 5)
+	if _, err := io.ReadFull(conn2, header); err != nil {
+		t.Fatalf("Read failed (server likely closed connection too fast): %v", err)
+	}
+	if header[0] != ResStatusServerBusy {
+		t.Errorf("Expected Busy (0x06), got 0x%02x", header[0])
+	}
+
+	// Verify error message body
+	ln := binary.BigEndian.Uint32(header[1:])
+	body := make([]byte, ln)
+	if _, err := io.ReadFull(conn2, body); err != nil {
+		t.Fatalf("Failed to read error body: %v", err)
+	}
+	if string(body) != "Max connections" {
+		t.Errorf("Unexpected error body: %s", string(body))
+	}
+
+	// 3. Release Capacity
+	c1.Close()
+
+	// 4. Connect New Client (1/1) - Should succeed now (Poll for success)
+	pollStart := time.Now()
+	success := false
+	for time.Since(pollStart) < 2*time.Second {
+		c3, err := tls.Dial("tcp", addr, tlsConfig)
+		if err == nil {
+			c3.Close()
+			success = true
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	if !success {
+		t.Fatal("Failed to connect after releasing capacity")
+	}
 }
