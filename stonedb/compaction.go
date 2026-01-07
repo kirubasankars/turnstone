@@ -37,6 +37,8 @@ func (db *DB) RunCompaction() error {
 		return nil
 	}
 
+	fmt.Printf("Compacting file %d (garbage: %d bytes)\n", bestFid, maxGarbage)
+
 	// 2. Rewrite valid entries
 	var validEntries []ValueLogEntry
 	currentBatchSize := 0
@@ -58,16 +60,19 @@ func (db *DB) RunCompaction() error {
 		return nil
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("compaction iteration failed for file %d: %w", bestFid, err)
 	}
 
 	if len(validEntries) > 0 {
 		if err := db.rewriteBatch(validEntries); err != nil {
-			return err
+			return fmt.Errorf("compaction flush failed: %w", err)
 		}
 	}
 
 	// 3. Mark for Deletion (Deferred)
+	// We capture the current transaction ID. Any transaction started AFTER this point
+	// is guaranteed not to need the old file because we have updated the index.
+	// Transactions started BEFORE this point might still have an iterator open pointing to the old file.
 	db.activeTxnsMu.Lock()
 	obsoleteAt := atomic.LoadUint64(&db.transactionID)
 	db.pendingDeletes = append(db.pendingDeletes, pendingFile{
@@ -105,16 +110,21 @@ func (db *DB) deleteObsoleteFiles() {
 		}
 	}
 
+	// If no transactions are active, we can delete anything up to the current head.
 	if len(db.activeTxns) == 0 {
 		minActiveID = atomic.LoadUint64(&db.transactionID) + 1
 	}
 
 	var remaining []pendingFile
 	for _, p := range db.pendingDeletes {
+		// A file is safe to delete if it became obsolete at a TxID strictly less than
+		// the oldest active reader's snapshot ID.
 		if p.obsoleteAt < minActiveID {
 			fmt.Printf("Physically deleting obsolete ValueLog file: %04d.vlog\n", p.fileID)
 			if err := db.valueLog.DeleteFile(p.fileID); err != nil {
 				fmt.Printf("Failed to delete file %04d.vlog: %v\n", p.fileID, err)
+				// Keep it in the list to retry later
+				remaining = append(remaining, p)
 			}
 		} else {
 			remaining = append(remaining, p)
@@ -127,7 +137,8 @@ func (db *DB) deleteObsoleteFiles() {
 // It also cleans up index entries for stale keys that are not moved.
 func (db *DB) rewriteBatch(entries []ValueLogEntry) error {
 	// OPTIMISTIC WRITE: Write to VLog without global Commit Lock first.
-	// We only hold lock to Update Index.
+	// We pay the I/O cost upfront. If we lose the race, we just wasted some disk space (garbage),
+	// but we maintain consistency.
 
 	// 1. Write to VLog (Expensive I/O) - NO LOCK
 	fileID, baseOffset, err := db.valueLog.AppendEntries(entries)
@@ -135,37 +146,44 @@ func (db *DB) rewriteBatch(entries []ValueLogEntry) error {
 		return err
 	}
 
-	// 2. Update Index (Fast Memory Ops) - LOCK
+	// 2. Update Index (Fast Memory Ops) - LOCK REQUIRED
+	// We must lock to ensure that no other Commit is changing the index while we verify.
 	db.commitMu.Lock()
 	defer db.commitMu.Unlock()
 
 	batch := new(leveldb.Batch)
 
-	// We need to re-verify against the *latest* index state under lock
+	// We iterate through the batch we just wrote. For each entry, we check if
+	// it is still the *authoritative* version in the index.
 	iter := db.ldb.NewIterator(nil, nil)
 	defer iter.Release()
 
 	currentOffset := baseOffset
 
 	for _, e := range entries {
+		recSize := ValueLogHeaderSize + len(e.Key) + len(e.Value)
 		isLatest := false
-		seekKey := encodeIndexKey(e.Key, math.MaxUint64)
 
+		// Verify against current index state
+		seekKey := encodeIndexKey(e.Key, math.MaxUint64)
 		if iter.Seek(seekKey) {
 			foundKey := iter.Key()
 			uKey, _, err := decodeIndexKey(foundKey)
 			if err == nil && bytes.Equal(uKey, e.Key) {
 				meta, err := decodeEntryMeta(iter.Value())
 				if err == nil {
-					// Check if the Index still points to the OLD location (TxID match)
-					if meta.TransactionID == e.TransactionID {
+					// CRITICAL RACE CHECK:
+					// Does the index still point to the EXACT same TransactionID and OperationID
+					// as the entry we are moving?
+					// If YES: We are safe to update the pointer to the new location.
+					// If NO:  The key was updated by a user transaction (or another process) since we read it.
+					//         Our "moved" entry is now garbage. We abandon it.
+					if meta.TransactionID == e.TransactionID && meta.OperationID == e.OperationID {
 						isLatest = true
 					}
 				}
 			}
 		}
-
-		recSize := ValueLogHeaderSize + len(e.Key) + len(e.Value)
 
 		if isLatest {
 			// Update Index to point to NEW VLog location
@@ -180,13 +198,16 @@ func (db *DB) rewriteBatch(entries []ValueLogEntry) error {
 			batch.Put(encodeIndexKey(e.Key, e.TransactionID), meta.Encode())
 		} else {
 			// Stale: The key was updated concurrently or was already stale.
-			// We effectively "wasted" space in the new VLog file.
-			// We should count this as garbage immediately so it gets cleaned up later.
-			// We only need to delete the specific TxID entry we are moving.
-			batch.Delete(encodeIndexKey(e.Key, e.TransactionID))
-
-			// Track garbage created in the NEW file
+			// The space we just used in the new VLog file is now garbage.
+			// We track this so the new file can eventually be compacted too.
 			db.deletedBytesByFile[fileID] += int64(recSize)
+
+			// OPTIONAL: If we found the key in the index but it was an older version (rare,
+			// usually we only compact live keys), we might want to delete the OLD index entry
+			// to reclaim LevelDB space.
+			// However, in this architecture, we usually leave old versions for MVCC until
+			// a separate index-cleanup process runs, or we can aggressively delete here if
+			// we are sure no active transaction needs it. For safety, we skip deletion here.
 		}
 
 		currentOffset += uint32(recSize)
