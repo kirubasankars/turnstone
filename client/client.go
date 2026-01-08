@@ -28,12 +28,11 @@ const (
 	OpCodeGet       = 0x02 // Retrieve a value. Payload: Key bytes.
 	OpCodeSet       = 0x03 // Store a value. Payload: [KeyLen(4)|Key|Value].
 	OpCodeDel       = 0x04 // Delete a value. Payload: Key bytes.
-	OpCodeSelect    = 0x05 // Select the active partition. Payload: Partition Name bytes.
+	OpCodeSelect    = 0x05 // Select the active database. Payload: Database Name bytes.
 	OpCodeBegin     = 0x10 // Start a new transaction context.
 	OpCodeCommit    = 0x11 // Commit the current transaction.
 	OpCodeAbort     = 0x12 // Rollback the current transaction.
-	OpCodeStat      = 0x20 // Retrieve server statistics.
-	OpCodeReplicaOf = 0x32 // Set replication source. Payload: [AddrLen][Addr][RemotePartition].
+	OpCodeReplicaOf = 0x32 // Set replication source. Payload: [AddrLen][Addr][RemoteDB].
 	OpCodeReplHello = 0x50 // Replication Handshake (Internal/Client CDC).
 	OpCodeReplBatch = 0x51 // Replication Batch (Internal/Client CDC).
 	OpCodeReplAck   = 0x52 // Replication Ack (Internal/Client CDC).
@@ -321,23 +320,23 @@ func (c *Client) Ping() error {
 	return err
 }
 
-// Select changes the active partition for the current connection.
-func (c *Client) Select(partitionName string) error {
-	_, err := c.roundTrip(OpCodeSelect, []byte(partitionName))
+// Select changes the active database for the current connection.
+func (c *Client) Select(dbName string) error {
+	_, err := c.roundTrip(OpCodeSelect, []byte(dbName))
 	return err
 }
 
-// ReplicaOf configures the currently selected partition to replicate from a remote source.
-// sourceAddr is "host:port", sourcePartition is the name of the partition on the remote server.
-func (c *Client) ReplicaOf(sourceAddr, sourcePartition string) error {
-	// Protocol: [AddrLen(4)][AddrBytes][RemotePartitionNameBytes]
+// ReplicaOf configures the currently selected database to replicate from a remote source.
+// sourceAddr is "host:port", sourceDB is the name of the database on the remote server.
+func (c *Client) ReplicaOf(sourceAddr, sourceDB string) error {
+	// Protocol: [AddrLen(4)][AddrBytes][RemoteDBNameBytes]
 	addrBytes := []byte(sourceAddr)
-	partBytes := []byte(sourcePartition)
-	payload := make([]byte, 4+len(addrBytes)+len(partBytes))
+	dbBytes := []byte(sourceDB)
+	payload := make([]byte, 4+len(addrBytes)+len(dbBytes))
 
 	binary.BigEndian.PutUint32(payload[0:4], uint32(len(addrBytes)))
 	copy(payload[4:], addrBytes)
-	copy(payload[4+len(addrBytes):], partBytes)
+	copy(payload[4+len(addrBytes):], dbBytes)
 
 	_, err := c.roundTrip(OpCodeReplicaOf, payload)
 	return err
@@ -412,14 +411,6 @@ func (c *Client) Abort() error {
 	return err
 }
 
-// --- Admin ---
-
-// Stat returns the internal server statistics (key count, memory usage, uptime).
-func (c *Client) Stat() (string, error) {
-	resp, err := c.roundTrip(OpCodeStat, nil)
-	return string(resp), err
-}
-
 // --- CDC / Replication Consumer ---
 
 // Change represents a single data modification event from the CDC stream.
@@ -431,11 +422,11 @@ type Change struct {
 	IsDelete bool
 }
 
-// Subscribe connects to the server and starts listening for changes on the specified partition.
+// Subscribe connects to the server and starts listening for changes on the specified database.
 // This function blocks until the connection is closed or an error occurs.
 // It invokes 'handler' for every change received.
 // Note: This method consumes the Client connection. You should create a dedicated Client instance for CDC.
-func (c *Client) Subscribe(partition string, startSeq uint64, handler func(Change) error) error {
+func (c *Client) Subscribe(dbName string, startSeq uint64, handler func(Change) error) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -449,8 +440,8 @@ func (c *Client) Subscribe(partition string, startSeq uint64, handler func(Chang
 	binary.Write(buf, binary.BigEndian, uint32(1)) // Version
 	binary.Write(buf, binary.BigEndian, uint32(1)) // Count (1 DB)
 
-	binary.Write(buf, binary.BigEndian, uint32(len(partition)))
-	buf.WriteString(partition)
+	binary.Write(buf, binary.BigEndian, uint32(len(dbName)))
+	buf.WriteString(dbName)
 	binary.Write(buf, binary.BigEndian, startSeq)
 
 	// Send Header
@@ -494,7 +485,7 @@ func (c *Client) Subscribe(partition string, startSeq uint64, handler func(Chang
 			if cursor+nLen > len(payload) {
 				return fmt.Errorf("malformed batch: short name")
 			}
-			// dbName := string(payload[cursor : cursor+nLen]) // verify partition match?
+			// dbName := string(payload[cursor : cursor+nLen]) // verify database match?
 			cursor += nLen
 
 			if cursor+4 > len(payload) {
@@ -553,8 +544,8 @@ func (c *Client) Subscribe(partition string, startSeq uint64, handler func(Chang
 			// Send ACK
 			// ACK Format: [DBNameLen][DBName][LogID]
 			ackBuf := new(bytes.Buffer)
-			binary.Write(ackBuf, binary.BigEndian, uint32(len(partition)))
-			ackBuf.WriteString(partition)
+			binary.Write(ackBuf, binary.BigEndian, uint32(len(dbName)))
+			ackBuf.WriteString(dbName)
 			binary.Write(ackBuf, binary.BigEndian, maxLogSeq)
 
 			ackHeader := make([]byte, ProtoHeaderSize)
