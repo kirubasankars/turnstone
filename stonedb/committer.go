@@ -9,6 +9,16 @@ import (
 	"sync/atomic"
 )
 
+// testingPrepareBatchErr allows tests to inject a system-level error into prepareBatch.
+// This variable is not mutex-protected and should only be set in serial tests.
+var testingPrepareBatchErr error
+
+// testingApplyBatchIndexErr allows tests to inject an error into applyBatchIndex.
+var testingApplyBatchIndexErr error
+
+// testingPersistBatchHook allows injecting logic after WAL write but before VLog write.
+var testingPersistBatchHook func()
+
 // commitBatch holds the state for a single Group Commit iteration.
 type commitBatch struct {
 	reqs         []commitRequest
@@ -67,6 +77,11 @@ func (db *DB) processCommitBatch(requests []commitRequest) {
 // prepareBatch validates transactions, detects conflicts (inter-tx and intra-batch),
 // and prepares the binary payloads for writing.
 func (db *DB) prepareBatch(requests []commitRequest) (*commitBatch, error) {
+	// Hook for testing the error path
+	if testingPrepareBatchErr != nil {
+		return nil, testingPrepareBatchErr
+	}
+
 	batch := &commitBatch{
 		staleBytes: make(map[uint32]int64),
 	}
@@ -131,6 +146,12 @@ func (db *DB) persistBatch(batch *commitBatch) error {
 	// If this returns nil, the transaction is physically durable on disk (fsync'd).
 	if err := db.writeAheadLog.AppendBatches(batch.walPayloads); err != nil {
 		return fmt.Errorf("wal write failed: %w", err)
+	}
+
+	// HOOK: Point of no return checks.
+	// Used to inject failures after WAL write but before VLog write to test rollback logic.
+	if testingPersistBatchHook != nil {
+		testingPersistBatchHook()
 	}
 
 	// 2. VLog Write (Grouped)
@@ -201,6 +222,11 @@ func (db *DB) rollbackWAL(bytesToRemove int64) error {
 // applyBatchIndex updates the in-memory index (LevelDB) to point to the new values
 // and updates the global sequence clocks.
 func (db *DB) applyBatchIndex(batch *commitBatch) error {
+	// Hook for testing the error path
+	if testingApplyBatchIndexErr != nil {
+		return testingApplyBatchIndexErr
+	}
+
 	// Calculate stale bytes (garbage) before updating index
 	// This finds existing entries that are about to be overwritten.
 	db.calculateStaleBytes(batch)
