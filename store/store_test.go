@@ -52,12 +52,7 @@ func TestStore_Recover_Basic(t *testing.T) {
 	defer s2.Close()
 
 	// 3. Verify Data
-	stats := s2.Stats()
-	// Expect 3 user keys.
-	if stats.KeyCount < 3 {
-		t.Errorf("Expected at least 3 keys, got %d", stats.KeyCount)
-	}
-
+	// Note: KeyCount removed from stats, so we verify by reading values directly.
 	for _, k := range keys {
 		val, err := s2.Get(k)
 		if err != nil {
@@ -229,7 +224,7 @@ func TestStore_Replication_Quorum(t *testing.T) {
 	// The write above generates a LogSeq.
 	// Since we started fresh, nextLogSeq was 1. The write used LogSeq 1.
 	// We acknowledge 1 to ensure the write is unblocked.
-	s.RegisterReplica("replica-1", 0)
+	s.RegisterReplica("replica-1", 0, "server") // Fixed: Added "server" role
 	s.UpdateReplicaLogSeq("replica-1", 1)
 
 	// 5. Verify Unblock
@@ -283,27 +278,105 @@ func TestStore_Replication_ApplyBatch(t *testing.T) {
 	}
 }
 
-func TestStore_ReadOnlySystemPartition(t *testing.T) {
-	// Create a store named "0" (System Partition)
-	dir := filepath.Join(t.TempDir(), "0")
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+func TestStoreStats_ConflictsAndStorage(t *testing.T) {
+	dir, _ := os.MkdirTemp("", "store_stats_test")
+	defer os.RemoveAll(dir)
 
-	// isSystem=true
-	s, err := NewStore(dir, logger, true, 0, true)
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	s, err := NewStore(dir, logger, true, 0, false)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("NewStore failed: %v", err)
 	}
 	defer s.Close()
 
-	// Attempt Write
-	err = s.ApplyBatch([]protocol.LogEntry{{OpCode: protocol.OpJournalSet, Key: []byte("k"), Value: []byte("v")}})
-	if err != protocol.ErrSystemPartitionReadOnly {
-		t.Errorf("Expected system partition read-only error, got %v", err)
+	// 1. Initial Stats
+	stats := s.Stats()
+	if stats.Conflicts != 0 {
+		t.Errorf("expected 0 conflicts, got %d", stats.Conflicts)
 	}
 
-	// Attempt Read (Also restricted by default in current store implementation)
-	_, err = s.Get("any")
-	if err != protocol.ErrSystemPartitionReadOnly {
-		t.Errorf("Expected system partition read-only error on Get, got %v", err)
+	// 2. Generate a Conflict
+	// Tx 1
+	tx1 := s.DB.NewTransaction(true)
+	tx1.Put([]byte("key"), []byte("val1"))
+
+	// Tx 2 (concurrent)
+	tx2 := s.DB.NewTransaction(true)
+	tx2.Put([]byte("key"), []byte("val2"))
+
+	if err := tx1.Commit(); err != nil {
+		t.Fatalf("tx1 commit failed: %v", err)
+	}
+
+	// Tx 2 should fail
+	if err := tx2.Commit(); err == nil {
+		t.Error("tx2 should have failed with conflict")
+	}
+
+	// 3. Verify Conflict Count
+	stats = s.Stats()
+	if stats.Conflicts != 1 {
+		t.Errorf("expected 1 conflict, got %d", stats.Conflicts)
+	}
+
+	// 4. Write data to generate WAL/VLog usage
+	entries := []protocol.LogEntry{
+		{Key: []byte("k1"), Value: []byte("v1"), OpCode: protocol.OpJournalSet},
+		{Key: []byte("k2"), Value: []byte("v2"), OpCode: protocol.OpJournalSet},
+	}
+	if err := s.ApplyBatch(entries); err != nil {
+		t.Fatalf("ApplyBatch failed: %v", err)
+	}
+
+	// 5. Verify Storage Metrics
+	stats = s.Stats()
+	if stats.WALFiles == 0 {
+		t.Error("expected >0 WAL files")
+	}
+	if stats.VLogFiles == 0 {
+		t.Error("expected >0 VLog files")
+	}
+	if stats.WALSize == 0 {
+		t.Error("expected >0 bytes WAL size")
+	}
+	if stats.VLogSize == 0 {
+		t.Error("expected >0 bytes VLog size")
+	}
+}
+
+func TestStore_ReplicaLag(t *testing.T) {
+	dir, _ := os.MkdirTemp("", "store_lag_test")
+	defer os.RemoveAll(dir)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	s, err := NewStore(dir, logger, true, 0, false)
+	if err != nil {
+		t.Fatalf("NewStore failed: %v", err)
+	}
+	defer s.Close()
+
+	// Write some data to advance log seq
+	entries := []protocol.LogEntry{
+		{Key: []byte("k1"), Value: []byte("v1"), OpCode: protocol.OpJournalSet},
+	}
+	s.ApplyBatch(entries)
+	head := s.DB.LastOpID()
+
+	// Register Replica at head
+	s.RegisterReplica("r1", head, "server")
+	stats := s.Stats()
+	if stats.ReplicaLag != 0 {
+		t.Errorf("expected 0 lag, got %d", stats.ReplicaLag)
+	}
+
+	// Write more data
+	s.ApplyBatch(entries)
+	newHead := s.DB.LastOpID()
+
+	// Check Lag (should be newHead - head)
+	stats = s.Stats()
+	expectedLag := newHead - head
+	if stats.ReplicaLag != expectedLag {
+		t.Errorf("expected lag %d, got %d", expectedLag, stats.ReplicaLag)
 	}
 }

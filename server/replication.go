@@ -16,7 +16,6 @@ import (
 )
 
 var (
-	ReplicaSendTimeout = 60 * time.Second
 	// MaxReplicationBatchSize limits the payload size of a single replication batch
 	// to prevent memory spikes and ensure keep-alives/ACKs flow regularly.
 	MaxReplicationBatchSize = 1 * 1024 * 1024 // 1MB
@@ -24,14 +23,15 @@ var (
 )
 
 type replPacket struct {
-	partitionName string
-	data          []byte
-	count         uint32
+	dbName string
+	data   []byte
+	count  uint32
 }
 
-// HandleReplicaConnection multiplexes streams from multiple partitions onto one connection.
-func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []byte) {
-	// 1. Parse Hello: [Ver:4][NumPartitions:4] ... [NameLen:4][Name][LogID:8]
+// HandleReplicaConnection multiplexes streams from multiple databases onto one connection.
+// It uses the provided role to distinguish between full Replicas (quorum members) and CDC clients (observers).
+func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []byte, role string, replicaID string) {
+	// 1. Parse Hello: [Ver:4][NumDBs:4] ... [NameLen:4][Name][LogID:8]
 	if len(payload) < 8 {
 		s.logger.Error("HandleReplicaConnection: payload too short for header")
 		return
@@ -45,7 +45,6 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 		logID uint64
 	}
 	var subs []subReq
-	replicaID := conn.RemoteAddr().String()
 
 	for i := 0; i < int(count); i++ {
 		if cursor+4 > len(payload) {
@@ -65,17 +64,17 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 		subs = append(subs, subReq{name, logID})
 
 		if st, ok := s.stores[name]; ok {
-			s.logger.Info("Replica subscribed", "replica", replicaID, "partition", name, "startLogID", logID)
-			st.RegisterReplica(replicaID, logID)
+			s.logger.Info("Replica subscribed", "replica", replicaID, "db", name, "startLogID", logID, "role", role)
+			st.RegisterReplica(replicaID, logID, role)
 
 			// Clean up when connection closes.
-			// We capture 'st' and 'name' for the specific partition.
-			defer func(storePtr *store.Store, pName string) {
-				s.logger.Info("Replica unsubscribed (connection closed)", "replica", replicaID, "partition", pName)
+			// We capture 'st' and 'name' for the specific database.
+			defer func(storePtr *store.Store, dbName string) {
+				s.logger.Info("Replica unsubscribed (connection closed)", "replica", replicaID, "db", dbName)
 				storePtr.UnregisterReplica(replicaID)
 			}(st, name)
 		} else {
-			s.logger.Warn("Replica requested unknown partition", "replica", replicaID, "partition", name)
+			s.logger.Warn("Replica requested unknown database", "replica", replicaID, "db", name)
 		}
 	}
 
@@ -87,7 +86,7 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 
 	var wg sync.WaitGroup
 
-	// Start reader for each requested Partition
+	// Start reader for each requested Database
 	for _, req := range subs {
 		storeInstance, ok := s.stores[req.name]
 		if !ok {
@@ -97,8 +96,8 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 		wg.Add(1)
 		go func(name string, st *store.Store, startLogID uint64) {
 			defer wg.Done()
-			if err := s.streamPartition(name, st, startLogID, outCh, done); err != nil {
-				s.logger.Error("StreamPartition failed", "partition", name, "err", err)
+			if err := s.streamDB(name, st, startLogID, outCh, done); err != nil {
+				s.logger.Error("StreamDB failed", "db", name, "err", err)
 				select {
 				case errCh <- err:
 				default:
@@ -110,7 +109,7 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 	// ACK Reader
 	go func() {
 		// Just consume ACKs to keep connection alive and update offsets
-		// Format: [OpCode][Len][PartitionNameLen][PartitionName][LogID]
+		// Format: [OpCode][Len][DBNameLen][DBName][LogID]
 		h := make([]byte, 5)
 		for {
 			if _, err := io.ReadFull(r, h); err != nil {
@@ -140,9 +139,9 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 				if len(b) > 4 {
 					nL := binary.BigEndian.Uint32(b[:4])
 					if len(b) >= 4+int(nL)+8 {
-						partitionName := string(b[4 : 4+nL])
+						dbName := string(b[4 : 4+nL])
 						logID := binary.BigEndian.Uint64(b[4+nL:])
-						if st, ok := s.stores[partitionName]; ok {
+						if st, ok := s.stores[dbName]; ok {
 							st.UpdateReplicaLogSeq(replicaID, logID)
 						}
 					}
@@ -159,7 +158,7 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 				// Client disconnected gracefully
 				return
 			}
-			s.logger.Warn("Dropping slow/failed replica", "addr", replicaID, "err", err)
+			s.logger.Warn("Dropping failed replica connection", "addr", replicaID, "err", err)
 
 			// Attempt to send error to client before closing
 			// This helps the client distinguish between network failure and fatal replication errors (e.g. purged logs)
@@ -175,26 +174,28 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 			return
 
 		case p := <-outCh:
-			// Frame: [OpCodeReplBatch][TotalLen] [PartitionNameLen][PartitionName][Count][BatchData...]
-			totalLen := 4 + len(p.partitionName) + 4 + len(p.data)
+			// Frame: [OpCodeReplBatch][TotalLen] [DBNameLen][DBName][Count][BatchData...]
+			totalLen := 4 + len(p.dbName) + 4 + len(p.data)
 			header := make([]byte, 5)
 			header[0] = protocol.OpCodeReplBatch
 			binary.BigEndian.PutUint32(header[1:], uint32(totalLen))
 
-			conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			// Blocking write with infinite timeout (or rely on system TCP/keepalive)
+			// We no longer enforce an application-level write timeout to support slow consumers
+			conn.SetWriteDeadline(time.Time{})
 			if _, err := conn.Write(header); err != nil {
 				s.logger.Error("Failed to write batch header", "replica", replicaID, "err", err)
 				return
 			}
 
 			nameH := make([]byte, 4)
-			binary.BigEndian.PutUint32(nameH, uint32(len(p.partitionName)))
+			binary.BigEndian.PutUint32(nameH, uint32(len(p.dbName)))
 			if _, err := conn.Write(nameH); err != nil {
-				s.logger.Error("Failed to write batch partition name len", "replica", replicaID, "err", err)
+				s.logger.Error("Failed to write batch db name len", "replica", replicaID, "err", err)
 				return
 			}
-			if _, err := conn.Write([]byte(p.partitionName)); err != nil {
-				s.logger.Error("Failed to write batch partition name", "replica", replicaID, "err", err)
+			if _, err := conn.Write([]byte(p.dbName)); err != nil {
+				s.logger.Error("Failed to write batch db name", "replica", replicaID, "err", err)
 				return
 			}
 
@@ -213,7 +214,7 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 	}
 }
 
-func (s *Server) streamPartition(name string, st *store.Store, minLogID uint64, outCh chan<- replPacket, done <-chan struct{}) error {
+func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh chan<- replPacket, done <-chan struct{}) error {
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -227,9 +228,17 @@ func (s *Server) streamPartition(name string, st *store.Store, minLogID uint64, 
 		var count uint32
 
 		// Scan from next ID
+		// The callback logic now includes injecting a Commit entry when a full WAL batch is processed.
 		err := st.ScanWAL(currentLogID+1, func(entries []stonedb.ValueLogEntry) error {
+			if len(entries) == 0 {
+				return nil
+			}
+
+			// Capture metadata for the Commit marker from the last entry
+			lastEntry := entries[len(entries)-1]
+
 			for _, e := range entries {
-				// Wire Format: [LogID(8)][LSN(8)][Op(1)][KLen(4)][Key][VLen(4)][Val]
+				// Wire Format: [LogID(8)][TxID(8)][Op(1)][KLen(4)][Key][VLen(4)][Val]
 				if err := binary.Write(&batchBuf, binary.BigEndian, e.OperationID); err != nil {
 					return err
 				}
@@ -264,17 +273,30 @@ func (s *Server) streamPartition(name string, st *store.Store, minLogID uint64, 
 					return ErrBatchFull
 				}
 			}
+
+			// If we reached here, it means we successfully processed the entire WAL batch (Transaction)
+			// without hitting ErrBatchFull. We can now safely append the Commit marker.
+			// Commit Marker Format: [LogID(8)][TxID(8)][Op=OpJournalCommit(1)][KLen=0][VLen=0]
+			if err := binary.Write(&batchBuf, binary.BigEndian, lastEntry.OperationID); err != nil {
+				return err
+			}
+			if err := binary.Write(&batchBuf, binary.BigEndian, lastEntry.TransactionID); err != nil {
+				return err
+			}
+			batchBuf.WriteByte(protocol.OpJournalCommit)
+			binary.Write(&batchBuf, binary.BigEndian, uint32(0)) // KeyLen
+			binary.Write(&batchBuf, binary.BigEndian, uint32(0)) // ValLen
+			count++
+
 			return nil
 		})
 
-		// Send if we have data
+		// Send if we have data - BLOCKING SEND (Backpressure)
 		if count > 0 {
 			select {
-			case outCh <- replPacket{partitionName: name, data: batchBuf.Bytes(), count: count}:
+			case outCh <- replPacket{dbName: name, data: batchBuf.Bytes(), count: count}:
 			case <-done:
 				return nil
-			case <-time.After(ReplicaSendTimeout):
-				return fmt.Errorf("replication send timeout for partition %s", name)
 			}
 		}
 
@@ -293,7 +315,7 @@ func (s *Server) streamPartition(name string, st *store.Store, minLogID uint64, 
 				}
 				// Otherwise, we are at the head (future data), so we just wait for new data.
 			} else {
-				s.logger.Error("ScanWAL error", "partition", name, "err", err)
+				s.logger.Error("ScanWAL error", "db", name, "err", err)
 				// Backoff slightly on error
 				time.Sleep(100 * time.Millisecond)
 			}

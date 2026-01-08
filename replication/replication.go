@@ -174,6 +174,9 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 	// Map RemoteDB -> []LocalDB
 	remoteToLocal := make(map[string][]string)
 
+	// Transaction Buffers: LocalDB -> []LogEntry
+	txBuffers := make(map[string][]protocol.LogEntry)
+
 	// Build Hello Payload
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.BigEndian, uint32(1))
@@ -188,6 +191,8 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 		rm.logger.Debug("Sending Hello for DB", "remote_db", cfg.RemoteDB, "local_db", cfg.LocalDB, "startLogID", logID)
 
 		remoteToLocal[cfg.RemoteDB] = append(remoteToLocal[cfg.RemoteDB], cfg.LocalDB)
+		// Initialize empty buffer
+		txBuffers[cfg.LocalDB] = make([]protocol.LogEntry, 0)
 	}
 
 	// Send Hello
@@ -241,21 +246,36 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 
 			for _, localDBName := range localDBNames {
 				if st, ok := rm.stores[localDBName]; ok {
-					if maxID, err := applyReplicationBatch(st, count, data); err == nil {
-						// Send ACK with REMOTE DB Name, so leader knows which stream to update
-						ackBuf := new(bytes.Buffer)
-						binary.Write(ackBuf, binary.BigEndian, uint32(len(remoteDBName)))
-						ackBuf.WriteString(remoteDBName)
-						binary.Write(ackBuf, binary.BigEndian, maxID)
+					// Use specific buffer for this store
+					buffer := txBuffers[localDBName]
 
-						h := make([]byte, 5)
-						h[0] = protocol.OpCodeReplAck
-						binary.BigEndian.PutUint32(h[1:], uint32(ackBuf.Len()))
-						if _, err := conn.Write(h); err != nil {
-							return err
-						}
-						if _, err := conn.Write(ackBuf.Bytes()); err != nil {
-							return err
+					// Parse and Buffer
+					newBuffer, lastCommittedID, err := processReplicationPacket(st, buffer, count, data)
+
+					// Update buffer state
+					txBuffers[localDBName] = newBuffer
+
+					if err == nil {
+						// Only ack if we actually committed something (lastCommittedID > 0)
+						// AND if we have drained the buffer.
+						// Actually, we should ACK the highest committed ID even if there is partial data remaining?
+						// No, the leader expects ACK to mean durability.
+						if lastCommittedID > 0 {
+							// Send ACK with REMOTE DB Name, so leader knows which stream to update
+							ackBuf := new(bytes.Buffer)
+							binary.Write(ackBuf, binary.BigEndian, uint32(len(remoteDBName)))
+							ackBuf.WriteString(remoteDBName)
+							binary.Write(ackBuf, binary.BigEndian, lastCommittedID)
+
+							h := make([]byte, 5)
+							h[0] = protocol.OpCodeReplAck
+							binary.BigEndian.PutUint32(h[1:], uint32(ackBuf.Len()))
+							if _, err := conn.Write(h); err != nil {
+								return err
+							}
+							if _, err := conn.Write(ackBuf.Bytes()); err != nil {
+								return err
+							}
 						}
 					} else {
 						rm.logger.Error("Failed to apply replication batch", "local_db", localDBName, "err", err)
@@ -268,51 +288,70 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 	}
 }
 
-func applyReplicationBatch(store *store.Store, count uint32, data []byte) (uint64, error) {
+// processReplicationPacket parses raw bytes into LogEntries, buffers them, and applies upon Commit.
+// Returns the updated buffer and the highest LogSeq that was committed.
+func processReplicationPacket(store *store.Store, buffer []protocol.LogEntry, count uint32, data []byte) ([]protocol.LogEntry, uint64, error) {
 	cursor := 0
-	var ops []protocol.LogEntry
-	var maxID uint64
+	var lastCommittedID uint64
 
 	for i := 0; i < int(count); i++ {
 		if cursor+17 > len(data) {
-			return 0, fmt.Errorf("malformed batch entry header")
+			return buffer, 0, fmt.Errorf("malformed batch entry header")
 		}
 		lid := binary.BigEndian.Uint64(data[cursor : cursor+8])
-		// lsn := binary.BigEndian.Uint64(data[cursor+8 : cursor+16]) // LSN unused on follower side
+		// txID := binary.BigEndian.Uint64(data[cursor+8 : cursor+16]) // Unused here, implicit in batch
 		op := data[cursor+16]
 		cursor += 17
 
 		if cursor+4 > len(data) {
-			return 0, fmt.Errorf("malformed batch entry key len")
+			return buffer, 0, fmt.Errorf("malformed batch entry key len")
 		}
 		kLen := int(binary.BigEndian.Uint32(data[cursor : cursor+4]))
 		cursor += 4
 
 		if cursor+kLen > len(data) {
-			return 0, fmt.Errorf("malformed batch entry key")
+			return buffer, 0, fmt.Errorf("malformed batch entry key")
 		}
 		key := data[cursor : cursor+kLen]
 		cursor += kLen
 
 		if cursor+4 > len(data) {
-			return 0, fmt.Errorf("malformed batch entry val len")
+			return buffer, 0, fmt.Errorf("malformed batch entry val len")
 		}
 		vLen := int(binary.BigEndian.Uint32(data[cursor : cursor+4]))
 		cursor += 4
 
-		var val []byte
-		if op != protocol.OpJournalDelete {
-			if cursor+vLen > len(data) {
-				return 0, fmt.Errorf("malformed batch entry val")
-			}
-			val = data[cursor : cursor+vLen]
-			cursor += vLen
+		if cursor+vLen > len(data) {
+			return buffer, 0, fmt.Errorf("malformed batch entry val")
 		}
-		ops = append(ops, protocol.LogEntry{LogSeq: lid, OpCode: op, Key: key, Value: val})
-		if lid > maxID {
-			maxID = lid
+		val := data[cursor : cursor+vLen]
+		cursor += vLen
+
+		// Handle Commit Marker
+		if op == protocol.OpJournalCommit {
+			// Apply buffered operations atomically
+			if len(buffer) > 0 {
+				if err := store.ReplicateBatch(buffer); err != nil {
+					return buffer, lastCommittedID, err
+				}
+				// Last committed ID matches the LogSeq of the Commit Marker itself
+				// (Sender uses last op's ID for the commit marker)
+				lastCommittedID = lid
+				buffer = buffer[:0] // Clear buffer
+			} else {
+				// Empty transaction or redundant commit? Just ack.
+				lastCommittedID = lid
+			}
+		} else {
+			// Buffer Operation
+			buffer = append(buffer, protocol.LogEntry{
+				LogSeq: lid,
+				OpCode: op,
+				Key:    key,
+				Value:  val,
+			})
 		}
 	}
 
-	return maxID, store.ReplicateBatch(ops)
+	return buffer, lastCommittedID, nil
 }

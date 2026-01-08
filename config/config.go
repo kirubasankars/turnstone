@@ -19,16 +19,17 @@ import (
 // Config represents the server configuration.
 // Simplified for in-memory mode.
 type Config struct {
-	Port               string `json:"port"`
-	Debug              bool   `json:"debug"`
-	MaxConns           int    `json:"max_conns"`
-	TLSCertFile        string `json:"tls_cert_file"`
-	TLSKeyFile         string `json:"tls_key_file"`
-	TLSCAFile          string `json:"tls_ca_file"`
-	TLSClientCertFile  string `json:"tls_client_cert_file"`
-	TLSClientKeyFile   string `json:"tls_client_key_file"`
-	MetricsAddr        string `json:"metrics_addr"`
-	NumberOfPartitions int    `json:"number_of_partitions"`
+	Port              string `json:"port"`
+	Debug             bool   `json:"debug"`
+	MaxConns          int    `json:"max_conns"`
+	TLSCertFile       string `json:"tls_cert_file"`
+	TLSKeyFile        string `json:"tls_key_file"`
+	TLSCAFile         string `json:"tls_ca_file"`
+	TLSClientCertFile string `json:"tls_client_cert_file"`
+	TLSClientKeyFile  string `json:"tls_client_key_file"`
+	MetricsAddr       string `json:"metrics_addr"`
+	NumberOfDatabases int    `json:"number_of_databases"`
+	WALRetention      string `json:"wal_retention"` // Duration string e.g. "2h"
 }
 
 // ResolvePath returns an absolute path relative to the home directory if strictly necessary.
@@ -62,14 +63,14 @@ func GenerateConfigArtifacts(homeDir string, defaultCfg Config, configPath strin
 		}
 	}
 
-	// Create data directories for partitions.
-	// Partition 0 is reserved for internal purposes.
-	// If NumberOfPartitions is N, we create partitions 0, 1, ..., N.
-	for i := 0; i <= defaultCfg.NumberOfPartitions; i++ {
-		partID := strconv.Itoa(i)
-		partPath := filepath.Join(homeDir, "data", partID)
-		if err := os.MkdirAll(partPath, 0o755); err != nil {
-			return fmt.Errorf("failed to create data directory for partition %s: %w", partID, err)
+	// Create data directories for databases.
+	// Database 0 is reserved for internal purposes.
+	// If NumberOfDatabases is N, we create databases 0, 1, ..., N.
+	for i := 0; i <= defaultCfg.NumberOfDatabases; i++ {
+		dbID := strconv.Itoa(i)
+		dbPath := filepath.Join(homeDir, "data", dbID)
+		if err := os.MkdirAll(dbPath, 0o755); err != nil {
+			return fmt.Errorf("failed to create data directory for database %s: %w", dbID, err)
 		}
 	}
 
@@ -83,6 +84,7 @@ func GenerateConfigArtifacts(homeDir string, defaultCfg Config, configPath strin
 	// instead of the restricted 'client' cert.
 	defaultCfg.TLSClientCertFile = "certs/server.crt"
 	defaultCfg.TLSClientKeyFile = "certs/server.key"
+	defaultCfg.WALRetention = "2h" // Default retention
 
 	data, err := json.MarshalIndent(defaultCfg, "", "  ")
 	if err != nil {

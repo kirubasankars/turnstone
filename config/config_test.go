@@ -63,11 +63,11 @@ func TestGenerateConfigArtifacts(t *testing.T) {
 	configPath := filepath.Join(tmpDir, "config.json")
 
 	defaultCfg := Config{
-		Port:               ":9999",
-		TLSCertFile:        "certs/server.crt", // Relative paths
-		TLSKeyFile:         "certs/server.key",
-		TLSCAFile:          "certs/ca.crt",
-		NumberOfPartitions: 1, // Should create partition 0 and 1
+		Port:              ":9999",
+		TLSCertFile:       "certs/server.crt", // Relative paths
+		TLSKeyFile:        "certs/server.key",
+		TLSCAFile:         "certs/ca.crt",
+		NumberOfDatabases: 1, // Should create database 0 and 1
 	}
 
 	// Execute
@@ -76,13 +76,13 @@ func TestGenerateConfigArtifacts(t *testing.T) {
 	}
 
 	// 1. Verify Directories
-	// Partition 0 (Internal)
+	// Database 0 (Internal)
 	if _, err := os.Stat(filepath.Join(tmpDir, "data", "0")); os.IsNotExist(err) {
-		t.Error("Data directory for partition '0' not created")
+		t.Error("Data directory for database '0' not created")
 	}
-	// Partition 1 (User)
+	// Database 1 (User)
 	if _, err := os.Stat(filepath.Join(tmpDir, "data", "1")); os.IsNotExist(err) {
-		t.Error("Data directory for partition '1' not created")
+		t.Error("Data directory for database '1' not created")
 	}
 
 	if _, err := os.Stat(filepath.Join(tmpDir, "certs")); os.IsNotExist(err) {
@@ -101,8 +101,8 @@ func TestGenerateConfigArtifacts(t *testing.T) {
 	if loadedCfg.Port != ":9999" {
 		t.Errorf("Config mismatch. Want :9999, got %s", loadedCfg.Port)
 	}
-	if loadedCfg.NumberOfPartitions != 1 {
-		t.Error("NumberOfPartitions mismatch")
+	if loadedCfg.NumberOfDatabases != 1 {
+		t.Error("NumberOfDatabases mismatch")
 	}
 
 	// 3. Verify Certificates

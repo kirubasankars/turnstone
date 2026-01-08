@@ -202,12 +202,12 @@ func (db *DB) rewriteBatch(entries []ValueLogEntry) error {
 			// We track this so the new file can eventually be compacted too.
 			db.deletedBytesByFile[fileID] += int64(recSize)
 
-			// OPTIONAL: If we found the key in the index but it was an older version (rare,
-			// usually we only compact live keys), we might want to delete the OLD index entry
-			// to reclaim LevelDB space.
-			// However, in this architecture, we usually leave old versions for MVCC until
-			// a separate index-cleanup process runs, or we can aggressively delete here if
-			// we are sure no active transaction needs it. For safety, we skip deletion here.
+			// Clean up the index entry pointing to the OLD VLog file.
+			// Since we are compacting the file containing 'e', and 'e' is not latest,
+			// this specific version is garbage and the old file will be deleted.
+			// We must remove the index record for this specific version to prevent
+			// dangling pointers in the version chain.
+			batch.Delete(encodeIndexKey(e.Key, e.TransactionID))
 		}
 
 		currentOffset += uint32(recSize)

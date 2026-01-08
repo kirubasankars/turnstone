@@ -33,7 +33,7 @@ func TestRunInit(t *testing.T) {
 		"certs/cdc.crt",
 		"certs/cdc.key",
 		"certs/ca.crt",
-		// Data Partitions (0=System, 16=Last User Partition in default config)
+		// Data Databases (0=System, 16=Last User Database in default config)
 		"data/0",
 		"data/1",
 		"data/16",
@@ -71,8 +71,8 @@ func TestGeneratedConfigsValidity(t *testing.T) {
 		if cfg.Port != ":6379" {
 			t.Errorf("Unexpected default port: %s", cfg.Port)
 		}
-		if cfg.NumberOfPartitions != 16 {
-			t.Errorf("Unexpected default partitions: %d", cfg.NumberOfPartitions)
+		if cfg.NumberOfDatabases != 16 {
+			t.Errorf("Unexpected default databases: %d", cfg.NumberOfDatabases)
 		}
 	})
 
