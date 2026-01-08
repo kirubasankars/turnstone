@@ -1,3 +1,4 @@
+```markdown
 # TurnstoneDB
 
 **TurnstoneDB** is a high-performance, transactional Key-Value store written in Go. It features a custom storage engine inspired by **WiscKey** (separating keys from values), built-in **Change Data Capture (CDC)**, and support for **synchronous replication**.
@@ -6,46 +7,51 @@
 
 ## 🚀 Key Features
 
-* **⚡ WiscKey-style Storage Engine**: Uses an LSM-tree (LevelDB) for keys and an append-only Value Log (VLog) for values. This minimizes write amplification and improves throughput for large values.
-* **🔒 ACID Transactions**: Full support for multi-key transactions with **Snapshot Isolation**. Uses Optimistic Concurrency Control (OCC) to handle conflicts.
-* **🛡️ Secure by Default**: All connections (Client-Server and Inter-Node) are secured via **mTLS** (Mutual TLS). Certificates are auto-generated during initialization.
-* **📡 Replication**: Partition-aware Leader-Follower replication. Supports **Quorum Writes** (`minReplicas`) for synchronous durability.
-* **🌊 Change Data Capture (CDC)**: First-class support for streaming data changes to JSON logs or external systems.
-* **🦆 DuckDB Integration**: Includes a specialized loader (`turnstone-duck`) to ingest CDC streams directly into DuckDB for analytics.
+* ⚡ **WiscKey-style Storage Engine:** Uses an LSM-tree (LevelDB) for keys and an append-only Value Log (VLog) for values. This minimizes write amplification and improves throughput for large values.
+* 🔒 **ACID Transactions:** Full support for multi-key transactions with **Snapshot Isolation**. Uses Optimistic Concurrency Control (OCC) to handle conflicts.
+* 🛡️ **Secure by Default:** All connections (Client-Server and Inter-Node) are secured via **mTLS** (Mutual TLS). Certificates are auto-generated during initialization.
+* 📡 **Replication:** Partition-aware Leader-Follower replication. Supports **Quorum Writes** (`minReplicas`) for synchronous durability.
+* 🌊 **Change Data Capture (CDC):** First-class support for streaming data changes to JSON logs or external systems.
+* 🦆 **DuckDB Integration:** Includes a specialized loader (`turnstone-duck`) to ingest CDC streams directly into DuckDB for analytics.
 
 ---
 
 ## 🛠️ Architecture
 
-TurnstoneDB separates the storage of keys and values:
+TurnstoneDB separates the storage of keys and values using the `stonedb` engine:
 
-1. **LevelDB (Index):** Stores `Key -> <FileID, Offset, Size>`. Keeps the index small and cacheable.
-2. **Value Log (VLog):** Stores the actual values on disk in append-only files.
-3. **Write-Ahead Log (WAL):** Ensures durability and crash recovery.
+1.  **LevelDB (Index):** Stores `Key -> <FileID, Offset, Size>`. Keeps the index small and cacheable.
+2.  **Value Log (VLog):** Stores the actual values on disk in append-only files.
+3.  **Write-Ahead Log (WAL):** Ensures durability and crash recovery.
 
-**Write Flow:**
+### Write Flow & Group Commit
+To maximize throughput, TurnstoneDB uses an asynchronous **Group Commit Pipeline**:
 
-1. Transaction buffers writes in memory.
-2. On `Commit`, writes are grouped into a batch.
-3. Batch is appended to WAL and VLog.
-4. In-memory Index is updated.
+1.  **Prepare:** Transactions buffer writes in memory. On commit, conflicts are checked (OCC).
+2.  **Persist:** Concurrent transactions are batched together. The batch is appended to the WAL and VLog in a single I/O operation (fsync).
+3.  **Apply:** The in-memory Index is updated, and transactions are acknowledged to the client.
+
+### Crash Recovery
+The system is crash-safe. On startup:
+
+* **WAL Replay:** Any committed data in the WAL that is not yet in the VLog/Index is replayed.
+* **Truncation:** Partially written batches at the end of the WAL (due to power loss) are detected and truncated to ensure atomicity.
+* **Index Rebuild:** If the index is missing or corrupt, it can be fully reconstructed from the persistent Value Log.
 
 ---
 
 ## 📦 Installation & Getting Started
 
 ### Prerequisites
-
 * Go 1.21 or higher.
 * `make` (optional, for convenience).
 
 ### 1. Build the Binaries
-
 TurnstoneDB comes with a server and several utility tools.
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/turnstone.git
+git clone [https://github.com/yourusername/turnstone.git](https://github.com/yourusername/turnstone.git)
 cd turnstone
 
 # Build all binaries
@@ -167,6 +173,10 @@ Use `turnstone-duck` to watch the CDC logs and ingest them into a DuckDB databas
 
 ## ⚙️ Configuration (`turnstone.json`)
 
+The configuration file controls server behavior and storage engine tuning.
+
+### Server Options
+
 | Field | Default | Description |
 | --- | --- | --- |
 | `port` | `:6379` | TCP listening address. |
@@ -175,6 +185,17 @@ Use `turnstone-duck` to watch the CDC logs and ingest them into a DuckDB databas
 | `tls_cert_file` | `certs/server.crt` | Server TLS Certificate. |
 | `tls_key_file` | `certs/server.key` | Server Private Key. |
 | `tls_client_auth` | `true` | Enforces mTLS client verification. |
+
+### Storage Engine Options (StoneDB)
+
+These settings apply per-partition.
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `wal_max_size` | `10MB` | Size limit for a WAL file before rotation. |
+| `wal_retention` | `2h` | Duration to keep WAL files after they are checkpointed. |
+| `compaction_min_garbage` | `1MB` | Stale data threshold to trigger VLog garbage collection. |
+| `truncate_corrupt_wal` | `false` | If true, allow startup by truncating corrupt tail data. |
 
 ---
 
@@ -200,3 +221,7 @@ Use `turnstone-duck` to watch the CDC logs and ingest them into a DuckDB databas
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
+
+```
+
+```
