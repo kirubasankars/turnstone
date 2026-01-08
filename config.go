@@ -12,31 +12,24 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 )
 
-// DatabaseConfig defines the settings for a single logical database.
-type DatabaseConfig struct {
-	Name        string `json:"name"`
-	Role        string `json:"role"` // "leader" or "follower"
-	ReplicaOf   string `json:"replica_of"`
-	MinReplicas int    `json:"min_replicas"`
-}
-
 // Config represents the server configuration.
 type Config struct {
-	Port                  string           `json:"port"`
-	Debug                 bool             `json:"debug"`
-	MaxConns              int              `json:"max_conns"`
-	Fsync                 bool             `json:"fsync"`
-	AllowRecoveryTruncate bool             `json:"allow_recovery_truncate"`
-	TLSCertFile           string           `json:"tls_cert_file"`
-	TLSKeyFile            string           `json:"tls_key_file"`
-	TLSCAFile             string           `json:"tls_ca_file"`
-	TLSClientCertFile     string           `json:"tls_client_cert_file"`
-	TLSClientKeyFile      string           `json:"tls_client_key_file"`
-	MetricsAddr           string           `json:"metrics_addr"`
-	Databases             []DatabaseConfig `json:"databases"`
+	Port                  string `json:"port"`
+	Debug                 bool   `json:"debug"`
+	MaxConns              int    `json:"max_conns"`
+	Fsync                 bool   `json:"fsync"`
+	AllowRecoveryTruncate bool   `json:"allow_recovery_truncate"`
+	TLSCertFile           string `json:"tls_cert_file"`
+	TLSKeyFile            string `json:"tls_key_file"`
+	TLSCAFile             string `json:"tls_ca_file"`
+	TLSClientCertFile     string `json:"tls_client_cert_file"`
+	TLSClientKeyFile      string `json:"tls_client_key_file"`
+	MetricsAddr           string `json:"metrics_addr"`
+	NumberOfDatabases     int    `json:"number_of_databases"`
 }
 
 // ResolvePath returns an absolute path relative to the home directory if strictly necessary.
@@ -70,10 +63,11 @@ func GenerateConfigArtifacts(homeDir string, defaultCfg Config, configPath strin
 		}
 	}
 
-	for _, db := range defaultCfg.Databases {
-		dbPath := filepath.Join("data", db.Name)
+	for i := 0; i < defaultCfg.NumberOfDatabases; i++ {
+		dbName := strconv.Itoa(i)
+		dbPath := filepath.Join("data", dbName)
 		if err := os.MkdirAll(ResolvePath(homeDir, dbPath), 0o755); err != nil {
-			return fmt.Errorf("failed to create data directory for %s: %w", db.Name, err)
+			return fmt.Errorf("failed to create data directory for %s: %w", dbName, err)
 		}
 	}
 
