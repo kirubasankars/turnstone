@@ -32,11 +32,12 @@ func setupSharedCertEnv(t *testing.T) (string, *tls.Config) {
 	t.Logf("Test Artifacts Directory: %s", dir)
 
 	// Generate artifacts (including admin certs)
+	// Keeps NumberOfDatabases as config parameter but logically creates databases
 	if err := config.GenerateConfigArtifacts(dir, config.Config{
-		TLSCertFile:        "certs/server.crt",
-		TLSKeyFile:         "certs/server.key",
-		TLSCAFile:          "certs/ca.crt",
-		NumberOfPartitions: 4,
+		TLSCertFile:       "certs/server.crt",
+		TLSKeyFile:        "certs/server.key",
+		TLSCAFile:         "certs/ca.crt",
+		NumberOfDatabases: 4,
 	}, filepath.Join(dir, "config.json")); err != nil {
 		t.Fatalf("Failed to generate artifacts: %v", err)
 	}
@@ -59,13 +60,13 @@ func startServerNode(t *testing.T, baseDir, name string, sharedTLS *tls.Config) 
 
 	nodeDir := filepath.Join(baseDir, name)
 	stores := make(map[string]*store.Store)
-	for _, partitionName := range []string{"0", "1", "2", "3"} {
-		partPath := filepath.Join(nodeDir, "data", partitionName)
+	for _, dbName := range []string{"0", "1", "2", "3"} {
+		partPath := filepath.Join(nodeDir, "data", dbName)
 		st, err := store.NewStore(partPath, logger, true, 0, true)
 		if err != nil {
-			t.Fatalf("Failed to init store %s: %v", partitionName, err)
+			t.Fatalf("Failed to init store %s: %v", dbName, err)
 		}
-		stores[partitionName] = st
+		stores[dbName] = st
 	}
 
 	// Replication Manager needs SERVER certs to connect to upstream masters
@@ -156,19 +157,19 @@ func (c *replTestClient) AssertStatus(opCode byte, payload []byte, expectedStatu
 	return body
 }
 
-// selectPartition switches the client's active partition.
-func selectPartition(t *testing.T, c *replTestClient, partitionName string) {
-	c.AssertStatus(protocol.OpCodeSelect, []byte(partitionName), protocol.ResStatusOK)
+// selectDatabase switches the client's active database.
+func selectDatabase(t *testing.T, c *replTestClient, dbName string) {
+	c.AssertStatus(protocol.OpCodeSelect, []byte(dbName), protocol.ResStatusOK)
 }
 
 // configureReplication sends the REPLICAOF command.
-func configureReplication(t *testing.T, c *replTestClient, targetAddr, targetPartition string) {
+func configureReplication(t *testing.T, c *replTestClient, targetAddr, targetDB string) {
 	addrBytes := []byte(targetAddr)
-	partBytes := []byte(targetPartition)
-	payload := make([]byte, 4+len(addrBytes)+len(partBytes))
+	dbBytes := []byte(targetDB)
+	payload := make([]byte, 4+len(addrBytes)+len(dbBytes))
 	binary.BigEndian.PutUint32(payload[0:4], uint32(len(addrBytes)))
 	copy(payload[4:], addrBytes)
-	copy(payload[4+len(addrBytes):], partBytes)
+	copy(payload[4+len(addrBytes):], dbBytes)
 
 	c.AssertStatus(protocol.OpCodeReplicaOf, payload, protocol.ResStatusOK)
 }
@@ -232,20 +233,20 @@ func TestServer_ReplicaOf_Integration(t *testing.T) {
 	// Clients
 	clientPrimary := connectReplClient(t, primaryAddr, clientTLS)
 	defer clientPrimary.Close()
-	selectPartition(t, clientPrimary, "1")
+	selectDatabase(t, clientPrimary, "1")
 
 	// IMPORTANT: Connect to Replica as ADMIN to configure replication
 	clientReplicaAdmin := connectReplClient(t, replicaAddr, adminTLS)
 	defer clientReplicaAdmin.Close()
-	selectPartition(t, clientReplicaAdmin, "1")
+	selectDatabase(t, clientReplicaAdmin, "1")
 
 	// Connect as Client to Replica for Reading
 	clientReplicaRead := connectReplClient(t, replicaAddr, clientTLS)
 	defer clientReplicaRead.Close()
-	selectPartition(t, clientReplicaRead, "1")
+	selectDatabase(t, clientReplicaRead, "1")
 
 	// --- PHASE 1: START REPLICATION ---
-	// Configure Replica -> Primary (Partition 1) using ADMIN connection
+	// Configure Replica -> Primary (Database 1) using ADMIN connection
 	configureReplication(t, clientReplicaAdmin, primaryAddr, "1")
 
 	// Write to Primary using CLIENT connection
@@ -259,11 +260,11 @@ func TestServer_ReplicaOf_Integration(t *testing.T) {
 
 	// --- PHASE 2: STOP REPLICATION ---
 	// Send REPLICAOF NO ONE using ADMIN connection
-	// Payload: [0][][PartitionName] (AddrLen=0 implies stop)
-	partBytes := []byte("1")
-	stopPayload := make([]byte, 4+0+len(partBytes))
+	// Payload: [0][][DBName] (AddrLen=0 implies stop)
+	dbBytes := []byte("1")
+	stopPayload := make([]byte, 4+0+len(dbBytes))
 	binary.BigEndian.PutUint32(stopPayload[0:4], 0)
-	copy(stopPayload[4:], partBytes)
+	copy(stopPayload[4:], dbBytes)
 	clientReplicaAdmin.AssertStatus(protocol.OpCodeReplicaOf, stopPayload, protocol.ResStatusOK)
 
 	// Write K2 to Primary
@@ -296,24 +297,24 @@ func TestReplication_FanOut(t *testing.T) {
 	// Connect Clients
 	clientPrimary := connectReplClient(t, primaryAddr, clientTLS)
 	defer clientPrimary.Close()
-	selectPartition(t, clientPrimary, "1")
+	selectDatabase(t, clientPrimary, "1")
 
 	clientR1 := connectReplClient(t, r1Addr, clientTLS)
 	defer clientR1.Close()
-	selectPartition(t, clientR1, "1")
+	selectDatabase(t, clientR1, "1")
 
 	clientR2 := connectReplClient(t, r2Addr, clientTLS)
 	defer clientR2.Close()
-	selectPartition(t, clientR2, "1")
+	selectDatabase(t, clientR2, "1")
 
 	// Admin clients for configuration
 	adminR1 := connectReplClient(t, r1Addr, adminTLS)
 	defer adminR1.Close()
-	selectPartition(t, adminR1, "1")
+	selectDatabase(t, adminR1, "1")
 
 	adminR2 := connectReplClient(t, r2Addr, adminTLS)
 	defer adminR2.Close()
-	selectPartition(t, adminR2, "1")
+	selectDatabase(t, adminR2, "1")
 
 	// Configure
 	configureReplication(t, adminR1, primaryAddr, "1")
@@ -351,32 +352,32 @@ func TestReplication_Cascading(t *testing.T) {
 	// Clients
 	clientA := connectReplClient(t, addrA, clientTLS)
 	defer clientA.Close()
-	selectPartition(t, clientA, "1")
+	selectDatabase(t, clientA, "1")
 
 	clientB := connectReplClient(t, addrB, clientTLS)
 	defer clientB.Close()
-	selectPartition(t, clientB, "1")
+	selectDatabase(t, clientB, "1")
 
 	clientC := connectReplClient(t, addrC, clientTLS)
 	defer clientC.Close()
-	selectPartition(t, clientC, "1")
+	selectDatabase(t, clientC, "1")
 
 	// Admins for config
 	adminB := connectReplClient(t, addrB, adminTLS)
 	defer adminB.Close()
-	selectPartition(t, adminB, "1")
+	selectDatabase(t, adminB, "1")
 
 	adminC := connectReplClient(t, addrC, adminTLS)
 	defer adminC.Close()
-	selectPartition(t, adminC, "1")
+	selectDatabase(t, adminC, "1")
 
-	// Configure B -> A (Partition 1)
+	// Configure B -> A (Database 1)
 	configureReplication(t, adminB, addrA, "1")
 
-	// Configure C -> B (Partition 1)
+	// Configure C -> B (Database 1)
 	configureReplication(t, adminC, addrB, "1")
 
-	// Write to A (Partition 1)
+	// Write to A (Database 1)
 	writeKeyVal(t, clientA, "cascadeKey", "cascadeVal")
 
 	// Verify C gets it (transitively via B)
@@ -386,8 +387,8 @@ func TestReplication_Cascading(t *testing.T) {
 	}, "Cascading replication failed: Node C did not receive data from Node A via Node B")
 }
 
-// TestReplication_SameServer_Loopback tests replication between two partitions on the SAME server.
-// Topology: NodeA(Partition 1) -> NodeA(Partition 2)
+// TestReplication_SameServer_Loopback tests replication between two databases on the SAME server.
+// Topology: NodeA(Database 1) -> NodeA(Database 2)
 func TestReplication_SameServer_Loopback(t *testing.T) {
 	baseDir, clientTLS := setupSharedCertEnv(t)
 	adminTLS := getRoleTLS(t, baseDir, "admin")
@@ -402,20 +403,20 @@ func TestReplication_SameServer_Loopback(t *testing.T) {
 	adminClient := connectReplClient(t, addr, adminTLS)
 	defer adminClient.Close()
 
-	// 1. Write data to Source Partition "1"
-	selectPartition(t, client, "1")
+	// 1. Write data to Source Database "1"
+	selectDatabase(t, client, "1")
 	writeKeyVal(t, client, "loopKey", "loopVal")
 
-	// 2. Select Target Partition "2" and configure replication from Partition "1" on the SAME address
-	selectPartition(t, client, "2")
-	selectPartition(t, adminClient, "2") // Admin also needs to be on target partition
+	// 2. Select Target Database "2" and configure replication from Database "1" on the SAME address
+	selectDatabase(t, client, "2")
+	selectDatabase(t, adminClient, "2") // Admin also needs to be on target DB
 	configureReplication(t, adminClient, addr, "1")
 
-	// 3. Verify data appears in Partition "2"
+	// 3. Verify data appears in Database "2"
 	waitForConditionOrTimeout(t, 10*time.Second, func() bool {
 		val := readKey(t, client, "loopKey")
 		return string(val) == "loopVal"
-	}, "Loopback replication failed: Partition 2 did not sync from Partition 1 on same server")
+	}, "Loopback replication failed: Database 2 did not sync from Database 1 on same server")
 }
 
 // TestReplication_SlowConsumer_Dropped verifies that the primary closes the connection
@@ -440,15 +441,15 @@ func TestReplication_SlowConsumer_Dropped(t *testing.T) {
 	}
 	defer conn.Close()
 
-	// 4. Send Hello Handshake to subscribe to "1" Partition (Valid Partition)
-	partitionName := "1"
+	// 4. Send Hello Handshake to subscribe to "1" Database (Valid Database)
+	dbName := "1"
 
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.BigEndian, uint32(1)) // Version
-	binary.Write(buf, binary.BigEndian, uint32(1)) // NumPartitions
+	binary.Write(buf, binary.BigEndian, uint32(1)) // NumDatabases
 
-	binary.Write(buf, binary.BigEndian, uint32(len(partitionName)))
-	buf.WriteString(partitionName)
+	binary.Write(buf, binary.BigEndian, uint32(len(dbName)))
+	buf.WriteString(dbName)
 	binary.Write(buf, binary.BigEndian, uint64(0)) // Start from LogSeq 0
 
 	header := make([]byte, 5)
@@ -470,7 +471,7 @@ func TestReplication_SlowConsumer_Dropped(t *testing.T) {
 		}
 		defer genConn.Close()
 
-		// Select partition 1
+		// Select database 1
 		pName := []byte("1")
 		sel := make([]byte, 9+len(pName))
 		sel[0] = protocol.OpCodeSelect

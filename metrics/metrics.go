@@ -18,6 +18,7 @@ type ServerStatsProvider interface {
 	ActiveConns() int64
 	TotalConns() uint64
 	ActiveTxs() int64
+	DatabaseConns(dbName string) int64
 }
 
 type TurnstoneCollector struct {
@@ -27,13 +28,18 @@ type TurnstoneCollector struct {
 	// Server-wide metrics
 	activeConns    *prometheus.Desc
 	totalConns     *prometheus.Desc
-	totalActiveTxs *prometheus.Desc // Aggregate server-wide active transactions
+	totalActiveTxs *prometheus.Desc
 
-	// Per-partition metrics
-	partitionKeys      *prometheus.Desc
-	partitionActiveTxs *prometheus.Desc
-	partitionConflicts *prometheus.Desc
-	partitionOffset    *prometheus.Desc
+	// Per-database metrics
+	dbConnections *prometheus.Desc
+	dbActiveTxs   *prometheus.Desc
+	dbConflicts   *prometheus.Desc
+	dbOffset      *prometheus.Desc
+	dbReplicaLag  *prometheus.Desc
+	dbWALFiles    *prometheus.Desc
+	dbWALBytes    *prometheus.Desc
+	dbVLogFiles   *prometheus.Desc
+	dbVLogBytes   *prometheus.Desc
 }
 
 func NewTurnstoneCollector(stores map[string]*store.Store, stats ServerStatsProvider) *TurnstoneCollector {
@@ -41,14 +47,21 @@ func NewTurnstoneCollector(stores map[string]*store.Store, stats ServerStatsProv
 		stores:      stores,
 		serverStats: stats,
 
+		// Server Wide
 		activeConns:    newDesc("server", "connections_active", "Active connections"),
 		totalConns:     newDesc("server", "connections_accepted_total", "Total connections"),
 		totalActiveTxs: newDesc("server", "transactions_active", "Total active transactions across server"),
 
-		partitionKeys:      newDescWithLabels("partition", "keys", "Total keys in partition", []string{"partition"}),
-		partitionActiveTxs: newDescWithLabels("partition", "active_txs", "Active transactions in partition", []string{"partition"}),
-		partitionConflicts: newDescWithLabels("partition", "conflicts_total", "Total transaction conflicts in partition", []string{"partition"}),
-		partitionOffset:    newDescWithLabels("partition", "offset", "Current WAL/VLog offset (LogID)", []string{"partition"}),
+		// Per Database
+		dbConnections: newDescWithLabels("db", "connections", "Active connections to this database", []string{"db"}),
+		dbActiveTxs:   newDescWithLabels("db", "active_txs", "Active transactions in database", []string{"db"}),
+		dbConflicts:   newDescWithLabels("db", "conflicts_total", "Total transaction conflicts in database", []string{"db"}),
+		dbOffset:      newDescWithLabels("db", "offset", "Current WAL/VLog offset (LogID)", []string{"db"}),
+		dbReplicaLag:  newDescWithLabels("db", "replica_lag", "Lag of the slowest replica in operations", []string{"db"}),
+		dbWALFiles:    newDescWithLabels("db", "wal_files", "Number of WAL files", []string{"db"}),
+		dbWALBytes:    newDescWithLabels("db", "wal_bytes", "Total size of WAL in bytes", []string{"db"}),
+		dbVLogFiles:   newDescWithLabels("db", "vlog_files", "Number of VLog files", []string{"db"}),
+		dbVLogBytes:   newDescWithLabels("db", "vlog_bytes", "Total size of VLog in bytes", []string{"db"}),
 	}
 }
 
@@ -64,10 +77,15 @@ func (c *TurnstoneCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.activeConns
 	ch <- c.totalConns
 	ch <- c.totalActiveTxs
-	ch <- c.partitionKeys
-	ch <- c.partitionActiveTxs
-	ch <- c.partitionConflicts
-	ch <- c.partitionOffset
+	ch <- c.dbConnections
+	ch <- c.dbActiveTxs
+	ch <- c.dbConflicts
+	ch <- c.dbOffset
+	ch <- c.dbReplicaLag
+	ch <- c.dbWALFiles
+	ch <- c.dbWALBytes
+	ch <- c.dbVLogFiles
+	ch <- c.dbVLogBytes
 }
 
 func (c *TurnstoneCollector) Collect(ch chan<- prometheus.Metric) {
@@ -80,10 +98,20 @@ func (c *TurnstoneCollector) Collect(ch chan<- prometheus.Metric) {
 	for name, db := range c.stores {
 		stats := db.Stats()
 
-		ch <- prometheus.MustNewConstMetric(c.partitionKeys, prometheus.GaugeValue, float64(stats.KeyCount), name)
-		ch <- prometheus.MustNewConstMetric(c.partitionActiveTxs, prometheus.GaugeValue, float64(stats.ActiveTxs), name)
-		ch <- prometheus.MustNewConstMetric(c.partitionConflicts, prometheus.CounterValue, float64(stats.Conflicts), name)
-		ch <- prometheus.MustNewConstMetric(c.partitionOffset, prometheus.GaugeValue, float64(stats.Offset), name)
+		dbConns := float64(0)
+		if c.serverStats != nil {
+			dbConns = float64(c.serverStats.DatabaseConns(name))
+		}
+
+		ch <- prometheus.MustNewConstMetric(c.dbConnections, prometheus.GaugeValue, dbConns, name)
+		ch <- prometheus.MustNewConstMetric(c.dbActiveTxs, prometheus.GaugeValue, float64(stats.ActiveTxs), name)
+		ch <- prometheus.MustNewConstMetric(c.dbConflicts, prometheus.CounterValue, float64(stats.Conflicts), name)
+		ch <- prometheus.MustNewConstMetric(c.dbOffset, prometheus.GaugeValue, float64(stats.Offset), name)
+		ch <- prometheus.MustNewConstMetric(c.dbReplicaLag, prometheus.GaugeValue, float64(stats.ReplicaLag), name)
+		ch <- prometheus.MustNewConstMetric(c.dbWALFiles, prometheus.GaugeValue, float64(stats.WALFiles), name)
+		ch <- prometheus.MustNewConstMetric(c.dbWALBytes, prometheus.GaugeValue, float64(stats.WALSize), name)
+		ch <- prometheus.MustNewConstMetric(c.dbVLogFiles, prometheus.GaugeValue, float64(stats.VLogFiles), name)
+		ch <- prometheus.MustNewConstMetric(c.dbVLogBytes, prometheus.GaugeValue, float64(stats.VLogSize), name)
 	}
 }
 

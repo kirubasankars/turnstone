@@ -22,7 +22,7 @@ import (
 type CDCConfig struct {
 	Host        string
 	Home        string
-	Partition   string
+	Database    string // Renamed from Partition
 	StateFile   string
 	TextMode    bool
 	MetricsAddr string
@@ -110,8 +110,8 @@ func StartCDC(cfg CDCConfig) {
 			if strings.Contains(err.Error(), "OUT_OF_SYNC") {
 				fmt.Fprintf(os.Stderr, "\n!!! FATAL REPLICATION ERROR !!!\n")
 				fmt.Fprintf(os.Stderr, "Message: %v\n", err)
-				fmt.Fprintf(os.Stderr, "Cause:   The server has purged the logs required to resume from ID %d.\n", lastSeq)
-				fmt.Fprintf(os.Stderr, "Action:  Delete the state file '%s' to resync from the server's current head.\n", cfg.StateFile)
+				fmt.Fprintf(os.Stderr, "Cause:    The server has purged the logs required to resume from ID %d.\n", lastSeq)
+				fmt.Fprintf(os.Stderr, "Action:   Delete the state file '%s' to resync from the server's current head.\n", cfg.StateFile)
 				os.Exit(1)
 			}
 			fmt.Fprintf(os.Stderr, "CDC Disconnected: %v. Retrying in %v...\n", err, backoff)
@@ -194,7 +194,7 @@ func runCDCStream(ctx context.Context, cfg CDCConfig, startID uint64, encoder *j
 		flushState(latestSeenSeq)
 	}()
 
-	return cl.Subscribe(cfg.Partition, startID, func(c client.Change) error {
+	return cl.Subscribe(cfg.Database, startID, func(c client.Change) error {
 		evt := Event{
 			Seq:      c.LogSeq,
 			Tx:       c.TxID,

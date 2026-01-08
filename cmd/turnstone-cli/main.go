@@ -76,7 +76,7 @@ func main() {
 	}
 
 	fmt.Println("Connected.")
-	fmt.Println("Commands: select <db>, replicaof <host:port> <remote_db>, get <k>, set <k> <v>, del <k>, begin, commit, abort, stat, clear, quit")
+	fmt.Println("Commands: select <db>, replicaof <host:port> <remote_db>, get <k>, set <k> <v>, del <k>, begin, commit, abort, clear, quit")
 	fmt.Print("> ")
 
 	// 2. Interactive Loop
@@ -109,19 +109,12 @@ func main() {
 func handleCommand(cl *client.Client, cmd string, parts []string) {
 	var err error
 	var result []byte
-	var resultStr string
 
 	switch cmd {
 	case "ping":
 		err = cl.Ping()
 		if err == nil {
 			fmt.Println("PONG")
-		}
-
-	case "stat":
-		resultStr, err = cl.Stat()
-		if err == nil {
-			fmt.Println(resultStr)
 		}
 
 	case "select":
