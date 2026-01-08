@@ -374,3 +374,170 @@ func TestCompaction_PrunesVersionChains(t *testing.T) {
 		t.Errorf("Expected v4, got %s", val)
 	}
 }
+
+// TestCompaction_BatchFlushLimit triggers the batch flush logic in RunCompaction.
+// RunCompaction has a batch limit of 1000 entries (maxBatchCount).
+// We write 1500 valid entries, ensure they are kept valid, and run compaction.
+// This forces rewriteBatch to be called mid-loop.
+func TestCompaction_BatchFlushLimit(t *testing.T) {
+	dir := t.TempDir()
+	// MinGarbage 1 ensures compaction runs on any file with garbage.
+	opts := Options{CompactionMinGarbage: 1}
+	db, err := Open(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// 1. Write 1500 items into File 0.
+	count := 1500
+	for i := 0; i < count; i++ {
+		tx := db.NewTransaction(true)
+		// Use small values so we don't hit the byte limit (2MB) first
+		tx.Put([]byte(fmt.Sprintf("k-%04d", i)), []byte("val"))
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Force rotation to seal File 0
+	if err := db.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Make File 0 eligible for compaction by invalidating a few entries.
+	// We update the first 50 keys.
+	// File 0: 50 garbage, 1450 valid.
+	// Compaction loop logic expected:
+	// - Iterate 1500 entries
+	// - Skip 50 (stale)
+	// - Buffer 1000 valid -> Flush (Reset buffer)
+	// - Buffer 450 valid -> Flush at end
+	for i := 0; i < 50; i++ {
+		tx := db.NewTransaction(true)
+		tx.Put([]byte(fmt.Sprintf("k-%04d", i)), []byte("val-new"))
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Checkpoint again so updates are in File 1 (or 2) and leave File 0 untouched
+	if err := db.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Run Compaction
+	if err := db.RunCompaction(); err != nil {
+		t.Fatalf("Compaction failed: %v", err)
+	}
+
+	// 4. Verify all data is present and correct
+	for i := 0; i < count; i++ {
+		tx := db.NewTransaction(false)
+		key := []byte(fmt.Sprintf("k-%04d", i))
+		val, err := tx.Get(key)
+		if err != nil {
+			t.Fatalf("Key %s missing after compaction: %v", key, err)
+		}
+
+		expected := "val"
+		if i < 50 {
+			expected = "val-new"
+		}
+
+		if string(val) != expected {
+			t.Errorf("Key %s value mismatch. Got %s, want %s", key, val, expected)
+		}
+		tx.Discard()
+	}
+}
+
+func TestCompaction_MixedScenario_CrossCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	opts := Options{
+		CompactionMinGarbage: 1,
+		MaxWALSize:           1024 * 1024,
+	}
+	db, err := Open(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// 1. Setup File 0 (Checkpoint 1)
+	// Key A: Active
+	// Key B: Will be updated (Deprecated)
+	// Key C: Will be deleted (Removed)
+	tx := db.NewTransaction(true)
+	tx.Put([]byte("A"), []byte("valA_v1"))
+	tx.Put([]byte("B"), []byte("valB_v1"))
+	tx.Put([]byte("C"), []byte("valC_v1"))
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Force rotation to File 1. File 0 is now sealed.
+	if err := db.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Setup File 1 (Checkpoint 2) - Modifications
+	tx = db.NewTransaction(true)
+	tx.Put([]byte("B"), []byte("valB_v2")) // Updates B (v1 deprecated)
+	tx.Delete([]byte("C"))                 // Deletes C (v1 removed)
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Force rotation to File 2. File 1 is now sealed.
+	if err := db.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify initial state before compaction
+	// File 0 should have garbage because B and C were updated/deleted.
+	db.mu.RLock()
+	if _, ok := db.deletedBytesByFile[0]; !ok {
+		t.Error("File 0 should have garbage recorded")
+	}
+	db.mu.RUnlock()
+
+	// 3. Run Compaction on File 0
+	if err := db.RunCompaction(); err != nil {
+		t.Fatalf("Compaction failed: %v", err)
+	}
+
+	// 4. Verify Data integrity
+	tx = db.NewTransaction(false)
+	defer tx.Discard()
+
+	// A should exist (v1) - preserved
+	val, err := tx.Get([]byte("A"))
+	if err != nil {
+		t.Fatalf("Key A missing: %v", err)
+	}
+	if string(val) != "valA_v1" {
+		t.Errorf("Key A mismatch: got %s, want valA_v1", val)
+	}
+
+	// B should exist (v2) - active version preserved
+	val, err = tx.Get([]byte("B"))
+	if err != nil {
+		t.Fatalf("Key B missing: %v", err)
+	}
+	if string(val) != "valB_v2" {
+		t.Errorf("Key B mismatch: got %s, want valB_v2", val)
+	}
+
+	// C should be deleted
+	_, err = tx.Get([]byte("C"))
+	if err != ErrKeyNotFound {
+		t.Errorf("Key C should be not found, got %v", err)
+	}
+
+	// 5. Verify File 0 Deletion
+	vlog0 := filepath.Join(dir, "vlog", fmt.Sprintf("%04d.vlog", 0))
+	if _, err := os.Stat(vlog0); !os.IsNotExist(err) {
+		t.Errorf("File 0 should have been deleted, exists at %s", vlog0)
+	}
+}
