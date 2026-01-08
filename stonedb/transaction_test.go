@@ -185,3 +185,85 @@ func TestIsolation_DisjointWrites_Succeeds(t *testing.T) {
 		t.Errorf("Tx1 failed to commit in disjoint scenario: %v", err)
 	}
 }
+
+// TestTransaction_ReadYourOwnWrites verifies that a transaction sees its own modifications
+// (Put and Delete) immediately within the transaction, masking the underlying database state.
+func TestTransaction_ReadYourOwnWrites(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// 1. Setup: Commit "key_A" -> "val_db"
+	{
+		tx := db.NewTransaction(true)
+		tx.Put([]byte("key_A"), []byte("val_db"))
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 2. Start a new transaction
+	tx := db.NewTransaction(true)
+	defer tx.Discard()
+
+	// Scenario A: Local Put shadows DB value
+	// We put "val_local". A subsequent Get should return "val_local", not "val_db".
+	if err := tx.Put([]byte("key_A"), []byte("val_local")); err != nil {
+		t.Fatal(err)
+	}
+	val, err := tx.Get([]byte("key_A"))
+	if err != nil {
+		t.Fatalf("Get key_A failed: %v", err)
+	}
+	if string(val) != "val_local" {
+		t.Errorf("Expected val_local, got %s", val)
+	}
+
+	// Scenario B: Local Put for new key
+	if err := tx.Put([]byte("key_B"), []byte("val_B")); err != nil {
+		t.Fatal(err)
+	}
+	val, err = tx.Get([]byte("key_B"))
+	if err != nil {
+		t.Fatalf("Get key_B failed: %v", err)
+	}
+	if string(val) != "val_B" {
+		t.Errorf("Expected val_B, got %s", val)
+	}
+
+	// Scenario C: Local Delete shadows Local Put
+	// We delete "key_B". Get should return ErrKeyNotFound.
+	if err := tx.Delete([]byte("key_B")); err != nil {
+		t.Fatal(err)
+	}
+	_, err = tx.Get([]byte("key_B"))
+	if err != ErrKeyNotFound {
+		t.Errorf("Expected ErrKeyNotFound for key_B after delete, got %v", err)
+	}
+
+	// Scenario D: Local Delete shadows DB value
+	// key_A is currently "val_local" in pendingOps. Delete it.
+	if err := tx.Delete([]byte("key_A")); err != nil {
+		t.Fatal(err)
+	}
+	_, err = tx.Get([]byte("key_A"))
+	if err != ErrKeyNotFound {
+		t.Errorf("Expected ErrKeyNotFound for key_A after delete, got %v", err)
+	}
+
+	// Scenario E: Re-Put after Delete
+	// Verify we can write to a key that was previously deleted in the same transaction.
+	if err := tx.Put([]byte("key_A"), []byte("val_resurrected")); err != nil {
+		t.Fatal(err)
+	}
+	val, err = tx.Get([]byte("key_A"))
+	if err != nil {
+		t.Fatalf("Get key_A failed: %v", err)
+	}
+	if string(val) != "val_resurrected" {
+		t.Errorf("Expected val_resurrected, got %s", val)
+	}
+}

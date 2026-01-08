@@ -58,9 +58,11 @@ type DB struct {
 	commitCh chan commitRequest
 
 	// Config
-	minGarbageThreshold int64
-	checksumInterval    time.Duration
-	walRetentionTime    time.Duration
+	minGarbageThreshold    int64
+	checksumInterval       time.Duration
+	autoCheckpointInterval time.Duration
+	compactionInterval     time.Duration
+	walRetentionTime       time.Duration
 }
 
 // Open initializes the DB.
@@ -79,6 +81,14 @@ func Open(dir string, opts Options) (*DB, error) {
 	if opts.WALRetentionTime == 0 {
 		opts.WALRetentionTime = 2 * time.Hour
 	}
+	// Default AutoCheckpoint to 60 seconds if not set
+	if opts.AutoCheckpointInterval == 0 {
+		opts.AutoCheckpointInterval = 60 * time.Second
+	}
+	// Default CompactionInterval to 2 minutes if not set
+	if opts.CompactionInterval == 0 {
+		opts.CompactionInterval = 2 * time.Minute
+	}
 
 	// 1. Storage Components
 	wal, err := OpenWriteAheadLog(filepath.Join(dir, "wal"), opts.MaxWALSize)
@@ -93,16 +103,18 @@ func Open(dir string, opts Options) (*DB, error) {
 	}
 
 	db := &DB{
-		dir:                 dir,
-		writeAheadLog:       wal,
-		valueLog:            vl,
-		deletedBytesByFile:  make(map[uint32]int64),
-		activeTxns:          make(map[*Transaction]uint64),
-		closeCh:             make(chan struct{}),
-		commitCh:            make(chan commitRequest, 500),
-		minGarbageThreshold: opts.CompactionMinGarbage,
-		checksumInterval:    opts.ChecksumInterval,
-		walRetentionTime:    opts.WALRetentionTime,
+		dir:                    dir,
+		writeAheadLog:          wal,
+		valueLog:               vl,
+		deletedBytesByFile:     make(map[uint32]int64),
+		activeTxns:             make(map[*Transaction]uint64),
+		closeCh:                make(chan struct{}),
+		commitCh:               make(chan commitRequest, 500),
+		minGarbageThreshold:    opts.CompactionMinGarbage,
+		checksumInterval:       opts.ChecksumInterval,
+		autoCheckpointInterval: opts.AutoCheckpointInterval,
+		compactionInterval:     opts.CompactionInterval,
+		walRetentionTime:       opts.WALRetentionTime,
 	}
 
 	// 2. Recovery (VLog -> WAL -> Index)
@@ -317,7 +329,7 @@ func (db *DB) SetWALRetentionTime(d time.Duration) {
 // Background Task: Auto Checkpoint
 func (db *DB) runAutoCheckpoint() {
 	defer db.wg.Done()
-	ticker := time.NewTicker(60 * time.Second)
+	ticker := time.NewTicker(db.autoCheckpointInterval)
 	defer ticker.Stop()
 
 	for {
@@ -358,7 +370,7 @@ func (db *DB) runAutoCheckpoint() {
 // Background Task: Auto Compaction
 func (db *DB) runAutoCompaction() {
 	defer db.wg.Done()
-	ticker := time.NewTicker(2 * time.Minute)
+	ticker := time.NewTicker(db.compactionInterval)
 	defer ticker.Stop()
 
 	for {
