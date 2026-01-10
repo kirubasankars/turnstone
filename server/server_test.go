@@ -70,7 +70,7 @@ func setupTestEnv(t *testing.T) (string, map[string]*store.Store, *Server, func(
 	stores := make(map[string]*store.Store)
 	for i := 0; i < 4; i++ {
 		dbName := strconv.Itoa(i)
-		store, err := store.NewStore(filepath.Join(dir, "data", dbName), logger, true, 0, true)
+		store, err := store.NewStore(filepath.Join(dir, "data", dbName), logger, true, 0, true, "time")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -91,10 +91,11 @@ func setupTestEnv(t *testing.T) (string, map[string]*store.Store, *Server, func(
 	pool.AppendCertsFromPEM(caCert)
 	tlsConf := &tls.Config{Certificates: []tls.Certificate{clientCert}, RootCAs: pool, InsecureSkipVerify: true}
 
-	rm := replication.NewReplicationManager(stores, tlsConf, logger)
+	rm := replication.NewReplicationManager("test-server", stores, tlsConf, logger)
 
 	// 4. Init Server (Port 0 for random free port)
 	srv, err := NewServer(
+		"test-server",
 		":0", stores, logger,
 		10, // MaxConns
 		filepath.Join(certsDir, "server.crt"),
@@ -597,6 +598,7 @@ func TestServer_Backpressure(t *testing.T) {
 	// Initialize a NEW server (S2) with MaxConns = 1 manually.
 	// Note: It reuses the same 'stores' map.
 	srv, err := NewServer(
+		"backpressure-server",
 		":0", stores, logger,
 		1, // MaxConns = 1
 		filepath.Join(certsDir, "server.crt"),
@@ -815,6 +817,9 @@ func TestCDC_PurgedWAL_ReturnsError(t *testing.T) {
 	// Handshake
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.BigEndian, uint32(1)) // Ver
+	clientid := "test-cdc"
+	binary.Write(buf, binary.BigEndian, uint32(len(clientid)))
+	buf.WriteString(clientid)
 	binary.Write(buf, binary.BigEndian, uint32(1)) // Count
 	part := "1"
 	binary.Write(buf, binary.BigEndian, uint32(len(part)))
