@@ -56,24 +56,27 @@ func main() {
 
 func runInit(home string) error {
 	defaultCfg := config.Config{
-		Port:              ":6379",
-		Debug:             true,
-		MaxConns:          1000,
-		NumberOfDatabases: 16,
-		TLSCertFile:       "certs/server.crt",
-		TLSKeyFile:        "certs/server.key",
-		TLSCAFile:         "certs/ca.crt",
-		TLSClientCertFile: "certs/client.crt",
-		TLSClientKeyFile:  "certs/client.key",
-		MetricsAddr:       ":9090",
-		WALRetention:      "2h", // Default
+		Port:                 ":6379",
+		Debug:                true,
+		MaxConns:             1000,
+		NumberOfDatabases:    16,
+		TLSCertFile:          "certs/server.crt",
+		TLSKeyFile:           "certs/server.key",
+		TLSCAFile:            "certs/ca.crt",
+		TLSClientCertFile:    "certs/client.crt",
+		TLSClientKeyFile:     "certs/client.key",
+		MetricsAddr:          ":9090",
+		WALRetention:         "2h",          // Default duration if strategy is time
+		WALRetentionStrategy: "replication", // Default strategy
 	}
+	// ID generation logic moved to config.GenerateConfigArtifacts
 	configPath := filepath.Join(home, "turnstone.json")
 	if err := config.GenerateConfigArtifacts(home, defaultCfg, configPath); err != nil {
 		return fmt.Errorf("failed to generate artifacts: %w", err)
 	}
 
 	cdcCfg := struct {
+		ID             string `json:"id"` // Unique CDC Client ID
 		Host           string `json:"host"`
 		Database       string `json:"database"`
 		OutputDir      string `json:"output_dir"`
@@ -87,6 +90,7 @@ func runInit(home string) error {
 		TLSKeyFile     string `json:"tls_key_file"`
 		TLSCAFile      string `json:"tls_ca_file"`
 	}{
+		ID:             "cdc-worker-1",
 		Host:           "localhost:6379",
 		Database:       "1",
 		OutputDir:      "cdc_logs",
@@ -142,6 +146,11 @@ func runServer(logger *slog.Logger) {
 		}
 	}
 
+	// Set default strategy if missing
+	if cfg.WALRetentionStrategy == "" {
+		cfg.WALRetentionStrategy = "replication"
+	}
+
 	certFile := config.ResolvePath(*homeDir, cfg.TLSCertFile)
 	keyFile := config.ResolvePath(*homeDir, cfg.TLSKeyFile)
 	caFile := config.ResolvePath(*homeDir, cfg.TLSCAFile)
@@ -154,13 +163,17 @@ func runServer(logger *slog.Logger) {
 		name := strconv.Itoa(i)
 		path := filepath.Join(*homeDir, "data", name)
 		isSystem := (i == 0)
-		st, err := store.NewStore(path, logger.With("db", name), true, 0, isSystem)
+		st, err := store.NewStore(path, logger.With("db", name), true, 0, isSystem, cfg.WALRetentionStrategy)
 		if err != nil {
 			logger.Error("Failed to initialize store", "db", name, "err", err)
 			os.Exit(1)
 		}
-		// Set retention on the underlying DB
-		st.DB.SetWALRetentionTime(walRetention)
+		// Set retention duration on the underlying DB only if strategy is "time".
+		// If strategy is "replication", NewStore initializes it to 0 (disabled),
+		// and we should NOT overwrite it with the config value here.
+		if cfg.WALRetentionStrategy == "time" {
+			st.DB.SetWALRetentionTime(walRetention)
+		}
 		stores[name] = st
 	}
 
@@ -170,9 +183,10 @@ func runServer(logger *slog.Logger) {
 		os.Exit(1)
 	}
 
-	rm := replication.NewReplicationManager(stores, replTLS, logger)
+	rm := replication.NewReplicationManager(cfg.ID, stores, replTLS, logger)
 
 	srv, err := server.NewServer(
+		cfg.ID,
 		cfg.Port,
 		stores,
 		logger,
@@ -225,6 +239,7 @@ type CDCState struct {
 
 func runCDC(logger *slog.Logger) {
 	cfg := struct {
+		ID             string `json:"id"`
 		Host           string `json:"host"`
 		Database       string `json:"database"`
 		OutputDir      string `json:"output_dir"`
@@ -238,6 +253,7 @@ func runCDC(logger *slog.Logger) {
 		TLSKeyFile     string `json:"tls_key_file"`
 		TLSCAFile      string `json:"tls_ca_file"`
 	}{
+		ID:             "cdc-default",
 		Host:           "localhost:6379",
 		Database:       "1",
 		OutputDir:      "cdc_logs",
@@ -435,7 +451,7 @@ func runCDC(logger *slog.Logger) {
 		}
 	}()
 
-	logger.Info("Starting subscription loop", "database", cfg.Database, "format", cfg.ValueFormat)
+	logger.Info("Starting subscription loop", "database", cfg.Database, "format", cfg.ValueFormat, "client_id", cfg.ID)
 
 	// Main Loop
 Loop:
@@ -465,6 +481,34 @@ Loop:
 			case <-time.After(5 * time.Second):
 				continue Loop
 			}
+		}
+
+		// Inject Configured ID into the client so it's used during Subscribe handshake
+		// Note: We need access to the underlying client config or a way to set it.
+		// Since NewMTLSClientHelper returns a *Client with configured struct, we can't easily mutate it
+		// without a setter or modifying NewMTLSClientHelper.
+		// HOWEVER, we modified client.Config to include ClientID. NewMTLSClientHelper needs to support it or we reconstruct manually.
+		// The helper doesn't take ClientID arg. We'll reconstruct manually here to be safe and explicit.
+		cli.Close() // Close the helper-created one
+
+		// Rebuild properly
+		caCert, _ := os.ReadFile(caPath)
+		pool := x509.NewCertPool()
+		pool.AppendCertsFromPEM(caCert)
+		cert, _ := tls.LoadX509KeyPair(certPath, keyPath)
+		tlsConf := &tls.Config{RootCAs: pool, Certificates: []tls.Certificate{cert}}
+
+		cli, err = client.NewClient(client.Config{
+			Address:        cfg.Host,
+			ClientID:       cfg.ID,
+			TLSConfig:      tlsConf,
+			ConnectTimeout: 5 * time.Second,
+			Logger:         logger,
+		})
+		if err != nil {
+			logger.Error("Client rebuild failed", "err", err)
+			time.Sleep(5 * time.Second)
+			continue Loop
 		}
 
 		logger.Info("Connected, subscribing...", "seq", lastSeenSeq)
