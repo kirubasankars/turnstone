@@ -30,9 +30,14 @@ func TestCDC_Streaming_WithIdle(t *testing.T) {
 	defer cdcConn.Close()
 
 	// 2. Send Hello Handshake
-	// Format: [Ver:4][NumDBs:4] ... [NameLen:4][Name][LogID:8]
+	// Format: [Ver:4][IDLen:4][ID][NumDBs:4] ... [NameLen:4][Name][LogID:8]
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.BigEndian, uint32(1)) // Version
+
+	clientID := "cdc-test-idle"
+	binary.Write(buf, binary.BigEndian, uint32(len(clientID)))
+	buf.WriteString(clientID)
+
 	binary.Write(buf, binary.BigEndian, uint32(1)) // Database Count
 
 	dbName := "1"
@@ -114,8 +119,14 @@ func TestCDC_MessageContent(t *testing.T) {
 	defer cdcConn.Close()
 
 	// 2. Handshake (StartSeq 0)
+	// Format: [Ver:4][IDLen:4][ID][NumDBs:4] ... [NameLen:4][Name][LogID:8]
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.BigEndian, uint32(1))
+
+	clientID := "cdc-test-content"
+	binary.Write(buf, binary.BigEndian, uint32(len(clientID)))
+	buf.WriteString(clientID)
+
 	binary.Write(buf, binary.BigEndian, uint32(1))
 	dbName := "1"
 	binary.Write(buf, binary.BigEndian, uint32(len(dbName)))

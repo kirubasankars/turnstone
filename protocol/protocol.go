@@ -46,6 +46,9 @@ const (
 	OpCodeSet       uint8 = 0x03
 	OpCodeDel       uint8 = 0x04
 	OpCodeSelect    uint8 = 0x05
+	OpCodeMGet      uint8 = 0x06
+	OpCodeMSet      uint8 = 0x07
+	OpCodeMDel      uint8 = 0x08
 	OpCodeBegin     uint8 = 0x10
 	OpCodeCommit    uint8 = 0x11
 	OpCodeAbort     uint8 = 0x12

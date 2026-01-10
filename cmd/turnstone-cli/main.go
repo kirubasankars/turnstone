@@ -76,7 +76,7 @@ func main() {
 	}
 
 	fmt.Println("Connected.")
-	fmt.Println("Commands: select <db>, replicaof <host:port> <remote_db>, get <k>, set <k> <v>, del <k>, begin, commit, abort, clear, quit")
+	fmt.Println("Commands: select <db>, replicaof <host:port> <remote_db>, get <k>, set <k> <v>, del <k>, mget <k>..., mset <k> <v>..., mdel <k>..., begin, commit, abort, clear, quit")
 	fmt.Print("> ")
 
 	// 2. Interactive Loop
@@ -194,6 +194,75 @@ func handleCommand(cl *client.Client, cmd string, parts []string) {
 		err = cl.Set(parts[1], []byte(parts[2]))
 		if err == nil {
 			fmt.Println("OK")
+		}
+
+	case "mget":
+		// Reconstruct args list from parts (handles > 2 keys)
+		var args []string
+		if len(parts) > 1 {
+			args = append(args, parts[1])
+		}
+		if len(parts) > 2 {
+			args = append(args, strings.Fields(parts[2])...)
+		}
+		if len(args) == 0 {
+			fmt.Println("Usage: mget <key1> [<key2> ...]")
+			return
+		}
+
+		vals, err2 := cl.MGet(args...)
+		err = err2
+		if err == nil {
+			for i, val := range vals {
+				if val == nil {
+					fmt.Printf("%d) (nil)\n", i+1)
+				} else {
+					fmt.Printf("%d) %s\n", i+1, string(val))
+				}
+			}
+		}
+
+	case "mset":
+		var allArgs []string
+		if len(parts) > 1 {
+			allArgs = append(allArgs, parts[1])
+		}
+		if len(parts) > 2 {
+			allArgs = append(allArgs, strings.Fields(parts[2])...)
+		}
+
+		if len(allArgs) < 2 || len(allArgs)%2 != 0 {
+			fmt.Println("Usage: mset <key1> <val1> [<key2> <val2> ...]")
+			return
+		}
+
+		data := make(map[string][]byte)
+		for i := 0; i < len(allArgs); i += 2 {
+			data[allArgs[i]] = []byte(allArgs[i+1])
+		}
+
+		err = cl.MSet(data)
+		if err == nil {
+			fmt.Println("OK")
+		}
+
+	case "mdel":
+		var args []string
+		if len(parts) > 1 {
+			args = append(args, parts[1])
+		}
+		if len(parts) > 2 {
+			args = append(args, strings.Fields(parts[2])...)
+		}
+		if len(args) == 0 {
+			fmt.Println("Usage: mdel <key1> [<key2> ...]")
+			return
+		}
+
+		n, err2 := cl.MDel(args...)
+		err = err2
+		if err == nil {
+			fmt.Printf("(integer) %d\n", n)
 		}
 
 	default:

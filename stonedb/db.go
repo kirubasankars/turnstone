@@ -270,6 +270,10 @@ func (db *DB) LastOpID() uint64 {
 	return atomic.LoadUint64(&db.operationID)
 }
 
+func (db *DB) GetLastCheckpointOpID() uint64 {
+	return atomic.LoadUint64(&db.lastCkptOpID)
+}
+
 // Metric Getters
 func (db *DB) GetConflicts() uint64 {
 	return atomic.LoadUint64(&db.metricsConflicts)
@@ -356,6 +360,8 @@ func (db *DB) runAutoCheckpoint() {
 					retention := db.walRetentionTime
 					db.mu.RUnlock()
 
+					// If retention is 0, automatic time-based purging is DISABLED.
+					// This allows external logic (e.g. replication-based) to call PurgeWAL manually.
 					if retention > 0 {
 						if err := db.writeAheadLog.PurgeExpired(retention, checkpointID); err != nil {
 							fmt.Printf("WAL purge failed: %v\n", err)

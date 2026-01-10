@@ -28,9 +28,10 @@ type StoreStats struct {
 
 // ReplicaSlot tracks the state of a connected replication consumer.
 type ReplicaSlot struct {
-	LogSeq   uint64    `json:"log_seq"`
-	Role     string    `json:"role"`
-	LastSeen time.Time `json:"last_seen"`
+	LogSeq    uint64    `json:"log_seq"`
+	Role      string    `json:"role"`
+	LastSeen  time.Time `json:"last_seen"`
+	Connected bool      `json:"connected"`
 }
 
 // Store wraps stonedb.DB to provide a compatibility layer, stats, and replication logic.
@@ -42,14 +43,15 @@ type Store struct {
 	minReplicas int
 
 	// Replication State
-	mu        sync.Mutex
-	replicas  map[string]*ReplicaSlot // ReplicaID -> Slot State
-	cond      *sync.Cond
-	slotsFile string
-	dirty     bool
+	mu          sync.Mutex
+	replicas    map[string]*ReplicaSlot // ReplicaID -> Slot State
+	cond        *sync.Cond
+	slotsFile   string
+	dirty       bool
+	walStrategy string
 }
 
-func NewStore(dir string, logger *slog.Logger, walSync bool, minReplicas int, isSystem bool) (*Store, error) {
+func NewStore(dir string, logger *slog.Logger, walSync bool, minReplicas int, isSystem bool, walStrategy string) (*Store, error) {
 	s := &Store{
 		logger:      logger,
 		startTime:   time.Now(),
@@ -57,21 +59,35 @@ func NewStore(dir string, logger *slog.Logger, walSync bool, minReplicas int, is
 		minReplicas: minReplicas,
 		replicas:    make(map[string]*ReplicaSlot),
 		slotsFile:   filepath.Join(dir, "replication.slots"),
+		walStrategy: walStrategy,
 	}
 	s.cond = sync.NewCond(&s.mu)
 
-	// Load existing persistence state (if any) - retained for reporting continuity, though not strictly required for WAL safety anymore
+	// Load existing persistence state (if any)
 	s.loadSlots()
 
-	// Start persistence loop (optional, but keeps stats across restarts)
+	// Start persistence loop
 	go s.runPersistence()
+
+	// Start WAL retention manager if strategy is replication
+	if s.walStrategy == "replication" {
+		go s.runRetentionManager()
+	}
 
 	opts := stonedb.Options{
 		MaxWALSize:           10 * 1024 * 1024,
 		CompactionMinGarbage: 4 * 1024 * 1024,
 		// Enable truncation to recover from partial writes/corruption automatically
 		TruncateCorruptWAL: true,
-		// WALRetentionProvider removed: Retention is now purely time-based via stonedb options.
+	}
+
+	// If strategy is "replication", disable time-based purge in DB by setting retention to 0.
+	// Store will manage purging manually.
+	if walStrategy == "replication" {
+		opts.WALRetentionTime = 0
+	} else {
+		// Default time-based
+		opts.WALRetentionTime = 2 * time.Hour
 	}
 
 	db, err := stonedb.Open(dir, opts)
@@ -213,24 +229,35 @@ func (s *Store) RegisterReplica(id string, logSeq uint64, role string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.logger.Info("Replica registered", "id", id, "seq", logSeq, "role", role)
-	s.replicas[id] = &ReplicaSlot{
-		LogSeq:   logSeq,
-		Role:     role,
-		LastSeen: time.Now(),
+
+	if slot, ok := s.replicas[id]; ok {
+		// Update existing slot status to Connected
+		slot.Connected = true
+		// We trust the handshake logSeq as the starting point for this session
+		if logSeq > slot.LogSeq {
+			slot.LogSeq = logSeq
+		}
+		slot.Role = role // Update role if changed
+		slot.LastSeen = time.Now()
+	} else {
+		// Create new persistent slot
+		s.replicas[id] = &ReplicaSlot{
+			LogSeq:    logSeq,
+			Role:      role,
+			LastSeen:  time.Now(),
+			Connected: true,
+		}
 	}
 	s.dirty = true
 }
 
-// UnregisterReplica logs the disconnection.
+// UnregisterReplica marks the replica as disconnected but keeps the slot.
 func (s *Store) UnregisterReplica(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// We keep the slot in memory for stats visualization until restart/manual cleanup,
-	// or we can remove it immediately since retention is time-based now.
-	// Let's remove it to keep the stats clean for active connections.
-	if _, ok := s.replicas[id]; ok {
+	if slot, ok := s.replicas[id]; ok {
 		s.logger.Info("Replica disconnected", "id", id)
-		delete(s.replicas, id) // Remove from map
+		slot.Connected = false
 		s.dirty = true
 	}
 }
@@ -283,8 +310,7 @@ func (s *Store) waitForQuorum(logSeq uint64) {
 	}
 }
 
-// getMinSlotLogSeq calculates the minimum LogSeq required by ANY connected client (Replicas AND CDC).
-// This is now purely advisory or used for lag calculation, as WAL purging is time-based.
+// getMinSlotLogSeq calculates the minimum LogSeq required by ANY registered client.
 func (s *Store) getMinSlotLogSeq() uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -300,6 +326,11 @@ func (s *Store) getMinSlotLogSeq() uint64 {
 	}
 
 	if !hasSlots {
+		// If no slots exist, we can arguably purge everything up to current checkpoint
+		// BUT to be safe and match behavior of "no slots = no retention constraints",
+		// we return MaxUint64 which effectively allows full purge if used as a ceiling,
+		// or if interpreted as "constraint", it means no constraint.
+		// Let's interpret it as: No slots -> Safe to purge everything that is checkpointed.
 		return math.MaxUint64
 	}
 	return minSeq
@@ -331,6 +362,39 @@ func (s *Store) runPersistence() {
 			s.dirty = false
 		}
 		s.mu.Unlock()
+	}
+}
+
+func (s *Store) runRetentionManager() {
+	// Check retention every 30 seconds
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		minReplicaSeq := s.getMinSlotLogSeq()
+		lastCkpt := s.DB.GetLastCheckpointOpID()
+
+		// Determine safe purge ID
+		// It must be safe regarding replicas (minReplicaSeq)
+		// AND safe regarding storage consistency (lastCkpt)
+		safeID := lastCkpt
+		if minReplicaSeq < safeID {
+			safeID = minReplicaSeq
+		}
+
+		if safeID > 0 && safeID != math.MaxUint64 {
+			// Trigger purge
+			if err := s.DB.PurgeWAL(safeID); err != nil {
+				s.logger.Error("Replication-based WAL purge failed", "err", err)
+			}
+		} else if minReplicaSeq == math.MaxUint64 {
+			// No replicas registered. If configured for "replication" strategy, this implies
+			// we can purge everything up to checkpoint (no one to save data for).
+			// This prevents infinite WAL growth if user sets strategy=replication but adds no replicas.
+			if err := s.DB.PurgeWAL(lastCkpt); err != nil {
+				s.logger.Error("Fallback WAL purge failed", "err", err)
+			}
+		}
 	}
 }
 

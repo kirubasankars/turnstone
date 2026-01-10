@@ -2,6 +2,7 @@ package server
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -36,6 +37,7 @@ const (
 type Server struct {
 	stores           map[string]*store.Store
 	defaultDB        string // Renamed from defaultPartition
+	id               string // Unique Server ID
 	addr             string
 	logger           *slog.Logger
 	listener         net.Listener
@@ -56,7 +58,7 @@ type Server struct {
 	dbConns map[string]int64 // Renamed from partitionConns
 }
 
-func NewServer(addr string, stores map[string]*store.Store, logger *slog.Logger, maxConns int, tlsCert, tlsKey, tlsCA string, rm *replication.ReplicationManager) (*Server, error) {
+func NewServer(id string, addr string, stores map[string]*store.Store, logger *slog.Logger, maxConns int, tlsCert, tlsKey, tlsCA string, rm *replication.ReplicationManager) (*Server, error) {
 	if tlsCert == "" || tlsKey == "" || tlsCA == "" {
 		return nil, fmt.Errorf("tls cert, key, and ca required")
 	}
@@ -72,6 +74,7 @@ func NewServer(addr string, stores map[string]*store.Store, logger *slog.Logger,
 	}
 
 	s := &Server{
+		id:          id,
 		addr:        addr,
 		stores:      stores,
 		defaultDB:   defDB,
@@ -132,7 +135,7 @@ func (s *Server) Run(ctx context.Context) error {
 		return err
 	}
 	s.listener = ln
-	s.logger.Info("Server listening (Persistent Mode)", "addr", s.addr, "databases", len(s.stores), "default", s.defaultDB)
+	s.logger.Info("Server listening (Persistent Mode)", "addr", s.addr, "id", s.id, "databases", len(s.stores), "default", s.defaultDB)
 
 	go s.handleSignals(ctx)
 
@@ -314,10 +317,16 @@ func (s *Server) dispatchCommand(conn net.Conn, r io.Reader, opCode uint8, paylo
 		s.handleSet(conn, payload, st)
 	case protocol.OpCodeDel:
 		s.handleDel(conn, payload, st)
+	case protocol.OpCodeMGet:
+		s.handleMGet(conn, payload, st)
+	case protocol.OpCodeMSet:
+		s.handleMSet(conn, payload, st)
+	case protocol.OpCodeMDel:
+		s.handleMDel(conn, payload, st)
 	case protocol.OpCodeReplicaOf:
 		s.handleReplicaOf(conn, payload, st)
 	case protocol.OpCodeReplHello:
-		// Hand off control to specialized handler, passing RBAC role and Stable ClientID
+		// Hand off control to specialized handler, passing RBAC role and Cert ClientID as fallback
 		s.HandleReplicaConnection(conn, r, payload, st.role, st.clientID)
 		return true // Connection takeover
 	default:
@@ -337,7 +346,8 @@ func (s *Server) isOpAllowed(role string, opCode uint8) bool {
 		switch opCode {
 		case protocol.OpCodePing, protocol.OpCodeQuit,
 			protocol.OpCodeSelect, protocol.OpCodeBegin, protocol.OpCodeCommit, protocol.OpCodeAbort,
-			protocol.OpCodeGet, protocol.OpCodeSet, protocol.OpCodeDel:
+			protocol.OpCodeGet, protocol.OpCodeSet, protocol.OpCodeDel,
+			protocol.OpCodeMGet, protocol.OpCodeMSet, protocol.OpCodeMDel:
 			return true
 		default:
 			return false
@@ -519,6 +529,183 @@ func (s *Server) handleDel(w io.Writer, payload []byte, st *connState) {
 	} else {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
 	}
+}
+
+func (s *Server) handleMGet(w io.Writer, payload []byte, st *connState) {
+	if st.db == nil {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Database selected"))
+		return
+	}
+	if st.tx == nil {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusTxRequired, nil)
+		return
+	}
+	if len(payload) < 4 {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Invalid mget payload"))
+		return
+	}
+
+	numKeys := binary.BigEndian.Uint32(payload[0:4])
+	offset := 4
+	respBuf := new(bytes.Buffer)
+	// Write NumValues back
+	binary.Write(respBuf, binary.BigEndian, numKeys)
+
+	for i := 0; i < int(numKeys); i++ {
+		if offset+4 > len(payload) {
+			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Malformed mget payload"))
+			return
+		}
+		kLen := int(binary.BigEndian.Uint32(payload[offset : offset+4]))
+		offset += 4
+		if offset+kLen > len(payload) {
+			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Malformed mget payload key"))
+			return
+		}
+		key := payload[offset : offset+kLen]
+		offset += kLen
+
+		if !isASCII(string(key)) {
+			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Key must be ASCII"))
+			return
+		}
+
+		val, err := st.tx.Get(key)
+		if err == stonedb.ErrKeyNotFound {
+			// Write sentinel length 0xFFFFFFFF
+			binary.Write(respBuf, binary.BigEndian, uint32(0xFFFFFFFF))
+		} else if err != nil {
+			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte(err.Error()))
+			return
+		} else {
+			binary.Write(respBuf, binary.BigEndian, uint32(len(val)))
+			respBuf.Write(val)
+		}
+	}
+
+	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, respBuf.Bytes())
+}
+
+func (s *Server) handleMSet(w io.Writer, payload []byte, st *connState) {
+	if st.db == nil {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Database selected"))
+		return
+	}
+	if st.dbName == "0" {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Database 0 is read-only"))
+		return
+	}
+	if st.tx == nil {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusTxRequired, nil)
+		return
+	}
+	if len(payload) < 4 {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Invalid mset payload"))
+		return
+	}
+
+	numPairs := binary.BigEndian.Uint32(payload[0:4])
+	offset := 4
+
+	for i := 0; i < int(numPairs); i++ {
+		if offset+4 > len(payload) {
+			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Malformed mset payload"))
+			return
+		}
+		kLen := int(binary.BigEndian.Uint32(payload[offset : offset+4]))
+		offset += 4
+		if offset+kLen > len(payload) {
+			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Malformed mset key"))
+			return
+		}
+		key := payload[offset : offset+kLen]
+		offset += kLen
+
+		if offset+4 > len(payload) {
+			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Malformed mset val len"))
+			return
+		}
+		vLen := int(binary.BigEndian.Uint32(payload[offset : offset+4]))
+		offset += 4
+		if offset+vLen > len(payload) {
+			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Malformed mset value"))
+			return
+		}
+		val := payload[offset : offset+vLen]
+		offset += vLen
+
+		if !isASCII(string(key)) {
+			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Key must be ASCII"))
+			return
+		}
+
+		if err := st.tx.Put(key, val); err != nil {
+			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte(err.Error()))
+			return
+		}
+	}
+
+	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
+}
+
+func (s *Server) handleMDel(w io.Writer, payload []byte, st *connState) {
+	if st.db == nil {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Database selected"))
+		return
+	}
+	if st.dbName == "0" {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Database 0 is read-only"))
+		return
+	}
+	if st.tx == nil {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusTxRequired, nil)
+		return
+	}
+	if len(payload) < 4 {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Invalid mdel payload"))
+		return
+	}
+
+	numKeys := binary.BigEndian.Uint32(payload[0:4])
+	offset := 4
+	deletedCount := uint32(0)
+
+	for i := 0; i < int(numKeys); i++ {
+		if offset+4 > len(payload) {
+			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Malformed mdel payload"))
+			return
+		}
+		kLen := int(binary.BigEndian.Uint32(payload[offset : offset+4]))
+		offset += 4
+		if offset+kLen > len(payload) {
+			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Malformed mdel key"))
+			return
+		}
+		key := payload[offset : offset+kLen]
+		offset += kLen
+
+		if !isASCII(string(key)) {
+			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Key must be ASCII"))
+			return
+		}
+
+		// Check existence to return correct count
+		_, err := st.tx.Get(key)
+		exists := err == nil
+
+		if err := st.tx.Delete(key); err != nil {
+			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte(err.Error()))
+			return
+		}
+
+		if exists {
+			deletedCount++
+		}
+	}
+
+	respBuf := make([]byte, 4)
+	binary.BigEndian.PutUint32(respBuf, deletedCount)
+	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, respBuf)
 }
 
 func (s *Server) handleReplicaOf(w io.Writer, payload []byte, st *connState) {
