@@ -58,6 +58,7 @@ func TestCDC_Streaming_WithIdle(t *testing.T) {
 
 	// 3. Helper to read a batch
 	readBatch := func() []byte {
+		t.Helper()
 		header := make([]byte, 5)
 		// Set a deadline for the test read, so we don't hang forever if something breaks
 		cdcConn.SetReadDeadline(time.Now().Add(5 * time.Second))
