@@ -50,6 +50,11 @@ func (db *DB) processCommitBatch(requests []commitRequest) {
 		return
 	}
 
+	if db.isDiskFull == 1 {
+		batch.failAll(ErrDiskFull)
+		return
+	}
+
 	// If all requests failed validation (e.g., conflicts), we are done.
 	if len(batch.reqs) == 0 {
 		return

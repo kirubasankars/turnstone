@@ -163,7 +163,7 @@ func runServer(logger *slog.Logger) {
 		name := strconv.Itoa(i)
 		path := filepath.Join(*homeDir, "data", name)
 		isSystem := (i == 0)
-		st, err := store.NewStore(path, logger.With("db", name), 0, isSystem, cfg.WALRetentionStrategy)
+		st, err := store.NewStore(path, logger.With("db", name), 0, isSystem, cfg.WALRetentionStrategy, cfg.MaxDiskUsagePercent)
 		if err != nil {
 			logger.Error("Failed to initialize store", "db", name, "err", err)
 			os.Exit(1)

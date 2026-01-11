@@ -64,7 +64,7 @@ func startServerNode(t *testing.T, baseDir, name string, sharedTLS *tls.Config) 
 	stores := make(map[string]*store.Store)
 	for _, dbName := range []string{"0", "1", "2", "3"} {
 		partPath := filepath.Join(nodeDir, "data", dbName)
-		st, err := store.NewStore(partPath, logger, 0, true, "time")
+		st, err := store.NewStore(partPath, logger, 0, true, "time", 90)
 		if err != nil {
 			t.Fatalf("Failed to init store %s: %v", dbName, err)
 		}

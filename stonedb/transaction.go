@@ -114,6 +114,9 @@ func (tx *Transaction) Commit() error {
 	if tx.finished {
 		return ErrTxnFinished
 	}
+	if tx.db.isDiskFull == 1 {
+		return ErrDiskFull
+	}
 	if len(tx.pendingOps) == 0 {
 		return nil
 	}

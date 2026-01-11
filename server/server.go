@@ -420,7 +420,9 @@ func (s *Server) handleCommit(w io.Writer, st *connState) {
 	st.tx = nil
 
 	if err != nil {
-		if err == stonedb.ErrWriteConflict {
+		if err == stonedb.ErrDiskFull {
+			_ = s.writeBinaryResponse(w, protocol.ResStatusServerBusy, []byte("ERR disk is full"))
+		} else if err == stonedb.ErrWriteConflict {
 			_ = s.writeBinaryResponse(w, protocol.ResStatusTxConflict, []byte(err.Error()))
 		} else {
 			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte(err.Error()))

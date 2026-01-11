@@ -51,7 +51,7 @@ type Store struct {
 	walStrategy string
 }
 
-func NewStore(dir string, logger *slog.Logger, minReplicas int, isSystem bool, walStrategy string) (*Store, error) {
+func NewStore(dir string, logger *slog.Logger, minReplicas int, isSystem bool, walStrategy string, maxDiskUsage int) (*Store, error) {
 	s := &Store{
 		logger:      logger,
 		startTime:   time.Now(),
@@ -78,7 +78,8 @@ func NewStore(dir string, logger *slog.Logger, minReplicas int, isSystem bool, w
 		MaxWALSize:           10 * 1024 * 1024,
 		CompactionMinGarbage: 4 * 1024 * 1024,
 		// Enable truncation to recover from partial writes/corruption automatically
-		TruncateCorruptWAL: true,
+		TruncateCorruptWAL:  true,
+		MaxDiskUsagePercent: maxDiskUsage,
 	}
 
 	// If strategy is "replication", disable time-based purge in DB by setting retention to 0.
