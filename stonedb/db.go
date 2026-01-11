@@ -98,7 +98,7 @@ func Open(dir string, opts Options) (*DB, error) {
 
 	vl, err := OpenValueLog(filepath.Join(dir, "vlog"))
 	if err != nil {
-		wal.Close()
+		_ = wal.Close()
 		return nil, fmt.Errorf("open vlog: %w", err)
 	}
 
@@ -274,7 +274,6 @@ func (db *DB) GetLastCheckpointOpID() uint64 {
 	return atomic.LoadUint64(&db.lastCkptOpID)
 }
 
-// Metric Getters
 func (db *DB) GetConflicts() uint64 {
 	return atomic.LoadUint64(&db.metricsConflicts)
 }
@@ -448,7 +447,6 @@ func isClosed(ch <-chan struct{}) bool {
 	}
 }
 
-// Transaction & Operation Access
 func (db *DB) NewTransaction(update bool) *Transaction {
 	readTxID := atomic.LoadUint64(&db.transactionID)
 	tx := &Transaction{
