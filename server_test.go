@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -18,29 +19,51 @@ import (
 // --- Test Infrastructure & Helpers ---
 
 func setupTestEnv(t *testing.T) (string, map[string]*Store, *Server) {
-	dir := t.TempDir()
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	// Use MkdirTemp to keep files (t.TempDir deletes them)
+	dir, err := os.MkdirTemp("", "turnstone-server-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("Test Environment Directory: %s", dir)
+
+	// Setup logging: Debug level, write to stdout and turnstone.log in the test dir
+	logPath := filepath.Join(dir, "turnstone.log")
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		t.Fatalf("Failed to open log file: %v", err)
+	}
+	t.Cleanup(func() {
+		logFile.Close()
+	})
+
+	multiWriter := io.MultiWriter(os.Stdout, logFile)
+	logger := slog.New(slog.NewTextHandler(multiWriter, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	// 1. Generate Certs
 	certsDir := filepath.Join(dir, "certs")
 	if err := os.MkdirAll(certsDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// Generate config with multiple databases to support testing DB 1, 2, 3
 	if err := GenerateConfigArtifacts(dir, Config{
 		TLSCertFile:       "certs/server.crt",
 		TLSKeyFile:        "certs/server.key",
 		TLSCAFile:         "certs/ca.crt",
-		NumberOfDatabases: 1,
+		NumberOfDatabases: 4, // 0 (Read-Only), 1, 2, 3 (Writable)
 	}, filepath.Join(dir, "config.json")); err != nil {
 		t.Fatalf("Failed to generate artifacts: %v", err)
 	}
 
-	// 2. Init Store (using "0" as default)
-	store, err := NewStore(filepath.Join(dir, "data", "0"), logger, true, 0, true)
-	if err != nil {
-		t.Fatal(err)
+	// 2. Init Stores (0, 1, 2)
+	stores := make(map[string]*Store)
+	for i := 0; i < 4; i++ {
+		dbName := strconv.Itoa(i)
+		store, err := NewStore(filepath.Join(dir, "data", dbName), logger, true, 0, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stores[dbName] = store
 	}
-	stores := map[string]*Store{"0": store}
 
 	// 3. Setup Replication Manager (Required for NewServer)
 	clientCertPath := filepath.Join(certsDir, "client.crt")
@@ -169,7 +192,6 @@ func (c *testClient) ReadStatus(opCode byte, payload []byte) ([]byte, byte) {
 func TestServer_Lifecycle_And_Ping(t *testing.T) {
 	dir, stores, srv := setupTestEnv(t)
 	defer stores["0"].Close()
-	defer os.RemoveAll(dir)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -192,10 +214,9 @@ func TestServer_Lifecycle_And_Ping(t *testing.T) {
 	}
 }
 
-func TestServer_CRUD(t *testing.T) {
+func TestServer_ReadOnlySystemDB(t *testing.T) {
 	dir, stores, srv := setupTestEnv(t)
 	defer stores["0"].Close()
-	defer os.RemoveAll(dir)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -204,6 +225,35 @@ func TestServer_CRUD(t *testing.T) {
 
 	client := connectClient(t, srv.listener.Addr().String(), getClientTLS(t, dir))
 	defer client.Close()
+
+	// 1. Connection starts at DB "0" by default
+	// 2. Attempt to Write (Should fail)
+	key := []byte("k")
+	val := []byte("v")
+	setPayload := make([]byte, 4+len(key)+len(val))
+	binary.BigEndian.PutUint32(setPayload[0:4], uint32(len(key)))
+	copy(setPayload[4:], key)
+	copy(setPayload[4+len(key):], val)
+
+	client.AssertStatus(OpCodeBegin, nil, ResStatusOK)
+	// Server returns Error on Set to DB 0
+	client.AssertStatus(OpCodeSet, setPayload, ResStatusErr)
+}
+
+func TestServer_CRUD(t *testing.T) {
+	dir, stores, srv := setupTestEnv(t)
+	defer stores["0"].Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.Run(ctx)
+	time.Sleep(100 * time.Millisecond)
+
+	client := connectClient(t, srv.listener.Addr().String(), getClientTLS(t, dir))
+	defer client.Close()
+
+	// 0. Switch to Writable DB "1"
+	client.AssertStatus(OpCodeSelect, []byte("1"), ResStatusOK)
 
 	// 1. Set
 	key := []byte("mykey")
@@ -239,13 +289,6 @@ func TestServer_CRUD(t *testing.T) {
 func TestServer_SelectDB(t *testing.T) {
 	dir, stores, srv := setupTestEnv(t)
 	defer stores["0"].Close()
-	defer os.RemoveAll(dir)
-
-	// Create a second DB "1"
-	db2Dir := filepath.Join(dir, "1")
-	store2, _ := NewStore(db2Dir, srv.logger, true, 0, true)
-	srv.stores["1"] = store2
-	defer store2.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -255,7 +298,9 @@ func TestServer_SelectDB(t *testing.T) {
 	client := connectClient(t, srv.listener.Addr().String(), getClientTLS(t, dir))
 	defer client.Close()
 
-	// Default DB (0): Set K=V1
+	// 1. Select DB "1" -> Set K=V1
+	client.AssertStatus(OpCodeSelect, []byte("1"), ResStatusOK)
+
 	k := []byte("k")
 	v1 := []byte("v1")
 	setPl1 := make([]byte, 4+len(k)+len(v1))
@@ -267,15 +312,15 @@ func TestServer_SelectDB(t *testing.T) {
 	client.AssertStatus(OpCodeSet, setPl1, ResStatusOK)
 	client.AssertStatus(OpCodeCommit, nil, ResStatusOK)
 
-	// Select DB "1"
-	client.AssertStatus(OpCodeSelect, []byte("1"), ResStatusOK)
+	// 2. Select DB "2"
+	client.AssertStatus(OpCodeSelect, []byte("2"), ResStatusOK)
 
-	// Verify Empty in DB "1"
+	// 3. Verify Empty in DB "2"
 	client.AssertStatus(OpCodeBegin, nil, ResStatusOK)
 	client.AssertStatus(OpCodeGet, k, ResStatusNotFound)
 	client.AssertStatus(OpCodeCommit, nil, ResStatusOK)
 
-	// DB "1": Set K=V2
+	// 4. DB "2": Set K=V2
 	v2 := []byte("v2")
 	setPl2 := make([]byte, 4+len(k)+len(v2))
 	binary.BigEndian.PutUint32(setPl2[:4], uint32(len(k)))
@@ -286,10 +331,10 @@ func TestServer_SelectDB(t *testing.T) {
 	client.AssertStatus(OpCodeSet, setPl2, ResStatusOK)
 	client.AssertStatus(OpCodeCommit, nil, ResStatusOK)
 
-	// Select Default "0" again
-	client.AssertStatus(OpCodeSelect, []byte("0"), ResStatusOK)
+	// 5. Select DB "1" again
+	client.AssertStatus(OpCodeSelect, []byte("1"), ResStatusOK)
 
-	// Verify V1 in Default
+	// 6. Verify V1 in DB "1"
 	client.AssertStatus(OpCodeBegin, nil, ResStatusOK)
 	resp := client.AssertStatus(OpCodeGet, k, ResStatusOK)
 	client.AssertStatus(OpCodeCommit, nil, ResStatusOK)
@@ -301,7 +346,6 @@ func TestServer_SelectDB(t *testing.T) {
 func TestServer_AdminOps(t *testing.T) {
 	dir, stores, srv := setupTestEnv(t)
 	defer stores["0"].Close()
-	defer os.RemoveAll(dir)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -317,14 +361,14 @@ func TestServer_AdminOps(t *testing.T) {
 		t.Error("Stats body empty")
 	}
 
-	// Compact - requires selecting a DB first implicitly (default)
+	// Compact - requires selecting a DB first implicitly (default 0)
+	// Compact on read-only DB 0 is technically allowed as it is a maintenance op, not a client write.
 	client.AssertStatus(OpCodeCompact, nil, ResStatusOK)
 }
 
 func TestServer_ErrorHandling_Protocol(t *testing.T) {
 	dir, stores, srv := setupTestEnv(t)
 	defer stores["0"].Close()
-	defer os.RemoveAll(dir)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -341,7 +385,6 @@ func TestServer_ErrorHandling_Protocol(t *testing.T) {
 func TestServer_Backpressure(t *testing.T) {
 	dir, stores, _ := setupTestEnv(t)
 	defer stores["0"].Close()
-	defer os.RemoveAll(dir)
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	certsDir := filepath.Join(dir, "certs")
