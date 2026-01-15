@@ -126,14 +126,14 @@ func startServerNode(t *testing.T, baseDir, name string, sharedTLS *tls.Config) 
 
 // --- Tests ---
 
-// TestReplication_FanOut tests a single leader with multiple direct replicas.
-// Topology: Leader -> (Replica1, Replica2)
+// TestReplication_FanOut tests a single primary with multiple direct replicas.
+// Topology: Primary -> (Replica1, Replica2)
 func TestReplication_FanOut(t *testing.T) {
 	baseDir, tlsConfig := setupSharedCertEnv(t)
 
-	// Start Leader
-	_, leaderAddr, cancelLeader := startServerNode(t, baseDir, "leader", tlsConfig)
-	defer cancelLeader()
+	// Start Primary
+	_, primaryAddr, cancelPrimary := startServerNode(t, baseDir, "primary", tlsConfig)
+	defer cancelPrimary()
 
 	// Start Replica 1
 	_, r1Addr, cancelR1 := startServerNode(t, baseDir, "replica1", tlsConfig)
@@ -144,9 +144,9 @@ func TestReplication_FanOut(t *testing.T) {
 	defer cancelR2()
 
 	// Connect Clients
-	clientLeader := connectClient(t, leaderAddr, tlsConfig)
-	defer clientLeader.Close()
-	selectDB(t, clientLeader, "1")
+	clientPrimary := connectClient(t, primaryAddr, tlsConfig)
+	defer clientPrimary.Close()
+	selectDB(t, clientPrimary, "1")
 
 	clientR1 := connectClient(t, r1Addr, tlsConfig)
 	defer clientR1.Close()
@@ -156,13 +156,13 @@ func TestReplication_FanOut(t *testing.T) {
 	defer clientR2.Close()
 	selectDB(t, clientR2, "1")
 
-	// Configure Replication: R1 -> Leader (DB 1)
-	configureReplication(t, clientR1, leaderAddr, "1")
-	// Configure Replication: R2 -> Leader (DB 1)
-	configureReplication(t, clientR2, leaderAddr, "1")
+	// Configure Replication: R1 -> Primary (DB 1)
+	configureReplication(t, clientR1, primaryAddr, "1")
+	// Configure Replication: R2 -> Primary (DB 1)
+	configureReplication(t, clientR2, primaryAddr, "1")
 
-	// Write to Leader (DB 1)
-	writeKeyVal(t, clientLeader, "fanKey", "fanVal")
+	// Write to Primary (DB 1)
+	writeKeyVal(t, clientPrimary, "fanKey", "fanVal")
 
 	// Verify both replicas received the data
 	waitForConditionOrTimeout(t, 10*time.Second, func() bool {
@@ -173,15 +173,15 @@ func TestReplication_FanOut(t *testing.T) {
 }
 
 // TestReplication_Cascading tests chained replication.
-// Topology: NodeA (Leader) -> NodeB (Replica/Leader) -> NodeC (Replica)
+// Topology: NodeA (Primary) -> NodeB (Replica/Primary) -> NodeC (Replica)
 func TestReplication_Cascading(t *testing.T) {
 	baseDir, tlsConfig := setupSharedCertEnv(t)
 
-	// Start Node A (Leader)
+	// Start Node A (Primary)
 	_, addrA, cancelA := startServerNode(t, baseDir, "nodeA", tlsConfig)
 	defer cancelA()
 
-	// Start Node B (Replica of A, Leader for C)
+	// Start Node B (Replica of A, Primary for C)
 	_, addrB, cancelB := startServerNode(t, baseDir, "nodeB", tlsConfig)
 	defer cancelB()
 
@@ -245,7 +245,7 @@ func TestReplication_SameServer_Loopback(t *testing.T) {
 	}, "Loopback replication failed: DB 2 did not sync from DB 1 on same server")
 }
 
-// TestReplication_SlowConsumer_Dropped verifies that the leader closes the connection
+// TestReplication_SlowConsumer_Dropped verifies that the primary closes the connection
 // to a replica that fails to consume the stream within ReplicaSendTimeout.
 func TestReplication_SlowConsumer_Dropped(t *testing.T) {
 	// 1. Lower timeout to speed up test
@@ -268,7 +268,7 @@ func TestReplication_SlowConsumer_Dropped(t *testing.T) {
 
 	// 4. Send Hello Handshake to subscribe to "1" DB (Valid DB)
 	// Protocol: [OpCodeReplHello][Len][Ver:1][NumDBs:1]...
-	// SubRequest: [NameLen][Name][LogID]
+	// SubRequest: [NameLen][Name][LogSeq]
 	dbName := "1"
 
 	buf := new(bytes.Buffer)
@@ -277,7 +277,7 @@ func TestReplication_SlowConsumer_Dropped(t *testing.T) {
 
 	binary.Write(buf, binary.BigEndian, uint32(len(dbName)))
 	buf.WriteString(dbName)
-	binary.Write(buf, binary.BigEndian, uint64(0)) // Start from LogID 0
+	binary.Write(buf, binary.BigEndian, uint64(0)) // Start from LogSeq 0
 
 	header := make([]byte, 5)
 	header[0] = OpCodeReplHello
@@ -290,7 +290,7 @@ func TestReplication_SlowConsumer_Dropped(t *testing.T) {
 		t.Fatalf("Failed to send body: %v", err)
 	}
 
-	// 5. Generate Load on Leader
+	// 5. Generate Load on Primary
 	client := connectClient(t, addr, tlsConfig)
 	defer client.Close()
 	selectDB(t, client, "1") // Write to DB 1
@@ -325,38 +325,38 @@ func TestReplication_SlowConsumer_Dropped(t *testing.T) {
 	}
 }
 
-// TestServer_ReplicaOf_Integration verifies that a follower can replicate from a leader
+// TestServer_ReplicaOf_Integration verifies that a replica can replicate from a primary
 // and that 'replicaof no one' stops the replication.
 func TestServer_ReplicaOf_Integration(t *testing.T) {
 	// Reusing the shared setup for consistency
 	baseDir, tlsConfig := setupSharedCertEnv(t)
 
-	// Start Leader
-	_, leaderAddr, cancelLeader := startServerNode(t, baseDir, "leader_int", tlsConfig)
-	defer cancelLeader()
+	// Start Primary
+	_, primaryAddr, cancelPrimary := startServerNode(t, baseDir, "primary_int", tlsConfig)
+	defer cancelPrimary()
 
-	// Start Follower
-	_, followerAddr, cancelFollower := startServerNode(t, baseDir, "follower_int", tlsConfig)
-	defer cancelFollower()
+	// Start Replica
+	_, replicaAddr, cancelReplica := startServerNode(t, baseDir, "replica_int", tlsConfig)
+	defer cancelReplica()
 
 	// Clients
-	clientLeader := connectClient(t, leaderAddr, tlsConfig)
-	defer clientLeader.Close()
-	selectDB(t, clientLeader, "1")
+	clientPrimary := connectClient(t, primaryAddr, tlsConfig)
+	defer clientPrimary.Close()
+	selectDB(t, clientPrimary, "1")
 
-	clientFollower := connectClient(t, followerAddr, tlsConfig)
-	defer clientFollower.Close()
-	selectDB(t, clientFollower, "1")
+	clientReplica := connectClient(t, replicaAddr, tlsConfig)
+	defer clientReplica.Close()
+	selectDB(t, clientReplica, "1")
 
 	// --- PHASE 1: START REPLICATION ---
-	configureReplication(t, clientFollower, leaderAddr, "1")
+	configureReplication(t, clientReplica, primaryAddr, "1")
 
-	// Write to Leader
-	writeKeyVal(t, clientLeader, "k1", "v1")
+	// Write to Primary
+	writeKeyVal(t, clientPrimary, "k1", "v1")
 
-	// Verify K1 on Follower
+	// Verify K1 on Replica
 	waitForConditionOrTimeout(t, 2*time.Second, func() bool {
-		val := readKey(t, clientFollower, "k1")
+		val := readKey(t, clientReplica, "k1")
 		return string(val) == "v1"
 	}, "Replication failed for K1")
 
@@ -367,16 +367,16 @@ func TestServer_ReplicaOf_Integration(t *testing.T) {
 	stopPayload := make([]byte, 4+0+len(dbBytes))
 	binary.BigEndian.PutUint32(stopPayload[0:4], 0)
 	copy(stopPayload[4:], dbBytes)
-	clientFollower.AssertStatus(OpCodeReplicaOf, stopPayload, ResStatusOK)
+	clientReplica.AssertStatus(OpCodeReplicaOf, stopPayload, ResStatusOK)
 
-	// Write K2 to Leader
-	writeKeyVal(t, clientLeader, "k2", "v2")
+	// Write K2 to Primary
+	writeKeyVal(t, clientPrimary, "k2", "v2")
 
 	// Wait a bit to ensure it DOESN'T replicate
 	time.Sleep(300 * time.Millisecond)
 
-	// Verify K2 is NOT on Follower
-	val := readKey(t, clientFollower, "k2")
+	// Verify K2 is NOT on Replica
+	val := readKey(t, clientReplica, "k2")
 	if val != nil {
 		t.Fatalf("Replication did not stop, found k2: %s", val)
 	}
