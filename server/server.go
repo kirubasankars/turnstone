@@ -451,6 +451,12 @@ func (s *Server) handleGet(w io.Writer, payload []byte, st *connState) {
 	}
 
 	key := string(payload)
+	// Internal check: keys starting with '_' are reserved
+	if len(key) > 0 && key[0] == '_' {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Keys starting with '_' are reserved"))
+		return
+	}
+
 	if !isASCII(key) {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Key must be ASCII"))
 		return
@@ -494,7 +500,14 @@ func (s *Server) handleSet(w io.Writer, payload []byte, st *connState) {
 	val := make([]byte, len(payload[4+kLen:]))
 	copy(val, payload[4+kLen:])
 
-	if !isASCII(string(key)) {
+	keyStr := string(key)
+	// Internal check: keys starting with '_' are reserved
+	if len(keyStr) > 0 && keyStr[0] == '_' {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Keys starting with '_' are reserved"))
+		return
+	}
+
+	if !isASCII(keyStr) {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Key must be ASCII"))
 		return
 	}
@@ -521,6 +534,12 @@ func (s *Server) handleDel(w io.Writer, payload []byte, st *connState) {
 	}
 
 	key := string(payload)
+	// Internal check: keys starting with '_' are reserved
+	if len(key) > 0 && key[0] == '_' {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Keys starting with '_' are reserved"))
+		return
+	}
+
 	if !isASCII(key) {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Key must be ASCII"))
 		return
@@ -567,7 +586,14 @@ func (s *Server) handleMGet(w io.Writer, payload []byte, st *connState) {
 		key := payload[offset : offset+kLen]
 		offset += kLen
 
-		if !isASCII(string(key)) {
+		keyStr := string(key)
+		// Internal check: keys starting with '_' are reserved
+		if len(keyStr) > 0 && keyStr[0] == '_' {
+			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Keys starting with '_' are reserved"))
+			return
+		}
+
+		if !isASCII(keyStr) {
 			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Key must be ASCII"))
 			return
 		}
@@ -636,7 +662,14 @@ func (s *Server) handleMSet(w io.Writer, payload []byte, st *connState) {
 		val := payload[offset : offset+vLen]
 		offset += vLen
 
-		if !isASCII(string(key)) {
+		keyStr := string(key)
+		// Internal check: keys starting with '_' are reserved
+		if len(keyStr) > 0 && keyStr[0] == '_' {
+			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Keys starting with '_' are reserved"))
+			return
+		}
+
+		if !isASCII(keyStr) {
 			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Key must be ASCII"))
 			return
 		}
@@ -686,7 +719,14 @@ func (s *Server) handleMDel(w io.Writer, payload []byte, st *connState) {
 		key := payload[offset : offset+kLen]
 		offset += kLen
 
-		if !isASCII(string(key)) {
+		keyStr := string(key)
+		// Internal check: keys starting with '_' are reserved
+		if len(keyStr) > 0 && keyStr[0] == '_' {
+			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Keys starting with '_' are reserved"))
+			return
+		}
+
+		if !isASCII(keyStr) {
 			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Key must be ASCII"))
 			return
 		}
