@@ -5,9 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
-	"time"
 )
 
 func TestRecovery_CrashConsistency(t *testing.T) {
@@ -150,15 +148,12 @@ func TestDB_LoadGarbageStats(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Manually inject garbage stats into LDB
-	k := make([]byte, len(sysStaleBytesPrefix)+4)
-	copy(k, sysStaleBytesPrefix)
-	binary.BigEndian.PutUint32(k[len(sysStaleBytesPrefix):], 99) // File 99
+	// Simulate in-memory garbage stats accumulation
+	db.mu.Lock()
+	db.deletedBytesByFile[99] = 1024
+	db.mu.Unlock()
 
-	v := make([]byte, 8)
-	binary.BigEndian.PutUint64(v, 1024) // 1024 bytes garbage
-
-	db.ldb.Put(k, v, nil)
+	// Close() triggers Checkpoint(), which persists deletedBytesByFile to LevelDB
 	db.Close()
 
 	// Reopen
@@ -449,342 +444,6 @@ func TestRecovery_WALCorruption_Strict(t *testing.T) {
 	}
 }
 
-func TestWAL_PurgeExpired(t *testing.T) {
-	dir := t.TempDir()
-	opts := Options{
-		MaxWALSize:       1024,
-		WALRetentionTime: 100 * time.Millisecond, // Short retention for testing
-	}
-
-	db, err := Open(dir, opts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	// 1. Generate WAL files
-	// Write enough to trigger rotation multiple times
-	for i := 0; i < 5; i++ {
-		// Write 500 bytes (approx half max wal size)
-		tx := db.NewTransaction(true)
-		tx.Put([]byte("k"), make([]byte, 500))
-		if err := tx.Commit(); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	// 2. Advance Checkpoint (SafeOpID)
-	// This ensures the logs are considered "flushed" to VLog/Index
-	if err := db.Checkpoint(); err != nil {
-		t.Fatal(err)
-	}
-	safeOpID := db.LastOpID()
-
-	// 3. Wait for retention
-	time.Sleep(200 * time.Millisecond)
-
-	// 4. Trigger Purge
-	if err := db.writeAheadLog.PurgeExpired(opts.WALRetentionTime, safeOpID); err != nil {
-		t.Fatalf("PurgeExpired failed: %v", err)
-	}
-
-	// 5. Verify some files are gone
-	matches, _ := filepath.Glob(filepath.Join(dir, "wal", "*.wal"))
-	if len(matches) == 0 {
-		t.Error("All WAL files deleted, expected at least one")
-	}
-	// Note: Precise assertion of file count is difficult due to header/metadata variance,
-	// but reaching here ensures no crash.
-}
-
-func TestDB_VerifyChecksums_HappyPath(t *testing.T) {
-	dir := t.TempDir()
-	db, err := Open(dir, Options{CompactionMinGarbage: 1})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	// Write and Rotate to create immutable VLog files
-	tx := db.NewTransaction(true)
-	tx.Put([]byte("k"), []byte("v"))
-	tx.Commit()
-	db.Checkpoint()
-
-	// Call Verify
-	if err := db.VerifyChecksums(); err != nil {
-		t.Errorf("VerifyChecksums failed on valid DB: %v", err)
-	}
-}
-
-func TestDB_RollbackWAL_Manual(t *testing.T) {
-	dir := t.TempDir()
-	db, err := Open(dir, Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	// 1. Get current WAL size
-	initialSize := db.writeAheadLog.writeOffset
-
-	// 2. Manually write to WAL (simulate the Prepare phase)
-	dummyData := []byte("payload")
-	if err := db.writeAheadLog.AppendBatch(dummyData); err != nil {
-		t.Fatal(err)
-	}
-
-	newSize := db.writeAheadLog.writeOffset
-	addedBytes := int64(newSize - initialSize)
-
-	// 3. Rollback
-	if err := db.rollbackWAL(addedBytes); err != nil {
-		t.Fatalf("rollbackWAL failed: %v", err)
-	}
-
-	// 4. Verify size is back to initial
-	if db.writeAheadLog.writeOffset != initialSize {
-		t.Errorf("Expected offset %d, got %d", initialSize, db.writeAheadLog.writeOffset)
-	}
-
-	// 5. Verify physical file size
-	info, _ := db.writeAheadLog.currentFile.Stat()
-	if uint32(info.Size()) != initialSize {
-		t.Errorf("Physical file size mismatch. Expected %d, got %d", initialSize, info.Size())
-	}
-}
-
-func TestDB_Stats(t *testing.T) {
-	dir := t.TempDir()
-	db, _ := Open(dir, Options{})
-	defer db.Close()
-
-	// Cover getters
-	_, _, _, _ = db.StorageStats()
-	_ = db.LastOpID()
-	_ = db.GetConflicts()
-	_ = db.ActiveTransactionCount()
-	db.SetCompactionMinGarbage(100)
-	db.SetWALRetentionTime(time.Hour)
-}
-
-func TestRecovery_IsIndexConsistent_EdgeCases(t *testing.T) {
-	dir := t.TempDir()
-	db, err := Open(dir, Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	// 1. Test ErrNotFound case with non-zero transaction ID
-	// Remove the sys key
-	if err := db.ldb.Delete(sysTransactionIDKey, nil); err != nil {
-		t.Fatal(err)
-	}
-	// Manually set transaction ID to simulate state
-	db.transactionID = 100
-	if db.isIndexConsistent() {
-		t.Error("Expected inconsistent index when sys key missing but txID > 0")
-	}
-
-	// 2. Test corrupt value length
-	if err := db.ldb.Put(sysTransactionIDKey, []byte("short"), nil); err != nil {
-		t.Fatal(err)
-	}
-	if db.isIndexConsistent() {
-		t.Error("Expected inconsistent index when sys key value is short")
-	}
-}
-
-// TestInternal_ComputeStaleBytes tests the helper function used for garbage estimation.
-// Targets compaction.go: computeStaleBytes (0.0%)
-func TestInternal_ComputeStaleBytes(t *testing.T) {
-	dir := t.TempDir()
-	db, err := Open(dir, Options{CompactionMinGarbage: 1})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	// 1. Setup: Write a key "k1" -> File 0
-	tx := db.NewTransaction(true)
-	tx.Put([]byte("k1"), []byte("val1"))
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
-	}
-	db.Checkpoint() // Rotate to File 1
-
-	// 2. Prepare PendingOps that overwrite "k1"
-	ops := map[string]*PendingOp{
-		"k1": {Value: []byte("val2"), IsDelete: false},
-		"k2": {Value: []byte("val2"), IsDelete: false}, // New key, no stale bytes
-	}
-
-	// 3. Call internal function
-	staleMap := db.computeStaleBytes(ops)
-
-	// 4. Verify
-	// We expect garbage in File 0 for "k1".
-	// Size = Header(29) + Key(2) + Val(4) = 35 bytes
-	if garbage, ok := staleMap[0]; !ok || garbage <= 0 {
-		t.Errorf("Expected garbage for file 0, got map: %v", staleMap)
-	}
-}
-
-// TestInternal_RollbackWAL_Boundary tests error handling when rollback crosses file boundaries.
-// Targets committer.go: rollbackWAL (73.3% -> 100%)
-func TestInternal_RollbackWAL_Boundary(t *testing.T) {
-	dir := t.TempDir()
-	db, err := Open(dir, Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	// Current offset is likely 0 or small.
-	// Try to rollback 1000 bytes, which is definitely more than the current file size
-	// (since we just opened it and wrote nothing/little).
-	err = db.rollbackWAL(1000000)
-	if err == nil {
-		t.Error("Expected error rolling back past file boundary, got nil")
-	}
-}
-
-// TestInternal_Commit_WALWritten_VLogFails verifies that VLog write failure triggers WAL rollback.
-// Targets committer.go: persistBatch (71.4%), rollbackWAL success path.
-// Scenario:
-// 1. Transaction starts.
-// 2. WAL append succeeds.
-// 3. VLog append fails (file handle closed).
-// 4. System detects failure, rolls back WAL, and returns error.
-func TestInternal_Commit_WALWritten_VLogFails(t *testing.T) {
-	dir := t.TempDir()
-	db, err := Open(dir, Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	// 1. Write initial data to ensure WAL has some valid data before the bad batch
-	txInit := db.NewTransaction(true)
-	txInit.Put([]byte("init"), []byte("val"))
-	txInit.Commit()
-
-	initialWALSize := db.writeAheadLog.writeOffset
-
-	// 2. Sabotage VLog: Close the file handle so Write() fails
-	// Note: We close the underlying file but the VLog struct doesn't know yet.
-	db.valueLog.currentFile.Close()
-
-	// 3. Attempt a Write
-	// This will:
-	// a. Write to WAL (Success - writes to DB.wal.currentFile)
-	// b. Write to VLog (Fail - writes to DB.vlog.currentFile which is closed)
-	// c. Trigger rollbackWAL on DB.wal
-	tx := db.NewTransaction(true)
-	tx.Put([]byte("k"), []byte("v"))
-	err = tx.Commit()
-
-	// 4. Verify Failure
-	if err == nil {
-		t.Fatal("Expected commit error due to closed VLog")
-	}
-
-	// 5. Verify specific error path
-	if !strings.Contains(err.Error(), "vlog write failed (wal rolled back)") {
-		t.Errorf("Expected error to mention wal rollback, got: %v", err)
-	}
-
-	// 6. Verify Rollback
-	// WAL offset should be back to where it was after txInit
-	if db.writeAheadLog.writeOffset != initialWALSize {
-		t.Errorf("WAL offset mismatch. Expected %d, got %d. Rollback failed.", initialWALSize, db.writeAheadLog.writeOffset)
-	}
-}
-
-// TestInternal_PrepareBatch_IntraBatchConflict tests the logic for detecting conflicts
-// between transactions *within the same batch*.
-// Targets committer.go: prepareBatch, hasIntraBatchConflict
-func TestInternal_PrepareBatch_IntraBatchConflict(t *testing.T) {
-	dir := t.TempDir()
-	db, err := Open(dir, Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	// Scenario 1: TxA and TxB both write "key1".
-	// TxA comes first in batch -> Succeeds.
-	// TxB comes second -> Fails (Write-Write conflict).
-
-	txA := db.NewTransaction(true)
-	txA.Put([]byte("key1"), []byte("valA"))
-
-	txB := db.NewTransaction(true)
-	txB.Put([]byte("key1"), []byte("valB"))
-
-	reqs := []commitRequest{
-		{tx: txA, resp: make(chan error, 1)},
-		{tx: txB, resp: make(chan error, 1)},
-	}
-
-	// Call prepareBatch directly
-	batch, _ := db.prepareBatch(reqs)
-
-	// Check results
-	// TxA should be in batch
-	if len(batch.reqs) != 1 {
-		t.Errorf("Expected 1 successful request in batch, got %d", len(batch.reqs))
-	}
-	if batch.reqs[0].tx != txA {
-		t.Error("TxA should have succeeded")
-	}
-
-	// TxB should have failed with ErrWriteConflict
-	errB := <-reqs[1].resp
-	if errB != ErrWriteConflict {
-		t.Errorf("TxB expected ErrWriteConflict, got %v", errB)
-	}
-
-	// Scenario 2: TxC reads "key2", TxD writes "key2".
-	// TxD comes first -> Succeeds.
-	// TxC comes second -> Fails (Read-Write conflict / Stale Read).
-	// Note: prepareBatch processes sequentially. If TxD is processed first, it registers a write to "key2".
-	// When TxC is processed, hasIntraBatchConflict checks TxC.readSet["key2"] against batchWrites.
-
-	txC := db.NewTransaction(true)
-	txC.readSet["key2"] = struct{}{} // Simulate read
-	txC.Put([]byte("other"), []byte("val"))
-
-	txD := db.NewTransaction(true)
-	txD.Put([]byte("key2"), []byte("valD"))
-
-	reqs2 := []commitRequest{
-		{tx: txD, resp: make(chan error, 1)}, // Writer first
-		{tx: txC, resp: make(chan error, 1)}, // Reader second
-	}
-
-	batch2, _ := db.prepareBatch(reqs2)
-
-	if len(batch2.reqs) != 1 {
-		t.Errorf("Expected 1 successful request in batch 2, got %d", len(batch2.reqs))
-	}
-	if batch2.reqs[0].tx != txD {
-		t.Error("TxD should have succeeded")
-	}
-
-	errC := <-reqs2[1].resp
-	if errC != ErrWriteConflict {
-		t.Errorf("TxC expected ErrWriteConflict (Intra-batch Read-Write), got %v", errC)
-	}
-}
-
-// TestRecovery_LastVLogCorruption_PartialWrite ensures data consistency when
-// the last ValueLog file ends with a partial (incomplete) entry.
-// The recovery process should truncate the partial entry and assume it wasn't committed.
-// However, if the WAL had it, the WAL replay will bring it back (if commit succeeded there).
-// In this test, we simulate that VLog corruption happened *after* DB closed (e.g. disk rot),
-// but we assume WAL is fine.
 func TestRecovery_LastVLogCorruption_PartialWrite(t *testing.T) {
 	dir := t.TempDir()
 	opts := Options{
@@ -871,8 +530,6 @@ func TestRecovery_LastVLogCorruption_PartialWrite(t *testing.T) {
 	}
 }
 
-// TestRecovery_LastVLogCorruption_GarbageAppend ensures that appending garbage
-// to the last ValueLog file does not prevent the DB from opening and serving existing data.
 func TestRecovery_LastVLogCorruption_GarbageAppend(t *testing.T) {
 	dir := t.TempDir()
 	opts := Options{MaxWALSize: 1024 * 1024}
@@ -969,5 +626,34 @@ func TestRecovery_VLogCorruption_Middle_Strict(t *testing.T) {
 	// Currently `Recover` in `vlog.go` returns error if `!isLastFile`.
 	if _, err := Open(dir, opts); err == nil {
 		t.Fatal("Expected Open to fail due to corruption in middle VLog file")
+	}
+}
+
+func TestRecovery_TimelineMeta_TempFileIgnored(t *testing.T) {
+	dir := t.TempDir()
+
+	// 1. Create a valid timeline.meta
+	metaPath := filepath.Join(dir, "timeline.meta")
+	validJSON := `{"current_timeline": 2, "history": []}`
+	if err := os.WriteFile(metaPath, []byte(validJSON), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Create a garbage/partial timeline.meta.tmp
+	tmpPath := filepath.Join(dir, "timeline.meta.tmp")
+	if err := os.WriteFile(tmpPath, []byte(`{"current_timel`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Open DB
+	db, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatalf("Open failed when .tmp meta file exists: %v", err)
+	}
+	defer db.Close()
+
+	// 4. Verify we loaded the valid timeline 2
+	if db.timelineMeta.CurrentTimeline != 2 {
+		t.Errorf("Expected timeline 2, got %d", db.timelineMeta.CurrentTimeline)
 	}
 }

@@ -54,8 +54,12 @@ func TestCompaction_BasicGarbageCollection(t *testing.T) {
 	}
 
 	// 3. Run Compaction
-	if err := db.RunCompaction(); err != nil {
+	didWork, err := db.RunCompaction()
+	if err != nil {
 		t.Fatalf("Compaction failed: %v", err)
+	}
+	if !didWork {
+		t.Error("Expected compaction to do work")
 	}
 
 	// 4. Verify Data integrity post-compaction
@@ -116,8 +120,12 @@ func TestCompaction_SnapshotIsolation_BlocksDeletion(t *testing.T) {
 	db.Checkpoint() // Rotate again
 
 	// 4. Run Compaction - should NOT physically delete File 0 due to longTx
-	if err := db.RunCompaction(); err != nil {
+	didWork, err := db.RunCompaction()
+	if err != nil {
 		t.Fatal(err)
+	}
+	if !didWork {
+		t.Error("Expected compaction to do work (mark for deletion)")
 	}
 
 	// 5. Verify File 0 still exists
@@ -173,7 +181,8 @@ func TestCompaction_RewriteWithSkip(t *testing.T) {
 	// rewriteBatch will see "A" in File 0.
 	// It checks LevelDB. LevelDB points to Tx2 (File 1).
 	// Tx1 != Tx2, so "A" from File 0 is dropped.
-	if err := db.RunCompaction(); err != nil {
+	_, err = db.RunCompaction()
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -203,7 +212,7 @@ func TestCompaction_Tombstones(t *testing.T) {
 	db.Checkpoint()
 
 	// Compaction on File 0 should remove A because latest version is tombstone in File 1
-	if err := db.RunCompaction(); err != nil {
+	if _, err := db.RunCompaction(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -230,9 +239,22 @@ func TestValueLog_Iterate_MissingFile(t *testing.T) {
 	db.deletedBytesByFile[999] = 100 // File 999 has garbage
 	db.mu.Unlock()
 
-	// Run compaction - it will pick 999, try to iterate, and fail because file 999 doesn't exist
-	if err := db.RunCompaction(); err == nil {
-		t.Error("Expected error compacting missing file")
+	// Run compaction - it will pick 999, try to iterate.
+	// The implementation swallows IsNotExist errors to prevent crash loops, removing the file from stats.
+	didWork, err := db.RunCompaction()
+	if err != nil {
+		t.Errorf("Unexpected error compacting missing file (should be handled gracefully): %v", err)
+	}
+	if didWork {
+		t.Error("Compaction should return false (didWork) when file is missing")
+	}
+
+	// Verify stats were cleaned up
+	db.mu.RLock()
+	_, exists := db.deletedBytesByFile[999]
+	db.mu.RUnlock()
+	if exists {
+		t.Error("Missing file 999 should have been removed from garbage stats")
 	}
 }
 
@@ -279,7 +301,7 @@ func TestCompaction_CleansUpStaleIndexEntries(t *testing.T) {
 	// This should target File 0 (contains v1).
 	// v1 is stale because v2 exists.
 	// rewriteBatch should delete the index entry for v1.
-	if err := db.RunCompaction(); err != nil {
+	if _, err := db.RunCompaction(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -340,7 +362,7 @@ func TestCompaction_PrunesVersionChains(t *testing.T) {
 	}
 
 	// 3. Run Compaction on File 0
-	if err := db.RunCompaction(); err != nil {
+	if _, err := db.RunCompaction(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -375,10 +397,6 @@ func TestCompaction_PrunesVersionChains(t *testing.T) {
 	}
 }
 
-// TestCompaction_BatchFlushLimit triggers the batch flush logic in RunCompaction.
-// RunCompaction has a batch limit of 1000 entries (maxBatchCount).
-// We write 1500 valid entries, ensure they are kept valid, and run compaction.
-// This forces rewriteBatch to be called mid-loop.
 func TestCompaction_BatchFlushLimit(t *testing.T) {
 	dir := t.TempDir()
 	// MinGarbage 1 ensures compaction runs on any file with garbage.
@@ -427,7 +445,7 @@ func TestCompaction_BatchFlushLimit(t *testing.T) {
 	}
 
 	// 3. Run Compaction
-	if err := db.RunCompaction(); err != nil {
+	if _, err := db.RunCompaction(); err != nil {
 		t.Fatalf("Compaction failed: %v", err)
 	}
 
@@ -503,7 +521,7 @@ func TestCompaction_MixedScenario_CrossCheckpoint(t *testing.T) {
 	db.mu.RUnlock()
 
 	// 3. Run Compaction on File 0
-	if err := db.RunCompaction(); err != nil {
+	if _, err := db.RunCompaction(); err != nil {
 		t.Fatalf("Compaction failed: %v", err)
 	}
 

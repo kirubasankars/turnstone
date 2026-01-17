@@ -17,13 +17,13 @@ import (
 
 var (
 	// MaxReplicationBatchSize limits the payload size of a single replication batch
-	// to prevent memory spikes and ensure keep-alives/ACKs flow regularly.
 	MaxReplicationBatchSize = 1 * 1024 * 1024 // 1MB
 	ErrBatchFull            = errors.New("replication batch full")
 )
 
 type replPacket struct {
 	dbName string
+	opCode uint8 // Added to support Snapshot opcodes
 	data   []byte
 	count  uint32
 }
@@ -53,7 +53,7 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 	replicaID := string(payload[cursor : cursor+idLen])
 	cursor += idLen
 
-	// ID is required field, no fallback required
+	// ID is required field
 	if replicaID == "" || replicaID == "client-unknown" {
 		s.logger.Error("HandleReplicaConnection: replica connected without explicit ID", "role", role)
 		return
@@ -100,8 +100,6 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 			)
 			st.RegisterReplica(replicaID, logID, role)
 
-			// Clean up when connection closes.
-			// We capture 'st' and 'name' for the specific database.
 			defer func(storePtr *store.Store, dbName string) {
 				s.logger.Info("Replica unsubscribed (connection closed)", "replica", replicaID, "db", dbName)
 				storePtr.UnregisterReplica(replicaID)
@@ -149,7 +147,6 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 				if err != io.EOF {
 					s.logger.Error("Replica ACK reader failed", "replica", replicaID, "err", err)
 				}
-				// CRITICAL: Signal main loop to exit if reader fails or disconnects
 				select {
 				case errCh <- err:
 				default:
@@ -161,7 +158,6 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 				b := make([]byte, ln)
 				if _, err := io.ReadFull(r, b); err != nil {
 					s.logger.Error("Replica ACK body read failed", "replica", replicaID, "err", err)
-					// Signal main loop
 					select {
 					case errCh <- err:
 					default:
@@ -188,13 +184,11 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 		select {
 		case err := <-errCh:
 			if err == io.EOF {
-				// Client disconnected gracefully
 				return
 			}
 			s.logger.Warn("Dropping failed replica connection", "addr", replicaID, "err", err)
 
 			// Attempt to send error to client before closing
-			// This helps the client distinguish between network failure and fatal replication errors (e.g. purged logs)
 			errMsg := err.Error()
 			errHeader := make([]byte, 5)
 			errHeader[0] = protocol.ResStatusErr
@@ -210,11 +204,14 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 			// Frame: [OpCodeReplBatch][TotalLen] [DBNameLen][DBName][Count][BatchData...]
 			totalLen := 4 + len(p.dbName) + 4 + len(p.data)
 			header := make([]byte, 5)
-			header[0] = protocol.OpCodeReplBatch
+			
+			// Use packet OpCode or default to Batch
+			op := p.opCode
+			if op == 0 { op = protocol.OpCodeReplBatch }
+			header[0] = op
+			
 			binary.BigEndian.PutUint32(header[1:], uint32(totalLen))
 
-			// Blocking write with infinite timeout (or rely on system TCP/keepalive)
-			// We no longer enforce an application-level write timeout to support slow consumers
 			conn.SetWriteDeadline(time.Time{})
 			if _, err := conn.Write(header); err != nil {
 				s.logger.Error("Failed to write batch header", "replica", replicaID, "err", err)
@@ -248,12 +245,74 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 }
 
 func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh chan<- replPacket, done <-chan struct{}) error {
+	currentLogID := minLogID
+
+	// 1. Check if WAL is available. If not, trigger Full Sync (Snapshot).
+	// StoneDB's ScanWAL returns ErrLogUnavailable if the log is purged.
+	// We perform a dummy check first.
+	err := st.ScanWAL(currentLogID+1, func(entries []stonedb.ValueLogEntry) error { return nil })
+	
+	if err == stonedb.ErrLogUnavailable && currentLogID < st.LastOpID() {
+		s.logger.Info("Replica too far behind (WAL purged). Starting Full Sync (Snapshot).", "db", name, "req_seq", currentLogID, "head", st.LastOpID())
+		
+		// --- SNAPSHOT PHASE ---
+		// Updated to receive TxID + OpID
+		snapTxID, snapOpID, snapErr := st.StreamSnapshot(func(batch []stonedb.SnapshotEntry) error {
+			var buf bytes.Buffer
+			
+			// Serialize Snapshot Batch
+			// Format matches WAL Batch roughly, but without TxIDs/OpIDs per entry
+			// [KLen][Key][VLen][Val]...
+			for _, e := range batch {
+				binary.Write(&buf, binary.BigEndian, uint32(len(e.Key)))
+				buf.Write(e.Key)
+				binary.Write(&buf, binary.BigEndian, uint32(len(e.Value)))
+				buf.Write(e.Value)
+			}
+
+			// Send Packet
+			select {
+			case outCh <- replPacket{
+				dbName: name,
+				opCode: protocol.OpCodeReplSnapshot,
+				data:   buf.Bytes(),
+				count:  uint32(len(batch)),
+			}:
+			case <-done:
+				return io.EOF
+			}
+			return nil
+		})
+
+		if snapErr != nil {
+			return fmt.Errorf("snapshot failed: %w", snapErr)
+		}
+
+		// Send DONE Signal with 16 bytes: [TxID(8)][OpID(8)]
+		doneBuf := make([]byte, 16)
+		binary.BigEndian.PutUint64(doneBuf[0:], snapTxID)
+		binary.BigEndian.PutUint64(doneBuf[8:], snapOpID)
+		
+		select {
+		case outCh <- replPacket{
+			dbName: name,
+			opCode: protocol.OpCodeReplSnapshotDone,
+			data:   doneBuf,
+			count:  0,
+		}:
+		case <-done:
+			return nil
+		}
+
+		s.logger.Info("Full Sync complete. Switching to WAL streaming.", "db", name, "resume_seq", snapOpID)
+		currentLogID = snapOpID
+	}
+
+	// 2. WAL Streaming Phase
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 
-	currentLogID := minLogID
-
-	// Loop indefinitely. We use 'shouldWait' to determine if we block on the ticker or loop immediately.
+	// Loop indefinitely.
 	for {
 		shouldWait := true
 
@@ -261,13 +320,11 @@ func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh c
 		var count uint32
 
 		// Scan from next ID
-		// The callback logic now includes injecting a Commit entry when a full WAL batch is processed.
 		err := st.ScanWAL(currentLogID+1, func(entries []stonedb.ValueLogEntry) error {
 			if len(entries) == 0 {
 				return nil
 			}
 
-			// Capture metadata for the Commit marker from the last entry
 			lastEntry := entries[len(entries)-1]
 
 			for _, e := range entries {
@@ -307,9 +364,7 @@ func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh c
 				}
 			}
 
-			// If we reached here, it means we successfully processed the entire WAL batch (Transaction)
-			// without hitting ErrBatchFull. We can now safely append the Commit marker.
-			// Commit Marker Format: [LogID(8)][TxID(8)][Op=OpJournalCommit(1)][KLen=0][VLen=0]
+			// Append Commit Marker
 			if err := binary.Write(&batchBuf, binary.BigEndian, lastEntry.OperationID); err != nil {
 				return err
 			}
@@ -324,10 +379,10 @@ func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh c
 			return nil
 		})
 
-		// Send if we have data - BLOCKING SEND (Backpressure)
+		// Send if we have data
 		if count > 0 {
 			select {
-			case outCh <- replPacket{dbName: name, data: batchBuf.Bytes(), count: count}:
+			case outCh <- replPacket{dbName: name, opCode: protocol.OpCodeReplBatch, data: batchBuf.Bytes(), count: count}:
 			case <-done:
 				return nil
 			}
@@ -336,39 +391,31 @@ func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh c
 		// Error Handling
 		if err != nil {
 			if err == ErrBatchFull {
-				// We hit the limit, implying more data might be available.
-				// Do not wait for ticker; immediate loop.
+				// We hit the limit, imply more data available. Do not wait.
 				shouldWait = false
 			} else if err == stonedb.ErrLogUnavailable {
-				// If the requested log ID is older than the last committed ID on the server,
-				// and the log is unavailable, it means the data has been purged.
-				// We must error out to prevent the client from waiting indefinitely.
+				// Check if it's truly purged or just not written yet
 				if currentLogID < st.LastOpID() {
-					return fmt.Errorf("OUT_OF_SYNC: requested log %d is purged (server head: %d). Snapshot required.", currentLogID+1, st.LastOpID())
+					return fmt.Errorf("OUT_OF_SYNC: requested log %d is purged. Snapshot required.", currentLogID+1)
 				}
-				// Otherwise, we are at the head (future data), so we just wait for new data.
+				// If currentLogID >= LastOpID, it means we are at the head, so just wait.
 			} else {
 				s.logger.Error("ScanWAL error", "db", name, "err", err)
-				// Backoff slightly on error
 				time.Sleep(100 * time.Millisecond)
 			}
 		}
 
-		// Wait logic
 		if shouldWait {
 			select {
 			case <-done:
 				return nil
 			case <-ticker.C:
-				// Ready to scan again
 			}
 		} else {
-			// Check done non-blocking to ensure we can exit even during high load
 			select {
 			case <-done:
 				return nil
 			default:
-				// Loop immediately
 			}
 		}
 	}

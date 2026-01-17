@@ -41,7 +41,6 @@ func (db *DB) syncWALToValueLog(truncateCorrupt bool) error {
 }
 
 func (db *DB) isIndexConsistent() bool {
-	// If LDB is not open, we can't check consistency
 	if db.ldb == nil {
 		return false
 	}
@@ -79,8 +78,6 @@ func (db *DB) RebuildIndexFromVLog() error {
 	batch := new(leveldb.Batch)
 	batchCount := 0
 
-	// REPLAY FIX: Pass 0 to replay ALL entries from the beginning.
-	// Passing db.transactionID (which is the latest) would skip everything.
 	err = db.valueLog.Replay(0, func(e ValueLogEntry, meta EntryMeta) error {
 		encKey := encodeIndexKey(e.Key, meta.TransactionID)
 		batch.Put(encKey, meta.Encode())
@@ -105,24 +102,12 @@ func (db *DB) RebuildIndexFromVLog() error {
 		}
 	}
 
-	return db.persistSequences()
-}
-
-func (db *DB) persistSequences() error {
-	// Guard against nil LDB
-	if db.ldb == nil {
-		return nil
+	// After rebuilding index, we must recalculate the KeyCount since we lost the persisted value
+	count, err := db.scanKeyCount()
+	if err != nil {
+		return fmt.Errorf("failed to recount keys after rebuild: %w", err)
 	}
+	atomic.StoreInt64(&db.keyCount, count)
 
-	batch := new(leveldb.Batch)
-
-	buf := make([]byte, 8)
-	binary.BigEndian.PutUint64(buf, atomic.LoadUint64(&db.transactionID))
-	batch.Put(sysTransactionIDKey, buf)
-
-	buf2 := make([]byte, 8)
-	binary.BigEndian.PutUint64(buf2, atomic.LoadUint64(&db.operationID))
-	batch.Put(sysOperationIDKey, buf2)
-
-	return db.ldb.Write(batch, &opt.WriteOptions{Sync: true})
+	return db.persistSequences()
 }
