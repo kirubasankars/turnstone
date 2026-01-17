@@ -59,6 +59,72 @@ func TestDB_BasicCRUD(t *testing.T) {
 	readTx2.Discard()
 }
 
+func TestDB_Promote_Integration(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, Options{MaxWALSize: 1024 * 1024})
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	// 1. Write on Timeline 1
+	tx1 := db.NewTransaction(true)
+	tx1.Put([]byte("t1_key"), []byte("val1"))
+	if err := tx1.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Promote
+	if err := db.Promote(); err != nil {
+		t.Fatalf("Promote failed: %v", err)
+	}
+
+	// 3. Write on Timeline 2
+	tx2 := db.NewTransaction(true)
+	tx2.Put([]byte("t2_key"), []byte("val2"))
+	if err := tx2.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 4. Verify Data from both timelines
+	rtx := db.NewTransaction(false)
+	v1, _ := rtx.Get([]byte("t1_key"))
+	if string(v1) != "val1" {
+		t.Error("Lost data from Timeline 1")
+	}
+	v2, _ := rtx.Get([]byte("t2_key"))
+	if string(v2) != "val2" {
+		t.Error("Missing data from Timeline 2")
+	}
+	rtx.Discard()
+
+	// 5. Verify Metadata Persistence
+	// Close and Reopen
+	db.Close()
+
+	db2, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatalf("Reopen failed: %v", err)
+	}
+	defer db2.Close()
+
+	// Check if current timeline is persisted
+	if db2.timelineMeta.CurrentTimeline != 2 {
+		t.Errorf("Expected CurrentTimeline 2, got %d", db2.timelineMeta.CurrentTimeline)
+	}
+
+	// Verify data access after recovery
+	rtx2 := db2.NewTransaction(false)
+	v1r, _ := rtx2.Get([]byte("t1_key"))
+	if string(v1r) != "val1" {
+		t.Error("Recovery lost T1 data")
+	}
+	v2r, _ := rtx2.Get([]byte("t2_key"))
+	if string(v2r) != "val2" {
+		t.Error("Recovery lost T2 data")
+	}
+	rtx2.Discard()
+}
+
 func TestDB_TransactionIsolation(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(dir, Options{})
@@ -351,7 +417,8 @@ func TestVLog_AppendEntries(t *testing.T) {
 // TestWAL_AppendBatch_Direct verifies low-level WAL appending.
 func TestWAL_AppendBatch_Direct(t *testing.T) {
 	dir := t.TempDir()
-	wal, err := OpenWriteAheadLog(dir, 1024*1024)
+	// Use OpenWriteAheadLog to get the default timeline 1
+	wal, err := OpenWriteAheadLog(dir, 1024*1024, 1)
 	if err != nil {
 		t.Fatal(err)
 	}

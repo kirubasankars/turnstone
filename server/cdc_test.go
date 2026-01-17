@@ -15,58 +15,61 @@ import (
 // and the connection remains open during idle periods.
 func TestCDC_Streaming_WithIdle(t *testing.T) {
 	baseDir, clientTLS := setupSharedCertEnv(t)
-	// CDC functionality requires the CDC role certificate
 	cdcTLS := getRoleTLS(t, baseDir, "cdc")
 
-	// Start a node
 	_, addr, cancel := startServerNode(t, baseDir, "cdc_node", clientTLS)
 	defer cancel()
 
-	// 1. Connect CDC Client via TLS (using CDC Cert)
+	// 0. Primer: Write initial data to stabilize WAL state
+	client := connectClient(t, addr, clientTLS)
+	defer client.Close()
+	selectDatabase(t, client, "1")
+	writeKeyVal(t, client, "primer", "val_0")
+
+	// 1. Connect CDC Client
 	cdcConn, err := tls.Dial("tcp", addr, cdcTLS)
 	if err != nil {
 		t.Fatalf("Failed to dial CDC: %v", err)
 	}
 	defer cdcConn.Close()
 
-	// 2. Send Hello Handshake
-	// Format: [Ver:4][IDLen:4][ID][NumDBs:4] ... [NameLen:4][Name][LogID:8]
+	// 2. Send Hello Handshake (StartSeq 0)
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.BigEndian, uint32(1)) // Version
-
 	clientID := "cdc-test-idle"
 	binary.Write(buf, binary.BigEndian, uint32(len(clientID)))
 	buf.WriteString(clientID)
-
-	binary.Write(buf, binary.BigEndian, uint32(1)) // Database Count
-
+	binary.Write(buf, binary.BigEndian, uint32(1)) // Count
 	dbName := "1"
 	binary.Write(buf, binary.BigEndian, uint32(len(dbName)))
 	buf.WriteString(dbName)
 	binary.Write(buf, binary.BigEndian, uint64(0)) // StartSeq
 
-	helloHeader := make([]byte, 5)
-	helloHeader[0] = protocol.OpCodeReplHello
-	binary.BigEndian.PutUint32(helloHeader[1:], uint32(buf.Len()))
+	h := make([]byte, 5)
+	h[0] = protocol.OpCodeReplHello
+	binary.BigEndian.PutUint32(h[1:], uint32(buf.Len()))
+	cdcConn.Write(h)
+	cdcConn.Write(buf.Bytes())
 
-	if _, err := cdcConn.Write(helloHeader); err != nil {
-		t.Fatalf("Failed to write header: %v", err)
-	}
-	if _, err := cdcConn.Write(buf.Bytes()); err != nil {
-		t.Fatalf("Failed to write body: %v", err)
-	}
-
-	// 3. Helper to read a batch
+	// Helper to read a batch
 	readBatch := func() []byte {
 		t.Helper()
 		header := make([]byte, 5)
-		// Set a deadline for the test read, so we don't hang forever if something breaks
 		cdcConn.SetReadDeadline(time.Now().Add(5 * time.Second))
 		if _, err := io.ReadFull(cdcConn, header); err != nil {
 			t.Fatalf("Read header failed: %v", err)
 		}
+		
+		// Handle potential errors from server
+		if header[0] == protocol.ResStatusErr {
+			length := binary.BigEndian.Uint32(header[1:])
+			payload := make([]byte, length)
+			io.ReadFull(cdcConn, payload)
+			t.Fatalf("Server returned error: %s", string(payload))
+		}
+
 		if header[0] != protocol.OpCodeReplBatch {
-			t.Fatalf("Expected OpCodeReplBatch, got 0x%x", header[0])
+			t.Fatalf("Expected OpCodeReplBatch (0x%x), got 0x%x", protocol.OpCodeReplBatch, header[0])
 		}
 		length := binary.BigEndian.Uint32(header[1:])
 		payload := make([]byte, length)
@@ -76,10 +79,13 @@ func TestCDC_Streaming_WithIdle(t *testing.T) {
 		return payload
 	}
 
-	// 4. Write Data via standard client
-	client := connectReplClient(t, addr, clientTLS)
-	defer client.Close()
-	selectDatabase(t, client, "1")
+	// 3. Verify Primer receipt (since we started at 0)
+	payload0 := readBatch()
+	if !bytes.Contains(payload0, []byte("primer")) {
+		t.Errorf("Expected 'primer' in first batch, got: %q", payload0)
+	}
+
+	// 4. Write Data live
 	writeKeyVal(t, client, "cdc_key_1", "val_1")
 
 	// 5. Verify CDC receipt
@@ -89,8 +95,6 @@ func TestCDC_Streaming_WithIdle(t *testing.T) {
 	}
 
 	// 6. Test Idle / Keep-Alive
-	// We wait 2 seconds. The server's default read deadline (set in handleConnection) would normally
-	// apply if we didn't clear it in HandleReplicaConnection.
 	time.Sleep(2 * time.Second)
 
 	// 7. Write more data
@@ -104,13 +108,19 @@ func TestCDC_Streaming_WithIdle(t *testing.T) {
 }
 
 // TestCDC_MessageContent verifies the structural integrity and correctness
-// of CDC messages for Set and Delete operations by parsing the binary stream.
+// of CDC messages for Set and Delete operations.
 func TestCDC_MessageContent(t *testing.T) {
 	baseDir, clientTLS := setupSharedCertEnv(t)
 	cdcTLS := getRoleTLS(t, baseDir, "cdc")
 
 	_, addr, cancel := startServerNode(t, baseDir, "cdc_content", clientTLS)
 	defer cancel()
+
+	// 0. Primer (to stabilize WAL)
+	client := connectClient(t, addr, clientTLS)
+	defer client.Close()
+	selectDatabase(t, client, "1")
+	writeKeyVal(t, client, "primer", "val_0")
 
 	// 1. Connect CDC Client
 	cdcConn, err := tls.Dial("tcp", addr, cdcTLS)
@@ -120,14 +130,11 @@ func TestCDC_MessageContent(t *testing.T) {
 	defer cdcConn.Close()
 
 	// 2. Handshake (StartSeq 0)
-	// Format: [Ver:4][IDLen:4][ID][NumDBs:4] ... [NameLen:4][Name][LogID:8]
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.BigEndian, uint32(1))
-
 	clientID := "cdc-test-content"
 	binary.Write(buf, binary.BigEndian, uint32(len(clientID)))
 	buf.WriteString(clientID)
-
 	binary.Write(buf, binary.BigEndian, uint32(1))
 	dbName := "1"
 	binary.Write(buf, binary.BigEndian, uint32(len(dbName)))
@@ -141,10 +148,6 @@ func TestCDC_MessageContent(t *testing.T) {
 	cdcConn.Write(buf.Bytes())
 
 	// 3. Perform Operations
-	client := connectReplClient(t, addr, clientTLS)
-	defer client.Close()
-	selectDatabase(t, client, "1")
-
 	// Op 1: Set
 	writeKeyVal(t, client, "test_key", "test_val")
 
@@ -154,7 +157,7 @@ func TestCDC_MessageContent(t *testing.T) {
 	client.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusOK)
 
 	// 4. Read and Parse CDC Stream
-	// We expect potentially 1 or 2 batches depending on timing/flushing.
+	// We might receive the primer first, then our ops.
 	foundSet := false
 	foundDel := false
 
@@ -174,8 +177,16 @@ func TestCDC_MessageContent(t *testing.T) {
 			}
 			t.Fatalf("Read CDC header failed: %v", err)
 		}
+		
+		if header[0] == protocol.ResStatusErr {
+			length := binary.BigEndian.Uint32(header[1:])
+			payload := make([]byte, length)
+			io.ReadFull(cdcConn, payload)
+			t.Fatalf("Server returned error: %s", string(payload))
+		}
+
 		if header[0] != protocol.OpCodeReplBatch {
-			continue // Skip other messages (e.g. heartbeats/acks if any)
+			continue // Skip other messages
 		}
 		length := binary.BigEndian.Uint32(header[1:])
 		payload := make([]byte, length)
@@ -185,38 +196,28 @@ func TestCDC_MessageContent(t *testing.T) {
 
 		// Parse Batch: [DBNameLen][DBName][Count][Entries...]
 		cursor := 0
-		if cursor+4 > len(payload) {
-			continue
-		}
+		if cursor+4 > len(payload) { continue }
 		dbLen := int(binary.BigEndian.Uint32(payload[cursor:]))
 		cursor += 4 + dbLen
-		if cursor+4 > len(payload) {
-			continue
-		}
+		if cursor+4 > len(payload) { continue }
 		count := int(binary.BigEndian.Uint32(payload[cursor:]))
 		cursor += 4
 
 		for i := 0; i < count; i++ {
 			// Entry Header: [LogID(8)][TxID(8)][Op(1)]
-			if cursor+17 > len(payload) {
-				break
-			}
+			if cursor+17 > len(payload) { break }
 			opType := payload[cursor+16]
 			cursor += 17
 
 			// Key
-			if cursor+4 > len(payload) {
-				break
-			}
+			if cursor+4 > len(payload) { break }
 			kLen := int(binary.BigEndian.Uint32(payload[cursor:]))
 			cursor += 4
 			key := string(payload[cursor : cursor+kLen])
 			cursor += kLen
 
 			// Val
-			if cursor+4 > len(payload) {
-				break
-			}
+			if cursor+4 > len(payload) { break }
 			vLen := int(binary.BigEndian.Uint32(payload[cursor:]))
 			cursor += 4
 			val := string(payload[cursor : cursor+vLen])

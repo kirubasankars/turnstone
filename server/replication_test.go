@@ -6,9 +6,9 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -23,7 +23,7 @@ import (
 // --- Replication Helpers ---
 
 // setupSharedCertEnv creates a temporary directory with a shared CA and certificates.
-// This mirrors setupTestEnv but returns just the dir and config for manual node spawning.
+// This is distinct from setupTestEnv in server_test.go as it prepares for multiple nodes.
 func setupSharedCertEnv(t *testing.T) (string, *tls.Config) {
 	t.Helper()
 	dir, err := os.MkdirTemp("", "turnstone-repl-test-*")
@@ -33,7 +33,6 @@ func setupSharedCertEnv(t *testing.T) (string, *tls.Config) {
 	t.Logf("Test Artifacts Directory: %s", dir)
 
 	// Generate artifacts (including admin certs)
-	// Keeps NumberOfDatabases as config parameter but logically creates databases
 	if err := config.GenerateConfigArtifacts(dir, config.Config{
 		TLSCertFile:       "certs/server.crt",
 		TLSKeyFile:        "certs/server.key",
@@ -43,7 +42,7 @@ func setupSharedCertEnv(t *testing.T) (string, *tls.Config) {
 		t.Fatalf("Failed to generate artifacts: %v", err)
 	}
 
-	// Load default client cert (role: client)
+	// Reuse getClientTLS from server_test.go (same package)
 	return dir, getClientTLS(t, dir)
 }
 
@@ -57,7 +56,6 @@ func startServerNode(t *testing.T, baseDir, name string, sharedTLS *tls.Config) 
 		t.Fatalf("Failed to open log file for node: %v", err)
 	}
 
-	// Create node-specific logger
 	logger := slog.New(slog.NewTextHandler(io.MultiWriter(os.Stdout, logFile), &slog.HandlerOptions{Level: slog.LevelDebug})).With("node", name)
 
 	nodeDir := filepath.Join(baseDir, name)
@@ -72,7 +70,6 @@ func startServerNode(t *testing.T, baseDir, name string, sharedTLS *tls.Config) 
 	}
 
 	// Replication Manager needs SERVER certs to connect to upstream masters
-	// We load them from the shared certs dir
 	certsDir := filepath.Join(baseDir, "certs")
 	serverCert, _ := tls.LoadX509KeyPair(filepath.Join(certsDir, "server.crt"), filepath.Join(certsDir, "server.key"))
 	caCert, _ := os.ReadFile(filepath.Join(certsDir, "ca.crt"))
@@ -102,76 +99,14 @@ func startServerNode(t *testing.T, baseDir, name string, sharedTLS *tls.Config) 
 	return srv, srv.listener.Addr().String(), cancel
 }
 
-// connectReplClient is a local helper similar to connectClient in server_test.go
-// but adapted for the replication tests context.
-func connectReplClient(t *testing.T, addr string, tlsConfig *tls.Config) *replTestClient {
-	t.Helper()
-	conn, err := tls.Dial("tcp", addr, tlsConfig)
-	if err != nil {
-		t.Fatalf("Failed to dial server: %v", err)
-	}
-	return &replTestClient{conn: conn, t: t}
-}
+// Helper wrappers using functions from server_test.go
 
-type replTestClient struct {
-	conn net.Conn
-	t    *testing.T
-}
-
-func (c *replTestClient) Close() {
-	c.conn.Close()
-}
-
-func (c *replTestClient) Send(opCode byte, payload []byte) {
-	c.t.Helper()
-	header := make([]byte, 5)
-	header[0] = opCode
-	binary.BigEndian.PutUint32(header[1:], uint32(len(payload)))
-	if _, err := c.conn.Write(header); err != nil {
-		c.t.Fatalf("Write header failed: %v", err)
-	}
-	if len(payload) > 0 {
-		if _, err := c.conn.Write(payload); err != nil {
-			c.t.Fatalf("Write payload failed: %v", err)
-		}
-	}
-}
-
-func (c *replTestClient) Read() (byte, []byte) {
-	c.t.Helper()
-	header := make([]byte, 5)
-	if _, err := io.ReadFull(c.conn, header); err != nil {
-		c.t.Fatalf("Read response header failed: %v", err)
-	}
-	length := binary.BigEndian.Uint32(header[1:])
-	var body []byte
-	if length > 0 {
-		body = make([]byte, length)
-		if _, err := io.ReadFull(c.conn, body); err != nil {
-			c.t.Fatalf("Read response body failed: %v", err)
-		}
-	}
-	return header[0], body
-}
-
-func (c *replTestClient) AssertStatus(opCode byte, payload []byte, expectedStatus byte) []byte {
-	c.t.Helper()
-	c.Send(opCode, payload)
-	status, body := c.Read()
-	if status != expectedStatus {
-		c.t.Fatalf("Op 0x%x: Expected status 0x%x, got 0x%x. Body: %s", opCode, expectedStatus, status, body)
-	}
-	return body
-}
-
-// selectDatabase switches the client's active database.
-func selectDatabase(t *testing.T, c *replTestClient, dbName string) {
+func selectDatabase(t *testing.T, c *testClient, dbName string) {
 	t.Helper()
 	c.AssertStatus(protocol.OpCodeSelect, []byte(dbName), protocol.ResStatusOK)
 }
 
-// configureReplication sends the REPLICAOF command.
-func configureReplication(t *testing.T, c *replTestClient, targetAddr, targetDB string) {
+func configureReplication(t *testing.T, c *testClient, targetAddr, targetDB string) {
 	t.Helper()
 	addrBytes := []byte(targetAddr)
 	dbBytes := []byte(targetDB)
@@ -183,8 +118,7 @@ func configureReplication(t *testing.T, c *replTestClient, targetAddr, targetDB 
 	c.AssertStatus(protocol.OpCodeReplicaOf, payload, protocol.ResStatusOK)
 }
 
-// writeKeyVal performs a Set operation within a transaction.
-func writeKeyVal(t *testing.T, c *replTestClient, k, v string) {
+func writeKeyVal(t *testing.T, c *testClient, k, v string) {
 	t.Helper()
 	key := []byte(k)
 	val := []byte(v)
@@ -198,8 +132,7 @@ func writeKeyVal(t *testing.T, c *replTestClient, k, v string) {
 	c.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusOK)
 }
 
-// readKey performs a Get operation within a transaction.
-func readKey(t *testing.T, c *replTestClient, k string) []byte {
+func readKey(t *testing.T, c *testClient, k string) []byte {
 	t.Helper()
 	c.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
 	c.Send(protocol.OpCodeGet, []byte(k))
@@ -211,7 +144,6 @@ func readKey(t *testing.T, c *replTestClient, k string) []byte {
 	return body
 }
 
-// waitForConditionOrTimeout is a helper to poll for a condition until timeout.
 func waitForConditionOrTimeout(t *testing.T, timeout time.Duration, check func() bool, errMsg string) {
 	t.Helper()
 	start := time.Now()
@@ -226,12 +158,9 @@ func waitForConditionOrTimeout(t *testing.T, timeout time.Duration, check func()
 
 // --- Tests ---
 
-// TestServer_ReplicaOf_Integration verifies that a replica can replicate from a primary
-// and that 'replicaof no one' stops the replication.
 func TestServer_ReplicaOf_Integration(t *testing.T) {
-	// Reusing the shared setup for consistency
 	baseDir, clientTLS := setupSharedCertEnv(t)
-	// Admin TLS needed for ReplicaOf command
+	// Reuse getRoleTLS from server_test.go
 	adminTLS := getRoleTLS(t, baseDir, "admin")
 
 	// Start Primary
@@ -242,18 +171,18 @@ func TestServer_ReplicaOf_Integration(t *testing.T) {
 	_, replicaAddr, cancelReplica := startServerNode(t, baseDir, "replica_int", clientTLS)
 	defer cancelReplica()
 
-	// Clients
-	clientPrimary := connectReplClient(t, primaryAddr, clientTLS)
+	// Clients (Using connectClient from server_test.go)
+	clientPrimary := connectClient(t, primaryAddr, clientTLS)
 	defer clientPrimary.Close()
 	selectDatabase(t, clientPrimary, "1")
 
 	// IMPORTANT: Connect to Replica as ADMIN to configure replication
-	clientReplicaAdmin := connectReplClient(t, replicaAddr, adminTLS)
+	clientReplicaAdmin := connectClient(t, replicaAddr, adminTLS)
 	defer clientReplicaAdmin.Close()
 	selectDatabase(t, clientReplicaAdmin, "1")
 
 	// Connect as Client to Replica for Reading
-	clientReplicaRead := connectReplClient(t, replicaAddr, clientTLS)
+	clientReplicaRead := connectClient(t, replicaAddr, clientTLS)
 	defer clientReplicaRead.Close()
 	selectDatabase(t, clientReplicaRead, "1")
 
@@ -272,7 +201,6 @@ func TestServer_ReplicaOf_Integration(t *testing.T) {
 
 	// --- PHASE 2: STOP REPLICATION ---
 	// Send REPLICAOF NO ONE using ADMIN connection
-	// Payload: [0][][DBName] (AddrLen=0 implies stop)
 	dbBytes := []byte("1")
 	stopPayload := make([]byte, 4+0+len(dbBytes))
 	binary.BigEndian.PutUint32(stopPayload[0:4], 0)
@@ -292,7 +220,6 @@ func TestServer_ReplicaOf_Integration(t *testing.T) {
 	}
 }
 
-// TestReplication_FanOut tests a single primary with multiple direct replicas.
 func TestReplication_FanOut(t *testing.T) {
 	baseDir, clientTLS := setupSharedCertEnv(t)
 	adminTLS := getRoleTLS(t, baseDir, "admin")
@@ -307,24 +234,24 @@ func TestReplication_FanOut(t *testing.T) {
 	defer cancelR2()
 
 	// Connect Clients
-	clientPrimary := connectReplClient(t, primaryAddr, clientTLS)
+	clientPrimary := connectClient(t, primaryAddr, clientTLS)
 	defer clientPrimary.Close()
 	selectDatabase(t, clientPrimary, "1")
 
-	clientR1 := connectReplClient(t, r1Addr, clientTLS)
+	clientR1 := connectClient(t, r1Addr, clientTLS)
 	defer clientR1.Close()
 	selectDatabase(t, clientR1, "1")
 
-	clientR2 := connectReplClient(t, r2Addr, clientTLS)
+	clientR2 := connectClient(t, r2Addr, clientTLS)
 	defer clientR2.Close()
 	selectDatabase(t, clientR2, "1")
 
 	// Admin clients for configuration
-	adminR1 := connectReplClient(t, r1Addr, adminTLS)
+	adminR1 := connectClient(t, r1Addr, adminTLS)
 	defer adminR1.Close()
 	selectDatabase(t, adminR1, "1")
 
-	adminR2 := connectReplClient(t, r2Addr, adminTLS)
+	adminR2 := connectClient(t, r2Addr, adminTLS)
 	defer adminR2.Close()
 	selectDatabase(t, adminR2, "1")
 
@@ -343,8 +270,6 @@ func TestReplication_FanOut(t *testing.T) {
 	}, "Fan-out replication failed")
 }
 
-// TestReplication_Cascading tests chained replication.
-// Topology: NodeA (Primary) -> NodeB (Replica/Primary) -> NodeC (Replica)
 func TestReplication_Cascading(t *testing.T) {
 	baseDir, clientTLS := setupSharedCertEnv(t)
 	adminTLS := getRoleTLS(t, baseDir, "admin")
@@ -362,24 +287,24 @@ func TestReplication_Cascading(t *testing.T) {
 	defer cancelC()
 
 	// Clients
-	clientA := connectReplClient(t, addrA, clientTLS)
+	clientA := connectClient(t, addrA, clientTLS)
 	defer clientA.Close()
 	selectDatabase(t, clientA, "1")
 
-	clientB := connectReplClient(t, addrB, clientTLS)
+	clientB := connectClient(t, addrB, clientTLS)
 	defer clientB.Close()
 	selectDatabase(t, clientB, "1")
 
-	clientC := connectReplClient(t, addrC, clientTLS)
+	clientC := connectClient(t, addrC, clientTLS)
 	defer clientC.Close()
 	selectDatabase(t, clientC, "1")
 
 	// Admins for config
-	adminB := connectReplClient(t, addrB, adminTLS)
+	adminB := connectClient(t, addrB, adminTLS)
 	defer adminB.Close()
 	selectDatabase(t, adminB, "1")
 
-	adminC := connectReplClient(t, addrC, adminTLS)
+	adminC := connectClient(t, addrC, adminTLS)
 	defer adminC.Close()
 	selectDatabase(t, adminC, "1")
 
@@ -399,8 +324,6 @@ func TestReplication_Cascading(t *testing.T) {
 	}, "Cascading replication failed: Node C did not receive data from Node A via Node B")
 }
 
-// TestReplication_SameServer_Loopback tests replication between two databases on the SAME server.
-// Topology: NodeA(Database 1) -> NodeA(Database 2)
 func TestReplication_SameServer_Loopback(t *testing.T) {
 	baseDir, clientTLS := setupSharedCertEnv(t)
 	adminTLS := getRoleTLS(t, baseDir, "admin")
@@ -409,10 +332,10 @@ func TestReplication_SameServer_Loopback(t *testing.T) {
 	_, addr, cancel := startServerNode(t, baseDir, "loopback", clientTLS)
 	defer cancel()
 
-	client := connectReplClient(t, addr, clientTLS)
+	client := connectClient(t, addr, clientTLS)
 	defer client.Close()
 
-	adminClient := connectReplClient(t, addr, adminTLS)
+	adminClient := connectClient(t, addr, adminTLS)
 	defer adminClient.Close()
 
 	// 1. Write data to Source Database "1"
@@ -431,8 +354,6 @@ func TestReplication_SameServer_Loopback(t *testing.T) {
 	}, "Loopback replication failed: Database 2 did not sync from Database 1 on same server")
 }
 
-// TestReplication_SlowConsumer_Dropped verifies that the primary closes the connection
-// to a replica that fails to consume the stream within protocol.ReplicationTimeout.
 func TestReplication_SlowConsumer_Dropped(t *testing.T) {
 	// 1. Lower timeout to speed up test
 	originalTimeout := protocol.ReplicationTimeout
@@ -445,7 +366,6 @@ func TestReplication_SlowConsumer_Dropped(t *testing.T) {
 	defer cancel()
 
 	// 3. Connect "Slow" Replica manually using CDC role credentials
-	// Note: We use CDC role because this simulates a replication handshake which uses OpCodeReplHello
 	cdcTLS := getRoleTLS(t, baseDir, "cdc")
 	conn, err := tls.Dial("tcp", addr, cdcTLS)
 	if err != nil {
@@ -453,19 +373,15 @@ func TestReplication_SlowConsumer_Dropped(t *testing.T) {
 	}
 	defer conn.Close()
 
-	// 4. Send Hello Handshake to subscribe to "1" Database (Valid Database)
-	// Format: [Ver:4][IDLen:4][ID][NumDBs:4] ... [NameLen:4][Name][LogID:8]
+	// 4. Send Hello Handshake
 	dbName := "1"
 	clientID := "slow-reader"
 
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.BigEndian, uint32(1)) // Version
-
 	binary.Write(buf, binary.BigEndian, uint32(len(clientID)))
 	buf.WriteString(clientID)
-
 	binary.Write(buf, binary.BigEndian, uint32(1)) // NumDatabases
-
 	binary.Write(buf, binary.BigEndian, uint32(len(dbName)))
 	buf.WriteString(dbName)
 	binary.Write(buf, binary.BigEndian, uint64(0)) // Start from LogSeq 0
@@ -500,11 +416,9 @@ func TestReplication_SlowConsumer_Dropped(t *testing.T) {
 		}
 		// Read Select Resp
 		dump := make([]byte, 1024)
-		if _, err := genConn.Read(dump); err != nil {
-			return
-		}
+		genConn.Read(dump)
 
-		// Helper to send/read without failure
+		// Helper to send/read
 		doRequest := func(op byte, payload []byte) error {
 			h := make([]byte, 5)
 			h[0] = op
@@ -517,15 +431,12 @@ func TestReplication_SlowConsumer_Dropped(t *testing.T) {
 					return err
 				}
 			}
-			// Read Response
 			if _, err := io.ReadFull(genConn, h); err != nil {
 				return err
 			}
 			length := binary.BigEndian.Uint32(h[1:])
 			if length > 0 {
-				if _, err := io.ReadFull(genConn, make([]byte, length)); err != nil {
-					return err
-				}
+				io.ReadFull(genConn, make([]byte, length))
 			}
 			return nil
 		}
@@ -550,10 +461,7 @@ func TestReplication_SlowConsumer_Dropped(t *testing.T) {
 		}
 	}()
 
-	// 6. Verify Disconnection
-	// We read nothing (simulating slow consumer). The server should close the connection
-	// when its buffer fills or timeout occurs (ReplicationTimeout).
-	// Allow slack for TCP buffers filling up.
+	// 6. Verify Disconnection (Timeout or EOF)
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	readBuf := make([]byte, 1024)
 	for {
@@ -562,8 +470,439 @@ func TestReplication_SlowConsumer_Dropped(t *testing.T) {
 			if err == io.EOF {
 				return // Success
 			}
-			// Success if reset/closed
-			return
+			return // Success if reset/closed
 		}
 	}
+}
+
+// TestCDC_PurgedWAL_TriggersSnapshot verifies that if the requested logs are missing,
+// the server initiates a Full Sync (Snapshot) instead of returning an error.
+func TestCDC_PurgedWAL_TriggersSnapshot(t *testing.T) {
+	dir, stores, srv, cleanup := setupTestEnv(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.Run(ctx)
+	time.Sleep(100 * time.Millisecond)
+
+	addr := srv.listener.Addr().String()
+	clientTLS := getClientTLS(t, dir)
+	cdcTLS := getRoleTLS(t, dir, "cdc")
+
+	// Helper to create SET payload
+	makeSet := func(k, v string) []byte {
+		kb, vb := []byte(k), []byte(v)
+		buf := make([]byte, 4+len(kb)+len(vb))
+		binary.BigEndian.PutUint32(buf[0:4], uint32(len(kb)))
+		copy(buf[4:], kb)
+		copy(buf[4+len(kb):], vb)
+		return buf
+	}
+
+	// 1. Write initial data to Database "1" to generate WAL entry (OpID 1)
+	c1 := connectClient(t, addr, clientTLS)
+	defer c1.Close()
+	selectDatabase(t, c1, "1")
+
+	c1.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
+	c1.AssertStatus(protocol.OpCodeSet, makeSet("k1", "v1"), protocol.ResStatusOK)
+	c1.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusOK)
+
+	// 2. Force WAL Rotation using Promote() (File 1 -> File 2)
+	// We use Promote because Checkpoint() only rotates VLog, not WAL.
+	st1 := stores["1"]
+	if err := st1.DB.Promote(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Write more data (OpID 2) into File 2
+	c1.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
+	c1.AssertStatus(protocol.OpCodeSet, makeSet("k2", "v2"), protocol.ResStatusOK)
+	c1.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusOK)
+
+	// 4. Force WAL Rotation again (File 2 -> File 3)
+	if err := st1.DB.Promote(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 5. Purge logs older than OpID 2. This deletes File 1.
+	// OpID 2 is in File 2. File 2 StartOpID is 2.
+	// 2 <= 2 -> File 1 is purged.
+	if err := st1.DB.PurgeWAL(2); err != nil {
+		t.Fatal(err)
+	}
+
+	// 6. Connect CDC requesting StartSeq 0.
+	cdcConn, err := tls.Dial("tcp", addr, cdcTLS)
+	if err != nil {
+		t.Fatalf("Failed to dial CDC: %v", err)
+	}
+	defer cdcConn.Close()
+
+	// Handshake
+	buf := new(bytes.Buffer)
+	binary.Write(buf, binary.BigEndian, uint32(1)) // Ver
+	clientid := "test-cdc-snapshot"
+	binary.Write(buf, binary.BigEndian, uint32(len(clientid)))
+	buf.WriteString(clientid)
+	binary.Write(buf, binary.BigEndian, uint32(1)) // Count
+	part := "1"
+	binary.Write(buf, binary.BigEndian, uint32(len(part)))
+	buf.WriteString(part)
+	binary.Write(buf, binary.BigEndian, uint64(0)) // Request StartSeq 0
+
+	header := make([]byte, 5)
+	header[0] = protocol.OpCodeReplHello
+	binary.BigEndian.PutUint32(header[1:], uint32(buf.Len()))
+
+	cdcConn.Write(header)
+	cdcConn.Write(buf.Bytes())
+
+	// 7. Read response. Expect Snapshot Packet.
+	respHead := make([]byte, 5)
+	cdcConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.ReadFull(cdcConn, respHead); err != nil {
+		t.Fatalf("Read CDC response failed: %v", err)
+	}
+
+	// Expect Snapshot OpCode
+	if respHead[0] != protocol.OpCodeReplSnapshot {
+		if respHead[0] == protocol.ResStatusErr {
+			ln := binary.BigEndian.Uint32(respHead[1:])
+			body := make([]byte, ln)
+			io.ReadFull(cdcConn, body)
+			t.Fatalf("Unexpected error from server: %s", string(body))
+		}
+		t.Fatalf("Expected OpCodeReplSnapshot (0x53), got 0x%x", respHead[0])
+	}
+
+	// Consume Snapshot Data
+	ln := binary.BigEndian.Uint32(respHead[1:])
+	body := make([]byte, ln)
+	if _, err := io.ReadFull(cdcConn, body); err != nil {
+		t.Fatalf("Read snapshot body failed: %v", err)
+	}
+
+	// Verify K1 and K2 are present in the snapshot
+	if !bytes.Contains(body, []byte("k1")) || !bytes.Contains(body, []byte("v1")) {
+		t.Error("Snapshot missing k1/v1")
+	}
+	if !bytes.Contains(body, []byte("k2")) || !bytes.Contains(body, []byte("v2")) {
+		t.Error("Snapshot missing k2/v2")
+	}
+
+	// 8. Expect Snapshot Done Signal (Updated for framing)
+	if _, err := io.ReadFull(cdcConn, respHead); err != nil {
+		t.Fatalf("Read Done header failed: %v", err)
+	}
+	if respHead[0] != protocol.OpCodeReplSnapshotDone {
+		t.Fatalf("Expected OpCodeReplSnapshotDone (0x54), got 0x%x", respHead[0])
+	}
+	ln = binary.BigEndian.Uint32(respHead[1:])
+	
+	// Payload contains [DBNameLen(4)][DBName][Count(4)][Data(16)]
+	// DBName="1" (1 byte) -> Total wrapper = 9 bytes. Total payload = 25 bytes.
+	if ln < 9+16 {
+		t.Fatalf("Expected at least 25 byte payload for SnapshotDone (wrapper+data), got %d", ln)
+	}
+	
+	payload := make([]byte, ln)
+	if _, err := io.ReadFull(cdcConn, payload); err != nil {
+		t.Fatalf("Read Done payload failed: %v", err)
+	}
+
+	// Skip framing
+	cursor := 0
+	nLen := int(binary.BigEndian.Uint32(payload[cursor:]))
+	cursor += 4 + nLen + 4 // DBNameLen + DBName + Count
+
+	data := payload[cursor:]
+	if len(data) != 16 {
+		t.Fatalf("Expected 16 byte data (TxID+OpID), got %d", len(data))
+	}
+
+	// 9. Verify transition to live streaming
+	c1.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
+	c1.AssertStatus(protocol.OpCodeSet, makeSet("k3", "v3"), protocol.ResStatusOK)
+	c1.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusOK)
+
+	// Read Next Packet - Should be Batch (0x51)
+	if _, err := io.ReadFull(cdcConn, respHead); err != nil {
+		t.Fatalf("Read Batch header failed: %v", err)
+	}
+	if respHead[0] != protocol.OpCodeReplBatch {
+		t.Fatalf("Expected OpCodeReplBatch (0x51), got 0x%x", respHead[0])
+	}
+}
+
+// TestReplication_FullSync_Integration verifies that a Replica server can correctly
+// ingest a full snapshot from a Primary when the WAL logs are missing, and then
+// seamlessly transition to receiving live updates.
+func TestReplication_FullSync_Integration(t *testing.T) {
+	baseDir, clientTLS := setupSharedCertEnv(t)
+	adminTLS := getRoleTLS(t, baseDir, "admin")
+
+	// 1. Start Primary
+	primarySrv, primaryAddr, cancelPrimary := startServerNode(t, baseDir, "primary_fs", clientTLS)
+	defer cancelPrimary()
+
+	// 2. Populate Primary with data that will be "snapshotted"
+	clientPrimary := connectClient(t, primaryAddr, clientTLS)
+	defer clientPrimary.Close()
+	selectDatabase(t, clientPrimary, "1")
+
+	writeKeyVal(t, clientPrimary, "snapKey", "snapVal")
+
+	// 3. Force WAL Purge on Primary to make logs unavailable using Promote (Forces rotation)
+	st1 := primarySrv.stores["1"]
+	if err := st1.DB.Promote(); err != nil {
+		t.Fatalf("Promote failed: %v", err)
+	}
+
+	// Purge WAL.
+	// We purge up to currentOpID + 1 to ensure the old log file is eligible.
+	currentOpID := st1.DB.LastOpID()
+	if err := st1.DB.PurgeWAL(currentOpID + 1); err != nil {
+		t.Fatalf("PurgeWAL failed: %v", err)
+	}
+
+	// 4. Start Replica (Empty)
+	_, replicaAddr, cancelReplica := startServerNode(t, baseDir, "replica_fs", clientTLS)
+	defer cancelReplica()
+
+	clientReplica := connectClient(t, replicaAddr, clientTLS)
+	defer clientReplica.Close()
+	selectDatabase(t, clientReplica, "1")
+
+	adminReplica := connectClient(t, replicaAddr, adminTLS)
+	defer adminReplica.Close()
+	selectDatabase(t, adminReplica, "1")
+
+	// 5. Configure Replication
+	// Primary should detect missing WAL and send Snapshot.
+	configureReplication(t, adminReplica, primaryAddr, "1")
+
+	// 6. Verify Snapshot Data Arrives
+	waitForConditionOrTimeout(t, 5*time.Second, func() bool {
+		val := readKey(t, clientReplica, "snapKey")
+		return string(val) == "snapVal"
+	}, "Replica failed to receive snapshot data (snapKey)")
+
+	// 7. Verify Transition to Live Streaming
+	// Write new data to Primary
+	writeKeyVal(t, clientPrimary, "liveKey", "liveVal")
+
+	// Check Replica
+	waitForConditionOrTimeout(t, 5*time.Second, func() bool {
+		val := readKey(t, clientReplica, "liveKey")
+		return string(val) == "liveVal"
+	}, "Replica failed to receive live stream data (liveKey) after snapshot")
+}
+
+func TestReplication_KeyCount_Match(t *testing.T) {
+	baseDir, clientTLS := setupSharedCertEnv(t)
+	adminTLS := getRoleTLS(t, baseDir, "admin")
+
+	// Start Primary
+	primarySrv, primaryAddr, cancelPrimary := startServerNode(t, baseDir, "primary_kc", clientTLS)
+	defer cancelPrimary()
+
+	// Start Replica
+	replicaSrv, replicaAddr, cancelReplica := startServerNode(t, baseDir, "replica_kc", clientTLS)
+	defer cancelReplica()
+
+	// Clients
+	clientPrimary := connectClient(t, primaryAddr, clientTLS)
+	defer clientPrimary.Close()
+	selectDatabase(t, clientPrimary, "1")
+
+	adminReplica := connectClient(t, replicaAddr, adminTLS)
+	defer adminReplica.Close()
+	selectDatabase(t, adminReplica, "1")
+
+	// 1. Write initial keys to Primary
+	numKeys := 50
+	for i := 0; i < numKeys; i++ {
+		writeKeyVal(t, clientPrimary, fmt.Sprintf("k%d", i), "val")
+	}
+
+	// 2. Configure Replication
+	configureReplication(t, adminReplica, primaryAddr, "1")
+
+	// 3. Verify Key Count on Replica matches Primary
+	// We check specific metrics "turnstone_db_key_count"
+	
+	// Wait for Primary to definitely have the count updated in metrics (it might be cached/background)
+	waitForMetric(t, primarySrv, "turnstone_db_key_count", func(val float64) bool {
+		return int(val) == numKeys
+	})
+
+	// Wait for Replica to sync and update its key count
+	waitForMetric(t, replicaSrv, "turnstone_db_key_count", func(val float64) bool {
+		return int(val) == numKeys
+	})
+}
+
+func TestReplication_TimelineFork_Recovery(t *testing.T) {
+	baseDir, clientTLS := setupSharedCertEnv(t)
+	adminTLS := getRoleTLS(t, baseDir, "admin")
+
+	// 1. Start Primary
+	primarySrv, primaryAddr, cancelPrimary := startServerNode(t, baseDir, "primary_tl", clientTLS)
+	defer cancelPrimary()
+
+	// 2. Start Replica
+	_, replicaAddr, cancelReplica := startServerNode(t, baseDir, "replica_tl", clientTLS)
+	defer cancelReplica()
+
+	// Clients
+	clientPrimary := connectClient(t, primaryAddr, clientTLS)
+	defer clientPrimary.Close()
+	selectDatabase(t, clientPrimary, "1")
+
+	clientReplica := connectClient(t, replicaAddr, clientTLS)
+	defer clientReplica.Close()
+	selectDatabase(t, clientReplica, "1")
+
+	adminReplica := connectClient(t, replicaAddr, adminTLS)
+	defer adminReplica.Close()
+	selectDatabase(t, adminReplica, "1")
+
+	// 3. Write on Timeline 1
+	writeKeyVal(t, clientPrimary, "t1_key", "val1")
+
+	// 4. Force Timeline Switch on Primary
+	// This simulates a promotion event or a history fork.
+	st1 := primarySrv.stores["1"]
+	if err := st1.Promote(); err != nil {
+		t.Fatalf("Primary promote failed: %v", err)
+	}
+
+	// 5. Write on Timeline 2
+	writeKeyVal(t, clientPrimary, "t2_key", "val2")
+
+	// 6. Configure Replication (Replica connects to Primary)
+	// The replica should pull T1 data, cross the timeline boundary, and pull T2 data.
+	configureReplication(t, adminReplica, primaryAddr, "1")
+
+	// 7. Verify Data
+	waitForConditionOrTimeout(t, 5*time.Second, func() bool {
+		v1 := readKey(t, clientReplica, "t1_key")
+		v2 := readKey(t, clientReplica, "t2_key")
+		return string(v1) == "val1" && string(v2) == "val2"
+	}, "Replica failed to sync across timeline fork")
+}
+
+// startServerNodeWithReplicas starts a single TurnstoneDB server instance with specific minReplicas.
+func startServerNodeWithReplicas(t *testing.T, baseDir, name string, sharedTLS *tls.Config, minReplicas int) (*Server, string, context.CancelFunc) {
+	t.Helper()
+	logPath := filepath.Join(baseDir, "turnstone.log")
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		t.Fatalf("Failed to open log file for node: %v", err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.MultiWriter(os.Stdout, logFile), &slog.HandlerOptions{Level: slog.LevelDebug})).With("node", name)
+
+	nodeDir := filepath.Join(baseDir, name)
+	stores := make(map[string]*store.Store)
+	for _, dbName := range []string{"0", "1", "2", "3"} {
+		partPath := filepath.Join(nodeDir, "data", dbName)
+		// Use minReplicas here
+		st, err := store.NewStore(partPath, logger, minReplicas, true, "time", 90)
+		if err != nil {
+			t.Fatalf("Failed to init store %s: %v", dbName, err)
+		}
+		stores[dbName] = st
+	}
+
+	certsDir := filepath.Join(baseDir, "certs")
+	serverCert, _ := tls.LoadX509KeyPair(filepath.Join(certsDir, "server.crt"), filepath.Join(certsDir, "server.key"))
+	caCert, _ := os.ReadFile(filepath.Join(certsDir, "ca.crt"))
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(caCert)
+	replTLS := &tls.Config{Certificates: []tls.Certificate{serverCert}, RootCAs: pool, InsecureSkipVerify: true}
+
+	rm := replication.NewReplicationManager(name, stores, replTLS, logger)
+
+	srv, err := NewServer(
+		name,
+		":0", stores, logger, 10,
+		filepath.Join(certsDir, "server.crt"),
+		filepath.Join(certsDir, "server.key"),
+		filepath.Join(certsDir, "ca.crt"),
+		rm,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go srv.Run(ctx)
+
+	time.Sleep(50 * time.Millisecond)
+	return srv, srv.listener.Addr().String(), cancel
+}
+
+func TestReplication_KeyCount_SyncAndAsync(t *testing.T) {
+	baseDir, clientTLS := setupSharedCertEnv(t)
+	adminTLS := getRoleTLS(t, baseDir, "admin")
+
+	// 1. Start Primary with MinReplicas=1 (Sync Replication)
+	// Writes to this server will block until at least 1 replica acknowledges.
+	primarySrv, primaryAddr, cancelPrimary := startServerNodeWithReplicas(t, baseDir, "primary_sync", clientTLS, 1)
+	defer cancelPrimary()
+
+	// 2. Start Sync Replica (This will satisfy the quorum)
+	replicaSyncSrv, replicaSyncAddr, cancelReplicaSync := startServerNode(t, baseDir, "replica_sync", clientTLS)
+	defer cancelReplicaSync()
+
+	// 3. Start Async Replica (This is an extra observer, not strictly required for quorum if Sync is present, but receives data)
+	replicaAsyncSrv, replicaAsyncAddr, cancelReplicaAsync := startServerNode(t, baseDir, "replica_async", clientTLS)
+	defer cancelReplicaAsync()
+
+	// Clients
+	clientPrimary := connectClient(t, primaryAddr, clientTLS)
+	defer clientPrimary.Close()
+	selectDatabase(t, clientPrimary, "1")
+
+	adminReplicaSync := connectClient(t, replicaSyncAddr, adminTLS)
+	defer adminReplicaSync.Close()
+	selectDatabase(t, adminReplicaSync, "1")
+
+	adminReplicaAsync := connectClient(t, replicaAsyncAddr, adminTLS)
+	defer adminReplicaAsync.Close()
+	selectDatabase(t, adminReplicaAsync, "1")
+
+	// 4. Configure Replication
+	// Connect Sync Replica -> Primary
+	configureReplication(t, adminReplicaSync, primaryAddr, "1")
+	
+	// Connect Async Replica -> Primary
+	configureReplication(t, adminReplicaAsync, primaryAddr, "1")
+
+	// 5. Write keys to Primary
+	// Since MinReplicas=1, this would hang if no replicas were connected.
+	// Success here implies quorum was met.
+	numKeys := 50
+	for i := 0; i < numKeys; i++ {
+		writeKeyVal(t, clientPrimary, fmt.Sprintf("k%d", i), "val")
+	}
+
+	// 6. Verify Key Counts on all nodes
+	// The Primary metric updates on write.
+	waitForMetric(t, primarySrv, "turnstone_db_key_count", func(val float64) bool {
+		return int(val) == numKeys
+	})
+
+	// The Sync Replica must have the keys to have acknowledged the writes.
+	waitForMetric(t, replicaSyncSrv, "turnstone_db_key_count", func(val float64) bool {
+		return int(val) == numKeys
+	})
+
+	// The Async Replica should also eventually catch up.
+	waitForMetric(t, replicaAsyncSrv, "turnstone_db_key_count", func(val float64) bool {
+		return int(val) == numKeys
+	})
 }
