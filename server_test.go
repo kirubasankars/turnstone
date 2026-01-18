@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -462,4 +463,129 @@ func TestServer_Backpressure(t *testing.T) {
 	if !success {
 		t.Fatal("Failed to connect after releasing capacity")
 	}
+}
+
+// TestServer_ProtectedKeys verifies that clients cannot modify keys starting with "_".
+func TestServer_ProtectedKeys(t *testing.T) {
+	dir, stores, srv := setupTestEnv(t)
+	defer stores["0"].Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.Run(ctx)
+	time.Sleep(100 * time.Millisecond)
+
+	client := connectClient(t, srv.listener.Addr().String(), getClientTLS(t, dir))
+	defer client.Close()
+
+	// Select DB 1
+	client.AssertStatus(OpCodeSelect, []byte("1"), ResStatusOK)
+
+	// Helper to create SET payload
+	createSetPayload := func(k, v string) []byte {
+		keyBytes := []byte(k)
+		valBytes := []byte(v)
+		buf := make([]byte, 4+len(keyBytes)+len(valBytes))
+		binary.BigEndian.PutUint32(buf[0:4], uint32(len(keyBytes)))
+		copy(buf[4:], keyBytes)
+		copy(buf[4+len(keyBytes):], valBytes)
+		return buf
+	}
+
+	client.AssertStatus(OpCodeBegin, nil, ResStatusOK)
+
+	// 1. Try to SET a protected key
+	// Should fail with ResStatusErr
+	resp := client.AssertStatus(OpCodeSet, createSetPayload("_id", "hacked"), ResStatusErr)
+	if !strings.Contains(string(resp), "read-only") {
+		t.Errorf("Expected read-only error for protected key, got: %s", string(resp))
+	}
+
+	// 2. Try to DEL a protected key
+	// Should fail with ResStatusErr
+	resp = client.AssertStatus(OpCodeDel, []byte("_meta"), ResStatusErr)
+	if !strings.Contains(string(resp), "read-only") {
+		t.Errorf("Expected read-only error for protected key deletion, got: %s", string(resp))
+	}
+
+	// 3. Verify normal keys still work
+	client.AssertStatus(OpCodeSet, createSetPayload("normal", "ok"), ResStatusOK)
+
+	client.AssertStatus(OpCodeCommit, nil, ResStatusOK)
+}
+
+// TestServer_ReplicaReadOnly verifies that a database in replica mode rejects writes
+// but accepts compaction.
+func TestServer_ReplicaReadOnly(t *testing.T) {
+	// 1. Setup Environment with 2 nodes (Primary, Replica)
+	baseDir, tlsConfig := setupSharedCertEnv(t)
+
+	// Start Primary
+	_, primaryAddr, cancelPrimary := startServerNode(t, baseDir, "primary_ro", tlsConfig)
+	defer cancelPrimary()
+
+	// Start Replica
+	_, replicaAddr, cancelReplica := startServerNode(t, baseDir, "replica_ro", tlsConfig)
+	defer cancelReplica()
+
+	// Connect Client to Replica
+	cReplica := connectClient(t, replicaAddr, tlsConfig)
+	selectDB(t, cReplica, "1")
+
+	// 2. Configure Replication (Replica -> Primary)
+	configureReplication(t, cReplica, primaryAddr, "1")
+
+	// Wait briefly for replication state to be registered in memory
+	time.Sleep(200 * time.Millisecond)
+
+	cReplica.AssertStatus(OpCodeBegin, nil, ResStatusOK)
+
+	// 3. Attempt Write (SET) on Replica
+	// Should fail because it is now a replica
+	key := []byte("k")
+	val := []byte("v")
+	pl := make([]byte, 4+len(key)+len(val))
+	binary.BigEndian.PutUint32(pl[0:4], uint32(len(key)))
+	copy(pl[4:], key)
+	copy(pl[4+len(key):], val)
+
+	resp := cReplica.AssertStatus(OpCodeSet, pl, ResStatusErr)
+	if !strings.Contains(string(resp), "Replica database is read-only") {
+		t.Errorf("Expected replica read-only error, got: %s", string(resp))
+	}
+
+	// 4. Attempt Delete (DEL) on Replica
+	resp = cReplica.AssertStatus(OpCodeDel, key, ResStatusErr)
+	if !strings.Contains(string(resp), "Replica database is read-only") {
+		t.Errorf("Expected replica read-only error for DEL, got: %s", string(resp))
+	}
+
+	// Abort the write transaction before attempting administrative operations
+	cReplica.AssertStatus(OpCodeAbort, nil, ResStatusOK)
+	cReplica.Close() // Close connection to ensure transaction state is definitely cleared
+
+	// 5. Attempt Compact on Replica (New Connection)
+	// Should SUCCEED (Compaction is allowed maintenance)
+	cReplicaAdmin := connectClient(t, replicaAddr, tlsConfig)
+	defer cReplicaAdmin.Close()
+	selectDB(t, cReplicaAdmin, "1")
+	cReplicaAdmin.AssertStatus(OpCodeCompact, nil, ResStatusOK)
+
+	// 6. Stop Replication
+	// REPLICAOF NO ONE
+	// Payload: [0][][DBName]
+	dbBytes := []byte("1")
+	stopPl := make([]byte, 4+0+len(dbBytes))
+	binary.BigEndian.PutUint32(stopPl[0:4], 0)
+	copy(stopPl[4:], dbBytes)
+	cReplicaAdmin.AssertStatus(OpCodeReplicaOf, stopPl, ResStatusOK)
+
+	// Wait for state update
+	time.Sleep(200 * time.Millisecond)
+
+	// 7. Attempt Write again
+	// Should SUCCEED now that it is no longer a replica
+	cReplicaAdmin.AssertStatus(OpCodeBegin, nil, ResStatusOK)
+	cReplicaAdmin.AssertStatus(OpCodeSet, pl, ResStatusOK)
+	cReplicaAdmin.AssertStatus(OpCodeCommit, nil, ResStatusOK)
 }
