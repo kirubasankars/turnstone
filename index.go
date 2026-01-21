@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
-	"sync"
 	"sync/atomic"
 
 	"github.com/syndtr/goleveldb/leveldb"
@@ -63,19 +62,6 @@ const (
 	prefixState      = byte('s')
 )
 
-var bufferPool = sync.Pool{
-	New: func() interface{} { return make([]byte, 256) },
-}
-
-func getBuf(size int) []byte {
-	b := bufferPool.Get().([]byte)
-	if cap(b) < size {
-		b = make([]byte, size)
-	}
-	return b[:size]
-}
-func putBuf(b []byte) { bufferPool.Put(b) }
-
 type LevelDBIndex struct {
 	db          *leveldb.DB
 	approxCount int64
@@ -100,7 +86,8 @@ func (idx *LevelDBIndex) Close() error { return idx.db.Close() }
 
 func (idx *LevelDBIndex) encodeKey(key string, txID uint64) []byte {
 	kLen := len(key)
-	buf := getBuf(1 + kLen + 8)
+	// Directly allocate buffer, ignoring pooling for correctness/simplicity
+	buf := make([]byte, 1+kLen+8)
 	buf[0] = prefixIndex
 	copy(buf[1:], key)
 	binary.BigEndian.PutUint64(buf[1+kLen:], ^txID) // Inverted TxID for descending sort
@@ -109,7 +96,6 @@ func (idx *LevelDBIndex) encodeKey(key string, txID uint64) []byte {
 
 func (idx *LevelDBIndex) Get(key string, readTxID uint64) (IndexEntry, bool) {
 	target := idx.encodeKey(key, readTxID)
-	defer putBuf(target)
 
 	iter := idx.db.NewIterator(nil, nil)
 	defer iter.Release()
@@ -129,7 +115,6 @@ func (idx *LevelDBIndex) Get(key string, readTxID uint64) (IndexEntry, bool) {
 
 func (idx *LevelDBIndex) Set(key string, offset int64, length int64, txID uint64, deleted bool, minReadTxID uint64) {
 	dbKey := idx.encodeKey(key, txID)
-	defer putBuf(dbKey)
 
 	var val [13]byte
 	binary.BigEndian.PutUint64(val[0:8], uint64(offset))
@@ -155,9 +140,7 @@ func (idx *LevelDBIndex) SetBatch(updates []IndexUpdate) error {
 			val[12] = 1
 		}
 
-		// LevelDB copies the key/value data, so it is safe to return dbKey to the pool immediately
 		batch.Put(dbKey, val[:])
-		putBuf(dbKey)
 	}
 
 	if err := idx.db.Write(batch, nil); err != nil {
@@ -178,7 +161,6 @@ func (idx *LevelDBIndex) GetLatest(key string) (IndexEntry, bool) {
 
 func (idx *LevelDBIndex) UpdateHead(key string, newOffset int64, newLength int64, txID uint64) bool {
 	dbKey := idx.encodeKey(key, txID)
-	defer putBuf(dbKey)
 
 	v, err := idx.db.Get(dbKey, nil)
 	if err == nil && v != nil {
@@ -219,7 +201,6 @@ func (idx *LevelDBIndex) Len() int         { return int(atomic.LoadInt64(&idx.ap
 func (idx *LevelDBIndex) SizeBytes() int64 { return 0 }
 func (idx *LevelDBIndex) Remove(key string) {
 	target := idx.encodeKey(key, ^uint64(0))
-	defer putBuf(target)
 	iter := idx.db.NewIterator(nil, nil)
 	defer iter.Release()
 	batch := new(leveldb.Batch)
