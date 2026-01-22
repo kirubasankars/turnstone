@@ -50,11 +50,11 @@ type StoreStats struct {
 }
 
 type Store struct {
-	dataDir     string
-	isSystemDB  bool
-	minReplicas int
-	logger      *slog.Logger
-	startTime   time.Time
+	dataDir           string
+	isSystemPartition bool
+	minReplicas       int
+	logger            *slog.Logger
+	startTime         time.Time
 
 	wal    *wal.WAL
 	engine *engine.StoneDB
@@ -72,6 +72,8 @@ type Store struct {
 
 	recoveryDuration int64
 	bytesWritten     int64
+	bytesRead        int64
+	conflictCount    int64
 }
 
 func NewStore(dataDir string, logger *slog.Logger, allowTruncate bool, minReplicas int, fsyncEnabled bool) (*Store, error) {
@@ -94,19 +96,19 @@ func NewStore(dataDir string, logger *slog.Logger, allowTruncate bool, minReplic
 	ctx, cancel := context.WithCancel(context.Background())
 
 	s := &Store{
-		dataDir:          dataDir,
-		isSystemDB:       filepath.Base(dataDir) == "0",
-		logger:           logger,
-		minReplicas:      0, // Init to 0 for bootstrap
-		startTime:        time.Now(),
-		wal:              w,
-		engine:           eng,
-		opsChannel:       make(chan protocol.BatchRequest, 5000),
-		ctx:              ctx,
-		cancel:           cancel,
-		checkpoints:      make([]Checkpoint, 0),
-		replicationSlots: make(map[string]ReplicaState),
-		nextLogSeq:       1,
+		dataDir:           dataDir,
+		isSystemPartition: filepath.Base(dataDir) == "0",
+		logger:            logger,
+		minReplicas:       0, // Init to 0 for bootstrap
+		startTime:         time.Now(),
+		wal:               w,
+		engine:            eng,
+		opsChannel:        make(chan protocol.BatchRequest, 5000),
+		ctx:               ctx,
+		cancel:            cancel,
+		checkpoints:       make([]Checkpoint, 0),
+		replicationSlots:  make(map[string]ReplicaState),
+		nextLogSeq:        1,
 	}
 	s.ackCond = sync.NewCond(&s.mu)
 
@@ -240,6 +242,9 @@ func (s *Store) processBatch(reqs []protocol.BatchRequest) {
 
 	if err := tx.Commit(); err != nil {
 		s.logger.Error("Failed to commit to StoneDB", "err", err)
+		// Track conflicts if it's a conflict error, though generally harder to distinguish without type check
+		// For now just increment generic conflict/error count if needed
+		atomic.AddInt64(&s.conflictCount, 1)
 		s.notifyErrors(reqs, err)
 		return
 	}
@@ -335,19 +340,22 @@ func (s *Store) recover() error {
 }
 
 func (s *Store) Get(key string) ([]byte, error) {
-	if s.isSystemDB {
-		return nil, protocol.ErrSystemDBReadOnly
+	if s.isSystemPartition {
+		return nil, protocol.ErrSystemPartitionReadOnly
 	}
 	val, err := s.engine.Get(key, s.engine.CurrentTxID())
 	if err == protocol.ErrKeyNotFound {
 		return nil, protocol.ErrKeyNotFound
 	}
+	if err == nil {
+		atomic.AddInt64(&s.bytesRead, int64(len(val)))
+	}
 	return val, err
 }
 
 func (s *Store) ApplyBatch(entries []protocol.LogEntry) error {
-	if s.isSystemDB {
-		return protocol.ErrSystemDBReadOnly
+	if s.isSystemPartition {
+		return protocol.ErrSystemPartitionReadOnly
 	}
 	return s.submitBatch(entries)
 }
@@ -452,6 +460,8 @@ func (s *Store) Stats() StoreStats {
 		PendingOps:       len(s.opsChannel),
 		QueueCapacity:    cap(s.opsChannel),
 		BytesWritten:     atomic.LoadInt64(&s.bytesWritten),
+		BytesRead:        atomic.LoadInt64(&s.bytesRead),
+		ConflictCount:    atomic.LoadInt64(&s.conflictCount),
 	}
 }
 

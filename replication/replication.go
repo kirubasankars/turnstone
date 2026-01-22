@@ -17,8 +17,8 @@ import (
 )
 
 type ReplicaSource struct {
-	LocalDB  string
-	RemoteDB string
+	LocalPartition  string
+	RemotePartition string
 }
 
 type ReplicationManager struct {
@@ -49,53 +49,53 @@ func (rm *ReplicationManager) Start() {
 	}
 }
 
-func (rm *ReplicationManager) AddReplica(dbName, sourceAddr, sourceDB string) {
+func (rm *ReplicationManager) AddReplica(partitionName, sourceAddr, sourcePartition string) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 
-	dbs, _ := rm.peers[sourceAddr]
+	parts, _ := rm.peers[sourceAddr]
 	found := false
-	for _, db := range dbs {
-		if db.LocalDB == dbName {
+	for _, p := range parts {
+		if p.LocalPartition == partitionName {
 			found = true
 			break
 		}
 	}
 
 	if !found {
-		rm.peers[sourceAddr] = append(rm.peers[sourceAddr], ReplicaSource{LocalDB: dbName, RemoteDB: sourceDB})
+		rm.peers[sourceAddr] = append(rm.peers[sourceAddr], ReplicaSource{LocalPartition: partitionName, RemotePartition: sourcePartition})
 		if cancel, exists := rm.cancelFunc[sourceAddr]; exists {
 			cancel()
 		}
 		rm.spawnConnection(sourceAddr)
-		rm.logger.Info("Added replica source", "db", dbName, "source", sourceAddr, "remote_db", sourceDB)
+		rm.logger.Info("Added replica source", "partition", partitionName, "source", sourceAddr, "remote_partition", sourcePartition)
 	}
 }
 
-func (rm *ReplicationManager) StopReplication(dbName string) {
+func (rm *ReplicationManager) StopReplication(partitionName string) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 
-	for addr, dbs := range rm.peers {
-		newDBs := make([]ReplicaSource, 0, len(dbs))
+	for addr, parts := range rm.peers {
+		newParts := make([]ReplicaSource, 0, len(parts))
 		changed := false
-		for _, db := range dbs {
-			if db.LocalDB != dbName {
-				newDBs = append(newDBs, db)
+		for _, p := range parts {
+			if p.LocalPartition != partitionName {
+				newParts = append(newParts, p)
 			} else {
 				changed = true
 			}
 		}
 
 		if changed {
-			rm.peers[addr] = newDBs
-			rm.logger.Info("Stopped replication", "db", dbName, "source", addr)
+			rm.peers[addr] = newParts
+			rm.logger.Info("Stopped replication", "partition", partitionName, "source", addr)
 
 			if cancel, exists := rm.cancelFunc[addr]; exists {
 				cancel()
 			}
 
-			if len(newDBs) > 0 {
+			if len(newParts) > 0 {
 				rm.spawnConnection(addr)
 			} else {
 				delete(rm.peers, addr)
@@ -106,12 +106,12 @@ func (rm *ReplicationManager) StopReplication(dbName string) {
 	}
 }
 
-func (rm *ReplicationManager) IsReplica(dbName string) bool {
+func (rm *ReplicationManager) IsReplica(partitionName string) bool {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 	for _, sources := range rm.peers {
 		for _, src := range sources {
-			if src.LocalDB == dbName {
+			if src.LocalPartition == partitionName {
 				return true
 			}
 		}
@@ -137,15 +137,15 @@ func (rm *ReplicationManager) maintainConnection(ctx context.Context, addr strin
 			rm.mu.Unlock()
 			return
 		}
-		dbs := make([]ReplicaSource, len(rm.peers[addr]))
-		copy(dbs, rm.peers[addr])
+		parts := make([]ReplicaSource, len(rm.peers[addr]))
+		copy(parts, rm.peers[addr])
 		rm.mu.Unlock()
 
-		if len(dbs) == 0 {
+		if len(parts) == 0 {
 			return
 		}
 
-		if err := rm.connectAndSync(ctx, addr, dbs); err != nil {
+		if err := rm.connectAndSync(ctx, addr, parts); err != nil {
 			if ctx.Err() != nil {
 				return
 			}
@@ -159,7 +159,7 @@ func (rm *ReplicationManager) maintainConnection(ctx context.Context, addr strin
 	}
 }
 
-func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, dbs []ReplicaSource) error {
+func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, parts []ReplicaSource) error {
 	dialer := net.Dialer{Timeout: 5 * time.Second}
 	conn, err := tls.DialWithDialer(&dialer, "tcp", addr, rm.tlsConf)
 	if err != nil {
@@ -171,23 +171,23 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 	}()
 	defer conn.Close()
 
-	rm.logger.Info("Connected to Primary for replication", "addr", addr, "count", len(dbs))
+	rm.logger.Info("Connected to Primary for replication", "addr", addr, "count", len(parts))
 
 	remoteToLocal := make(map[string][]string)
 
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.BigEndian, uint32(1))
-	binary.Write(buf, binary.BigEndian, uint32(len(dbs)))
+	binary.Write(buf, binary.BigEndian, uint32(len(parts)))
 
-	for _, cfg := range dbs {
-		stats := rm.stores[cfg.LocalDB].Stats()
+	for _, cfg := range parts {
+		stats := rm.stores[cfg.LocalPartition].Stats()
 		logSeq := stats.NextLogSeq - 1
-		binary.Write(buf, binary.BigEndian, uint32(len(cfg.RemoteDB)))
-		buf.WriteString(cfg.RemoteDB)
+		binary.Write(buf, binary.BigEndian, uint32(len(cfg.RemotePartition)))
+		buf.WriteString(cfg.RemotePartition)
 		binary.Write(buf, binary.BigEndian, logSeq)
-		rm.logger.Debug("Sending Hello for DB", "remote_db", cfg.RemoteDB, "local_db", cfg.LocalDB, "startLogSeq", logSeq)
+		rm.logger.Debug("Sending Hello for Partition", "remote_partition", cfg.RemotePartition, "local_partition", cfg.LocalPartition, "startLogSeq", logSeq)
 
-		remoteToLocal[cfg.RemoteDB] = append(remoteToLocal[cfg.RemoteDB], cfg.LocalDB)
+		remoteToLocal[cfg.RemotePartition] = append(remoteToLocal[cfg.RemotePartition], cfg.LocalPartition)
 	}
 
 	header := make([]byte, 5)
@@ -217,31 +217,31 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 
 			cursor := 0
 			if cursor+4 > len(payload) {
-				return fmt.Errorf("malformed batch: no db len")
+				return fmt.Errorf("malformed batch: no partition len")
 			}
 			nLen := int(binary.BigEndian.Uint32(payload[cursor : cursor+4]))
 			cursor += 4
 			if cursor+nLen+4 > len(payload) {
-				return fmt.Errorf("malformed batch: no db name or count")
+				return fmt.Errorf("malformed batch: no partition name or count")
 			}
-			remoteDBName := string(payload[cursor : cursor+nLen])
+			remotePartitionName := string(payload[cursor : cursor+nLen])
 			cursor += nLen
 			count := binary.BigEndian.Uint32(payload[cursor : cursor+4])
 			cursor += 4
 			data := payload[cursor:]
 
-			localDBNames, ok := remoteToLocal[remoteDBName]
+			localPartitionNames, ok := remoteToLocal[remotePartitionName]
 			if !ok {
-				rm.logger.Warn("Received batch for unknown remote db", "remote_db", remoteDBName)
+				rm.logger.Warn("Received batch for unknown remote partition", "remote_partition", remotePartitionName)
 				continue
 			}
 
-			for _, localDBName := range localDBNames {
-				if st, ok := rm.stores[localDBName]; ok {
+			for _, localPartitionName := range localPartitionNames {
+				if st, ok := rm.stores[localPartitionName]; ok {
 					if maxID, err := applyReplicationBatch(st, count, data); err == nil {
 						ackBuf := new(bytes.Buffer)
-						binary.Write(ackBuf, binary.BigEndian, uint32(len(remoteDBName)))
-						ackBuf.WriteString(remoteDBName)
+						binary.Write(ackBuf, binary.BigEndian, uint32(len(remotePartitionName)))
+						ackBuf.WriteString(remotePartitionName)
 						binary.Write(ackBuf, binary.BigEndian, maxID)
 
 						h := make([]byte, 5)
@@ -254,7 +254,7 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 							return err
 						}
 					} else {
-						rm.logger.Error("Failed to apply replication batch", "local_db", localDBName, "err", err)
+						rm.logger.Error("Failed to apply replication batch", "local_partition", localPartitionName, "err", err)
 					}
 				}
 			}
