@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"sync"
 	"time"
@@ -22,49 +23,52 @@ var (
 
 type replPacket struct {
 	dbName string
-	opCode uint8 
+	opCode uint8
 	data   []byte
 	count  uint32
 }
 
-func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []byte, role string, certClientID string) {
-	// CRITICAL FIX: Clear the Read/Write deadlines inherited from the main server loop.
-	// Replication is a long-lived stream; we must not timeout idle or slow connections.
+// HandleReplicaConnection handles the handshake for incoming replicas (Followers or CDC).
+// It now uses the context-aware logger from the connection state (*connState).
+func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []byte, st *connState) {
+	// Clear deadlines for long-lived replication stream
 	if err := conn.SetDeadline(time.Time{}); err != nil {
-		s.logger.Error("Failed to clear deadlines", "err", err)
+		st.logger.Error("Failed to clear deadlines", "err", err)
 		return
 	}
 
-	// 1. Parse Hello: [Ver:4][IDLen:4][ID][NumDBs:4] ... [NameLen:4][Name][LogID:8]
+	// 1. Parse Hello: [Ver:4][IDLen:4][ID][NumDBs:4] ...
 	if len(payload) < 8 {
-		s.logger.Error("HandleReplicaConnection: payload too short for header")
+		st.logger.Warn("Replica handshake failed: payload too short")
 		return
 	}
 	cursor := 4
 
 	// Parse ID
 	if cursor+4 > len(payload) {
-		s.logger.Error("HandleReplicaConnection: payload truncated reading ID len")
+		st.logger.Warn("Replica handshake failed: ID len truncated")
 		return
 	}
 	idLen := int(binary.BigEndian.Uint32(payload[cursor : cursor+4]))
 	cursor += 4
 	if cursor+idLen > len(payload) {
-		s.logger.Error("HandleReplicaConnection: payload truncated reading ID")
+		st.logger.Warn("Replica handshake failed: ID truncated")
 		return
 	}
 	replicaID := string(payload[cursor : cursor+idLen])
 	cursor += idLen
 
-	// ID is required field
 	if replicaID == "" || replicaID == "client-unknown" {
-		s.logger.Error("HandleReplicaConnection: replica connected without explicit ID", "role", role)
+		st.logger.Warn("Replica handshake rejected: missing client ID")
 		return
 	}
 
+	// Update Logger with specific Replica ID
+	st.logger = st.logger.With("replica_id", replicaID)
+
 	// Parse DB Count
 	if cursor+4 > len(payload) {
-		s.logger.Error("HandleReplicaConnection: payload truncated reading count")
+		st.logger.Warn("Replica handshake failed: count truncated")
 		return
 	}
 	count := binary.BigEndian.Uint32(payload[cursor : cursor+4])
@@ -78,13 +82,13 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 
 	for i := 0; i < int(count); i++ {
 		if cursor+4 > len(payload) {
-			s.logger.Error("HandleReplicaConnection: payload truncated reading name len", "replica", replicaID)
+			st.logger.Warn("Replica handshake failed: db name len truncated")
 			return
 		}
 		nLen := int(binary.BigEndian.Uint32(payload[cursor : cursor+4]))
 		cursor += 4
 		if cursor+nLen+8 > len(payload) {
-			s.logger.Error("HandleReplicaConnection: payload truncated reading name/logID", "replica", replicaID)
+			st.logger.Warn("Replica handshake failed: db name/logID truncated")
 			return
 		}
 		name := string(payload[cursor : cursor+nLen])
@@ -93,22 +97,16 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 		cursor += 8
 		subs = append(subs, subReq{name, logID})
 
-		if st, ok := s.stores[name]; ok {
-			s.logger.Info("Replica subscribed",
-				"replica_id", replicaID,
-				"auth_id", certClientID,
-				"db", name,
-				"startLogID", logID,
-				"role", role,
-			)
-			st.RegisterReplica(replicaID, logID, role)
+		if storePtr, ok := s.stores[name]; ok {
+			st.logger.Info("Replica subscribed", "db", name, "start_seq", logID)
+			storePtr.RegisterReplica(replicaID, logID, st.role)
 
-			defer func(storePtr *store.Store, dbName string) {
-				s.logger.Info("Replica unsubscribed (connection closed)", "replica", replicaID, "db", dbName)
-				storePtr.UnregisterReplica(replicaID)
-			}(st, name)
+			defer func(sp *store.Store, dbName string) {
+				st.logger.Info("Replica disconnected", "db", dbName)
+				sp.UnregisterReplica(replicaID)
+			}(storePtr, name)
 		} else {
-			s.logger.Warn("Replica requested unknown database", "replica", replicaID, "db", name)
+			st.logger.Warn("Replica requested unknown database", "db", name)
 		}
 	}
 
@@ -120,18 +118,18 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 	var wg sync.WaitGroup
 
 	for _, req := range subs {
-		if st, ok := s.stores[req.name]; ok {
+		if storePtr, ok := s.stores[req.name]; ok {
 			wg.Add(1)
-			go func(name string, st *store.Store, startLogID uint64) {
+			go func(name string, sp *store.Store, startLogID uint64) {
 				defer wg.Done()
-				if err := s.streamDB(name, st, startLogID, outCh, done); err != nil {
-					s.logger.Error("StreamDB failed", "db", name, "err", err)
+				if err := s.streamDB(name, sp, startLogID, outCh, done, st.logger); err != nil {
+					st.logger.Error("Replica stream failed", "db", name, "err", err)
 					select {
 					case errCh <- err:
 					default:
 					}
 				}
-			}(req.name, st, req.logID)
+			}(req.name, storePtr, req.logID)
 		}
 	}
 
@@ -162,8 +160,8 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 					if len(b) >= 4+int(nL)+8 {
 						dbName := string(b[4 : 4+nL])
 						logID := binary.BigEndian.Uint64(b[4+nL:])
-						if st, ok := s.stores[dbName]; ok {
-							st.UpdateReplicaLogSeq(replicaID, logID)
+						if storePtr, ok := s.stores[dbName]; ok {
+							storePtr.UpdateReplicaLogSeq(replicaID, logID)
 						}
 					}
 				}
@@ -175,7 +173,7 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 	for {
 		select {
 		case err := <-errCh:
-			s.logger.Warn("Dropping failed replica connection", "addr", replicaID, "err", err)
+			st.logger.Warn("Dropping replica connection due to error", "err", err)
 			return
 		case p := <-outCh:
 			// Frame: [OpCode][TotalLen] [DBNameLen][DBName][Count/Reserved][Data...]
@@ -183,12 +181,12 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 			header := make([]byte, 5)
 			header[0] = p.opCode
 			binary.BigEndian.PutUint32(header[1:], uint32(totalLen))
-			
+
 			// Write strictly without Deadlines to allow slow consumers
 			if _, err := conn.Write(header); err != nil {
 				return
 			}
-			
+
 			nameH := make([]byte, 4)
 			binary.BigEndian.PutUint32(nameH, uint32(len(p.dbName)))
 			if _, err := conn.Write(nameH); err != nil {
@@ -197,13 +195,13 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 			if _, err := conn.Write([]byte(p.dbName)); err != nil {
 				return
 			}
-			
+
 			cntH := make([]byte, 4)
 			binary.BigEndian.PutUint32(cntH, p.count)
 			if _, err := conn.Write(cntH); err != nil {
 				return
 			}
-			
+
 			if _, err := conn.Write(p.data); err != nil {
 				return
 			}
@@ -211,15 +209,15 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 	}
 }
 
-func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh chan<- replPacket, done <-chan struct{}) error {
+func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh chan<- replPacket, done <-chan struct{}, logger *slog.Logger) error {
 	currentLogID := minLogID
 
 	// 1. Snapshot Check
 	err := st.ScanWAL(currentLogID+1, func([]stonedb.ValueLogEntry) error { return nil })
-	
+
 	if err == stonedb.ErrLogUnavailable && currentLogID < st.LastOpID() {
-		s.logger.Info("Replica too far behind (WAL purged). Starting Full Sync (Snapshot).", "db", name, "req_seq", currentLogID, "head", st.LastOpID())
-		
+		logger.Info("Replica lag exceeds WAL retention. Starting Full Snapshot.", "db", name, "req_seq", currentLogID, "head", st.LastOpID())
+
 		snapTxID, snapOpID, snapErr := st.StreamSnapshot(func(batch []stonedb.SnapshotEntry) error {
 			var buf bytes.Buffer
 			for _, e := range batch {
@@ -248,7 +246,7 @@ func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh c
 		doneBuf := make([]byte, 16)
 		binary.BigEndian.PutUint64(doneBuf[0:], snapTxID)
 		binary.BigEndian.PutUint64(doneBuf[8:], snapOpID)
-		
+
 		select {
 		case outCh <- replPacket{
 			dbName: name,
@@ -259,14 +257,14 @@ func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh c
 		case <-done:
 			return nil
 		}
-		s.logger.Info("Full Sync complete. Switching to WAL streaming.", "db", name, "resume_seq", snapOpID)
+		logger.Info("Snapshot complete. Resuming WAL stream.", "db", name, "resume_seq", snapOpID)
 		currentLogID = snapOpID
 	}
 
 	// 2. WAL Streaming & SafePoint Broadcast
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
-	
+
 	safePointTicker := time.NewTicker(1 * time.Second)
 	defer safePointTicker.Stop()
 
@@ -274,14 +272,14 @@ func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh c
 		select {
 		case <-done:
 			return nil
-		
+
 		case <-safePointTicker.C:
 			// Broadcast Safe Point
 			minSeq := st.GetMinSlotLogSeq()
 			if minSeq > 0 {
 				buf := make([]byte, 8)
 				binary.BigEndian.PutUint64(buf, minSeq)
-				
+
 				select {
 				case outCh <- replPacket{
 					dbName: name,
@@ -355,16 +353,16 @@ func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh c
 			if count > 0 {
 				select {
 				case outCh <- replPacket{
-					dbName: name, 
-					opCode: protocol.OpCodeReplBatch, 
-					data:   batchBuf.Bytes(), 
+					dbName: name,
+					opCode: protocol.OpCodeReplBatch,
+					data:   batchBuf.Bytes(),
 					count:  count,
 				}:
 				case <-done:
 					return nil
 				}
-			} 
-			
+			}
+
 			if err != nil {
 				if err == ErrBatchFull {
 					continue
@@ -373,7 +371,7 @@ func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh c
 						return fmt.Errorf("OUT_OF_SYNC: requested log %d is purged", currentLogID+1)
 					}
 				} else {
-					s.logger.Error("ScanWAL error", "db", name, "err", err)
+					logger.Error("WAL Scan error", "db", name, "err", err)
 					time.Sleep(100 * time.Millisecond)
 				}
 			}
