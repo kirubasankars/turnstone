@@ -2,7 +2,7 @@ package stonedb
 
 import (
 	"bytes"
-	"fmt"
+	"time"
 )
 
 // SnapshotEntry represents a single Key-Value pair from the database state.
@@ -14,6 +14,7 @@ type SnapshotEntry struct {
 // StreamSnapshot iterates over the entire active keyspace and invokes the callback.
 // Returns the TxID and OpID (Log Sequence) at the time the snapshot completed.
 func (db *DB) StreamSnapshot(fn func(batch []SnapshotEntry) error) (uint64, uint64, error) {
+	start := time.Now()
 	// 1. Start a Read Transaction.
 	tx := db.NewTransaction(false)
 	defer tx.Discard()
@@ -24,6 +25,8 @@ func (db *DB) StreamSnapshot(fn func(batch []SnapshotEntry) error) (uint64, uint
 	snapTxID := db.transactionID
 	db.mu.RUnlock()
 
+	db.logger.Info("Starting snapshot stream", "snap_tx_id", snapTxID, "snap_op_id", snapOpID)
+
 	// 3. Create Iterator
 	iter := db.ldb.NewIterator(nil, nil)
 	defer iter.Release()
@@ -33,6 +36,7 @@ func (db *DB) StreamSnapshot(fn func(batch []SnapshotEntry) error) (uint64, uint
 	const maxBatchBytes = 1 * 1024 * 1024 // 1MB Batches
 
 	var lastLogicalKey []byte
+	itemCount := 0
 
 	// 4. Iterate keyspace
 	for iter.Next() {
@@ -69,7 +73,7 @@ func (db *DB) StreamSnapshot(fn func(batch []SnapshotEntry) error) (uint64, uint
 		// Fetch Value
 		val, err := db.valueLog.ReadValue(meta.FileID, meta.ValueOffset, meta.ValueLen)
 		if err != nil {
-			fmt.Printf("Snapshot warning: missing value for key %s (FileID %d): %v\n", uKey, meta.FileID, err)
+			db.logger.Warn("Snapshot: missing value for key", "key", string(uKey), "file_id", meta.FileID, "err", err)
 			continue
 		}
 
@@ -79,6 +83,7 @@ func (db *DB) StreamSnapshot(fn func(batch []SnapshotEntry) error) (uint64, uint
 			Value: val,
 		})
 		batchSize += len(uKey) + len(val)
+		itemCount++
 
 		// Flush Batch
 		if batchSize >= maxBatchBytes {
@@ -95,6 +100,12 @@ func (db *DB) StreamSnapshot(fn func(batch []SnapshotEntry) error) (uint64, uint
 		if err := fn(batch); err != nil {
 			return 0, 0, err
 		}
+	}
+
+	if iter.Error() != nil {
+		db.logger.Error("Snapshot iteration error", "err", iter.Error())
+	} else {
+		db.logger.Info("Snapshot stream complete", "items", itemCount, "duration", time.Since(start))
 	}
 
 	return snapTxID, snapOpID, iter.Error()

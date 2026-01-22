@@ -2,6 +2,7 @@ package store
 
 import (
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"math"
 	"os"
@@ -86,7 +87,7 @@ func NewStore(dir string, logger *slog.Logger, minReplicas int, isSystem bool, w
 
 	// Default values
 	maxWALSize := 10 * 1024 * 1024
-	
+
 	// Allow Test Override
 	if v := os.Getenv("TS_TEST_WAL_SIZE"); v != "" {
 		if i, err := strconv.Atoi(v); err == nil && i > 0 {
@@ -125,7 +126,6 @@ func (s *Store) SetLeaderSafeSeq(seq uint64) {
 	atomic.StoreUint64(&s.leaderSafeSeq, seq)
 }
 
-
 // GetMinSlotLogSeq calculates the minimum LogSeq required by ANY registered client.
 func (s *Store) GetMinSlotLogSeq() uint64 {
 	s.mu.Lock()
@@ -134,19 +134,16 @@ func (s *Store) GetMinSlotLogSeq() uint64 {
 	minSeq := uint64(math.MaxUint64)
 	hasSlots := false
 
-	for id, slot := range s.replicas {
+	for _, slot := range s.replicas {
 		hasSlots = true
 		if slot.LogSeq < minSeq {
 			minSeq = slot.LogSeq
 		}
-		// Debug logging for slot state
-		s.logger.Debug("Checking replica slot", "id", id, "seq", slot.LogSeq, "connected", slot.Connected)
+		// Debug logging for slot state (verbose, so check level if possible, or keep minimal)
+		// Removed per "keep clean" instruction, relying on EnforceRetentionPolicy debug logs.
 	}
 
 	if !hasSlots {
-		s.logger.Debug("No replica slots found")
-		// If no slots exist, we can arguably purge everything up to current checkpoint
-		// returning MaxUint64 signals no downstream constraint.
 		return math.MaxUint64
 	}
 	return minSeq
@@ -182,36 +179,48 @@ func (s *Store) EnforceRetentionPolicy() {
 	// SafeID = Min(LocalCheckpoint, DownstreamReplicas, UpstreamLeader)
 
 	safeID := lastCkpt
-
-	s.logger.Info("Retention Policy Check",
-		"minReplicaSeq", minReplicaSeq,
-		"leaderSafeSeq", leaderSafeSeq,
-		"lastCkpt", lastCkpt,
-	)
+	constraintSource := "checkpoint"
 
 	// If a downstream replica needs log X, we must keep it.
 	if minReplicaSeq < safeID {
 		safeID = minReplicaSeq
+		constraintSource = "replica_lag"
 	}
 
 	// If the upstream leader says "Someone in the cluster needs log Y", we must keep it.
 	// This enables us to serve that straggler if we are promoted.
 	if leaderSafeSeq < safeID {
 		safeID = leaderSafeSeq
+		constraintSource = "leader_constraint"
 	}
 
-	s.logger.Info("Retention Decision", "safeID", safeID)
+	// Only log DEBUG unless we are blocked significantly or purging
+	s.logger.Debug("Retention check",
+		"safe_seq", safeID,
+		"constraint", constraintSource,
+		"replica_min", minReplicaSeq,
+		"leader_min", leaderSafeSeq,
+		"checkpoint", lastCkpt,
+	)
 
 	if safeID > 0 && safeID != math.MaxUint64 {
 		// Trigger purge
 		if err := s.DB.PurgeWAL(safeID); err != nil {
 			s.logger.Error("Replication-based WAL purge failed", "err", err)
+		} else {
+			// Only log if something was potentially deleted (PurgeWAL doesn't return count, 
+			// but we can assume if safeID advanced significantly since last log it might interest op)
+			// For now, keep it clean and rely on DB logs or Metrics.
 		}
 	} else if minReplicaSeq == math.MaxUint64 && leaderSafeSeq == math.MaxUint64 {
 		// No replicas registered AND no upstream leader constraints.
 		// This implies we can purge everything up to checkpoint (standalone mode or leaf with no followers).
 		// This prevents infinite WAL growth if user sets strategy=replication but adds no replicas.
-		s.logger.Info("No replication constraints, purging up to checkpoint", "ckpt", lastCkpt)
+		
+		// Rate limit this log to avoid spamming every 30s if system is idle
+		// (Logic for rate limiting omitted for simplicity, downgrading to Debug)
+		s.logger.Debug("No replication constraints, purging up to checkpoint", "ckpt", lastCkpt)
+		
 		if err := s.DB.PurgeWAL(lastCkpt); err != nil {
 			s.logger.Error("Fallback WAL purge failed", "err", err)
 		}
@@ -295,7 +304,7 @@ func (s *Store) Get(key string) ([]byte, error) {
 
 // Close closes the underlying StoneDB instance.
 func (s *Store) Close() error {
-	s.logger.Info("Closing StoneDB store")
+	s.logger.Info("Closing store")
 	// Save slots one last time
 	s.mu.Lock()
 	if s.dirty {
@@ -351,19 +360,23 @@ func (s *Store) Stats() StoreStats {
 func (s *Store) RegisterReplica(id string, logSeq uint64, role string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.logger.Info("Replica registered", "id", id, "seq", logSeq, "role", role)
 
 	if slot, ok := s.replicas[id]; ok {
-		// Update existing slot status to Connected
+		// Only log info if connection status changed or seq jumped significantly (optional noise reduction)
+		if !slot.Connected {
+			s.logger.Info("Replica reconnected", "id", id, "seq", logSeq, "role", role)
+		} else {
+			s.logger.Debug("Replica state update", "id", id, "seq", logSeq)
+		}
+		
 		slot.Connected = true
-		// We trust the handshake logSeq as the starting point for this session
 		if logSeq > slot.LogSeq {
 			slot.LogSeq = logSeq
 		}
-		slot.Role = role // Update role if changed
+		slot.Role = role
 		slot.LastSeen = time.Now()
 	} else {
-		// Create new persistent slot
+		s.logger.Info("New replica registered", "id", id, "seq", logSeq, "role", role)
 		s.replicas[id] = &ReplicaSlot{
 			LogSeq:    logSeq,
 			Role:      role,
@@ -379,9 +392,11 @@ func (s *Store) UnregisterReplica(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if slot, ok := s.replicas[id]; ok {
-		s.logger.Info("Replica disconnected", "id", id)
-		slot.Connected = false
-		s.dirty = true
+		if slot.Connected {
+			s.logger.Info("Replica disconnected", "id", id)
+			slot.Connected = false
+			s.dirty = true
+		}
 	}
 }
 
@@ -390,7 +405,7 @@ func (s *Store) DeleteReplica(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.replicas[id]; !ok {
-		return protocol.ErrKeyNotFound // reusing error for "slot not found"
+		return protocol.ErrKeyNotFound
 	}
 	delete(s.replicas, id)
 	s.dirty = true
@@ -403,13 +418,13 @@ func (s *Store) UpdateReplicaLogSeq(id string, logSeq uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if slot, ok := s.replicas[id]; ok {
-		// Only update if seq advances (or first connect)
+		// Only update if seq advances
 		if logSeq > slot.LogSeq {
 			slot.LogSeq = logSeq
 			s.dirty = true
+			s.cond.Broadcast() // Wake up quorum waiters
 		}
 		slot.LastSeen = time.Now()
-		s.cond.Broadcast()
 	}
 }
 
@@ -418,9 +433,13 @@ func (s *Store) waitForQuorum(logSeq uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	startWait := time.Now()
+	warned := false
+
 	for {
 		acks := 0
 		for _, slot := range s.replicas {
+			// Only count servers towards quorum, not CDC clients
 			if slot.Role == "server" && slot.LogSeq >= logSeq {
 				acks++
 			}
@@ -429,6 +448,13 @@ func (s *Store) waitForQuorum(logSeq uint64) {
 		if acks >= s.minReplicas {
 			return
 		}
+
+		// Log warning if waiting too long (> 5s)
+		if !warned && time.Since(startWait) > 5*time.Second {
+			s.logger.Warn("Slow quorum commit", "target_seq", logSeq, "current_acks", acks, "needed", s.minReplicas)
+			warned = true
+		}
+
 		s.cond.Wait()
 	}
 }
@@ -442,7 +468,7 @@ func (s *Store) loadSlots() {
 		return
 	}
 	if err := json.Unmarshal(data, &s.replicas); err != nil {
-		s.logger.Error("Failed to parse replication slots", "err", err)
+		s.logger.Error("Failed to parse replication slots file", "err", err)
 	} else {
 		s.logger.Info("Loaded replication slots", "count", len(s.replicas))
 	}
@@ -455,51 +481,50 @@ func (s *Store) runPersistence() {
 	for range ticker.C {
 		s.mu.Lock()
 		if s.dirty {
-			s.saveSlotsLocked()
-			s.dirty = false
+			if err := s.saveSlotsLocked(); err != nil {
+				s.logger.Error("Failed to persist replica slots", "err", err)
+			} else {
+				s.dirty = false
+			}
 		}
 		s.mu.Unlock()
 	}
 }
 
 // saveSlotsLocked assumes mu is held
-func (s *Store) saveSlotsLocked() {
+func (s *Store) saveSlotsLocked() error {
 	data, err := json.MarshalIndent(s.replicas, "", "  ")
 	if err != nil {
-		s.logger.Error("Failed to marshal slots", "err", err)
-		return
+		return fmt.Errorf("marshal: %w", err)
 	}
 	tmp := s.slotsFile + ".tmp"
 
 	// 1. Create/Truncate Temp File
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
-		s.logger.Error("Failed to create slots tmp file", "err", err)
-		return
+		return fmt.Errorf("create tmp: %w", err)
 	}
 
 	// 2. Write Data
 	if _, err := f.Write(data); err != nil {
 		f.Close()
-		s.logger.Error("Failed to write to slots tmp file", "err", err)
-		return
+		return fmt.Errorf("write: %w", err)
 	}
 
 	// 3. Fsync to ensure durability on disk
 	if err := f.Sync(); err != nil {
 		f.Close()
-		s.logger.Error("Failed to sync slots tmp file", "err", err)
-		return
+		return fmt.Errorf("sync: %w", err)
 	}
 
 	// 4. Close
 	if err := f.Close(); err != nil {
-		s.logger.Error("Failed to close slots tmp file", "err", err)
-		return
+		return fmt.Errorf("close: %w", err)
 	}
 
 	// 5. Atomic Rename
 	if err := os.Rename(tmp, s.slotsFile); err != nil {
-		s.logger.Error("Failed to rename slots file", "err", err)
+		return fmt.Errorf("rename: %w", err)
 	}
+	return nil
 }

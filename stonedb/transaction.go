@@ -89,6 +89,7 @@ func (tx *Transaction) Get(key []byte) ([]byte, error) {
 			if version <= tx.readTxID {
 				meta, err := decodeEntryMeta(tx.iter.Value())
 				if err != nil {
+					tx.db.logger.Error("Index meta corruption", "key", string(key), "err", err)
 					return nil, fmt.Errorf("meta corrupt: %w", err)
 				}
 				if meta.IsTombstone {
@@ -96,6 +97,9 @@ func (tx *Transaction) Get(key []byte) ([]byte, error) {
 				}
 
 				val, err := tx.db.valueLog.ReadValue(meta.FileID, meta.ValueOffset, meta.ValueLen)
+				if err != nil {
+					tx.db.logger.Error("VLog read failure during Get", "key", string(key), "file_id", meta.FileID, "err", err)
+				}
 				return val, err
 			}
 			tx.iter.Next()
@@ -126,6 +130,20 @@ func (tx *Transaction) Commit() error {
 		resp: make(chan error, 1),
 	}
 
-	tx.db.commitCh <- req
-	return <-req.resp
+	// Use select to avoid blocking if the commit channel is full, though unexpected
+	select {
+	case tx.db.commitCh <- req:
+	default:
+		tx.db.logger.Warn("Commit channel full, blocking transaction")
+		tx.db.commitCh <- req
+	}
+
+	err := <-req.resp
+	if err != nil {
+		// Log specific commit errors that aren't conflicts (conflicts are normal flow)
+		if err != ErrWriteConflict {
+			tx.db.logger.Error("Transaction commit failed", "err", err)
+		}
+	}
+	return err
 }

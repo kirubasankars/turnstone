@@ -86,7 +86,7 @@ func (rm *ReplicationManager) StopReplication(dbName string) {
 		}
 		if changed {
 			rm.peers[addr] = newDBs
-			rm.logger.Info("Stopped replication", "db", dbName, "source", addr)
+			rm.logger.Info("Stopped replication source", "db", dbName, "source", addr)
 			if cancel, exists := rm.cancelFunc[addr]; exists {
 				cancel()
 			}
@@ -108,6 +108,9 @@ func (rm *ReplicationManager) spawnConnection(addr string) {
 }
 
 func (rm *ReplicationManager) maintainConnection(ctx context.Context, addr string) {
+	// Create a logger with context for this peer connection
+	peerLogger := rm.logger.With("peer_addr", addr)
+	
 	for {
 		if ctx.Err() != nil {
 			return
@@ -125,11 +128,12 @@ func (rm *ReplicationManager) maintainConnection(ctx context.Context, addr strin
 			return
 		}
 
-		if err := rm.connectAndSync(ctx, addr, dbs); err != nil {
+		peerLogger.Debug("Attempting replication connection")
+		if err := rm.connectAndSync(ctx, addr, dbs, peerLogger); err != nil {
 			if ctx.Err() != nil {
 				return
 			}
-			rm.logger.Error("Replication sync failed", "peer", addr, "err", err)
+			peerLogger.Error("Replication sync failed, retrying in 3s", "err", err)
 			select {
 			case <-ctx.Done():
 				return
@@ -139,7 +143,7 @@ func (rm *ReplicationManager) maintainConnection(ctx context.Context, addr strin
 	}
 }
 
-func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, dbs []ReplicaSource) error {
+func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, dbs []ReplicaSource, logger *slog.Logger) error {
 	dialer := net.Dialer{Timeout: 5 * time.Second}
 	conn, err := tls.DialWithDialer(&dialer, "tcp", addr, rm.tlsConf)
 	if err != nil {
@@ -151,7 +155,7 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 		_ = conn.Close()
 	}()
 
-	rm.logger.Info("Connected to Leader for replication", "addr", addr, "count", len(dbs))
+	logger.Info("Connected to Leader", "db_count", len(dbs))
 
 	remoteToLocal := make(map[string][]string)
 	txBuffers := make(map[string][]protocol.LogEntry)
@@ -170,7 +174,9 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 		binary.Write(buf, binary.BigEndian, uint32(len(cfg.RemoteDB)))
 		buf.WriteString(cfg.RemoteDB)
 		binary.Write(buf, binary.BigEndian, logID)
-		rm.logger.Debug("Sending Hello for DB", "remote_db", cfg.RemoteDB, "local_db", cfg.LocalDB, "startLogID", logID)
+		
+		logger.Debug("Sending Hello for DB", "remote_db", cfg.RemoteDB, "local_db", cfg.LocalDB, "start_log_id", logID)
+		
 		remoteToLocal[cfg.RemoteDB] = append(remoteToLocal[cfg.RemoteDB], cfg.LocalDB)
 		txBuffers[cfg.LocalDB] = make([]protocol.LogEntry, 0)
 	}
@@ -223,6 +229,8 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 				if localDBNames, ok := remoteToLocal[remoteDBName]; ok {
 					for _, localDB := range localDBNames {
 						if st, ok := rm.stores[localDB]; ok {
+							// Debug log only for safe points to avoid noise
+							// logger.Debug("Received safe point", "db", localDB, "seq", safeSeq)
 							st.SetLeaderSafeSeq(safeSeq)
 						}
 					}
@@ -246,6 +254,7 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 			if localDBNames, ok := remoteToLocal[remoteDBName]; ok {
 				for _, localDBName := range localDBNames {
 					if st, ok := rm.stores[localDBName]; ok {
+						logger.Info("Applying snapshot batch", "db", localDBName, "count", count, "bytes", len(data))
 						dCursor := 0
 						var entries []protocol.LogEntry
 						for i := 0; i < int(count); i++ {
@@ -282,7 +291,7 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 
 			if cursor+8 <= len(payload) {
 				resumeSeq := binary.BigEndian.Uint64(payload[cursor:])
-				rm.logger.Info("Snapshot finished, resuming WAL", "remote", remoteDBName, "resume_seq", resumeSeq)
+				logger.Info("Snapshot finished, switching to WAL streaming", "remote_db", remoteDBName, "resume_seq", resumeSeq)
 			}
 			continue
 		}
@@ -304,10 +313,14 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 					if st, ok := rm.stores[localDBName]; ok {
 						buffer := txBuffers[localDBName]
 						newBuffer, lastID, err := processReplicationPacket(st, buffer, count, data)
+						if err != nil {
+							logger.Error("Failed to process WAL batch", "db", localDBName, "err", err)
+							return err
+						}
 						txBuffers[localDBName] = newBuffer
 
 						// Send ACK if successful
-						if err == nil && lastID > 0 {
+						if lastID > 0 {
 							ackBuf := new(bytes.Buffer)
 							binary.Write(ackBuf, binary.BigEndian, uint32(len(remoteDBName)))
 							ackBuf.WriteString(remoteDBName)

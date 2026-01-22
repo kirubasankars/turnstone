@@ -18,17 +18,19 @@ func (db *DB) recoverValueLog() error {
 	}
 	db.transactionID = maxTx
 	db.operationID = maxOp
+	db.logger.Info("ValueLog recovered", "max_tx", maxTx, "max_op", maxOp)
 	return nil
 }
 
 func (db *DB) syncWALToValueLog(truncateCorrupt bool) error {
 	onTruncate := func() error {
 		indexPath := filepath.Join(db.dir, "index")
-		fmt.Printf("WAL truncated due to corruption. Deleting LevelDB index at %s to ensure consistency.\n", indexPath)
+		db.logger.Warn("WAL truncated due to corruption. Deleting LevelDB index to ensure consistency", "path", indexPath)
 		return os.RemoveAll(indexPath)
 	}
 
 	return db.writeAheadLog.ReplaySinceTx(db.valueLog, db.transactionID, truncateCorrupt, func(entries []ValueLogEntry) {
+		replayCount := 0
 		for _, e := range entries {
 			if e.TransactionID > db.transactionID {
 				db.transactionID = e.TransactionID
@@ -36,6 +38,11 @@ func (db *DB) syncWALToValueLog(truncateCorrupt bool) error {
 			if e.OperationID > db.operationID {
 				db.operationID = e.OperationID
 			}
+			replayCount++
+		}
+		// Log batch replays minimally unless debug
+		if replayCount > 0 {
+			db.logger.Debug("Replayed WAL entries", "count", replayCount, "new_head_tx", db.transactionID)
 		}
 	}, onTruncate)
 }
@@ -77,12 +84,14 @@ func (db *DB) RebuildIndexFromVLog() error {
 
 	batch := new(leveldb.Batch)
 	batchCount := 0
+	totalCount := 0
 
 	err = db.valueLog.Replay(0, func(e ValueLogEntry, meta EntryMeta) error {
 		encKey := encodeIndexKey(e.Key, meta.TransactionID)
 		batch.Put(encKey, meta.Encode())
 
 		batchCount++
+		totalCount++
 		if batchCount >= 1000 {
 			if err := db.ldb.Write(batch, nil); err != nil {
 				return err
@@ -101,6 +110,8 @@ func (db *DB) RebuildIndexFromVLog() error {
 			return err
 		}
 	}
+
+	db.logger.Info("Index rebuilt from VLog", "total_entries", totalCount)
 
 	// After rebuilding index, we must recalculate the KeyCount since we lost the persisted value
 	count, err := db.scanKeyCount()
