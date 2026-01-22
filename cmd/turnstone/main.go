@@ -66,7 +66,7 @@ func runInit(home string) error {
 		TLSClientCertFile:    "certs/client.crt",
 		TLSClientKeyFile:     "certs/client.key",
 		MetricsAddr:          ":9090",
-		WALRetention:         "2h",          // Default duration if strategy is time
+		WALRetention:         "2h",           // Default duration if strategy is time
 		WALRetentionStrategy: "replication", // Default strategy
 	}
 	// ID generation logic moved to config.GenerateConfigArtifacts
@@ -525,6 +525,12 @@ Loop:
 		}()
 
 		err = cli.Subscribe(cfg.Database, lastSeenSeq, func(c client.Change) error {
+			// FIX: Ignore entries with empty keys (e.g. Commit Markers or internal signals that leaked through)
+			// This prevents CDC from writing "empty" lines for metadata operations.
+			if len(c.Key) == 0 {
+				return nil
+			}
+
 			var val any
 			if !c.IsDelete {
 				switch cfg.ValueFormat {

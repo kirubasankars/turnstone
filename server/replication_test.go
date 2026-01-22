@@ -118,6 +118,17 @@ func configureReplication(t *testing.T, c *testClient, targetAddr, targetDB stri
 	c.AssertStatus(protocol.OpCodeReplicaOf, payload, protocol.ResStatusOK)
 }
 
+func stopReplication(t *testing.T, c *testClient, targetDB string) {
+	t.Helper()
+	dbBytes := []byte(targetDB)
+	// Payload: [0 len][empty addr][dbName]
+	payload := make([]byte, 4+0+len(dbBytes))
+	binary.BigEndian.PutUint32(payload[0:4], 0)
+	copy(payload[4:], dbBytes)
+	
+	c.AssertStatus(protocol.OpCodeReplicaOf, payload, protocol.ResStatusOK)
+}
+
 func writeKeyVal(t *testing.T, c *testClient, k, v string) {
 	t.Helper()
 	key := []byte(k)
@@ -905,4 +916,211 @@ func TestReplication_KeyCount_SyncAndAsync(t *testing.T) {
 	waitForMetric(t, replicaAsyncSrv, "turnstone_db_key_count", func(val float64) bool {
 		return int(val) == numKeys
 	})
+}
+
+func TestReplication_Retention_LeaderProtectsSlowFollower(t *testing.T) {
+	// Force tiny WAL files (1KB) so we generate multiple files quickly
+	os.Setenv("TS_TEST_WAL_SIZE", "1024")
+	defer os.Unsetenv("TS_TEST_WAL_SIZE")
+
+	baseDir, clientTLS := setupSharedCertEnv(t)
+	adminTLS := getRoleTLS(t, baseDir, "admin")
+
+	// 1. Start Leader
+	leaderSrv, leaderAddr, cancelLeader := startServerNode(t, baseDir, "leader_ret", clientTLS)
+	defer cancelLeader()
+
+	// 2. Start Follower (Using CDC for manual control simulation, or standard replica)
+	// We use standard replica to ensure it registers a slot properly
+	_, replicaAddr, cancelReplica := startServerNode(t, baseDir, "replica_ret", clientTLS)
+	defer cancelReplica()
+
+	// Connect
+	adminReplica := connectClient(t, replicaAddr, adminTLS)
+	defer adminReplica.Close()
+	selectDatabase(t, adminReplica, "1")
+	configureReplication(t, adminReplica, leaderAddr, "1")
+
+	// 3. Write data to generate multiple WAL files
+	// Entry ~50 bytes. 100 entries = 5KB -> ~5 WAL files.
+	clientLeader := connectClient(t, leaderAddr, clientTLS)
+	defer clientLeader.Close()
+	selectDatabase(t, clientLeader, "1")
+
+	for i := 0; i < 100; i++ {
+		writeKeyVal(t, clientLeader, fmt.Sprintf("k%d", i), "val")
+	}
+
+	// 4. Wait for sync
+	clientReplica := connectClient(t, replicaAddr, clientTLS)
+	defer clientReplica.Close()
+	selectDatabase(t, clientReplica, "1")
+	waitForConditionOrTimeout(t, 5*time.Second, func() bool {
+		val := readKey(t, clientReplica, "k99")
+		return string(val) == "val"
+	}, "Initial sync failed")
+
+	// 5. STOP the replica (cancel context)
+	// Important: Explicitly stop replication on the replica first to cut the connection immediately.
+	// Simply canceling the server context might leave the outgoing replication loop running for a bit.
+	adminReplica2 := connectClient(t, replicaAddr, adminTLS)
+	selectDatabase(t, adminReplica2, "1")
+	stopReplication(t, adminReplica2, "1")
+	adminReplica2.Close()
+	
+	cancelReplica()
+
+	// 6. Write MORE data to Leader (Another 100 entries -> ~5 more WAL files)
+	for i := 100; i < 200; i++ {
+		writeKeyVal(t, clientLeader, fmt.Sprintf("k%d", i), "val")
+	}
+
+	// 7. Force Checkpoint on Leader (Enables purging of old WALs if no replicas needed them)
+	st1 := leaderSrv.stores["1"]
+	if err := st1.DB.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 8. Run Retention Check Manually
+	st1.EnforceRetentionPolicy()
+
+	// 9. Verify WAL files are RETAINED
+	// The follower disconnected around OpID ~100.
+	// We wrote up to ~200.
+	// If retention works, files containing 100..200 must exist.
+	// If it failed, older files would be deleted because Leader checkpointed.
+	walDir := filepath.Join(baseDir, "leader_ret", "data", "1", "wal")
+	files, _ := filepath.Glob(filepath.Join(walDir, "*.wal"))
+	
+	// With 1KB limit and 200 writes, we expect roughly 10 files.
+	if len(files) < 5 {
+		t.Errorf("Leader deleted WAL files too aggressively! Found %d files", len(files))
+	}
+
+	// 10. Delete the Replica Slot manually on Leader
+	if err := st1.DeleteReplica("replica_ret"); err != nil {
+		t.Fatalf("Failed to delete replica slot: %v", err)
+	}
+
+	// 11. Run Retention again
+	st1.EnforceRetentionPolicy()
+
+	// 12. Verify WAL files are PURGED
+	// Now that the slot is gone, Leader should only keep files needed for its own crash recovery (latest ones)
+	filesAfter, _ := filepath.Glob(filepath.Join(walDir, "*.wal"))
+	if len(filesAfter) >= len(files) {
+		t.Errorf("Leader failed to purge WAL files after slot deletion. Before: %d, After: %d", len(files), len(filesAfter))
+	}
+}
+
+func TestReplication_Retention_FollowerRespectsLeaderSafePoint(t *testing.T) {
+	// Force tiny WAL files
+	os.Setenv("TS_TEST_WAL_SIZE", "1024")
+	defer os.Unsetenv("TS_TEST_WAL_SIZE")
+
+	baseDir, clientTLS := setupSharedCertEnv(t)
+	adminTLS := getRoleTLS(t, baseDir, "admin")
+
+	// Topology: Leader -> Follower1
+	//           Leader -> Follower2 (Simulated)
+
+	// 1. Start Leader
+	_, leaderAddr, cancelLeader := startServerNode(t, baseDir, "leader_safe", clientTLS)
+	defer cancelLeader()
+
+	// 2. Start Follower1 (The one we are testing)
+	follower1Srv, follower1Addr, cancelFollower1 := startServerNode(t, baseDir, "follower1", clientTLS)
+	defer cancelFollower1()
+
+	// Connect F1 -> Leader
+	adminF1 := connectClient(t, follower1Addr, adminTLS)
+	defer adminF1.Close()
+	selectDatabase(t, adminF1, "1")
+	configureReplication(t, adminF1, leaderAddr, "1")
+
+	// 3. Start Follower2 (To create a straggler)
+	_, follower2Addr, cancelFollower2 := startServerNode(t, baseDir, "follower_straggler", clientTLS)
+	defer cancelFollower2()
+
+	// Connect F2 -> Leader
+	adminF2 := connectClient(t, follower2Addr, adminTLS)
+	defer adminF2.Close()
+	selectDatabase(t, adminF2, "1")
+	configureReplication(t, adminF2, leaderAddr, "1")
+
+	clientLeader := connectClient(t, leaderAddr, clientTLS)
+	defer clientLeader.Close()
+	selectDatabase(t, clientLeader, "1")
+
+	// 4. Write Batch 1 (0..100) -> Both Followers sync
+	for i := 0; i < 100; i++ {
+		writeKeyVal(t, clientLeader, fmt.Sprintf("k%d", i), "val")
+	}
+
+	// Wait for F1 to sync
+	clientF1 := connectClient(t, follower1Addr, clientTLS)
+	defer clientF1.Close()
+	selectDatabase(t, clientF1, "1")
+	waitForConditionOrTimeout(t, 5*time.Second, func() bool {
+		val := readKey(t, clientF1, "k99")
+		return string(val) == "val"
+	}, "F1 sync failed")
+
+	// Wait for F2 to sync
+	clientF2 := connectClient(t, follower2Addr, clientTLS)
+	defer clientF2.Close()
+	selectDatabase(t, clientF2, "1")
+	waitForConditionOrTimeout(t, 5*time.Second, func() bool {
+		val := readKey(t, clientF2, "k99")
+		return string(val) == "val"
+	}, "F2 sync failed")
+
+	// 5. STOP Follower 2 (Straggler)
+	// Explicitly STOP REPLICATION first to ensure it stops pulling/ACKing
+	adminF2ForStop := connectClient(t, follower2Addr, adminTLS)
+	selectDatabase(t, adminF2ForStop, "1")
+	stopReplication(t, adminF2ForStop, "1")
+	adminF2ForStop.Close()
+	
+	cancelFollower2()
+
+	// 6. Write Batch 2 (100..200) -> F1 syncs, F2 is dead
+	for i := 100; i < 200; i++ {
+		writeKeyVal(t, clientLeader, fmt.Sprintf("k%d", i), "val")
+	}
+
+	// Verify F1 sync
+	waitForConditionOrTimeout(t, 5*time.Second, func() bool {
+		val := readKey(t, clientF1, "k199")
+		return string(val) == "val"
+	}, "F1 batch 2 sync failed")
+
+	// 7. Trigger Leader to broadcast SafePoint
+	// Leader sees F2 at ~100. Leader sends SafePoint(~100) to F1.
+	// We wait a bit for the periodic broadcast (1s interval in replication.go).
+	time.Sleep(2 * time.Second)
+
+	// 8. Force Checkpoint on F1
+	// This would normally allow F1 to delete logs 0..100 IF it had no constraints.
+	stF1 := follower1Srv.stores["1"]
+	if err := stF1.DB.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 9. Run Retention on F1
+	stF1.EnforceRetentionPolicy()
+
+	// 10. Verify F1 RETAINS logs
+	// F1 has no downstream replicas (minReplicaSeq=Max).
+	// But it has Upstream SafePoint = ~100.
+	// It should NOT delete files containing OpID 100.
+	f1WalDir := filepath.Join(baseDir, "follower1", "data", "1", "wal")
+	files, _ := filepath.Glob(filepath.Join(f1WalDir, "*.wal"))
+	
+	// 200 writes @ 1KB limit = ~10 files.
+	// If it deleted everything older than checkpoint (200), we'd have 1-2 files.
+	// If it respected SafePoint(100), we should have ~5 files.
+	if len(files) < 4 {
+		t.Errorf("Follower 1 purged logs despite Leader SafePoint! Files: %d", len(files))
+	}
 }
