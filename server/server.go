@@ -35,27 +35,31 @@ const (
 )
 
 type Server struct {
-	stores           map[string]*store.Store
-	defaultDB        string // Renamed from defaultPartition
-	id               string // Unique Server ID
-	addr             string
-	logger           *slog.Logger
-	listener         net.Listener
-	maxConns         int
-	sem              chan struct{}
-	wg               sync.WaitGroup
-	totalConns       uint64
-	activeConns      int64
-	tlsConfig        *tls.Config
-	tlsCertFile      string
-	tlsKeyFile       string
-	tlsCAFile        string
-	currentTLSConfig atomic.Value
-	replManager      *replication.ReplicationManager
+	stores             map[string]*store.Store
+	defaultDB          string // Renamed from defaultPartition
+	id                 string // Unique Server ID
+	addr               string
+	logger             *slog.Logger
+	listener           net.Listener
+	maxConns           int
+	sem                chan struct{}
+	wg                 sync.WaitGroup
+	totalConns         uint64
+	activeConns        int64
+	tlsConfig          *tls.Config
+	tlsCertFile        string
+	tlsKeyFile         string
+	tlsCAFile          string
+	currentTLSConfig   atomic.Value
+	replManager        *replication.ReplicationManager
 
 	// Metrics per database
 	connsMu sync.Mutex
 	dbConns map[string]int64 // Renamed from partitionConns
+
+	// Active connections object tracking for StepDown
+	activeClientsMu sync.Mutex
+	activeClients   map[string]map[net.Conn]struct{}
 }
 
 func NewServer(id string, addr string, stores map[string]*store.Store, logger *slog.Logger, maxConns int, tlsCert, tlsKey, tlsCA string, rm *replication.ReplicationManager) (*Server, error) {
@@ -74,18 +78,19 @@ func NewServer(id string, addr string, stores map[string]*store.Store, logger *s
 	}
 
 	s := &Server{
-		id:          id,
-		addr:        addr,
-		stores:      stores,
-		defaultDB:   defDB,
-		logger:      logger,
-		maxConns:    maxConns,
-		sem:         make(chan struct{}, maxConns),
-		tlsCertFile: tlsCert,
-		tlsKeyFile:  tlsKey,
-		tlsCAFile:   tlsCA,
-		replManager: rm,
-		dbConns:     make(map[string]int64),
+		id:            id,
+		addr:          addr,
+		stores:        stores,
+		defaultDB:     defDB,
+		logger:        logger,
+		maxConns:      maxConns,
+		sem:           make(chan struct{}, maxConns),
+		tlsCertFile:   tlsCert,
+		tlsKeyFile:    tlsKey,
+		tlsCAFile:     tlsCA,
+		replManager:   rm,
+		dbConns:       make(map[string]int64),
+		activeClients: make(map[string]map[net.Conn]struct{}),
 	}
 
 	if err := s.ReloadTLS(); err != nil {
@@ -143,7 +148,9 @@ func (s *Server) Run(ctx context.Context) error {
 		return err
 	}
 	s.listener = ln
-	s.logger.Info("TurnstoneDB Server Ready",
+	
+	// INFO: Startup configuration
+	s.logger.Info("TurnstoneDB Server Started",
 		"version", "1.0.0",
 		"addr", s.addr,
 		"id", s.id,
@@ -171,7 +178,7 @@ func (s *Server) Run(ctx context.Context) error {
 			s.wg.Add(1)
 			go s.handleConnection(ctx, conn)
 		default:
-			// Rate limit logging for rejected connections to avoid DOS logging
+			// WARN: Capacity limits
 			s.logger.Warn("Max connections reached, rejecting client", "remote", conn.RemoteAddr().String())
 			_ = s.writeBinaryResponse(conn, protocol.ResStatusServerBusy, []byte("Max connections"))
 			_ = conn.Close()
@@ -187,6 +194,7 @@ func (s *Server) handleSignals(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-sig:
+			// INFO: Operator requested config reload
 			s.logger.Info("Reloading TLS configuration...")
 			if err := s.ReloadTLS(); err != nil {
 				s.logger.Error("TLS reload failed", "err", err)
@@ -213,6 +221,39 @@ func (s *Server) DatabaseConns(dbName string) int64 {
 // PartitionConns is kept for interface compatibility if needed, aliasing DatabaseConns.
 func (s *Server) PartitionConns(partition string) int64 {
 	return s.DatabaseConns(partition)
+}
+
+func (s *Server) registerConn(db string, conn net.Conn) {
+	s.activeClientsMu.Lock()
+	defer s.activeClientsMu.Unlock()
+	if s.activeClients[db] == nil {
+		s.activeClients[db] = make(map[net.Conn]struct{})
+	}
+	s.activeClients[db][conn] = struct{}{}
+}
+
+func (s *Server) unregisterConn(db string, conn net.Conn) {
+	s.activeClientsMu.Lock()
+	defer s.activeClientsMu.Unlock()
+	if m, ok := s.activeClients[db]; ok {
+		delete(m, conn)
+		if len(m) == 0 {
+			delete(s.activeClients, db)
+		}
+	}
+}
+
+func (s *Server) killDBConnections(db string) {
+	s.activeClientsMu.Lock()
+	defer s.activeClientsMu.Unlock()
+	if m, ok := s.activeClients[db]; ok {
+		// We copy keys to avoid issues while iterating (though Close() is safe)
+		// and we deleted the map entry anyway.
+		for conn := range m {
+			_ = conn.Close()
+		}
+		delete(s.activeClients, db)
+	}
 }
 
 // connState is shared with replication.go
@@ -260,6 +301,7 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 				}
 			}
 		} else {
+			// WARN: Security handshake issues
 			connLogger.Warn("TLS Handshake failed", "err", err)
 			return
 		}
@@ -267,6 +309,8 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 
 	// Enrich logger with identity info
 	connLogger = connLogger.With("client_id", clientID, "role", role)
+	
+	// DEBUG: High frequency connection events
 	connLogger.Debug("Connection accepted", "auth_type", authType)
 
 	state := &connState{
@@ -280,8 +324,11 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 
 	// Track connection for default DB
 	s.trackConn(state.dbName, 1)
+	s.registerConn(state.dbName, conn)
 	defer func() {
 		s.trackConn(state.dbName, -1)
+		s.unregisterConn(state.dbName, conn)
+		// DEBUG: Connection close
 		connLogger.Debug("Connection closed")
 	}()
 
@@ -340,11 +387,9 @@ func (s *Server) dispatchCommand(conn net.Conn, r io.Reader, opCode uint8, paylo
 		return false
 	}
 
-	// Debug log only for mutation or complex ops to reduce noise
-	if opCode != protocol.OpCodePing && opCode != protocol.OpCodeGet {
-		if s.logger.Enabled(context.Background(), slog.LevelDebug) {
-			st.logger.Debug("Dispatching command", "opcode", fmt.Sprintf("0x%02x", opCode), "payload_len", len(payload))
-		}
+	// DEBUG: Verbose protocol logging (usually disabled)
+	if s.logger.Enabled(context.Background(), slog.LevelDebug) && opCode != protocol.OpCodePing {
+		st.logger.Debug("Dispatching command", "opcode", fmt.Sprintf("0x%02x", opCode), "payload_len", len(payload))
 	}
 
 	switch opCode {
@@ -374,6 +419,10 @@ func (s *Server) dispatchCommand(conn net.Conn, r io.Reader, opCode uint8, paylo
 		s.handleMDel(conn, payload, st)
 	case protocol.OpCodeReplicaOf:
 		s.handleReplicaOf(conn, payload, st)
+	case protocol.OpCodePromote:
+		s.handlePromote(conn, payload, st)
+	case protocol.OpCodeStepDown:
+		s.handleStepDown(conn, st)
 	case protocol.OpCodeReplHello:
 		// Hand off control to specialized handler in replication.go
 		s.HandleReplicaConnection(conn, r, payload, st)
@@ -433,20 +482,26 @@ func (s *Server) writeBinaryResponse(w io.Writer, status byte, body []byte) erro
 
 // Handlers with updated logging usage (using st.logger)
 
-func (s *Server) handleSelect(w io.Writer, payload []byte, st *connState) {
+func (s *Server) handleSelect(conn net.Conn, payload []byte, st *connState) {
 	name := string(payload)
 	if db, ok := s.stores[name]; ok {
 		// Update connection counts
 		s.trackConn(st.dbName, -1)
+		s.unregisterConn(st.dbName, conn)
+
 		st.dbName = name
 		st.db = db
-		s.trackConn(st.dbName, 1)
 
+		s.trackConn(st.dbName, 1)
+		s.registerConn(st.dbName, conn)
+
+		// DEBUG: Client state change
 		st.logger.Debug("Switched database", "db", name)
-		_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
+		_ = s.writeBinaryResponse(conn, protocol.ResStatusOK, nil)
 	} else {
+		// DEBUG: Invalid DB request
 		st.logger.Debug("Select failed: DB not found", "db", name)
-		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Database not found"))
+		_ = s.writeBinaryResponse(conn, protocol.ResStatusErr, []byte("Database not found"))
 	}
 }
 
@@ -455,10 +510,18 @@ func (s *Server) handleBegin(w io.Writer, st *connState) {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Database selected"))
 		return
 	}
+	// State Check: Only Primary or Replica allow transactions
+	state := st.db.GetState()
+	if state != store.StatePrimary && state != store.StateReplica {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Database not available for transactions"))
+		return
+	}
+
 	if st.tx != nil {
 		_ = s.writeBinaryResponse(w, protocol.ResTxInProgress, nil)
 		return
 	}
+
 	// Start a read-write transaction
 	st.tx = st.db.NewTransaction(true)
 	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
@@ -475,14 +538,14 @@ func (s *Server) handleCommit(w io.Writer, st *connState) {
 	if err != nil {
 		switch err {
 		case stonedb.ErrDiskFull:
-			st.logger.Error("Commit failed: Disk Full")
+			s.logger.Error("Commit failed: Disk Full")
 			_ = s.writeBinaryResponse(w, protocol.ResStatusServerBusy, []byte("ERR disk is full"))
 		case stonedb.ErrWriteConflict:
-			// Conflicts are normal operations, log as Debug or Info
+			// DEBUG: Conflicts are normal operation, not system errors
 			st.logger.Debug("Commit failed: Conflict")
 			_ = s.writeBinaryResponse(w, protocol.ResStatusTxConflict, []byte(err.Error()))
 		default:
-			st.logger.Error("Commit failed: Internal Error", "err", err)
+			s.logger.Error("Commit failed: Internal Error", "err", err)
 			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte(err.Error()))
 		}
 		return
@@ -512,6 +575,10 @@ func (s *Server) handleGet(w io.Writer, payload []byte, st *connState) {
 	}
 	if st.tx == nil {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusTxRequired, nil)
+		return
+	}
+	if st.db.GetState() == store.StateUndefined {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Database undefined (no reads)"))
 		return
 	}
 
@@ -544,6 +611,10 @@ func (s *Server) handleSet(w io.Writer, payload []byte, st *connState) {
 	}
 	if st.db.IsSystem() {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Database 0 is read-only"))
+		return
+	}
+	if st.db.GetState() != store.StatePrimary && st.db.GetState() != store.StateSteppingDown {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Read-only/Undefined state"))
 		return
 	}
 	if st.tx == nil {
@@ -593,6 +664,10 @@ func (s *Server) handleDel(w io.Writer, payload []byte, st *connState) {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Database 0 is read-only"))
 		return
 	}
+	if st.db.GetState() != store.StatePrimary && st.db.GetState() != store.StateSteppingDown {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Read-only/Undefined state"))
+		return
+	}
 	if st.tx == nil {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusTxRequired, nil)
 		return
@@ -624,6 +699,10 @@ func (s *Server) handleMGet(w io.Writer, payload []byte, st *connState) {
 	}
 	if st.tx == nil {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusTxRequired, nil)
+		return
+	}
+	if st.db.GetState() == store.StateUndefined {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Database undefined (no reads)"))
 		return
 	}
 	if len(payload) < 4 {
@@ -696,6 +775,10 @@ func (s *Server) handleMSet(w io.Writer, payload []byte, st *connState) {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Database 0 is read-only"))
 		return
 	}
+	if st.db.GetState() != store.StatePrimary && st.db.GetState() != store.StateSteppingDown {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Read-only/Undefined state"))
+		return
+	}
 	if st.tx == nil {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusTxRequired, nil)
 		return
@@ -765,6 +848,10 @@ func (s *Server) handleMDel(w io.Writer, payload []byte, st *connState) {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Database 0 is read-only"))
 		return
 	}
+	if st.db.GetState() != store.StatePrimary && st.db.GetState() != store.StateSteppingDown {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Read-only/Undefined state"))
+		return
+	}
 	if st.tx == nil {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusTxRequired, nil)
 		return
@@ -827,6 +914,13 @@ func (s *Server) handleReplicaOf(w io.Writer, payload []byte, st *connState) {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Replication disabled on server"))
 		return
 	}
+
+	// VALID ONLY IF UNDEFINED
+	if st.db.GetState() != store.StateUndefined {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Must be in UNDEFINED state to call REPLICAOF"))
+		return
+	}
+
 	if len(payload) < 4 {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Invalid payload"))
 		return
@@ -839,13 +933,106 @@ func (s *Server) handleReplicaOf(w io.Writer, payload []byte, st *connState) {
 	addr := string(payload[4 : 4+addrLen])
 	remoteDB := string(payload[4+addrLen:])
 
-	if addr == "" && addrLen == 0 {
-		st.logger.Info("Stopping replication", "db", st.dbName)
-		s.replManager.StopReplication(st.dbName)
-	} else {
-		st.logger.Info("Starting replication", "db", st.dbName, "source", addr, "remote_db", remoteDB)
-		s.replManager.AddReplica(st.dbName, addr, remoteDB)
+	// Must provide an address (no empty stop command anymore, use STEPDOWN)
+	if addr == "" {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("REPLICAOF requires primary address"))
+		return
 	}
+
+	// INFO: Significant role change
+	st.logger.Info("Starting replication (Transition to REPLICA)", "db", st.dbName, "source", addr, "remote_db", remoteDB)
+
+	// Transition State
+	st.db.SetState(store.StateReplica)
+	s.replManager.AddReplica(st.dbName, addr, remoteDB)
+
+	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
+}
+
+func (s *Server) handlePromote(w io.Writer, payload []byte, st *connState) {
+	// Valid when UNDEFINED, REPLICA, or PRIMARY (idempotent/timeline bump)
+	currentState := st.db.GetState()
+	if currentState != store.StateUndefined && currentState != store.StateReplica && currentState != store.StatePrimary {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("PROMOTE invalid state: "+currentState))
+		return
+	}
+
+	if len(payload) < 4 {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Invalid PROMOTE payload"))
+		return
+	}
+	minReplicas := binary.BigEndian.Uint32(payload[:4])
+
+	// INFO: Significant role change
+	st.logger.Info("Promoting database to PRIMARY", "db", st.dbName, "min_replicas", minReplicas)
+
+	// Stop existing replication if any
+	s.replManager.StopReplication(st.dbName)
+
+	// Configure the minimum replicas required for future writes on this primary
+	// This is set BEFORE promotion logic completes to ensure consistency from op 1.
+	st.db.SetMinReplicas(int(minReplicas))
+
+	if err := st.db.Promote(); err != nil {
+		st.logger.Error("Promote failed", "err", err)
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte(err.Error()))
+		return
+	}
+	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
+}
+
+func (s *Server) handleStepDown(w io.Writer, st *connState) {
+	// INFO: Significant role change
+	st.logger.Info("Stepping down database...", "db", st.dbName, "current_state", st.db.GetState())
+
+	currentState := st.db.GetState()
+
+	if currentState == store.StateReplica {
+		// State 1: Stop incoming replication immediately
+		if s.replManager != nil {
+			s.replManager.StopReplication(st.dbName)
+		}
+		// Transition to UNDEFINED immediately
+		st.db.SetState(store.StateUndefined)
+	} else if currentState == store.StatePrimary {
+		// State 1: Block NEW transactions (Transition to STEPPING_DOWN)
+		st.db.SetState(store.StateSteppingDown)
+
+		// State 2: Drain ACTIVE transactions
+		st.logger.Info("Waiting for active transactions to drain...", "db", st.dbName)
+		if err := st.db.WaitForActiveTransactions(5 * time.Second); err != nil {
+			st.logger.Warn("Timeout waiting for active transactions", "err", err)
+		}
+
+		// State 3: Propagate changes to Replicas
+		// Wait for all replicas to acknowledge the latest OpID
+		st.logger.Info("Waiting for replicas to catch up...", "db", st.dbName)
+		if err := st.db.WaitForReplication(5 * time.Second); err != nil {
+			st.logger.Warn("Timeout waiting for replication sync", "err", err)
+		}
+
+		// State 4: Send Safe OpID (Trigger SafePoint Broadcast)
+		st.logger.Info("Broadcasting final safe point...", "db", st.dbName)
+		st.db.TriggerSafePoint()
+		// Give a small moment for the broadcast loop to pick it up and write to network
+		time.Sleep(50 * time.Millisecond)
+
+		// State 5: Reset ReplicaSet (Clear slots)
+		st.db.ResetReplicas()
+
+		// Transition to UNDEFINED
+		st.db.SetState(store.StateUndefined)
+	} else {
+		// Already Undefined or unknown
+		st.db.SetState(store.StateUndefined)
+	}
+
+	// Disconnect ALL clients (including self/current connection)
+	go func(dbName string) {
+		time.Sleep(20 * time.Millisecond) // Attempt to flush OK response
+		s.killDBConnections(dbName)
+	}(st.dbName)
+
 	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
 }
 
