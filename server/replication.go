@@ -80,6 +80,9 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 	}
 	var subs []subReq
 
+	// Track the kill switches for all involved databases
+	var killChannels []<-chan struct{}
+
 	for i := 0; i < int(count); i++ {
 		if cursor+4 > len(payload) {
 			st.logger.Warn("Replica handshake failed: db name len truncated")
@@ -95,11 +98,23 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 		cursor += nLen
 		logID := binary.BigEndian.Uint64(payload[cursor : cursor+8])
 		cursor += 8
+
+		// Check if this server is already a replica for this database.
+		if s.replManager != nil && s.replManager.IsReplicating(name) {
+			st.logger.Warn("Rejected downstream replication request (cascading/cdc disabled on replicas)", "db", name, "replica_id", replicaID)
+			continue
+		}
+
 		subs = append(subs, subReq{name, logID})
 
 		if storePtr, ok := s.stores[name]; ok {
 			st.logger.Info("Replica subscribed", "db", name, "start_seq", logID)
 			storePtr.RegisterReplica(replicaID, logID, st.role)
+
+			// Capture the kill switch for this specific subscription
+			if ch := storePtr.GetReplicaSignalChannel(replicaID); ch != nil {
+				killChannels = append(killChannels, ch)
+			}
 
 			defer func(sp *store.Store, dbName string) {
 				st.logger.Info("Replica disconnected", "db", dbName)
@@ -109,6 +124,30 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 			st.logger.Warn("Replica requested unknown database", "db", name)
 		}
 	}
+
+	// Create a merged kill channel. If any store triggers a kill, we drop the connection.
+	mergedKill := make(chan struct{})
+	killWg := sync.WaitGroup{}
+	killOnce := sync.Once{}
+
+	for _, ch := range killChannels {
+		killWg.Add(1)
+		go func(c <-chan struct{}) {
+			defer killWg.Done()
+			select {
+			case <-c:
+				killOnce.Do(func() { close(mergedKill) })
+			case <-mergedKill: // Stop waiting if already closed
+			}
+		}(ch)
+	}
+
+	// Ensure we don't leak merged kill routines
+	defer func() {
+		// Just in case we exit normally without kill
+		killOnce.Do(func() { close(mergedKill) })
+		killWg.Wait()
+	}()
 
 	outCh := make(chan replPacket, 10)
 	errCh := make(chan error, 1)
@@ -172,6 +211,9 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 	// Central Writer
 	for {
 		select {
+		case <-mergedKill:
+			st.logger.Info("Replica disconnected by store (kill switch)")
+			return
 		case err := <-errCh:
 			st.logger.Warn("Dropping replica connection due to error", "err", err)
 			return

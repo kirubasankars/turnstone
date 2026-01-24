@@ -47,7 +47,7 @@ const (
 const (
 	OpJournalSet    = 1
 	OpJournalDelete = 2
-    OpJournalCommit = 3
+	OpJournalCommit = 3
 )
 
 // Response Codes indicate the status of a request.
@@ -60,6 +60,7 @@ const (
 	ResStatusTxTimeout      = 0x04 // Transaction exceeded MaxTxDuration.
 	ResStatusTxConflict     = 0x05 // Write conflict or snapshot invalidation.
 	ResStatusTxInProgress   = 0x06 // Transaction is already active.
+	ResStatusTxCommitted    = 0x0A // Transaction committed successfully.
 	ResStatusServerBusy     = 0x07 // Server reached MaxConns.
 	ResStatusEntityTooLarge = 0x08 // Payload exceeds MaxCommandSize.
 	ResStatusMemoryLimit    = 0x09 // Server OOM protection triggered.
@@ -540,6 +541,10 @@ type Change struct {
 	Key      []byte
 	Value    []byte // nil if IsDelete is true
 	IsDelete bool
+
+	// IsSnapshotDone indicates that the full-sync snapshot is complete.
+	// When true, LogSeq contains the ResumeSeq to start the WAL stream from.
+	IsSnapshotDone bool
 }
 
 // Subscribe connects to the server and starts listening for changes on the specified database.
@@ -548,9 +553,10 @@ type Change struct {
 // Note: This method consumes the Client connection. You should create a dedicated Client instance for CDC.
 func (c *Client) Subscribe(dbName string, startSeq uint64, handler func(Change) error) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	// Removed defer c.mu.Unlock() to prevent deadlock during Close()
 
 	if c.conn == nil {
+		c.mu.Unlock() // Release lock
 		return ErrConnection
 	}
 
@@ -579,12 +585,17 @@ func (c *Client) Subscribe(dbName string, startSeq uint64, handler func(Change) 
 	binary.BigEndian.PutUint32(reqHeader[1:], uint32(buf.Len()))
 
 	if _, err := c.conn.Write(reqHeader); err != nil {
+		c.mu.Unlock() // Release lock
 		return err
 	}
 	// Send Body
 	if _, err := c.conn.Write(buf.Bytes()); err != nil {
+		c.mu.Unlock() // Release lock
 		return err
 	}
+
+	// Release lock BEFORE entering the blocking loop
+	c.mu.Unlock()
 
 	// 2. Loop Read
 	respHeader := make([]byte, ProtoHeaderSize)
@@ -655,7 +666,9 @@ func (c *Client) Subscribe(dbName string, startSeq uint64, handler func(Change) 
 
 				// Skip Commit Markers in the event stream as they are just signals
 				if opType == OpJournalCommit { // OpJournalCommit from Protocol
-					if logSeq > maxLogSeq { maxLogSeq = logSeq }
+					if logSeq > maxLogSeq {
+						maxLogSeq = logSeq
+					}
 					continue
 				}
 
@@ -729,16 +742,31 @@ func (c *Client) Subscribe(dbName string, startSeq uint64, handler func(Change) 
 			}
 
 		} else if opCode == OpCodeReplSnapshotDone {
-			// Snapshot Done Signal: [DBNameLen][DBName][0][ResumeSeq(8)]
+			// Snapshot Done Signal: [DBNameLen][DBName][0][Data...]
+			// Data from server is [TxID(8)][OpID(8)]. We need OpID as the resume sequence.
 			cursor := 0
 			nLen := int(binary.BigEndian.Uint32(payload[cursor : cursor+4]))
 			cursor += 4 + nLen + 4 // Skip Name + Count(0)
-			
-			if cursor + 8 <= len(payload) {
-				resumeSeq := binary.BigEndian.Uint64(payload[cursor:])
+
+			// FIX: Handle the 16-byte payload from server [TxID][OpID] correctly.
+			// The server sends [TxID(8)][OpID(8)]. We want OpID.
+			if cursor+16 <= len(payload) {
+				resumeSeq := binary.BigEndian.Uint64(payload[cursor+8:])
 				c.logger.Info("Snapshot sync complete", "resume_seq", resumeSeq)
+
+				// Notify handler so it can persist the state
+				if err := handler(Change{IsSnapshotDone: true, LogSeq: resumeSeq}); err != nil {
+					return err
+				}
+			} else if cursor+8 <= len(payload) {
+				// Fallback: If server only sent 8 bytes (Old version?), use it.
+				resumeSeq := binary.BigEndian.Uint64(payload[cursor:])
+				c.logger.Info("Snapshot sync complete (short payload)", "resume_seq", resumeSeq)
+				if err := handler(Change{IsSnapshotDone: true, LogSeq: resumeSeq}); err != nil {
+					return err
+				}
 			}
-			
+
 		} else {
 			// Ignore other opcodes or handle error/quit
 			if opCode == ResStatusErr {
