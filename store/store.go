@@ -46,9 +46,9 @@ type ReplicaSlot struct {
 // Store wraps stonedb.DB to provide a compatibility layer, stats, and replication logic.
 type Store struct {
 	*stonedb.DB
-	logger      *slog.Logger
-	startTime   time.Time
-	isSystem    bool
+	logger    *slog.Logger
+	startTime time.Time
+	isSystem  bool
 	minReplicas int
 
 	// Persistence Context
@@ -56,13 +56,13 @@ type Store struct {
 	dbOpts stonedb.Options
 
 	// Replication State
-	mu          sync.Mutex
-	dbMu        sync.RWMutex            // Protects s.DB pointer and state
-	replicas    map[string]*ReplicaSlot // ReplicaID -> Slot State
-	cond        *sync.Cond
-	slotsFile   string
-	dirty       bool
-	walStrategy string
+	mu            sync.Mutex
+	dbMu          sync.RWMutex            // Protects s.DB pointer and state
+	replicas      map[string]*ReplicaSlot // ReplicaID -> Slot State
+	cond          *sync.Cond
+	slotsFile     string
+	dirty         bool
+	walStrategy   string
 
 	// Leader-Propagated Safety Barrier
 	// If we are a follower, the leader tells us what the global minimum sequence is.
@@ -71,7 +71,7 @@ type Store struct {
 	leaderSafeSeq uint64
 }
 
-func NewStore(dir string, logger *slog.Logger, minReplicas int, isSystem bool, walStrategy string, maxDiskUsage int) (*Store, error) {
+func NewStore(dir string, logger *slog.Logger, minReplicas int, isSystem bool, walStrategy string, maxDiskUsage int, blockCacheSize int) (*Store, error) {
 	// Default values
 	maxWALSize := 10 * 1024 * 1024
 
@@ -94,6 +94,7 @@ func NewStore(dir string, logger *slog.Logger, minReplicas int, isSystem bool, w
 		CompactionMinGarbage: 4 * 1024 * 1024,
 		TruncateCorruptWAL:   truncateWAL,
 		MaxDiskUsagePercent:  maxDiskUsage,
+		BlockCacheSize:       blockCacheSize,
 		Logger:               logger, // Ensure logger is passed down
 	}
 

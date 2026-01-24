@@ -71,7 +71,7 @@ func setupTestEnv(t *testing.T) (string, map[string]*store.Store, *Server, func(
 	stores := make(map[string]*store.Store)
 	for i := 0; i < 4; i++ {
 		dbName := strconv.Itoa(i)
-		store, err := store.NewStore(filepath.Join(dir, "data", dbName), logger, 0, i == 0, "time", 90)
+		store, err := store.NewStore(filepath.Join(dir, "data", dbName), logger, 0, i == 0, "time", 90, 0)
 		if err != nil {
 			t.Fatal(err)
 		}

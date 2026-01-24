@@ -71,7 +71,7 @@ func (db *DB) RebuildIndexFromVLog() error {
 	os.RemoveAll(indexPath)
 
 	ldbOpts := &opt.Options{
-		BlockCacheCapacity: 64 * 1024 * 1024,
+		BlockCacheCapacity: db.blockCacheSize,
 		Compression:        opt.SnappyCompression,
 	}
 	var err error
