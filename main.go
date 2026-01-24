@@ -15,6 +15,13 @@ import (
 	"strconv"
 	"syscall"
 	"time"
+
+	"turnstone/config"
+	"turnstone/metrics"
+	"turnstone/protocol"
+	"turnstone/replication"
+	"turnstone/server"
+	"turnstone/store"
 )
 
 func main() {
@@ -31,22 +38,21 @@ func main() {
 	}
 
 	configPath := filepath.Join(homeDir, "config.json")
-	defaultCfg := Config{
-		Port: DefaultPort, MaxConns: 500, Fsync: true,
+	defaultCfg := config.Config{
+		Port: protocol.DefaultPort, MaxConns: 500, Fsync: true,
 		TLSCertFile: "certs/server.crt", TLSKeyFile: "certs/server.key", TLSCAFile: "certs/ca.crt",
 		TLSClientCertFile: "certs/client.crt", TLSClientKeyFile: "certs/client.key", MetricsAddr: ":9090",
 		NumberOfDatabases: 16,
 	}
 
 	if *genConfig {
-		if err := GenerateConfigArtifacts(homeDir, defaultCfg, configPath); err != nil {
+		if err := config.GenerateConfigArtifacts(homeDir, defaultCfg, configPath); err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to generate config: %v\n", err)
 			os.Exit(1)
 		}
 		return
 	}
 
-	// Load Config
 	cfg := defaultCfg
 	if data, err := os.ReadFile(configPath); err == nil {
 		if err := json.Unmarshal(data, &cfg); err != nil {
@@ -60,20 +66,17 @@ func main() {
 		_ = os.MkdirAll(homeDir, 0o755)
 	}
 
-	// Resolve absolute paths
-	cfg.TLSCertFile = ResolvePath(homeDir, cfg.TLSCertFile)
-	cfg.TLSKeyFile = ResolvePath(homeDir, cfg.TLSKeyFile)
-	cfg.TLSCAFile = ResolvePath(homeDir, cfg.TLSCAFile)
-	cfg.TLSClientCertFile = ResolvePath(homeDir, cfg.TLSClientCertFile)
-	cfg.TLSClientKeyFile = ResolvePath(homeDir, cfg.TLSClientKeyFile)
+	cfg.TLSCertFile = config.ResolvePath(homeDir, cfg.TLSCertFile)
+	cfg.TLSKeyFile = config.ResolvePath(homeDir, cfg.TLSKeyFile)
+	cfg.TLSCAFile = config.ResolvePath(homeDir, cfg.TLSCAFile)
+	cfg.TLSClientCertFile = config.ResolvePath(homeDir, cfg.TLSClientCertFile)
+	cfg.TLSClientKeyFile = config.ResolvePath(homeDir, cfg.TLSClientKeyFile)
 
-	// Logging
 	lvl := slog.LevelInfo
 	if cfg.Debug {
 		lvl = slog.LevelDebug
 	}
 
-	// Ensure home directory exists
 	if err := os.MkdirAll(homeDir, 0o755); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to ensure home directory exists: %v\n", err)
 		os.Exit(1)
@@ -87,38 +90,33 @@ func main() {
 	}
 	defer logFile.Close()
 
-	// Write logs to both stdout and the file
 	multiWriter := io.MultiWriter(os.Stdout, logFile)
 	logger := slog.New(slog.NewTextHandler(multiWriter, &slog.HandlerOptions{Level: lvl}))
 
-	txDuration := MaxTxDuration
+	txDuration := protocol.MaxTxDuration
 	if *devMode {
 		logger.Info("DEV MODE Enabled")
 		txDuration = 120 * time.Second
 	}
 
-	if err := ValidateSecurityConfig(cfg); err != nil {
+	if err := config.ValidateSecurityConfig(cfg); err != nil {
 		logger.Error("Config invalid", "err", err)
 		os.Exit(1)
 	}
 
-	// Initialize Stores
-	stores := make(map[string]*Store)
+	stores := make(map[string]*store.Store)
 	for i := 0; i < cfg.NumberOfDatabases; i++ {
 		dbName := strconv.Itoa(i)
 		dbPath := filepath.Join(homeDir, "data", dbName)
-		// MinReplicas defaulted to 0 since static config is removed.
-		store, err := NewStore(dbPath, logger, cfg.AllowRecoveryTruncate, 0, cfg.Fsync)
+		st, err := store.NewStore(dbPath, logger, cfg.AllowRecoveryTruncate, 0, cfg.Fsync)
 		if err != nil {
 			logger.Error("Failed to init store", "db", dbName, "err", err)
 			os.Exit(1)
 		}
-		stores[dbName] = store
+		stores[dbName] = st
 	}
 
-	// Initialize Replication Manager (Follower Mode)
-	// We init RM if client certs are valid, regardless of initial config, to allow dynamic commands
-	var replManager *ReplicationManager
+	var replManager *replication.ReplicationManager
 	clientCert, err := tls.LoadX509KeyPair(cfg.TLSClientCertFile, cfg.TLSClientKeyFile)
 	if err == nil {
 		caCert, _ := os.ReadFile(cfg.TLSCAFile)
@@ -126,16 +124,20 @@ func main() {
 		pool.AppendCertsFromPEM(caCert)
 		tlsConf := &tls.Config{Certificates: []tls.Certificate{clientCert}, RootCAs: pool}
 
-		replManager = NewReplicationManager(stores, tlsConf, logger)
+		replManager = replication.NewReplicationManager(stores, tlsConf, logger)
 		replManager.Start()
 	} else {
 		logger.Warn("Client certs not found, replication client disabled", "err", err)
 	}
 
-	srv, err := NewServer(cfg.Port, cfg.MetricsAddr, stores, logger, cfg.MaxConns, txDuration, cfg.TLSCertFile, cfg.TLSKeyFile, cfg.TLSCAFile, replManager)
+	srv, err := server.NewServer(cfg.Port, stores, logger, cfg.MaxConns, txDuration, cfg.TLSCertFile, cfg.TLSKeyFile, cfg.TLSCAFile, replManager)
 	if err != nil {
 		logger.Error("Server init failed", "err", err)
 		os.Exit(1)
+	}
+
+	if cfg.MetricsAddr != "" {
+		metrics.StartMetricsServer(cfg.MetricsAddr, stores, srv, logger)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

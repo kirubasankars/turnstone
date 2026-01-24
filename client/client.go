@@ -35,7 +35,6 @@ const (
 	OpCodeCommit    = 0x11 // Commit the current transaction.
 	OpCodeAbort     = 0x12 // Rollback the current transaction.
 	OpCodeStat      = 0x20 // Retrieve server statistics.
-	OpCodeCompact   = 0x31 // Trigger a background compaction job.
 	OpCodeReplicaOf = 0x32 // Set replication source. Payload: [AddrLen][Addr][RemoteDB].
 	OpCodeReplHello = 0x50 // Replication Handshake (Internal).
 	OpCodeReplBatch = 0x51 // Replication Batch (Internal).
@@ -391,11 +390,4 @@ func (c *Client) Abort() error {
 func (c *Client) Stat() (string, error) {
 	resp, err := c.roundTrip(OpCodeStat, nil)
 	return string(resp), err
-}
-
-// Compact triggers the background Compaction process to reclaim disk space
-// from deleted keys and old versions in the WAL.
-func (c *Client) Compact() error {
-	_, err := c.roundTrip(OpCodeCompact, nil)
-	return err
 }
