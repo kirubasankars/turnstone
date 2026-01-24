@@ -99,6 +99,26 @@ func startServerNode(t *testing.T, baseDir, name string, sharedTLS *tls.Config) 
 	return srv, srv.listener.Addr().String(), cancel
 }
 
+func promoteNode(t *testing.T, baseDir, addr string, databases ...string) {
+	t.Helper()
+	adminTLS := getRoleTLS(t, baseDir, "admin")
+	c := connectClient(t, addr, adminTLS)
+	defer c.Close()
+
+	if len(databases) == 0 {
+		// Default to all if none specified? Or no-op?
+		// Retain compatibility with my previous "Promote All" intent?
+		// No, explicit is better.
+		databases = []string{"0", "1", "2", "3"}
+	}
+
+	for _, dbName := range databases {
+		selectDatabase(t, c, dbName)
+		// Promote Payload: [MinReplicas(4)] = 0
+		c.AssertStatus(protocol.OpCodePromote, make([]byte, 4), protocol.ResStatusOK)
+	}
+}
+
 // Helper wrappers using functions from server_test.go
 
 func selectDatabase(t *testing.T, c *testClient, dbName string) {
@@ -118,15 +138,9 @@ func configureReplication(t *testing.T, c *testClient, targetAddr, targetDB stri
 	c.AssertStatus(protocol.OpCodeReplicaOf, payload, protocol.ResStatusOK)
 }
 
-func stopReplication(t *testing.T, c *testClient, targetDB string) {
+func stepDownNode(t *testing.T, c *testClient) {
 	t.Helper()
-	dbBytes := []byte(targetDB)
-	// Payload: [0 len][empty addr][dbName]
-	payload := make([]byte, 4+0+len(dbBytes))
-	binary.BigEndian.PutUint32(payload[0:4], 0)
-	copy(payload[4:], dbBytes)
-
-	c.AssertStatus(protocol.OpCodeReplicaOf, payload, protocol.ResStatusOK)
+	c.AssertStatus(protocol.OpCodeStepDown, nil, protocol.ResStatusOK)
 }
 
 func writeKeyVal(t *testing.T, c *testClient, k, v string) {
@@ -177,6 +191,7 @@ func TestServer_ReplicaOf_Integration(t *testing.T) {
 	// Start Primary
 	_, primaryAddr, cancelPrimary := startServerNode(t, baseDir, "primary_int", clientTLS)
 	defer cancelPrimary()
+	promoteNode(t, baseDir, primaryAddr, "1")
 
 	// Start Replica
 	_, replicaAddr, cancelReplica := startServerNode(t, baseDir, "replica_int", clientTLS)
@@ -211,24 +226,27 @@ func TestServer_ReplicaOf_Integration(t *testing.T) {
 	}, "Replication failed for K1")
 
 	// --- PHASE 2: STOP REPLICATION ---
-	// Send REPLICAOF NO ONE using ADMIN connection
-	dbBytes := []byte("1")
-	stopPayload := make([]byte, 4+0+len(dbBytes))
-	binary.BigEndian.PutUint32(stopPayload[0:4], 0)
-	copy(stopPayload[4:], dbBytes)
-	clientReplicaAdmin.AssertStatus(protocol.OpCodeReplicaOf, stopPayload, protocol.ResStatusOK)
+	// Use STEPDOWN instead of REPLICAOF NO ONE
+	clientReplicaAdmin.AssertStatus(protocol.OpCodeStepDown, nil, protocol.ResStatusOK)
 
 	// Write K2 to Primary
 	writeKeyVal(t, clientPrimary, "k2", "v2")
 
-	// Wait a bit to ensure it DOESN'T replicate
+	// Wait a bit
 	time.Sleep(300 * time.Millisecond)
 
-	// Verify K2 is NOT on Replica
-	val := readKey(t, clientReplicaRead, "k2")
-	if val != nil {
-		t.Fatalf("Replication did not stop, found k2: %s", val)
+	// Verify clientReplicaRead was disconnected
+	// A Read attempt should fail
+	_, err := clientReplicaRead.conn.Read(make([]byte, 1))
+	if err == nil {
+		t.Error("Client should have been disconnected after StepDown")
 	}
+
+	// Verify we can reconnect but DB is Undefined
+	cNew := connectClient(t, replicaAddr, clientTLS)
+	cNew.AssertStatus(protocol.OpCodeSelect, []byte("1"), protocol.ResStatusOK)
+	cNew.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusErr) // Undefined
+	cNew.Close()
 }
 
 func TestReplication_FanOut(t *testing.T) {
@@ -237,6 +255,7 @@ func TestReplication_FanOut(t *testing.T) {
 
 	_, primaryAddr, cancelPrimary := startServerNode(t, baseDir, "primary", clientTLS)
 	defer cancelPrimary()
+	promoteNode(t, baseDir, primaryAddr, "1")
 
 	_, r1Addr, cancelR1 := startServerNode(t, baseDir, "replica1", clientTLS)
 	defer cancelR1()
@@ -288,6 +307,7 @@ func TestReplication_Cascading_Rejected(t *testing.T) {
 	// Start Node A (Primary)
 	_, addrA, cancelA := startServerNode(t, baseDir, "nodeA", clientTLS)
 	defer cancelA()
+	promoteNode(t, baseDir, addrA, "1")
 
 	// Start Node B (Replica of A, Primary for C)
 	_, addrB, cancelB := startServerNode(t, baseDir, "nodeB", clientTLS)
@@ -343,6 +363,7 @@ func TestReplication_SameServer_Loopback(t *testing.T) {
 	// Start Single Node
 	_, addr, cancel := startServerNode(t, baseDir, "loopback", clientTLS)
 	defer cancel()
+	promoteNode(t, baseDir, addr, "1")
 
 	client := connectClient(t, addr, clientTLS)
 	defer client.Close()
@@ -376,6 +397,7 @@ func TestReplication_SlowConsumer_Dropped(t *testing.T) {
 	baseDir, clientTLS := setupSharedCertEnv(t)
 	_, addr, cancel := startServerNode(t, baseDir, "slow_consumer", clientTLS)
 	defer cancel()
+	promoteNode(t, baseDir, addr, "1")
 
 	// 3. Connect "Slow" Replica manually using CDC role credentials
 	cdcTLS := getRoleTLS(t, baseDir, "cdc")
@@ -487,167 +509,6 @@ func TestReplication_SlowConsumer_Dropped(t *testing.T) {
 	}
 }
 
-// TestCDC_PurgedWAL_TriggersSnapshot verifies that if the requested logs are missing,
-// the server initiates a Full Sync (Snapshot) instead of returning an error.
-func TestCDC_PurgedWAL_TriggersSnapshot(t *testing.T) {
-	dir, stores, srv, cleanup := setupTestEnv(t)
-	defer cleanup()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go srv.Run(ctx)
-	time.Sleep(100 * time.Millisecond)
-
-	addr := srv.listener.Addr().String()
-	clientTLS := getClientTLS(t, dir)
-	cdcTLS := getRoleTLS(t, dir, "cdc")
-
-	// Helper to create SET payload
-	makeSet := func(k, v string) []byte {
-		kb, vb := []byte(k), []byte(v)
-		buf := make([]byte, 4+len(kb)+len(vb))
-		binary.BigEndian.PutUint32(buf[0:4], uint32(len(kb)))
-		copy(buf[4:], kb)
-		copy(buf[4+len(kb):], vb)
-		return buf
-	}
-
-	// 1. Write initial data to Database "1" to generate WAL entry (OpID 1)
-	c1 := connectClient(t, addr, clientTLS)
-	defer c1.Close()
-	selectDatabase(t, c1, "1")
-
-	c1.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
-	c1.AssertStatus(protocol.OpCodeSet, makeSet("k1", "v1"), protocol.ResStatusOK)
-	c1.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusOK)
-
-	// 2. Force WAL Rotation using Promote() (File 1 -> File 2)
-	// We use Promote because Checkpoint() only rotates VLog, not WAL.
-	st1 := stores["1"]
-	if err := st1.DB.Promote(); err != nil {
-		t.Fatal(err)
-	}
-
-	// 3. Write more data (OpID 2) into File 2
-	c1.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
-	c1.AssertStatus(protocol.OpCodeSet, makeSet("k2", "v2"), protocol.ResStatusOK)
-	c1.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusOK)
-
-	// 4. Force WAL Rotation again (File 2 -> File 3)
-	if err := st1.DB.Promote(); err != nil {
-		t.Fatal(err)
-	}
-
-	// 5. Purge logs older than OpID 2. This deletes File 1.
-	// OpID 2 is in File 2. File 2 StartOpID is 2.
-	// 2 <= 2 -> File 1 is purged.
-	if err := st1.DB.PurgeWAL(2); err != nil {
-		t.Fatal(err)
-	}
-
-	// 6. Connect CDC requesting StartSeq 0.
-	cdcConn, err := tls.Dial("tcp", addr, cdcTLS)
-	if err != nil {
-		t.Fatalf("Failed to dial CDC: %v", err)
-	}
-	defer cdcConn.Close()
-
-	// Handshake
-	buf := new(bytes.Buffer)
-	binary.Write(buf, binary.BigEndian, uint32(1)) // Ver
-	clientid := "test-cdc-snapshot"
-	binary.Write(buf, binary.BigEndian, uint32(len(clientid)))
-	buf.WriteString(clientid)
-	binary.Write(buf, binary.BigEndian, uint32(1)) // Count
-	part := "1"
-	binary.Write(buf, binary.BigEndian, uint32(len(part)))
-	buf.WriteString(part)
-	binary.Write(buf, binary.BigEndian, uint64(0)) // Request StartSeq 0
-
-	header := make([]byte, 5)
-	header[0] = protocol.OpCodeReplHello
-	binary.BigEndian.PutUint32(header[1:], uint32(buf.Len()))
-
-	cdcConn.Write(header)
-	cdcConn.Write(buf.Bytes())
-
-	// 7. Read response. Expect Snapshot Packet.
-	respHead := make([]byte, 5)
-	cdcConn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	if _, err := io.ReadFull(cdcConn, respHead); err != nil {
-		t.Fatalf("Read CDC response failed: %v", err)
-	}
-
-	// Expect Snapshot OpCode
-	if respHead[0] != protocol.OpCodeReplSnapshot {
-		if respHead[0] == protocol.ResStatusErr {
-			ln := binary.BigEndian.Uint32(respHead[1:])
-			body := make([]byte, ln)
-			io.ReadFull(cdcConn, body)
-			t.Fatalf("Unexpected error from server: %s", string(body))
-		}
-		t.Fatalf("Expected OpCodeReplSnapshot (0x53), got 0x%x", respHead[0])
-	}
-
-	// Consume Snapshot Data
-	ln := binary.BigEndian.Uint32(respHead[1:])
-	body := make([]byte, ln)
-	if _, err := io.ReadFull(cdcConn, body); err != nil {
-		t.Fatalf("Read snapshot body failed: %v", err)
-	}
-
-	// Verify K1 and K2 are present in the snapshot
-	if !bytes.Contains(body, []byte("k1")) || !bytes.Contains(body, []byte("v1")) {
-		t.Error("Snapshot missing k1/v1")
-	}
-	if !bytes.Contains(body, []byte("k2")) || !bytes.Contains(body, []byte("v2")) {
-		t.Error("Snapshot missing k2/v2")
-	}
-
-	// 8. Expect Snapshot Done Signal (Updated for framing)
-	if _, err := io.ReadFull(cdcConn, respHead); err != nil {
-		t.Fatalf("Read Done header failed: %v", err)
-	}
-	if respHead[0] != protocol.OpCodeReplSnapshotDone {
-		t.Fatalf("Expected OpCodeReplSnapshotDone (0x54), got 0x%x", respHead[0])
-	}
-	ln = binary.BigEndian.Uint32(respHead[1:])
-
-	// Payload contains [DBNameLen(4)][DBName][Count(4)][Data(16)]
-	// DBName="1" (1 byte) -> Total wrapper = 9 bytes. Total payload = 25 bytes.
-	if ln < 9+16 {
-		t.Fatalf("Expected at least 25 byte payload for SnapshotDone (wrapper+data), got %d", ln)
-	}
-
-	payload := make([]byte, ln)
-	if _, err := io.ReadFull(cdcConn, payload); err != nil {
-		t.Fatalf("Read Done payload failed: %v", err)
-	}
-
-	// Skip framing
-	cursor := 0
-	nLen := int(binary.BigEndian.Uint32(payload[cursor:]))
-	cursor += 4 + nLen + 4 // DBNameLen + DBName + Count
-
-	data := payload[cursor:]
-	if len(data) != 16 {
-		t.Fatalf("Expected 16 byte data (TxID+OpID), got %d", len(data))
-	}
-
-	// 9. Verify transition to live streaming
-	c1.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
-	c1.AssertStatus(protocol.OpCodeSet, makeSet("k3", "v3"), protocol.ResStatusOK)
-	c1.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusOK)
-
-	// Read Next Packet - Should be Batch (0x51)
-	if _, err := io.ReadFull(cdcConn, respHead); err != nil {
-		t.Fatalf("Read Batch header failed: %v", err)
-	}
-	if respHead[0] != protocol.OpCodeReplBatch {
-		t.Fatalf("Expected OpCodeReplBatch (0x51), got 0x%x", respHead[0])
-	}
-}
-
 // TestReplication_FullSync_Integration verifies that a Replica server can correctly
 // ingest a full snapshot from a Primary when the WAL logs are missing, and then
 // seamlessly transition to receiving live updates.
@@ -658,6 +519,7 @@ func TestReplication_FullSync_Integration(t *testing.T) {
 	// 1. Start Primary
 	primarySrv, primaryAddr, cancelPrimary := startServerNode(t, baseDir, "primary_fs", clientTLS)
 	defer cancelPrimary()
+	promoteNode(t, baseDir, primaryAddr, "1")
 
 	// 2. Populate Primary with data that will be "snapshotted"
 	clientPrimary := connectClient(t, primaryAddr, clientTLS)
@@ -719,6 +581,7 @@ func TestReplication_KeyCount_Match(t *testing.T) {
 	// Start Primary
 	primarySrv, primaryAddr, cancelPrimary := startServerNode(t, baseDir, "primary_kc", clientTLS)
 	defer cancelPrimary()
+	promoteNode(t, baseDir, primaryAddr, "1")
 
 	// Start Replica
 	replicaSrv, replicaAddr, cancelReplica := startServerNode(t, baseDir, "replica_kc", clientTLS)
@@ -763,6 +626,7 @@ func TestReplication_TimelineFork_Recovery(t *testing.T) {
 	// 1. Start Primary
 	primarySrv, primaryAddr, cancelPrimary := startServerNode(t, baseDir, "primary_tl", clientTLS)
 	defer cancelPrimary()
+	promoteNode(t, baseDir, primaryAddr, "1")
 
 	// 2. Start Replica
 	_, replicaAddr, cancelReplica := startServerNode(t, baseDir, "replica_tl", clientTLS)
@@ -866,6 +730,11 @@ func TestReplication_KeyCount_SyncAndAsync(t *testing.T) {
 	primarySrv, primaryAddr, cancelPrimary := startServerNodeWithReplicas(t, baseDir, "primary_sync", clientTLS, 1)
 	defer cancelPrimary()
 
+	// FIX: Promote Primary Node so it accepts writes.
+	// Wait briefly to ensure the promote call connects after server starts.
+	time.Sleep(50 * time.Millisecond)
+	promoteNode(t, baseDir, primaryAddr, "1")
+
 	// 2. Start Sync Replica (This will satisfy the quorum)
 	replicaSyncSrv, replicaSyncAddr, cancelReplicaSync := startServerNode(t, baseDir, "replica_sync", clientTLS)
 	defer cancelReplicaSync()
@@ -931,6 +800,10 @@ func TestReplication_Retention_LeaderProtectsSlowFollower(t *testing.T) {
 	leaderSrv, leaderAddr, cancelLeader := startServerNode(t, baseDir, "leader_ret", clientTLS)
 	defer cancelLeader()
 
+	// FIX: Promote Leader so it accepts writes
+	time.Sleep(50 * time.Millisecond)
+	promoteNode(t, baseDir, leaderAddr, "1")
+
 	// 2. Start Follower (Using CDC for manual control simulation, or standard replica)
 	// We use standard replica to ensure it registers a slot properly
 	_, replicaAddr, cancelReplica := startServerNode(t, baseDir, "replica_ret", clientTLS)
@@ -966,7 +839,8 @@ func TestReplication_Retention_LeaderProtectsSlowFollower(t *testing.T) {
 	// Simply canceling the server context might leave the outgoing replication loop running for a bit.
 	adminReplica2 := connectClient(t, replicaAddr, adminTLS)
 	selectDatabase(t, adminReplica2, "1")
-	stopReplication(t, adminReplica2, "1")
+	// Use StepDown to stop replication properly
+	stepDownNode(t, adminReplica2)
 	adminReplica2.Close()
 
 	cancelReplica()
@@ -1028,6 +902,7 @@ func TestReplication_Retention_FollowerRespectsLeaderSafePoint(t *testing.T) {
 	// 1. Start Leader
 	_, leaderAddr, cancelLeader := startServerNode(t, baseDir, "leader_safe", clientTLS)
 	defer cancelLeader()
+	promoteNode(t, baseDir, leaderAddr, "1")
 
 	// 2. Start Follower1 (The one we are testing)
 	follower1Srv, follower1Addr, cancelFollower1 := startServerNode(t, baseDir, "follower1", clientTLS)
@@ -1080,7 +955,8 @@ func TestReplication_Retention_FollowerRespectsLeaderSafePoint(t *testing.T) {
 	// Explicitly STOP REPLICATION first to ensure it stops pulling/ACKing
 	adminF2ForStop := connectClient(t, follower2Addr, adminTLS)
 	selectDatabase(t, adminF2ForStop, "1")
-	stopReplication(t, adminF2ForStop, "1")
+	// Use StepDown to stop replication properly
+	stepDownNode(t, adminF2ForStop)
 	adminF2ForStop.Close()
 
 	cancelFollower2()

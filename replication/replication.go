@@ -130,7 +130,6 @@ func (rm *ReplicationManager) spawnConnection(addr string) {
 }
 
 func (rm *ReplicationManager) maintainConnection(ctx context.Context, addr string) {
-	// Create a logger with context for this peer connection
 	peerLogger := rm.logger.With("peer_addr", addr)
 
 	for {
@@ -150,12 +149,15 @@ func (rm *ReplicationManager) maintainConnection(ctx context.Context, addr strin
 			return
 		}
 
+		// DEBUG: Connection attempt loop (don't spam INFO)
 		peerLogger.Debug("Attempting replication connection")
+		
 		if err := rm.connectAndSync(ctx, addr, dbs, peerLogger); err != nil {
 			if ctx.Err() != nil {
 				return
 			}
-			peerLogger.Error("Replication sync failed, retrying in 3s", "err", err)
+			// WARN: Failure to connect/sync
+			peerLogger.Warn("Replication sync failed, retrying in 3s", "err", err)
 			select {
 			case <-ctx.Done():
 				return
@@ -178,6 +180,7 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 	}()
 	defer conn.Close()
 
+	// INFO: Successfully connected to upstream
 	logger.Info("Connected to Leader", "db_count", len(dbs))
 
 	remoteToLocal := make(map[string][]string)
@@ -200,6 +203,7 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 		buf.WriteString(cfg.RemoteDB)
 		binary.Write(buf, binary.BigEndian, logID)
 
+		// DEBUG: Protocol handshake details
 		logger.Debug("Sending Hello for DB", "remote_db", cfg.RemoteDB, "local_db", cfg.LocalDB, "start_log_id", logID)
 
 		remoteToLocal[cfg.RemoteDB] = append(remoteToLocal[cfg.RemoteDB], cfg.LocalDB)
@@ -255,9 +259,43 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 				if localDBNames, ok := remoteToLocal[remoteDBName]; ok {
 					for _, localDB := range localDBNames {
 						if st, ok := rm.stores[localDB]; ok {
-							// Debug log only for safe points to avoid noise
-							// logger.Debug("Received safe point", "db", localDB, "seq", safeSeq)
+							// DEBUG log inside safe point if needed, otherwise silent
 							st.SetLeaderSafeSeq(safeSeq)
+						}
+					}
+				}
+			}
+			continue
+		}
+
+		// --- Handle Timeline Update ---
+		// Payload: [DBNameLen][DBName][Count/Res][TimelineID(8)]
+		if opCode == protocol.OpCodeReplTimeline {
+			cursor := 0
+			if cursor+4 > len(payload) {
+				continue
+			}
+			nLen := int(binary.BigEndian.Uint32(payload[cursor : cursor+4]))
+			cursor += 4
+			nEnd := cursor + nLen
+			if nEnd > len(payload) {
+				continue
+			}
+			remoteDBName := string(payload[cursor:nEnd])
+			cursor = nEnd
+			cursor += 4 // Skip Count/Reserved
+
+			if cursor+8 <= len(payload) {
+				tli := binary.BigEndian.Uint64(payload[cursor:])
+				if localDBNames, ok := remoteToLocal[remoteDBName]; ok {
+					for _, localDB := range localDBNames {
+						if st, ok := rm.stores[localDB]; ok {
+							if err := st.SetTimeline(tli); err != nil {
+								logger.Warn("Failed to set timeline", "db", localDB, "tli", tli, "err", err)
+							} else {
+								// INFO: Significant state change
+								logger.Info("Updated timeline from leader", "db", localDB, "tli", tli)
+							}
 						}
 					}
 				}
@@ -280,6 +318,7 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 			if localDBNames, ok := remoteToLocal[remoteDBName]; ok {
 				// Detect start of a new snapshot sequence and RESET local state
 				if !snapshotStarted[remoteDBName] {
+					// INFO: Snapshot
 					logger.Info("Snapshot detected, resetting local databases", "remote_db", remoteDBName)
 					for _, localDBName := range localDBNames {
 						if st, ok := rm.stores[localDBName]; ok {
@@ -294,6 +333,7 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 
 				for _, localDBName := range localDBNames {
 					if st, ok := rm.stores[localDBName]; ok {
+						// INFO: Progress log for snapshot
 						logger.Info("Applying snapshot batch", "db", localDBName, "count", count, "bytes", len(data))
 						dCursor := 0
 						var entries []protocol.LogEntry
@@ -320,7 +360,7 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 		}
 
 		// --- Handle Snapshot Done Signal ---
-		// Payload: [DBNameLen][DBName][0][ResumeSeq(8)]
+		// Payload: [DBNameLen][DBName][0][TxID(8)][OpID(8)]
 		if opCode == protocol.OpCodeReplSnapshotDone {
 			cursor := 0
 			nLen := int(binary.BigEndian.Uint32(payload[cursor : cursor+4]))
@@ -329,9 +369,25 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 			cursor += nLen
 			cursor += 4 // Skip Count(0)
 
-			if cursor+8 <= len(payload) {
-				resumeSeq := binary.BigEndian.Uint64(payload[cursor:])
-				logger.Info("Snapshot finished, switching to WAL streaming", "remote_db", remoteDBName, "resume_seq", resumeSeq)
+			// FIX: Read 16 bytes (TxID + OpID) and update clocks
+			if cursor+16 <= len(payload) {
+				txID := binary.BigEndian.Uint64(payload[cursor:])
+				opID := binary.BigEndian.Uint64(payload[cursor+8:])
+				// INFO: Snapshot Done
+				logger.Info("Snapshot finished, syncing clocks", "remote_db", remoteDBName, "tx_id", txID, "resume_seq", opID)
+
+				if localDBNames, ok := remoteToLocal[remoteDBName]; ok {
+					for _, localDB := range localDBNames {
+						if st, ok := rm.stores[localDB]; ok {
+							// CRITICAL: Update the store's sequence counters to match the snapshot state.
+							// Without this, the store assumes it's at seq 0 and may conflict with
+							// or gap against the incoming WAL stream.
+							st.DB.ForceSetClocks(txID, opID)
+						}
+					}
+				}
+			} else {
+				logger.Warn("Snapshot done signal received with insufficient payload", "len", len(payload))
 			}
 			// Mark snapshot as complete for this DB so future snapshots trigger reset again
 			snapshotStarted[remoteDBName] = false
@@ -421,6 +477,7 @@ func processReplicationPacket(store *store.Store, buffer []protocol.LogEntry, cu
 		val := data[cursor : cursor+vLen]
 		cursor += vLen
 
+		// Handle Commit Marker
 		// Handle Commit Marker
 		if op == protocol.OpJournalCommit {
 			if len(buffer) > 0 {

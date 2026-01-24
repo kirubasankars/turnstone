@@ -18,7 +18,8 @@ func (db *DB) recoverValueLog() error {
 	}
 	db.transactionID = maxTx
 	db.operationID = maxOp
-	db.logger.Info("ValueLog recovered", "max_tx", maxTx, "max_op", maxOp)
+	// CHANGED: Reduced from INFO to DEBUG
+	db.logger.Debug("ValueLog recovered", "max_tx", maxTx, "max_op", maxOp)
 	return nil
 }
 
@@ -111,7 +112,8 @@ func (db *DB) RebuildIndexFromVLog() error {
 		}
 	}
 
-	db.logger.Info("Index rebuilt from VLog", "total_entries", totalCount)
+	// CHANGED: Reduced from INFO to DEBUG
+	db.logger.Debug("Index rebuilt from VLog", "total_entries", totalCount)
 
 	// After rebuilding index, we must recalculate the KeyCount since we lost the persisted value
 	count, err := db.scanKeyCount()
