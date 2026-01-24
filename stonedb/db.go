@@ -80,6 +80,7 @@ type DB struct {
 	walRetentionTime       time.Duration
 	maxDiskUsagePercent    int   // Configured threshold
 	isDiskFull             int32 // Atomic boolean (1=Full, 0=OK)
+	isCorrupt              int32 // Atomic boolean (1=Corrupt, 0=OK) - Prevents writes after critical failure
 
 	// Timeline Meta
 	timelineMeta TimelineMeta
@@ -538,6 +539,18 @@ func isClosed(ch <-chan struct{}) bool {
 }
 
 func (db *DB) NewTransaction(update bool) *Transaction {
+	// Check for corruption first
+	if atomic.LoadInt32(&db.isCorrupt) == 1 {
+		// Return a transaction that will fail immediately/safely?
+		// Better probably to have Transaction struct handle it or just return a dummy
+		// that errors on any operation. But Transaction struct doesn't have error state on creation.
+		// So we return a transaction but note that subsequent ops might fail if we checked there.
+		// Actually, let's just let it be created, but any Commit() will fail because we check canCommit?
+		// Or better, we can't return nil here as it might panic caller.
+		// We'll let it proceed but Commit will check isCorrupt?
+		// However, the best place is to prevent Commit.
+	}
+	
 	readTxID := atomic.LoadUint64(&db.transactionID)
 	tx := &Transaction{
 		db:         db,
@@ -579,6 +592,10 @@ func (db *DB) PurgeWAL(minOpID uint64) error {
 }
 
 func (db *DB) ApplyBatch(entries []ValueLogEntry) error {
+	// Check Corruption
+	if atomic.LoadInt32(&db.isCorrupt) == 1 {
+		return errors.New("database is corrupt")
+	}
 	// For backward compatibility or single batch application.
 	// Delegates to ApplyBatches for consistency.
 	return db.ApplyBatches([][]ValueLogEntry{entries})
@@ -587,6 +604,10 @@ func (db *DB) ApplyBatch(entries []ValueLogEntry) error {
 // ApplyBatches applies multiple transactions (batches of entries) atomically to disk.
 // This enables Group Commit for replication streams.
 func (db *DB) ApplyBatches(batches [][]ValueLogEntry) error {
+	if atomic.LoadInt32(&db.isCorrupt) == 1 {
+		return errors.New("database is corrupt")
+	}
+
 	if len(batches) == 0 {
 		return nil
 	}

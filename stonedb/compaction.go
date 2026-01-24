@@ -52,7 +52,7 @@ func (db *DB) RunCompaction() (bool, error) {
 	// Helper to flush stale deletes
 	flushStale := func() error {
 		if staleBatch.Len() > 0 {
-			if err := db.ldb.Write(staleBatch, &opt.WriteOptions{Sync: false}); err != nil {
+			if err := db.ldb.Write(staleBatch, &opt.WriteOptions{Sync: true}); err != nil {
 				return err
 			}
 			staleBatch.Reset()
@@ -261,7 +261,10 @@ func (db *DB) rewriteBatch(entries []ValueLogEntry) error {
 	}
 
 	if batch.Len() > 0 {
-		if err := db.ldb.Write(batch, &opt.WriteOptions{Sync: false}); err != nil {
+		// Use Sync: true to ensure index updates are persisted before we consider the old file obsolete.
+		// If we crash before this sync, the old file is still valid (not deleted yet).
+		// If we crash after, the index points to the new file.
+		if err := db.ldb.Write(batch, &opt.WriteOptions{Sync: true}); err != nil {
 			return err
 		}
 	}
