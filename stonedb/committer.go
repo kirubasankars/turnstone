@@ -3,6 +3,7 @@ package stonedb
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"sync/atomic"
 	"time"
@@ -56,6 +57,12 @@ func (db *DB) processCommitBatch(requests []commitRequest) {
 		return
 	}
 
+	// Double check corruption before proceeding
+	if atomic.LoadInt32(&db.isCorrupt) == 1 {
+		batch.failAll(errors.New("database is corrupt"))
+		return
+	}
+
 	if len(batch.reqs) == 0 {
 		return
 	}
@@ -88,19 +95,36 @@ func (db *DB) processCommitBatch(requests []commitRequest) {
 }
 
 func (db *DB) attemptRollbackAndFail(batch *commitBatch, originalErr error, vlogOffset uint32, walBytes int64) {
+	// Try VLog Truncate
 	if vErr := db.valueLog.Truncate(vlogOffset); vErr != nil {
-		db.logger.Error("CRITICAL: Index failed and VLog rollback failed. Data corruption imminent.", "index_err", originalErr, "vlog_err", vErr)
-		panic(fmt.Sprintf("CRITICAL: Index failed (%v) and VLog rollback failed (%v). Crashing.", originalErr, vErr))
+		// VLog truncate failed. This is bad but maybe effectively appended garbage if index wasn't updated.
+		// However, if we can't seek back, we are in trouble for next writes.
+		db.logger.Error("CRITICAL: Index failed and VLog rollback failed. Marking DB Corrupt.", "index_err", originalErr, "vlog_err", vErr)
+		atomic.StoreInt32(&db.isCorrupt, 1)
+		batch.failAll(fmt.Errorf("CRITICAL: Index failed and VLog rollback failed: %v", vErr))
+		return
 	}
+
+	// Try WAL Rollback
 	if wErr := db.rollbackWAL(walBytes); wErr != nil {
-		db.logger.Error("CRITICAL: Index failed, VLog rolled back, but WAL rollback failed.", "index_err", originalErr, "wal_err", wErr)
-		panic(fmt.Sprintf("CRITICAL: Index failed (%v), VLog rolled back, but WAL rollback failed (%v). Crashing.", originalErr, wErr))
+		// WAL rollback failed (e.g. rotation boundary violation).
+		// We MUST mark the DB as corrupt to prevent further writes effectively relying on this WAL state
+		// or if we are in an inconsistent state where WAL has data but VLog/Index doesn't.
+		db.logger.Error("CRITICAL: Index failed, VLog rolled back, but WAL rollback failed. Marking DB Corrupt.", "index_err", originalErr, "wal_err", wErr)
+		atomic.StoreInt32(&db.isCorrupt, 1)
+		batch.failAll(fmt.Errorf("CRITICAL: WAL rollback failed: %v", wErr))
+		return
 	}
+
 	db.logger.Info("Safe rollback performed after index failure")
 	batch.failAll(fmt.Errorf("internal error (safe rollback performed): %w", originalErr))
 }
 
 func (db *DB) prepareBatch(requests []commitRequest) (*commitBatch, error) {
+	if atomic.LoadInt32(&db.isCorrupt) == 1 {
+		return nil, errors.New("database is corrupt")
+	}
+
 	if testingPrepareBatchErr != nil {
 		return nil, testingPrepareBatchErr
 	}
@@ -165,8 +189,9 @@ func (db *DB) persistBatch(batch *commitBatch) (int64, error) {
 	fileID, offset, err := db.valueLog.AppendEntries(batch.combinedVLog)
 	if err != nil {
 		if rbErr := db.rollbackWAL(walBytesWritten); rbErr != nil {
-			db.logger.Error("CRITICAL: Consistency violation in persistBatch", "wal_written", true, "vlog_err", err, "rollback_err", rbErr)
-			panic(fmt.Sprintf("CRITICAL: Consistency violation in persistBatch. WAL written, VLog failed, Rollback failed: %v. Orig Err: %v\n", rbErr, err))
+			db.logger.Error("CRITICAL: Consistency violation in persistBatch. Marking Corrupt.", "wal_written", true, "vlog_err", err, "rollback_err", rbErr)
+			atomic.StoreInt32(&db.isCorrupt, 1) // Mark corrupt immediately
+			return 0, fmt.Errorf("CRITICAL: vlog write failed AND rollback failed: %v | Original Err: %w", rbErr, err)
 		}
 		return 0, fmt.Errorf("vlog write failed (wal rolled back): %w", err)
 	}

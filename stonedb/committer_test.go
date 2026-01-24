@@ -3,7 +3,6 @@ package stonedb
 import (
 	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -271,50 +270,56 @@ func TestProcessCommitBatch_PreparationFailure(t *testing.T) {
 	}
 }
 
-// TestProcessCommitBatch_CriticalCrash verifies that the system crashes (os.Exit)
-// when a rollback fails after a failed VLog write.
-// This ensures that we do not leave the system in an inconsistent state.
-func TestProcessCommitBatch_CriticalCrash(t *testing.T) {
-	// 1. The Crasher Subprocess
-	if os.Getenv("BE_CRASHER") == "1" {
-		dir, _ := os.MkdirTemp("", "crash_test")
-		defer os.RemoveAll(dir)
+// TestProcessCommitBatch_CorruptionState verifies that the system handles
+// critical rollback failures by marking the DB as corrupt instead of panicking.
+func TestProcessCommitBatch_CorruptionState(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close() // Ensure cleanup even if corrupt
 
-		db, err := Open(dir, Options{})
-		if err != nil {
-			// Should not happen, but exit 0 to distinguish from the expected crash
-			os.Exit(0)
-		}
-
-		// Inject Hook: Trigger critical failure conditions
-		testingPersistBatchHook = func() {
-			// 1. Sabotage VLog to force write failure (closes the active file handle)
-			db.valueLog.Close()
-			// 2. Sabotage WAL to force rollback failure (truncation on closed file fails)
-			db.writeAheadLog.Close()
-		}
-
-		tx := db.NewTransaction(true)
-		tx.Put([]byte("k"), []byte("v"))
-
-		// This call should result in os.Exit(1)
-		db.processCommitBatch([]commitRequest{{tx: tx, resp: make(chan error, 1)}})
-
-		// If we reach here, the crash logic failed
-		os.Exit(0)
+	// Inject Hook: Trigger critical failure conditions
+	testingPersistBatchHook = func() {
+		// 1. Sabotage VLog to force write failure (closes the active file handle)
+		db.valueLog.Close()
+		// 2. Sabotage WAL to trigger the bounds check failure in rollbackWAL
+		// Setting writeOffset to 0 ensures (currentSize < bytesToRemove) becomes true
+		db.writeAheadLog.writeOffset = 0
 	}
 
-	// 2. The Test Runner (Parent)
-	cmd := exec.Command(os.Args[0], "-test.run=TestProcessCommitBatch_CriticalCrash")
-	cmd.Env = append(os.Environ(), "BE_CRASHER=1")
-	err := cmd.Run()
+	tx := db.NewTransaction(true)
+	tx.Put([]byte("k"), []byte("v"))
 
-	// Check exit code
-	if e, ok := err.(*exec.ExitError); ok && !e.Success() {
-		// Pass: The process crashed as expected (non-zero exit code)
-		return
+	reqs := []commitRequest{{tx: tx, resp: make(chan error, 1)}}
+
+	// Execution should NOT panic now
+	db.processCommitBatch(reqs)
+
+	// Verify Error Response
+	err = <-reqs[0].resp
+	if err == nil {
+		t.Fatal("Expected error response, got nil")
 	}
-	t.Fatalf("Process did not crash as expected. Err: %v", err)
+	if !strings.Contains(err.Error(), "CRITICAL") && !strings.Contains(err.Error(), "Consistency violation") {
+		t.Errorf("Expected CRITICAL error, got: %v", err)
+	}
+
+	// Verify Corruption State
+	if db.isCorrupt != 1 {
+		t.Error("Expected DB to be marked as corrupt (isCorrupt=1)")
+	}
+
+	// Verify Subsequent Writes Rejected
+	tx2 := db.NewTransaction(true)
+	tx2.Put([]byte("should_fail"), []byte("val"))
+	// Even if tx creation succeeds (it shouldn't if we check there), Commit MUST fail
+	if err := tx2.Commit(); err == nil {
+		t.Error("Subsequent commit should fail due to corruption")
+	} else if err.Error() != "database is corrupt" {
+		t.Errorf("Expected 'database is corrupt' error, got: %v", err)
+	}
 }
 
 // Helpers for test conciseness

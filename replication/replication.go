@@ -16,6 +16,12 @@ import (
 	"turnstone/store"
 )
 
+var (
+	// MaxTransactionBufferSize limits the size of a single transaction buffered in memory
+	// to prevent OOM attacks or leaks from malicious/broken leaders.
+	MaxTransactionBufferSize = uint64(64 * 1024 * 1024) // 64MB
+)
+
 type ReplicaSource struct {
 	LocalDB  string
 	RemoteDB string
@@ -170,11 +176,13 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 		<-ctx.Done()
 		_ = conn.Close()
 	}()
+	defer conn.Close()
 
 	logger.Info("Connected to Leader", "db_count", len(dbs))
 
 	remoteToLocal := make(map[string][]string)
 	txBuffers := make(map[string][]protocol.LogEntry)
+	txBufferSizes := make(map[string]uint64)
 	snapshotStarted := make(map[string]bool)
 
 	// Handshake
@@ -196,6 +204,7 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 
 		remoteToLocal[cfg.RemoteDB] = append(remoteToLocal[cfg.RemoteDB], cfg.LocalDB)
 		txBuffers[cfg.LocalDB] = make([]protocol.LogEntry, 0)
+		txBufferSizes[cfg.LocalDB] = 0
 	}
 
 	header := make([]byte, 5)
@@ -345,12 +354,14 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 				for _, localDBName := range localDBNames {
 					if st, ok := rm.stores[localDBName]; ok {
 						buffer := txBuffers[localDBName]
-						newBuffer, lastID, err := processReplicationPacket(st, buffer, count, data)
+						sze := txBufferSizes[localDBName]
+						newBuffer, lastID, newSze, err := processReplicationPacket(st, buffer, sze, count, data)
 						if err != nil {
 							logger.Error("Failed to process WAL batch", "db", localDBName, "err", err)
 							return err
 						}
 						txBuffers[localDBName] = newBuffer
+						txBufferSizes[localDBName] = newSze
 
 						// Send ACK if successful
 						if lastID > 0 {
@@ -380,7 +391,7 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 
 // processReplicationPacket parses raw bytes into LogEntries, buffers them, and applies them.
 // It handles fragmentation by accumulating entries in 'buffer' until a Commit marker is found.
-func processReplicationPacket(store *store.Store, buffer []protocol.LogEntry, count uint32, data []byte) ([]protocol.LogEntry, uint64, error) {
+func processReplicationPacket(store *store.Store, buffer []protocol.LogEntry, currentSize uint64, count uint32, data []byte) ([]protocol.LogEntry, uint64, uint64, error) {
 	cursor := 0
 	var lastCommittedID uint64
 	var pendingBatches [][]protocol.LogEntry
@@ -388,7 +399,7 @@ func processReplicationPacket(store *store.Store, buffer []protocol.LogEntry, co
 	for i := 0; i < int(count); i++ {
 		// Entry: [LogID(8)][TxID(8)][Op(1)][KLen(4)][Key][VLen(4)][Val]
 		if cursor+17 > len(data) {
-			return buffer, 0, fmt.Errorf("malformed batch entry header")
+			return buffer, 0, currentSize, fmt.Errorf("malformed batch entry header")
 		}
 		lid := binary.BigEndian.Uint64(data[cursor : cursor+8])
 		op := data[cursor+16]
@@ -397,7 +408,7 @@ func processReplicationPacket(store *store.Store, buffer []protocol.LogEntry, co
 		kLen := int(binary.BigEndian.Uint32(data[cursor : cursor+4]))
 		cursor += 4
 		if cursor+kLen > len(data) {
-			return buffer, 0, fmt.Errorf("malformed batch entry key")
+			return buffer, 0, currentSize, fmt.Errorf("malformed batch entry key")
 		}
 		key := data[cursor : cursor+kLen]
 		cursor += kLen
@@ -405,7 +416,7 @@ func processReplicationPacket(store *store.Store, buffer []protocol.LogEntry, co
 		vLen := int(binary.BigEndian.Uint32(data[cursor : cursor+4]))
 		cursor += 4
 		if cursor+vLen > len(data) {
-			return buffer, 0, fmt.Errorf("malformed batch entry val")
+			return buffer, 0, currentSize, fmt.Errorf("malformed batch entry val")
 		}
 		val := data[cursor : cursor+vLen]
 		cursor += vLen
@@ -419,11 +430,19 @@ func processReplicationPacket(store *store.Store, buffer []protocol.LogEntry, co
 
 				// Reset buffer for next transaction (CRITICAL: ensure new slice allocation)
 				buffer = nil
+				currentSize = 0
 			} else {
 				// Empty commit (rare but valid)
 				lastCommittedID = lid
 			}
 		} else {
+			// Check Size Limit
+			entrySize := uint64(len(key) + len(val) + 20) // overhead estimation
+			if currentSize+entrySize > MaxTransactionBufferSize {
+				return buffer, 0, currentSize, fmt.Errorf("transaction too large: %d > %d", currentSize+entrySize, MaxTransactionBufferSize)
+			}
+			currentSize += entrySize
+
 			// Buffer the op until we see a commit
 			buffer = append(buffer, protocol.LogEntry{
 				LogSeq: lid,
@@ -437,10 +456,10 @@ func processReplicationPacket(store *store.Store, buffer []protocol.LogEntry, co
 	// Apply all fully accumulated transactions
 	if len(pendingBatches) > 0 {
 		if err := store.ReplicateBatches(pendingBatches); err != nil {
-			return buffer, lastCommittedID, err
+			return buffer, lastCommittedID, currentSize, err
 		}
 	}
 
 	// Return remaining buffer (incomplete transaction) and last commit ID
-	return buffer, lastCommittedID, nil
+	return buffer, lastCommittedID, currentSize, nil
 }
