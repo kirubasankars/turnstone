@@ -57,6 +57,7 @@ type Store struct {
 
 	// Replication State
 	mu          sync.Mutex
+	dbMu        sync.RWMutex            // Protects s.DB pointer and state
 	replicas    map[string]*ReplicaSlot // ReplicaID -> Slot State
 	cond        *sync.Cond
 	slotsFile   string
@@ -81,13 +82,19 @@ func NewStore(dir string, logger *slog.Logger, minReplicas int, isSystem bool, w
 		}
 	}
 
+	// Enable truncation to recover from partial writes/corruption automatically
+	// UPDATE: User requirement is to NOT auto-truncate. Operator must decide (e.g. by manual tool or config override).
+	truncateWAL := false
+	if os.Getenv("TS_TEST_WAL_TRUNCATE") == "true" {
+		truncateWAL = true
+	}
+
 	opts := stonedb.Options{
 		MaxWALSize:           uint32(maxWALSize),
 		CompactionMinGarbage: 4 * 1024 * 1024,
-		// Enable truncation to recover from partial writes/corruption automatically
-		TruncateCorruptWAL:  true,
-		MaxDiskUsagePercent: maxDiskUsage,
-		Logger:              logger, // Ensure logger is passed down
+		TruncateCorruptWAL:   truncateWAL,
+		MaxDiskUsagePercent:  maxDiskUsage,
+		Logger:               logger, // Ensure logger is passed down
 	}
 
 	// If strategy is "replication", disable time-based purge in DB by setting retention to 0.
@@ -141,12 +148,16 @@ func (s *Store) Reset() error {
 	// 1. Disconnect any downstream consumers to prevent them from reading invalid state
 	s.RemoveAllReplicas()
 
-	// 2. Close the existing DB instance
+	// 2. Lock for Write: Exclusive access to swap s.DB
+	s.dbMu.Lock()
+	defer s.dbMu.Unlock()
+
+	// 3. Close the existing DB instance
 	if err := s.DB.Close(); err != nil {
 		return fmt.Errorf("close failed during reset: %w", err)
 	}
 
-	// 3. Wipe Data Files
+	// 4. Wipe Data Files
 	// We preserve the directory but remove all contents
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
@@ -162,19 +173,22 @@ func (s *Store) Reset() error {
 		}
 	}
 
-	// 4. Re-Open Database
+	// 5. Re-Open Database
 	newDB, err := stonedb.Open(s.dir, s.dbOpts)
 	if err != nil {
 		return fmt.Errorf("reopen failed during reset: %w", err)
 	}
 
-	// 5. Swap Pointer
-	// Note: There is a brief window where s.DB was closed/invalid.
-	// Background tasks on s.Store might have errored during this time, which is expected.
+	// 6. Swap Pointer
 	s.DB = newDB
 
 	s.logger.Info("Database reset complete")
 	return nil
+}
+
+// IsSystem returns true if this database is a system database (read-only for clients).
+func (s *Store) IsSystem() bool {
+	return s.isSystem
 }
 
 // SetLeaderSafeSeq updates the retention barrier received from the upstream leader.
@@ -217,6 +231,9 @@ func (s *Store) runRetentionManager() {
 // It considers local checkpoints, downstream replicas, and upstream leader constraints.
 // This is public to allow deterministic testing.
 func (s *Store) EnforceRetentionPolicy() {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+
 	// 1. Constraint from Downstream (Our Followers)
 	minReplicaSeq := s.GetMinSlotLogSeq()
 
@@ -267,6 +284,9 @@ func (s *Store) EnforceRetentionPolicy() {
 
 // ApplyBatch applies a batch of protocol entries.
 func (s *Store) ApplyBatch(entries []protocol.LogEntry) error {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+
 	tx := s.DB.NewTransaction(true)
 	for _, e := range entries {
 		var err error
@@ -286,7 +306,7 @@ func (s *Store) ApplyBatch(entries []protocol.LogEntry) error {
 	}
 
 	if s.minReplicas > 0 {
-		s.waitForQuorum(s.DB.LastOpID())
+		s.WaitForQuorum(s.DB.LastOpID())
 	}
 
 	return nil
@@ -299,6 +319,9 @@ func (s *Store) ReplicateBatch(entries []protocol.LogEntry) error {
 
 // ReplicateBatches applies multiple batches from a leader using group commit.
 func (s *Store) ReplicateBatches(batches [][]protocol.LogEntry) error {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+
 	var vlogBatches [][]stonedb.ValueLogEntry
 
 	for _, entries := range batches {
@@ -325,6 +348,9 @@ func (s *Store) ReplicateBatches(batches [][]protocol.LogEntry) error {
 
 // Get retrieves a value by key.
 func (s *Store) Get(key string) ([]byte, error) {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+
 	tx := s.DB.NewTransaction(false)
 	defer tx.Discard()
 	val, err := tx.Get([]byte(key))
@@ -342,15 +368,35 @@ func (s *Store) Close() error {
 		s.saveSlotsLocked()
 	}
 	s.mu.Unlock()
+
+	s.dbMu.Lock()
+	defer s.dbMu.Unlock()
 	return s.DB.Close()
+}
+
+// ScanWAL wrapper for thread safety
+func (s *Store) ScanWAL(startOpID uint64, fn func([]stonedb.ValueLogEntry) error) error {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	return s.DB.ScanWAL(startOpID, fn)
+}
+
+// LastOpID wrapper for thread safety
+func (s *Store) LastOpID() uint64 {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	return s.DB.LastOpID()
 }
 
 // Stats returns usage statistics.
 func (s *Store) Stats() StoreStats {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+
 	wf, ws, vf, vs := s.DB.StorageStats()
 	keyCount, _ := s.DB.KeyCount()
-
 	head := s.DB.LastOpID()
+
 	minLag := uint64(0)
 	first := true
 
@@ -497,8 +543,13 @@ func (s *Store) UpdateReplicaLogSeq(id string, logSeq uint64) {
 	}
 }
 
-// waitForQuorum blocks until enough replicas with Role="server" have acknowledged the given logSeq.
-func (s *Store) waitForQuorum(logSeq uint64) {
+// MinReplicas returns the configured minimum number of replicas required for quorum.
+func (s *Store) MinReplicas() int {
+	return s.minReplicas
+}
+
+// WaitForQuorum blocks until enough replicas with Role="server" have acknowledged the given logSeq.
+func (s *Store) WaitForQuorum(logSeq uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
