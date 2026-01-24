@@ -50,7 +50,7 @@ func main() {
 	keyPath := filepath.Join(*home, "certs", certRole+".key")
 
 	// Check if certificates exist to determine connection mode
-	if _, err := os.Stat(caPath); err == nil {
+	if _, statErr := os.Stat(caPath); statErr == nil {
 		fmt.Printf("Connecting to %s via mTLS as %s (Home: %s)...\n", *host, strings.ToUpper(certRole), *home)
 		cl, err = client.NewMTLSClientHelper(*host, caPath, certPath, keyPath, logger)
 	} else {
@@ -76,7 +76,7 @@ func main() {
 	}
 
 	fmt.Println("Connected.")
-	fmt.Println("Commands: select <db>, replicaof <host:port> <remote_db>, get <k>, set <k> <v>, del <k>, mget <k>..., mset <k> <v>..., mdel <k>..., begin, commit, abort, clear, quit")
+	fmt.Println("Commands: select <db>, replicaof <host:port> <remote_db>, promote [min_replicas], stepdown, get <k>, set <k> <v>, del <k>, mget <k>..., mset <k> <v>..., mdel <k>..., begin, commit, abort, checkpoint, clear, quit")
 	fmt.Print("> ")
 
 	// 2. Interactive Loop
@@ -148,6 +148,29 @@ func handleCommand(cl *client.Client, cmd string, parts []string) {
 			}
 		}
 
+	case "promote":
+		minReplicas := 0
+		if len(parts) > 1 {
+			// Parse optional argument
+			var val int
+			if _, errScan := fmt.Sscanf(parts[1], "%d", &val); errScan == nil {
+				minReplicas = val
+			} else {
+				// If parsing fails, maybe user typed something else. Warn but proceed with 0?
+				// Better to just ignore if it's not an int.
+			}
+		}
+		err = cl.Promote(minReplicas)
+		if err == nil {
+			fmt.Println("OK")
+		}
+
+	case "stepdown":
+		err = cl.StepDown()
+		if err == nil {
+			fmt.Println("OK")
+		}
+
 	case "begin":
 		err = cl.Begin()
 		if err == nil {
@@ -162,6 +185,12 @@ func handleCommand(cl *client.Client, cmd string, parts []string) {
 
 	case "abort":
 		err = cl.Abort()
+		if err == nil {
+			fmt.Println("OK")
+		}
+
+	case "checkpoint":
+		err = cl.Checkpoint()
 		if err == nil {
 			fmt.Println("OK")
 		}

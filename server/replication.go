@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"sync"
 	"time"
@@ -101,13 +102,14 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 
 		// Check if this server is already a replica for this database.
 		if s.replManager != nil && s.replManager.IsReplicating(name) {
-			st.logger.Warn("Rejected downstream replication request (cascading/cdc disabled on replicas)", "db", name, "replica_id", replicaID)
+			st.logger.Warn("Rejected downstream replication request (cascading/cdc disabled on replicas)", "db", name)
 			continue
 		}
 
 		subs = append(subs, subReq{name, logID})
 
 		if storePtr, ok := s.stores[name]; ok {
+			// INFO: Replica Connected
 			st.logger.Info("Replica subscribed", "db", name, "start_seq", logID)
 			storePtr.RegisterReplica(replicaID, logID, st.role)
 
@@ -117,6 +119,7 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 			}
 
 			defer func(sp *store.Store, dbName string) {
+				// INFO: Replica Disconnected
 				st.logger.Info("Replica disconnected", "db", dbName)
 				sp.UnregisterReplica(replicaID)
 			}(storePtr, name)
@@ -254,10 +257,29 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh chan<- replPacket, done <-chan struct{}, logger *slog.Logger) error {
 	currentLogID := minLogID
 
+	// 0. Send Initial Timeline
+	// This ensures the replica is aware of the leader's timeline immediately upon joining.
+	currentTL := st.DB.CurrentTimeline()
+	tlBuf := make([]byte, 8)
+	binary.BigEndian.PutUint64(tlBuf, currentTL)
+	select {
+	case outCh <- replPacket{
+		dbName: name,
+		opCode: protocol.OpCodeReplTimeline,
+		data:   tlBuf,
+		count:  0,
+	}:
+		// DEBUG: Timeline details
+		logger.Debug("Sent initial timeline to replica", "db", name, "timeline", currentTL)
+	case <-done:
+		return nil
+	}
+
 	// 1. Snapshot Check
 	err := st.ScanWAL(currentLogID+1, func([]stonedb.ValueLogEntry) error { return nil })
 
 	if err == stonedb.ErrLogUnavailable && currentLogID < st.LastOpID() {
+		// INFO: Snapshot required
 		logger.Info("Replica lag exceeds WAL retention. Starting Full Snapshot.", "db", name, "req_seq", currentLogID, "head", st.LastOpID())
 
 		snapTxID, snapOpID, snapErr := st.StreamSnapshot(func(batch []stonedb.SnapshotEntry) error {
@@ -299,8 +321,27 @@ func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh c
 		case <-done:
 			return nil
 		}
+		// INFO: Snapshot done
 		logger.Info("Snapshot complete. Resuming WAL stream.", "db", name, "resume_seq", snapOpID)
 		currentLogID = snapOpID
+
+		// 1.5. Resend Timeline after Snapshot
+		// If a promotion occurred during the snapshot stream (which can take time),
+		// the non-blocking signal in TriggerTimelineUpdate might have been missed.
+		// We send the current timeline again to ensure the replica is consistent before receiving WAL.
+		currentTL = st.DB.CurrentTimeline()
+		binary.BigEndian.PutUint64(tlBuf, currentTL)
+		select {
+		case outCh <- replPacket{
+			dbName: name,
+			opCode: protocol.OpCodeReplTimeline,
+			data:   tlBuf,
+			count:  0,
+		}:
+			logger.Debug("Resending timeline after snapshot", "db", name, "timeline", currentTL)
+		case <-done:
+			return nil
+		}
 	}
 
 	// 2. WAL Streaming & SafePoint Broadcast
@@ -315,6 +356,23 @@ func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh c
 		case <-done:
 			return nil
 
+		case <-st.TimelineSignal():
+			// DEBUG: Timeline event
+			logger.Debug("Broadcasting new timeline", "db", name)
+			currentTL := st.DB.CurrentTimeline()
+			tlBuf := make([]byte, 8)
+			binary.BigEndian.PutUint64(tlBuf, currentTL)
+			select {
+			case outCh <- replPacket{
+				dbName: name,
+				opCode: protocol.OpCodeReplTimeline,
+				data:   tlBuf,
+				count:  0,
+			}:
+			case <-done:
+				return nil
+			}
+
 		case <-safePointTicker.C:
 			// Broadcast Safe Point
 			minSeq := st.GetMinSlotLogSeq()
@@ -328,6 +386,27 @@ func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh c
 					opCode: protocol.OpCodeReplSafePoint,
 					data:   buf,
 					count:  0, // Ignored
+				}:
+				case <-done:
+					return nil
+				}
+			}
+
+		case <-st.SafePointSignal():
+			// DEBUG: Forced safe point
+			logger.Debug("Broadcasting forced safe point", "db", name)
+			// Forced Broadcast of Safe Point
+			minSeq := st.GetMinSlotLogSeq()
+			if minSeq > 0 && minSeq != math.MaxUint64 {
+				buf := make([]byte, 8)
+				binary.BigEndian.PutUint64(buf, minSeq)
+
+				select {
+				case outCh <- replPacket{
+					dbName: name,
+					opCode: protocol.OpCodeReplSafePoint,
+					data:   buf,
+					count:  0,
 				}:
 				case <-done:
 					return nil

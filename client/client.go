@@ -36,6 +36,9 @@ const (
 	OpCodeCommit           = 0x11 // Commit the current transaction.
 	OpCodeAbort            = 0x12 // Rollback the current transaction.
 	OpCodeReplicaOf        = 0x32 // Set replication source. Payload: [AddrLen][Addr][RemoteDB].
+	OpCodePromote          = 0x34 // Promote a replica to primary. Payload: [MinReplicas(4)].
+	OpCodeStepDown         = 0x35 // Step down a primary to undefined.
+	OpCodeCheckpoint       = 0x36 // Force manual checkpoint and log rotation.
 	OpCodeReplHello        = 0x50 // Replication Handshake (Internal/Client CDC).
 	OpCodeReplBatch        = 0x51 // Replication Batch (Internal/Client CDC).
 	OpCodeReplAck          = 0x52 // Replication Ack (Internal/Client CDC).
@@ -492,6 +495,28 @@ func (c *Client) ReplicaOf(sourceAddr, sourceDB string) error {
 	copy(payload[4+len(addrBytes):], dbBytes)
 
 	_, err := c.roundTrip(OpCodeReplicaOf, payload)
+	return err
+}
+
+// Checkpoint forces a manual flush of the ValueLog and persistence of sequences.
+// This is an Admin-only command.
+func (c *Client) Checkpoint() error {
+	_, err := c.roundTrip(OpCodeCheckpoint, nil)
+	return err
+}
+
+// Promote promotes the current node to Primary.
+// minReplicas specifies how many healthy replicas must be connected for the promotion to succeed (quorum check).
+func (c *Client) Promote(minReplicas int) error {
+	payload := make([]byte, 4)
+	binary.BigEndian.PutUint32(payload, uint32(minReplicas))
+	_, err := c.roundTrip(OpCodePromote, payload)
+	return err
+}
+
+// StepDown steps down the current node from Primary/Replica to Undefined.
+func (c *Client) StepDown() error {
+	_, err := c.roundTrip(OpCodeStepDown, nil)
 	return err
 }
 

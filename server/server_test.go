@@ -12,7 +12,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
@@ -71,11 +70,12 @@ func setupTestEnv(t *testing.T) (string, map[string]*store.Store, *Server, func(
 	stores := make(map[string]*store.Store)
 	for i := 0; i < 4; i++ {
 		dbName := strconv.Itoa(i)
-		store, err := store.NewStore(filepath.Join(dir, "data", dbName), logger, 0, i == 0, "time", 90, 0)
+		s, err := store.NewStore(filepath.Join(dir, "data", dbName), logger, 0, i == 0, "time", 90, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
-		stores[dbName] = store
+		s.SetState(store.StatePrimary)
+		stores[dbName] = s
 	}
 
 	// 3. Setup Replication Manager (Required for NewServer)
@@ -756,10 +756,12 @@ func TestServer_Command_Validation(t *testing.T) {
 	client.AssertStatus(protocol.OpCodeAbort, nil, protocol.ResStatusOK)
 }
 
-func TestCDC_PurgedWAL_ReturnsError(t *testing.T) {
-	return
+func TestServer_RoleTransitions(t *testing.T) {
 	dir, stores, srv, cleanup := setupTestEnv(t)
 	defer cleanup()
+
+	// Set DB "1" to UNDEFINED for testing
+	stores["1"].SetState(store.StateUndefined)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -768,101 +770,240 @@ func TestCDC_PurgedWAL_ReturnsError(t *testing.T) {
 
 	addr := srv.listener.Addr().String()
 	clientTLS := getClientTLS(t, dir)
-	cdcTLS := getRoleTLS(t, dir, "cdc")
+	adminTLS := getRoleTLS(t, dir, "admin")
 
-	// Helper to create SET payload
-	makeSet := func(k, v string) []byte {
-		kb, vb := []byte(k), []byte(v)
-		buf := make([]byte, 4+len(kb)+len(vb))
-		binary.BigEndian.PutUint32(buf[0:4], uint32(len(kb)))
-		copy(buf[4:], kb)
-		copy(buf[4+len(kb):], vb)
-		return buf
+	// 1. Client connects to Undefined DB -> Should allow Select, Fail Begin
+	client := connectClient(t, addr, clientTLS)
+	client.AssertStatus(protocol.OpCodeSelect, []byte("1"), protocol.ResStatusOK)
+	client.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusErr) // Undefined
+	client.Close()
+
+	// 2. Admin Promotes DB
+	admin := connectClient(t, addr, adminTLS)
+	admin.AssertStatus(protocol.OpCodeSelect, []byte("1"), protocol.ResStatusOK)
+	// Payload: 0 (min replicas)
+	promotePayload := make([]byte, 4) // 0
+	admin.AssertStatus(protocol.OpCodePromote, promotePayload, protocol.ResStatusOK)
+	admin.Close()
+
+	// 3. Client matches Primary -> Success
+	client = connectClient(t, addr, clientTLS)
+	client.AssertStatus(protocol.OpCodeSelect, []byte("1"), protocol.ResStatusOK)
+	client.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
+	client.Close() // Keep clean
+
+	// 4. Admin StepDown
+	admin = connectClient(t, addr, adminTLS)
+	admin.AssertStatus(protocol.OpCodeSelect, []byte("1"), protocol.ResStatusOK)
+
+	// Create a hanging client to verify disconnect
+	hangingClient := connectClient(t, addr, clientTLS)
+	hangingClient.AssertStatus(protocol.OpCodeSelect, []byte("1"), protocol.ResStatusOK)
+
+	// Admin executes StepDown
+	admin.AssertStatus(protocol.OpCodeStepDown, nil, protocol.ResStatusOK)
+	// Admin connection might be closed by server immediately after response logic
+
+	// Verify hanging client is disconnected
+	// Read should return EOF or error
+	_, err := hangingClient.conn.Read(make([]byte, 1))
+	if err == nil {
+		t.Error("Hanging client still connected after StepDown")
 	}
 
-	// 1. Write initial data to Database "1" to generate WAL entry (OpID 1)
-	c1 := connectClient(t, addr, clientTLS)
-	defer c1.Close()
-	c1.AssertStatus(protocol.OpCodeSelect, []byte("1"), protocol.ResStatusOK)
+	// 5. Verify DB State is Undefined (New client cant Begin)
+	// Note: We need a new connection (old admin conn likely closed too)
+	admin = connectClient(t, addr, adminTLS)
+	admin.AssertStatus(protocol.OpCodeSelect, []byte("1"), protocol.ResStatusOK)
+	// REPLICAOF valid only in UNDEFINED
+	// ReplicaOf(addr="dummy", db="origin")
+	replPayload := []byte{0, 0, 0, 5} // addr len 5
+	binary.BigEndian.PutUint32(replPayload[0:4], 5)
+	replPayload = append(replPayload, []byte("dummy")...)
+	replPayload = append(replPayload, []byte("origin")...)
 
-	c1.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
-	c1.AssertStatus(protocol.OpCodeSet, makeSet("k1", "v1"), protocol.ResStatusOK)
-	c1.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusOK)
+	admin.AssertStatus(protocol.OpCodeReplicaOf, replPayload, protocol.ResStatusOK)
+	admin.Close()
 
-	// 2. Force WAL Rotation on Database 1 (File 1 -> File 2)
-	st1 := stores["1"]
-	if err := st1.DB.Checkpoint(); err != nil {
-		t.Fatal(err)
+	// 6. Verify Replica State (Read OK, Write Fail)
+	client = connectClient(t, addr, clientTLS)
+	client.AssertStatus(protocol.OpCodeSelect, []byte("1"), protocol.ResStatusOK)
+	// Read OK
+	client.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
+	client.AssertStatus(protocol.OpCodeGet, []byte("k"), protocol.ResStatusNotFound) // k not found, but status OK
+
+	// Write Fail: Set
+	key := []byte("k")
+	val := []byte("v")
+	setPayload := make([]byte, 4+len(key)+len(val))
+	binary.BigEndian.PutUint32(setPayload[0:4], uint32(len(key)))
+	copy(setPayload[4:], key)
+	copy(setPayload[4+len(key):], val)
+	client.AssertStatus(protocol.OpCodeSet, setPayload, protocol.ResStatusErr)
+
+	client.Close()
+}
+
+func TestPromote_QuorumBehavior(t *testing.T) {
+	dir, _, srv, cleanup := setupTestEnv(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.Run(ctx)
+	time.Sleep(100 * time.Millisecond)
+
+	addr := srv.listener.Addr().String()
+	admin := connectClient(t, addr, getRoleTLS(t, dir, "admin"))
+	defer admin.Close()
+	selectDatabase(t, admin, "1")
+
+	// 1. Promote with MinReplicas=1
+	// Should succeed IMMEDIATELY even with 0 replicas.
+	promotePayload := make([]byte, 4)
+	binary.BigEndian.PutUint32(promotePayload, 1)
+	admin.AssertStatus(protocol.OpCodePromote, promotePayload, protocol.ResStatusOK)
+
+	// 2. Write should BLOCK
+	client := connectClient(t, addr, getClientTLS(t, dir))
+	defer client.Close()
+	selectDatabase(t, client, "1")
+
+	key := []byte("block_key")
+	val := []byte("val")
+	pl := make([]byte, 4+len(key)+len(val))
+	binary.BigEndian.PutUint32(pl[0:4], uint32(len(key)))
+	copy(pl[4:], key)
+	copy(pl[4+len(key):], val)
+
+	client.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
+	client.AssertStatus(protocol.OpCodeSet, pl, protocol.ResStatusOK)
+
+	// Commit - Perform in goroutine to verify blocking
+	doneCh := make(chan struct{})
+	go func() {
+		client.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusOK)
+		close(doneCh)
+	}()
+
+	// Verify blocked
+	select {
+	case <-doneCh:
+		t.Fatal("Commit should have blocked waiting for quorum")
+	case <-time.After(200 * time.Millisecond):
+		// Expected behavior
 	}
 
-	// 3. Write more data (OpID 2) into File 2
-	c1.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
-	c1.AssertStatus(protocol.OpCodeSet, makeSet("k2", "v2"), protocol.ResStatusOK)
-	c1.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusOK)
+	// 3. Connect a "Fake" Replica to satisfy quorum
+	// We use the admin connection to act as a replica
+	// But to register as a replica, we need to send Hello.
+	// Since we can't easily hijack the admin connection for repl protocol in this test helper structure,
+	// we'll start a real Replica node and connect it.
 
-	// 4. Force WAL Rotation again (File 2 -> File 3)
-	if err := st1.DB.Checkpoint(); err != nil {
-		t.Fatal(err)
+	// Start Replica Node
+	_, replicaAddr, cancelReplica := startServerNode(t, dir, "replica_quorum", getClientTLS(t, dir))
+	defer cancelReplica()
+
+	// Configure Replica -> Primary
+	adminReplica := connectClient(t, replicaAddr, getRoleTLS(t, dir, "admin"))
+	selectDatabase(t, adminReplica, "1")
+	configureReplication(t, adminReplica, addr, "1")
+	adminReplica.Close()
+
+	// 4. Verify Unblock
+	select {
+	case <-doneCh:
+		// Success
+	case <-time.After(5 * time.Second):
+		t.Fatal("Commit failed to unblock after replica joined")
+	}
+}
+
+func TestStepDown_SafetySequence(t *testing.T) {
+	// 1. Setup Environment
+	baseDir, clientTLS := setupSharedCertEnv(t)
+	adminTLS := getRoleTLS(t, baseDir, "admin")
+
+	// Start Primary
+	_, primAddr, cancelPrim := startServerNode(t, baseDir, "prim_step", clientTLS)
+	defer cancelPrim()
+	promoteNode(t, baseDir, primAddr, "1")
+
+	// Start Replica
+	_, replAddr, cancelRepl := startServerNode(t, baseDir, "repl_step", clientTLS)
+	defer cancelRepl()
+
+	// Connect & Configure Replication
+	cAdminRepl := connectClient(t, replAddr, adminTLS)
+	selectDatabase(t, cAdminRepl, "1")
+	configureReplication(t, cAdminRepl, primAddr, "1")
+	cAdminRepl.Close()
+
+	// 2. Start a transaction that hangs open on Primary
+	cTx := connectClient(t, primAddr, clientTLS)
+	defer cTx.Close()
+	selectDatabase(t, cTx, "1")
+	cTx.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
+
+	// 3. Initiate StepDown in background
+	stepDownDone := make(chan struct{})
+	go func() {
+		cAdmin := connectClient(t, primAddr, adminTLS)
+		defer cAdmin.Close()
+		selectDatabase(t, cAdmin, "1")
+		cAdmin.AssertStatus(protocol.OpCodeStepDown, nil, protocol.ResStatusOK)
+		close(stepDownDone)
+	}()
+
+	// 4. Verify StepDown is blocked by active transaction
+	select {
+	case <-stepDownDone:
+		t.Fatal("StepDown finished prematurely (should wait for active tx)")
+	case <-time.After(200 * time.Millisecond):
+		// Good, it's blocked
 	}
 
-	// Current WAL State for Database 1:
-	// File 1: Contains OpID 1
-	// File 2: Contains OpID 2
-	// File 3: Active (Empty or new ops)
+	// 5. Try to start NEW transaction -> Should be blocked/failed
+	cNew := connectClient(t, primAddr, clientTLS)
+	defer cNew.Close()
+	selectDatabase(t, cNew, "1")
+	// Should fail immediately because state is STEPPING_DOWN
+	cNew.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusErr)
 
-	// 5. Purge logs older than OpID 2. This deletes File 1.
-	if err := st1.DB.PurgeWAL(2); err != nil {
-		t.Fatal(err)
+	// 6. Finish the active transaction
+	// Write something to ensure it replicates
+	k := []byte("safety_key")
+	v := []byte("safety_val")
+	pl := make([]byte, 4+len(k)+len(v))
+	binary.BigEndian.PutUint32(pl[0:4], uint32(len(k)))
+	copy(pl[4:], k)
+	copy(pl[4+len(k):], v)
+	cTx.AssertStatus(protocol.OpCodeSet, pl, protocol.ResStatusOK)
+	cTx.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusOK)
+
+	// 7. StepDown should now complete
+	select {
+	case <-stepDownDone:
+		// Success
+	case <-time.After(5 * time.Second):
+		t.Fatal("StepDown failed to complete after draining tx")
 	}
 
-	// 6. Connect CDC requesting StartSeq 0.
-	// Since StartSeq 0 implies we need the log starting at 1, but File 1 is purged,
-	// the server should return an OUT_OF_SYNC error.
+	// 8. Verify Primary is now UNDEFINED (Clients disconnected)
+	// Try to connect and check state
+	cCheck := connectClient(t, primAddr, clientTLS)
+	defer cCheck.Close()
+	selectDatabase(t, cCheck, "1")
+	cCheck.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusErr)
 
-	cdcConn, err := tls.Dial("tcp", addr, cdcTLS)
-	if err != nil {
-		t.Fatalf("Failed to dial CDC: %v", err)
-	}
-	defer cdcConn.Close()
+	// 9. Verify Replica got the data from the drained transaction
+	cReplRead := connectClient(t, replAddr, clientTLS)
+	defer cReplRead.Close()
+	selectDatabase(t, cReplRead, "1")
 
-	// Handshake
-	buf := new(bytes.Buffer)
-	binary.Write(buf, binary.BigEndian, uint32(1)) // Ver
-	clientid := "test-cdc"
-	binary.Write(buf, binary.BigEndian, uint32(len(clientid)))
-	buf.WriteString(clientid)
-	binary.Write(buf, binary.BigEndian, uint32(1)) // Count
-	part := "1"
-	binary.Write(buf, binary.BigEndian, uint32(len(part)))
-	buf.WriteString(part)
-	binary.Write(buf, binary.BigEndian, uint64(0)) // Request StartSeq 0
-
-	header := make([]byte, 5)
-	header[0] = protocol.OpCodeReplHello
-	binary.BigEndian.PutUint32(header[1:], uint32(buf.Len()))
-
-	cdcConn.Write(header)
-	cdcConn.Write(buf.Bytes())
-
-	// 7. Read response. Expect Error Packet immediately.
-	respHead := make([]byte, 5)
-	cdcConn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	if _, err := io.ReadFull(cdcConn, respHead); err != nil {
-		t.Fatalf("Read CDC response failed: %v", err)
-	}
-
-	if respHead[0] != protocol.ResStatusErr {
-		t.Fatalf("Expected ResStatusErr (0x01), got 0x%x", respHead[0])
-	}
-
-	ln := binary.BigEndian.Uint32(respHead[1:])
-	body := make([]byte, ln)
-	if _, err := io.ReadFull(cdcConn, body); err != nil {
-		t.Fatalf("Read error body failed: %v", err)
-	}
-
-	errMsg := string(body)
-	if !strings.Contains(errMsg, "OUT_OF_SYNC") {
-		t.Errorf("Expected OUT_OF_SYNC error, got: %s", errMsg)
+	// Retry loop for eventual consistency if needed, though StepDown waits for replication
+	val := readKey(t, cReplRead, "safety_key")
+	if string(val) != "safety_val" {
+		t.Errorf("Replica missing data. Got %q, want 'safety_val'", val)
 	}
 }
