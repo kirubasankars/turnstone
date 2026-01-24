@@ -87,6 +87,10 @@ type Options struct {
 	// If 0, disabled.
 	MaxDiskUsagePercent int
 
+	// BlockCacheSize is the capacity of the LevelDB block cache in bytes.
+	// If 0, defaults to 64MB.
+	BlockCacheSize int
+
 	// Logger is the structured logger to use. If nil, logging is discarded.
 	Logger *slog.Logger
 }

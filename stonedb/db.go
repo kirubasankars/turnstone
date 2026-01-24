@@ -79,6 +79,7 @@ type DB struct {
 	compactionInterval     time.Duration
 	walRetentionTime       time.Duration
 	maxDiskUsagePercent    int   // Configured threshold
+	blockCacheSize         int   // Configured cache size
 	isDiskFull             int32 // Atomic boolean (1=Full, 0=OK)
 	isCorrupt              int32 // Atomic boolean (1=Corrupt, 0=OK) - Prevents writes after critical failure
 
@@ -106,6 +107,10 @@ func Open(dir string, opts Options) (*DB, error) {
 	}
 	if opts.CompactionInterval == 0 {
 		opts.CompactionInterval = 20 * time.Second
+	}
+	// Default Block Cache to 64MB if not specified
+	if opts.BlockCacheSize == 0 {
+		opts.BlockCacheSize = 64 * 1024 * 1024
 	}
 
 	logger := opts.Logger
@@ -145,6 +150,7 @@ func Open(dir string, opts Options) (*DB, error) {
 		compactionInterval:     opts.CompactionInterval,
 		walRetentionTime:       opts.WALRetentionTime,
 		maxDiskUsagePercent:    opts.MaxDiskUsagePercent,
+		blockCacheSize:         opts.BlockCacheSize,
 		timelineMeta:           meta,
 		logger:                 logger,
 	}
@@ -256,7 +262,7 @@ func (db *DB) ForceSetClocks(txID, opID uint64) {
 func (db *DB) openLevelDB(dir string) error {
 	indexPath := filepath.Join(dir, "index")
 	ldbOpts := &opt.Options{
-		BlockCacheCapacity: 64 * 1024 * 1024,
+		BlockCacheCapacity: db.blockCacheSize,
 		Compression:        opt.SnappyCompression,
 	}
 
