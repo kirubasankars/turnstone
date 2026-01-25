@@ -53,9 +53,9 @@ type ReplicaSlot struct {
 // Store wraps stonedb.DB to provide a compatibility layer, stats, and replication logic.
 type Store struct {
 	*stonedb.DB
-	logger        *slog.Logger
-	startTime     time.Time
-	isSystem      bool
+	logger      *slog.Logger
+	startTime   time.Time
+	isSystem    bool
 	minReplicas int
 
 	// Persistence Context
@@ -63,12 +63,12 @@ type Store struct {
 	dbOpts stonedb.Options
 
 	// Replication State
-	mu            sync.Mutex
-	dbMu          sync.RWMutex            // Protects s.DB pointer and state
-	replicas      map[string]*ReplicaSlot // ReplicaID -> Slot State
-	cond          *sync.Cond
-	slotsFile     string
-	dirty         bool
+	mu          sync.Mutex
+	dbMu        sync.RWMutex            // Protects s.DB pointer and state
+	replicas    map[string]*ReplicaSlot // ReplicaID -> Slot State
+	cond        *sync.Cond
+	slotsFile   string
+	dirty       bool
 	walStrategy string
 	state       string // Current Database State (UNDEFINED, PRIMARY, REPLICA)
 

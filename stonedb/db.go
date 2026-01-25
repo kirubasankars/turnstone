@@ -191,7 +191,8 @@ func loadTimelineMeta(dir string) (TimelineMeta, error) {
 	path := filepath.Join(dir, "timeline.meta")
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
-		return TimelineMeta{CurrentTimeline: 1}, nil
+		// DEFAULT CHANGED: Start at Timeline 0 so first promotion is 1
+		return TimelineMeta{CurrentTimeline: 0}, nil
 	}
 	if err != nil {
 		return TimelineMeta{}, err
@@ -199,9 +200,6 @@ func loadTimelineMeta(dir string) (TimelineMeta, error) {
 	var meta TimelineMeta
 	if err := json.Unmarshal(data, &meta); err != nil {
 		return TimelineMeta{}, err
-	}
-	if meta.CurrentTimeline == 0 {
-		meta.CurrentTimeline = 1
 	}
 	return meta, nil
 }
