@@ -18,8 +18,9 @@ import (
 )
 
 var (
-	MaxReplicationBatchSize = 1 * 1024 * 1024 // 1MB
-	ErrBatchFull            = errors.New("replication batch full")
+	MaxReplicationBatchSize  = 1 * 1024 * 1024            // 1MB
+	MaxTransactionBufferSize = uint64(64 * 1024 * 1024)   // 64MB
+	ErrBatchFull             = errors.New("replication batch full")
 )
 
 type replPacket struct {
@@ -41,6 +42,7 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 	// 1. Parse Hello: [Ver:4][IDLen:4][ID][NumDBs:4] ...
 	if len(payload) < 8 {
 		st.logger.Warn("Replica handshake failed: payload too short")
+		_ = s.writeBinaryResponse(conn, protocol.ResStatusErr, []byte("Payload too short"))
 		return
 	}
 	cursor := 4
@@ -48,12 +50,14 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 	// Parse ID
 	if cursor+4 > len(payload) {
 		st.logger.Warn("Replica handshake failed: ID len truncated")
+		_ = s.writeBinaryResponse(conn, protocol.ResStatusErr, []byte("ID len truncated"))
 		return
 	}
 	idLen := int(binary.BigEndian.Uint32(payload[cursor : cursor+4]))
 	cursor += 4
 	if cursor+idLen > len(payload) {
 		st.logger.Warn("Replica handshake failed: ID truncated")
+		_ = s.writeBinaryResponse(conn, protocol.ResStatusErr, []byte("ID truncated"))
 		return
 	}
 	replicaID := string(payload[cursor : cursor+idLen])
@@ -61,6 +65,7 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 
 	if replicaID == "" || replicaID == "client-unknown" {
 		st.logger.Warn("Replica handshake rejected: missing client ID")
+		_ = s.writeBinaryResponse(conn, protocol.ResStatusErr, []byte("Missing client ID"))
 		return
 	}
 
@@ -70,6 +75,7 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 	// Parse DB Count
 	if cursor+4 > len(payload) {
 		st.logger.Warn("Replica handshake failed: count truncated")
+		_ = s.writeBinaryResponse(conn, protocol.ResStatusErr, []byte("Count truncated"))
 		return
 	}
 	count := binary.BigEndian.Uint32(payload[cursor : cursor+4])
@@ -87,12 +93,14 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 	for i := 0; i < int(count); i++ {
 		if cursor+4 > len(payload) {
 			st.logger.Warn("Replica handshake failed: db name len truncated")
+			_ = s.writeBinaryResponse(conn, protocol.ResStatusErr, []byte("DB Name len truncated"))
 			return
 		}
 		nLen := int(binary.BigEndian.Uint32(payload[cursor : cursor+4]))
 		cursor += 4
 		if cursor+nLen+8 > len(payload) {
 			st.logger.Warn("Replica handshake failed: db name/logID truncated")
+			_ = s.writeBinaryResponse(conn, protocol.ResStatusErr, []byte("DB Name/LogID truncated"))
 			return
 		}
 		name := string(payload[cursor : cursor+nLen])
@@ -103,12 +111,21 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 		// Check if this server is already a replica for this database.
 		if s.replManager != nil && s.replManager.IsReplicating(name) {
 			st.logger.Warn("Rejected downstream replication request (cascading/cdc disabled on replicas)", "db", name)
-			continue
+			_ = s.writeBinaryResponse(conn, protocol.ResStatusErr, []byte(fmt.Sprintf("Cascading replication disabled for DB '%s'", name)))
+			return
 		}
 
 		subs = append(subs, subReq{name, logID})
 
 		if storePtr, ok := s.stores[name]; ok {
+			// RULE: Replica can't join non promoted/undefined server
+			// We only allow replication if we are PRIMARY.
+			if storePtr.GetState() != store.StatePrimary {
+				st.logger.Warn("Replica handshake rejected: Server is not PRIMARY for this DB", "db", name, "state", storePtr.GetState())
+				_ = s.writeBinaryResponse(conn, protocol.ResStatusErr, []byte(fmt.Sprintf("Replica handshake rejected: DB '%s' is %s (must be PRIMARY)", name, storePtr.GetState())))
+				return // Disconnect
+			}
+
 			// INFO: Replica Connected
 			st.logger.Info("Replica subscribed", "db", name, "start_seq", logID)
 			storePtr.RegisterReplica(replicaID, logID, st.role)
@@ -125,6 +142,8 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 			}(storePtr, name)
 		} else {
 			st.logger.Warn("Replica requested unknown database", "db", name)
+			_ = s.writeBinaryResponse(conn, protocol.ResStatusErr, []byte(fmt.Sprintf("Unknown database: %s", name)))
+			return
 		}
 	}
 
@@ -498,4 +517,80 @@ func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh c
 			}
 		}
 	}
+}
+
+// processReplicationPacket parses raw bytes into LogEntries, buffers them, and applies them.
+// It handles fragmentation by accumulating entries in 'buffer' until a Commit marker is found.
+func processReplicationPacket(store *store.Store, buffer []protocol.LogEntry, currentSize uint64, count uint32, data []byte) ([]protocol.LogEntry, uint64, uint64, error) {
+	cursor := 0
+	var lastCommittedID uint64
+	var pendingBatches [][]protocol.LogEntry
+
+	for i := 0; i < int(count); i++ {
+		// Entry: [LogID(8)][TxID(8)][Op(1)][KLen(4)][Key][VLen(4)][Val]
+		if cursor+17 > len(data) {
+			return buffer, 0, currentSize, fmt.Errorf("malformed batch entry header")
+		}
+		lid := binary.BigEndian.Uint64(data[cursor : cursor+8])
+		op := data[cursor+16]
+		cursor += 17
+
+		kLen := int(binary.BigEndian.Uint32(data[cursor : cursor+4]))
+		cursor += 4
+		if cursor+kLen > len(data) {
+			return buffer, 0, currentSize, fmt.Errorf("malformed batch entry key")
+		}
+		key := data[cursor : cursor+kLen]
+		cursor += kLen
+
+		vLen := int(binary.BigEndian.Uint32(data[cursor : cursor+4]))
+		cursor += 4
+		if cursor+vLen > len(data) {
+			return buffer, 0, currentSize, fmt.Errorf("malformed batch entry val")
+		}
+		val := data[cursor : cursor+vLen]
+		cursor += vLen
+
+		// Handle Commit Marker
+		// Handle Commit Marker
+		if op == protocol.OpJournalCommit {
+			if len(buffer) > 0 {
+				// We have a complete transaction in buffer
+				pendingBatches = append(pendingBatches, buffer)
+				lastCommittedID = lid
+
+				// Reset buffer for next transaction (CRITICAL: ensure new slice allocation)
+				buffer = nil
+				currentSize = 0
+			} else {
+				// Empty commit (rare but valid)
+				lastCommittedID = lid
+			}
+		} else {
+			// Check Size Limit
+			entrySize := uint64(len(key) + len(val) + 20) // overhead estimation
+			if currentSize+entrySize > MaxTransactionBufferSize {
+				return buffer, 0, currentSize, fmt.Errorf("transaction too large: %d > %d", currentSize+entrySize, MaxTransactionBufferSize)
+			}
+			currentSize += entrySize
+
+			// Buffer the op until we see a commit
+			buffer = append(buffer, protocol.LogEntry{
+				LogSeq: lid,
+				OpCode: op,
+				Key:    key,
+				Value:  val,
+			})
+		}
+	}
+
+	// Apply all fully accumulated transactions
+	if len(pendingBatches) > 0 {
+		if err := store.ReplicateBatches(pendingBatches); err != nil {
+			return buffer, lastCommittedID, currentSize, err
+		}
+	}
+
+	// Return remaining buffer (incomplete transaction) and last commit ID
+	return buffer, lastCommittedID, currentSize, nil
 }

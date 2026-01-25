@@ -81,6 +81,7 @@ func main() {
 
 	// 2. Interactive Loop
 	scanner := bufio.NewScanner(os.Stdin)
+	hasError := false
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
@@ -98,15 +99,27 @@ func main() {
 			continue
 		}
 		if cmd == "quit" || cmd == "exit" {
+			if hasError {
+				os.Exit(1)
+			}
 			return
 		}
 
-		handleCommand(cl, cmd, parts)
+		if err := handleCommand(cl, cmd, parts); err != nil {
+			// Don't flag "key not found" (nil) as a failure condition for exit code
+			if !errors.Is(err, client.ErrNotFound) {
+				hasError = true
+			}
+		}
 		fmt.Print("> ")
+	}
+
+	if hasError {
+		os.Exit(1)
 	}
 }
 
-func handleCommand(cl *client.Client, cmd string, parts []string) {
+func handleCommand(cl *client.Client, cmd string, parts []string) error {
 	var err error
 	var result []byte
 
@@ -120,7 +133,7 @@ func handleCommand(cl *client.Client, cmd string, parts []string) {
 	case "select":
 		if len(parts) < 2 {
 			fmt.Println("Usage: select <db>")
-			return
+			return errors.New("usage error")
 		}
 		err = cl.Select(parts[1])
 		if err == nil {
@@ -198,7 +211,7 @@ func handleCommand(cl *client.Client, cmd string, parts []string) {
 	case "get":
 		if len(parts) < 2 {
 			fmt.Println("Usage: get <key>")
-			return
+			return errors.New("usage error")
 		}
 		result, err = cl.Get(parts[1])
 		if err == nil {
@@ -208,7 +221,7 @@ func handleCommand(cl *client.Client, cmd string, parts []string) {
 	case "del":
 		if len(parts) < 2 {
 			fmt.Println("Usage: del <key>")
-			return
+			return errors.New("usage error")
 		}
 		err = cl.Del(parts[1])
 		if err == nil {
@@ -218,7 +231,7 @@ func handleCommand(cl *client.Client, cmd string, parts []string) {
 	case "set":
 		if len(parts) < 3 {
 			fmt.Println("Usage: set <key> <value>")
-			return
+			return errors.New("usage error")
 		}
 		err = cl.Set(parts[1], []byte(parts[2]))
 		if err == nil {
@@ -236,7 +249,7 @@ func handleCommand(cl *client.Client, cmd string, parts []string) {
 		}
 		if len(args) == 0 {
 			fmt.Println("Usage: mget <key1> [<key2> ...]")
-			return
+			return errors.New("usage error")
 		}
 
 		vals, err2 := cl.MGet(args...)
@@ -262,7 +275,7 @@ func handleCommand(cl *client.Client, cmd string, parts []string) {
 
 		if len(allArgs) < 2 || len(allArgs)%2 != 0 {
 			fmt.Println("Usage: mset <key1> <val1> [<key2> <val2> ...]")
-			return
+			return errors.New("usage error")
 		}
 
 		data := make(map[string][]byte)
@@ -285,7 +298,7 @@ func handleCommand(cl *client.Client, cmd string, parts []string) {
 		}
 		if len(args) == 0 {
 			fmt.Println("Usage: mdel <key1> [<key2> ...]")
-			return
+			return errors.New("usage error")
 		}
 
 		n, err2 := cl.MDel(args...)
@@ -296,12 +309,13 @@ func handleCommand(cl *client.Client, cmd string, parts []string) {
 
 	default:
 		fmt.Println("Unknown command")
-		return
+		return errors.New("unknown command")
 	}
 
 	if err != nil {
 		printError(err)
 	}
+	return err
 }
 
 func printError(err error) {
