@@ -69,9 +69,10 @@ const (
 	ResStatusTxRequired     = 0x03
 	ResStatusTxTimeout      = 0x04
 	ResStatusTxConflict     = 0x05
-	ResStatusServerBusy     = 0x06
-	ResStatusEntityTooLarge = 0x07
-	ResStatusMemoryLimit    = 0x08
+	ResTxInProgress         = 0x06
+	ResStatusServerBusy     = 0x07
+	ResStatusEntityTooLarge = 0x08
+	ResStatusMemoryLimit    = 0x09
 )
 
 // Errors
@@ -100,8 +101,10 @@ type LogEntry struct {
 	Offset int64 // Virtual Offset in the WAL (internal use for checkpoints)
 }
 
-// BatchRequest wraps a batch of entries for the Store channel.
-type BatchRequest struct {
-	Entries []LogEntry
-	Resp    chan error
+type Entry struct {
+	Key      string
+	Value    []byte
+	IsDelete bool
+	TxID     uint64
+	LogSeq   uint64
 }
