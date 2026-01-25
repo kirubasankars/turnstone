@@ -36,8 +36,8 @@ const (
 	OpCodeCommit           = 0x11 // Commit the current transaction.
 	OpCodeAbort            = 0x12 // Rollback the current transaction.
 	OpCodeReplicaOf        = 0x32 // Set replication source. Payload: [AddrLen][Addr][RemoteDB].
-	OpCodePromote          = 0x34 // Promote a replica to primary. Payload: [MinReplicas(4)].
-	OpCodeStepDown         = 0x35 // Step down a primary to undefined.
+	OpCodePromote          = 0x34 // Promote database to Primary. Payload: [MinReplicas(4)].
+	OpCodeStepDown         = 0x35 // Demote database from Primary.
 	OpCodeCheckpoint       = 0x36 // Force manual checkpoint and log rotation.
 	OpCodeReplHello        = 0x50 // Replication Handshake (Internal/Client CDC).
 	OpCodeReplBatch        = 0x51 // Replication Batch (Internal/Client CDC).
@@ -498,15 +498,8 @@ func (c *Client) ReplicaOf(sourceAddr, sourceDB string) error {
 	return err
 }
 
-// Checkpoint forces a manual flush of the ValueLog and persistence of sequences.
-// This is an Admin-only command.
-func (c *Client) Checkpoint() error {
-	_, err := c.roundTrip(OpCodeCheckpoint, nil)
-	return err
-}
-
-// Promote promotes the current node to Primary.
-// minReplicas specifies how many healthy replicas must be connected for the promotion to succeed (quorum check).
+// Promote promotes the currently selected database to Primary.
+// minReplicas specifies the minimum number of replicas required for synchronous replication (0 for async).
 func (c *Client) Promote(minReplicas int) error {
 	payload := make([]byte, 4)
 	binary.BigEndian.PutUint32(payload, uint32(minReplicas))
@@ -514,9 +507,17 @@ func (c *Client) Promote(minReplicas int) error {
 	return err
 }
 
-// StepDown steps down the current node from Primary/Replica to Undefined.
+// StepDown demotes the currently selected database from Primary/Replica to undefined state.
+// This stops writes and replication immediately.
 func (c *Client) StepDown() error {
 	_, err := c.roundTrip(OpCodeStepDown, nil)
+	return err
+}
+
+// Checkpoint forces a manual flush of the ValueLog and persistence of sequences.
+// This is an Admin-only command.
+func (c *Client) Checkpoint() error {
+	_, err := c.roundTrip(OpCodeCheckpoint, nil)
 	return err
 }
 
@@ -703,11 +704,11 @@ func (c *Client) Abort() error {
 
 // Change represents a single data modification event from the CDC stream.
 type Change struct {
-	LogSeq   uint64 // The global operation sequence number (0 for snapshot entries)
-	TxID     uint64 // The transaction ID this change belongs to
-	Key      []byte
-	Value    []byte // nil if IsDelete is true
-	IsDelete bool
+	LogSeq       uint64 // The global operation sequence number (0 for snapshot entries)
+	TxID         uint64 // The transaction ID this change belongs to
+	Key          []byte
+	Value        []byte // nil if IsDelete is true
+	IsDelete     bool
 
 	// IsSnapshotDone indicates that the full-sync snapshot is complete.
 	// When true, LogSeq contains the ResumeSeq to start the WAL stream from.

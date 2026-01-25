@@ -152,6 +152,7 @@ func runServer(logger *slog.Logger) {
 		os.Exit(1)
 	}
 
+	// Updated: Remove homeDir from NewReplicationManager call
 	rm := replication.NewReplicationManager(cfg.ID, stores, replTLS, logger)
 
 	srv, err := server.NewServer(

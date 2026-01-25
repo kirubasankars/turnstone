@@ -423,6 +423,8 @@ func (s *Server) dispatchCommand(conn net.Conn, r io.Reader, opCode uint8, paylo
 		s.handlePromote(conn, payload, st)
 	case protocol.OpCodeStepDown:
 		s.handleStepDown(conn, st)
+	case protocol.OpCodeCheckpoint:
+		s.handleCheckpoint(conn, st)
 	case protocol.OpCodeReplHello:
 		// Hand off control to specialized handler in replication.go
 		s.HandleReplicaConnection(conn, r, payload, st)
@@ -583,10 +585,6 @@ func (s *Server) handleGet(w io.Writer, payload []byte, st *connState) {
 	}
 
 	key := string(payload)
-	if len(key) > 0 && key[0] == '_' {
-		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Keys starting with '_' are reserved"))
-		return
-	}
 
 	if !isASCII(key) {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Key must be ASCII"))
@@ -607,10 +605,6 @@ func (s *Server) handleGet(w io.Writer, payload []byte, st *connState) {
 func (s *Server) handleSet(w io.Writer, payload []byte, st *connState) {
 	if st.db == nil {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Database selected"))
-		return
-	}
-	if st.db.IsSystem() {
-		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Database 0 is read-only"))
 		return
 	}
 	if st.db.GetState() != store.StatePrimary && st.db.GetState() != store.StateSteppingDown {
@@ -637,10 +631,6 @@ func (s *Server) handleSet(w io.Writer, payload []byte, st *connState) {
 	copy(val, payload[4+kLen:])
 
 	keyStr := string(key)
-	if len(keyStr) > 0 && keyStr[0] == '_' {
-		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Keys starting with '_' are reserved"))
-		return
-	}
 
 	if !isASCII(keyStr) {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Key must be ASCII"))
@@ -660,10 +650,6 @@ func (s *Server) handleDel(w io.Writer, payload []byte, st *connState) {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Database selected"))
 		return
 	}
-	if st.db.IsSystem() {
-		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Database 0 is read-only"))
-		return
-	}
 	if st.db.GetState() != store.StatePrimary && st.db.GetState() != store.StateSteppingDown {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Read-only/Undefined state"))
 		return
@@ -674,13 +660,21 @@ func (s *Server) handleDel(w io.Writer, payload []byte, st *connState) {
 	}
 
 	key := string(payload)
-	if len(key) > 0 && key[0] == '_' {
-		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Keys starting with '_' are reserved"))
-		return
-	}
 
 	if !isASCII(key) {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Key must be ASCII"))
+		return
+	}
+
+	// Check if key exists before deleting to provide feedback
+	_, err := st.tx.Get([]byte(key))
+	if err == stonedb.ErrKeyNotFound {
+		// Key doesn't exist, return NotFound status (client will see "(nil)" or ErrNotFound)
+		_ = s.writeBinaryResponse(w, protocol.ResStatusNotFound, nil)
+		return
+	} else if err != nil {
+		st.logger.Error("Del existence check failed", "key", key, "err", err)
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte(err.Error()))
 		return
 	}
 
@@ -740,10 +734,6 @@ func (s *Server) handleMGet(w io.Writer, payload []byte, st *connState) {
 		offset += uint64(kLen)
 
 		keyStr := string(key)
-		if len(keyStr) > 0 && keyStr[0] == '_' {
-			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Keys starting with '_' are reserved"))
-			return
-		}
 
 		if !isASCII(keyStr) {
 			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Key must be ASCII"))
@@ -769,10 +759,6 @@ func (s *Server) handleMGet(w io.Writer, payload []byte, st *connState) {
 func (s *Server) handleMSet(w io.Writer, payload []byte, st *connState) {
 	if st.db == nil {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Database selected"))
-		return
-	}
-	if st.db.IsSystem() {
-		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Database 0 is read-only"))
 		return
 	}
 	if st.db.GetState() != store.StatePrimary && st.db.GetState() != store.StateSteppingDown {
@@ -819,10 +805,6 @@ func (s *Server) handleMSet(w io.Writer, payload []byte, st *connState) {
 		offset += uint64(vLen)
 
 		keyStr := string(key)
-		if len(keyStr) > 0 && keyStr[0] == '_' {
-			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Keys starting with '_' are reserved"))
-			return
-		}
 
 		if !isASCII(keyStr) {
 			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Key must be ASCII"))
@@ -842,10 +824,6 @@ func (s *Server) handleMSet(w io.Writer, payload []byte, st *connState) {
 func (s *Server) handleMDel(w io.Writer, payload []byte, st *connState) {
 	if st.db == nil {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Database selected"))
-		return
-	}
-	if st.db.IsSystem() {
-		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Database 0 is read-only"))
 		return
 	}
 	if st.db.GetState() != store.StatePrimary && st.db.GetState() != store.StateSteppingDown {
@@ -880,10 +858,6 @@ func (s *Server) handleMDel(w io.Writer, payload []byte, st *connState) {
 		offset += uint64(kLen)
 
 		keyStr := string(key)
-		if len(keyStr) > 0 && keyStr[0] == '_' {
-			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Keys starting with '_' are reserved"))
-			return
-		}
 
 		if !isASCII(keyStr) {
 			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Key must be ASCII"))
@@ -915,6 +889,12 @@ func (s *Server) handleReplicaOf(w io.Writer, payload []byte, st *connState) {
 		return
 	}
 
+	// Transaction Check
+	if st.tx != nil {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Cannot call REPLICAOF inside a transaction"))
+		return
+	}
+
 	// VALID ONLY IF UNDEFINED
 	if st.db.GetState() != store.StateUndefined {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Must be in UNDEFINED state to call REPLICAOF"))
@@ -943,17 +923,34 @@ func (s *Server) handleReplicaOf(w io.Writer, payload []byte, st *connState) {
 	st.logger.Info("Starting replication (Transition to REPLICA)", "db", st.dbName, "source", addr, "remote_db", remoteDB)
 
 	// Transition State
+	// We optimistically set state to REPLICA to allow the handshake (which might check state),
+	// but we must revert if the handshake fails.
 	st.db.SetState(store.StateReplica)
-	s.replManager.AddReplica(st.dbName, addr, remoteDB)
+
+	if err := s.replManager.AddReplica(st.dbName, addr, remoteDB); err != nil {
+		st.logger.Error("Replication handshake failed", "err", err)
+		// Revert state on failure so the user can try again or Promote
+		st.db.SetState(store.StateUndefined)
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte(err.Error()))
+		return
+	}
 
 	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
 }
 
 func (s *Server) handlePromote(w io.Writer, payload []byte, st *connState) {
-	// Valid when UNDEFINED, REPLICA, or PRIMARY (idempotent/timeline bump)
+	// Transaction Check
+	if st.tx != nil {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Cannot call PROMOTE inside a transaction"))
+		return
+	}
+
 	currentState := st.db.GetState()
-	if currentState != store.StateUndefined && currentState != store.StateReplica && currentState != store.StatePrimary {
-		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("PROMOTE invalid state: "+currentState))
+
+	// Consolidated check for consistency with REPLICAOF message style
+	// Valid only if UNDEFINED or REPLICA
+	if currentState != store.StateUndefined && currentState != store.StateReplica {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Must be in UNDEFINED or REPLICA state to call PROMOTE"))
 		return
 	}
 
@@ -982,10 +979,21 @@ func (s *Server) handlePromote(w io.Writer, payload []byte, st *connState) {
 }
 
 func (s *Server) handleStepDown(w io.Writer, st *connState) {
-	// INFO: Significant role change
-	st.logger.Info("Stepping down database...", "db", st.dbName, "current_state", st.db.GetState())
+	// Transaction Check
+	if st.tx != nil {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Cannot call STEPDOWN inside a transaction"))
+		return
+	}
 
+	// Only allow StepDown if actively running as Primary or Replica
 	currentState := st.db.GetState()
+	if currentState != store.StatePrimary && currentState != store.StateReplica {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Command only valid for PRIMARY or REPLICA state"))
+		return
+	}
+
+	// INFO: Significant role change
+	st.logger.Info("Stepping down database...", "db", st.dbName, "current_state", currentState)
 
 	if currentState == store.StateReplica {
 		// State 1: Stop incoming replication immediately
@@ -1022,9 +1030,6 @@ func (s *Server) handleStepDown(w io.Writer, st *connState) {
 
 		// Transition to UNDEFINED
 		st.db.SetState(store.StateUndefined)
-	} else {
-		// Already Undefined or unknown
-		st.db.SetState(store.StateUndefined)
 	}
 
 	// Disconnect ALL clients (including self/current connection)
@@ -1033,6 +1038,26 @@ func (s *Server) handleStepDown(w io.Writer, st *connState) {
 		s.killDBConnections(dbName)
 	}(st.dbName)
 
+	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
+}
+
+func (s *Server) handleCheckpoint(w io.Writer, st *connState) {
+	if st.db == nil {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Database selected"))
+		return
+	}
+
+	if st.role != RoleAdmin && st.role != RoleServer {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Permission Denied"))
+		return
+	}
+
+	st.logger.Info("Manual checkpoint requested", "db", st.dbName)
+	if err := st.db.Checkpoint(); err != nil {
+		st.logger.Error("Manual checkpoint failed", "err", err)
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte(err.Error()))
+		return
+	}
 	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
 }
 

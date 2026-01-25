@@ -49,10 +49,7 @@ func OpenWriteAheadLog(dir string, maxSize uint32, requestedTL uint64, logger *s
 		return nil, err
 	}
 
-	// Default to Timeline 1 if nothing specified
-	if requestedTL == 0 {
-		requestedTL = 1
-	}
+	// NOTE: Removed default override of 0 -> 1 for timeline. 0 is valid.
 
 	var activePath string
 	var currentStartOffset uint64
@@ -133,7 +130,7 @@ func parseWALFilename(name string) (uint64, uint64, error) {
 	if err != nil {
 		return 0, 0, err
 	}
-	return 1, off, nil
+	return 0, off, nil // Changed default legacy timeline from 1 to 0
 }
 
 func sortWALFiles(paths []string) {
