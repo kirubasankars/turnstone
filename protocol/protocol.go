@@ -30,9 +30,13 @@ const (
 	MaxBatchBytes      = 64 * 1024
 	ProtoHeaderSize    = 5
 	CheckpointInterval = 512 * 1024 * 1024
-	ReplicationTimeout = 30 * time.Second
 	SlowOpThreshold    = 500 * time.Millisecond
 	MaxWALSize         = 200 * 1024 * 1024 // 200MB Limit
+)
+
+// Variables (Mutable for testing)
+var (
+	ReplicationTimeout = 30 * time.Second
 )
 
 // OpCodes
@@ -72,17 +76,17 @@ const (
 
 // Errors
 var (
-	ErrKeyNotFound         = errors.New("key does not exist")
-	ErrCrcMismatch         = errors.New("crc checksum mismatch")
-	ErrClosed              = errors.New("store closed")
-	ErrCommandTooLarge     = errors.New("command line too large")
-	ErrConflict            = errors.New("transaction conflict")
-	ErrBusy                = errors.New("server busy")
-	ErrTransactionTimeout  = errors.New("transaction timeout")
-	ErrReadOnly            = errors.New("server is read-only")
-	ErrMemoryLimitExceeded = errors.New("memory limit exceeded")
-	ErrDbNotFound          = errors.New("database not found")
-	ErrSystemDBReadOnly    = errors.New("system database is read-only")
+	ErrKeyNotFound             = errors.New("key does not exist")
+	ErrCrcMismatch             = errors.New("crc checksum mismatch")
+	ErrClosed                  = errors.New("store closed")
+	ErrCommandTooLarge         = errors.New("command line too large")
+	ErrConflict                = errors.New("transaction conflict")
+	ErrBusy                    = errors.New("server busy")
+	ErrTransactionTimeout      = errors.New("transaction timeout")
+	ErrReadOnly                = errors.New("server is read-only")
+	ErrMemoryLimitExceeded     = errors.New("memory limit exceeded")
+	ErrPartitionNotFound       = errors.New("partition not found")
+	ErrSystemPartitionReadOnly = errors.New("system partition is read-only")
 )
 
 var Crc32Table = crc32.MakeTable(crc32.Castagnoli)
