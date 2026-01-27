@@ -327,6 +327,14 @@ func (wal *WriteAheadLog) Scan(startLoc WALLocation, fn func([]ValueLogEntry) er
 	// 4. Iterate files from startIndex
 	for i := startIndex; i < len(matches); i++ {
 		path := matches[i]
+		fileStart := parseWALName(filepath.Base(path))
+
+		// IMPORTANT: Skip files that are strictly older than the requested start file
+		// This prevents re-reading previous files if startIndex calculation was fuzzy
+		if fileStart < startLoc.FileStartOffset {
+			continue
+		}
+
 		f, err := os.Open(path)
 		if err != nil {
 			return err
@@ -334,8 +342,6 @@ func (wal *WriteAheadLog) Scan(startLoc WALLocation, fn func([]ValueLogEntry) er
 
 		// Calculate seek offset
 		seekOff := int64(0)
-		fileStart := parseWALName(filepath.Base(path))
-
 		// Only seek if this is the specific start file
 		if fileStart == startLoc.FileStartOffset {
 			seekOff = int64(startLoc.RelativeOffset)
@@ -427,6 +433,14 @@ func (wal *WriteAheadLog) readFirstOpID(path string) (uint64, error) {
 // scanFile reads entries from a single WAL file starting at a given offset
 func (wal *WriteAheadLog) scanFile(f *os.File, startOffset int64, fn func([]ValueLogEntry) error) error {
 	if startOffset > 0 {
+		stat, err := f.Stat()
+		if err != nil {
+			return err
+		}
+		// Avoid seeking beyond EOF
+		if startOffset >= stat.Size() {
+			return nil
+		}
 		if _, err := f.Seek(startOffset, 0); err != nil {
 			return err
 		}
