@@ -49,17 +49,14 @@ func setupTestEnv(t *testing.T) (string, *server.Server, func()) {
 	stores := make(map[string]*store.Store)
 	for i := 0; i < 4; i++ {
 		dbName := strconv.Itoa(i)
-		// Database 0 is system (read-only for clients), 1-3 are user dbs
-		isSystem := (i == 0)
-		s, err := store.NewStore(filepath.Join(dir, "data", dbName), logger, 0, isSystem, "time", 90, 0)
+		// No special system database at 0 anymore
+		s, err := store.NewStore(filepath.Join(dir, "data", dbName), logger, 0, "time", 90, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
-		// Promote user databases so they are writable
-		if !isSystem {
-			if err := s.Promote(); err != nil {
-				t.Fatalf("Failed to promote db %s: %v", dbName, err)
-			}
+		// Promote all databases so they are writable
+		if err := s.Promote(); err != nil {
+			t.Fatalf("Failed to promote db %s: %v", dbName, err)
 		}
 		stores[dbName] = s
 	}
@@ -406,36 +403,4 @@ func TestClientPool_Poison(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pool.Close()
-
-	// 1. Get client
-	// c1, _ := pool.Get()
-	// defer c1.Close()
-
-	// 2. Kill server to force error? Or just close client manually?
-	// Simulating network error logic internal to client is hard from outside without mocks.
-	// But we can trigger an error by sending invalid data or closing the conn underneath?
-	// Let's rely on Ping returning error if server is dead? No, we still want server for reallocation.
-	// We can manually close conn? No, conn is private.
-	// We can invoke an operation that fails, e.g. writing to closed writer?
-	// Wait, we configured the client. If we set a tiny write timeout and delay, maybe?
-	// Easiest path: The pool logic sets `poisoned` on ANY error from roundTrip.
-	// Let's trigger an error. OpCode 0xFF is Quit, connection closes.
-	// Or maybe just call a method that will fail IO.
-
-	// Actually, easier: If we shut down the server, Ping will error.
-	// But then reallocation will verify new connection attempt fails too?
-	// We want to test that a BROKEN connection isn't put back.
-
-	// Let's use the property that roundTrip sets poisoned on IO error.
-	// We can trigger IO error by closing the connection ourselves? No access.
-	// We can simulate a server disconnect.
-	// Since we can't easily simulate networking failure without mocking net.Conn,
-	// we will assume valid behavior if test coverage confirms markPoisoned lines are hit.
-	// But let's try a simple case: Client sends request, Server closes connection abruptly.
-	// That causes `ReadFull` to error -> `markPoisoned` -> `Close` returns nil but pool decrements count.
-	// Next `Get` creates NEW client.
-
-	// This integration test is tricky. We'll trust the unit logic for now since `pool != ptr1` check covers reuse.
-	// If reuse works, we assume non-reuse works if logic is sound.
-	// Let's stick to Reuse and Capacity tests as primary validation for Pool mechanics.
 }
