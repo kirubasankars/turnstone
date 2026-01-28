@@ -13,7 +13,6 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
-	"time"
 
 	"turnstone/config"
 	"turnstone/metrics"
@@ -93,16 +92,6 @@ func runServer(logger *slog.Logger) {
 		logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	}
 
-	// Parse WAL Retention
-	walRetention := 2 * time.Hour
-	if cfg.WALRetention != "" {
-		if d, err := time.ParseDuration(cfg.WALRetention); err == nil {
-			walRetention = d
-		} else {
-			logger.Warn("Invalid wal_retention, using default 2h", "err", err)
-		}
-	}
-
 	// Parse Block Cache
 	blockCacheSize := 64 * 1024 * 1024 // Default 64MB
 	if cfg.BlockCacheSize != "" {
@@ -131,17 +120,13 @@ func runServer(logger *slog.Logger) {
 	for i := 0; i <= cfg.NumberOfDatabases; i++ {
 		name := strconv.Itoa(i)
 		path := filepath.Join(*homeDir, "data", name)
-		isSystem := (i == 0)
-		st, err := store.NewStore(path, logger.With("db", name), 0, isSystem, cfg.WALRetentionStrategy, cfg.MaxDiskUsagePercent, blockCacheSize)
+		
+		// DB 0 is now treated as a regular database (minReplicas configurable, not implicitly system)
+		// We hardcode minReplicas=0 for initial startup, but it can be promoted later.
+		st, err := store.NewStore(path, logger.With("db", name), 0, cfg.WALRetentionStrategy, cfg.MaxDiskUsagePercent, blockCacheSize)
 		if err != nil {
 			logger.Error("Failed to initialize store", "db", name, "err", err)
 			os.Exit(1)
-		}
-		// Set retention duration on the underlying DB only if strategy is "time".
-		// If strategy is "replication", NewStore initializes it to 0 (disabled),
-		// and we should NOT overwrite it with the config value here.
-		if cfg.WALRetentionStrategy == "time" {
-			st.DB.SetWALRetentionTime(walRetention)
 		}
 		stores[name] = st
 	}
@@ -152,7 +137,6 @@ func runServer(logger *slog.Logger) {
 		os.Exit(1)
 	}
 
-	// Updated: Remove homeDir from NewReplicationManager call
 	rm := replication.NewReplicationManager(cfg.ID, stores, replTLS, logger)
 
 	srv, err := server.NewServer(

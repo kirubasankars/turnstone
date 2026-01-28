@@ -77,7 +77,6 @@ type DB struct {
 	checksumInterval       time.Duration
 	autoCheckpointInterval time.Duration
 	compactionInterval     time.Duration
-	walRetentionTime       time.Duration
 	maxDiskUsagePercent    int   // Configured threshold
 	blockCacheSize         int   // Configured cache size
 	isDiskFull             int32 // Atomic boolean (1=Full, 0=OK)
@@ -98,9 +97,6 @@ func Open(dir string, opts Options) (*DB, error) {
 	}
 	if opts.CompactionMinGarbage == 0 {
 		opts.CompactionMinGarbage = 1024 * 1024
-	}
-	if opts.WALRetentionTime == 0 {
-		opts.WALRetentionTime = 2 * time.Hour
 	}
 	if opts.AutoCheckpointInterval == 0 {
 		opts.AutoCheckpointInterval = 60 * time.Second
@@ -148,7 +144,6 @@ func Open(dir string, opts Options) (*DB, error) {
 		checksumInterval:       opts.ChecksumInterval,
 		autoCheckpointInterval: opts.AutoCheckpointInterval,
 		compactionInterval:     opts.CompactionInterval,
-		walRetentionTime:       opts.WALRetentionTime,
 		maxDiskUsagePercent:    opts.MaxDiskUsagePercent,
 		blockCacheSize:         opts.BlockCacheSize,
 		timelineMeta:           meta,
@@ -156,7 +151,7 @@ func Open(dir string, opts Options) (*DB, error) {
 	}
 
 	// CHANGED: Reduced from INFO to DEBUG to prevent log spam on startup
-	logger.Debug("Opening Database", "wal_max_size", opts.MaxWALSize, "wal_retention", opts.WALRetentionTime)
+	logger.Debug("Opening Database", "wal_max_size", opts.MaxWALSize)
 
 	if err := db.recoverValueLog(); err != nil {
 		db.Close()
@@ -472,12 +467,6 @@ func (db *DB) SetCompactionMinGarbage(minGarbage int64) {
 	db.minGarbageThreshold = minGarbage
 }
 
-func (db *DB) SetWALRetentionTime(d time.Duration) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	db.walRetentionTime = d
-}
-
 func (db *DB) runAutoCheckpoint() {
 	defer db.wg.Done()
 	ticker := time.NewTicker(db.autoCheckpointInterval)
@@ -495,16 +484,6 @@ func (db *DB) runAutoCheckpoint() {
 				if err := db.Checkpoint(); err != nil {
 					if !strings.Contains(err.Error(), "closed") {
 						db.logger.Error("Auto-checkpoint failed", "err", err)
-					}
-				} else {
-					checkpointID := atomic.LoadUint64(&db.lastCkptOpID)
-					db.mu.RLock()
-					retention := db.walRetentionTime
-					db.mu.RUnlock()
-					if retention > 0 {
-						if err := db.writeAheadLog.PurgeExpired(retention, checkpointID); err != nil {
-							db.logger.Error("WAL purge failed", "err", err)
-						}
 					}
 				}
 			}

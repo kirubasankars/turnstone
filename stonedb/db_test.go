@@ -66,19 +66,19 @@ func TestDB_Promote_Integration(t *testing.T) {
 		t.Fatalf("Open failed: %v", err)
 	}
 
-	// 1. Write on Timeline 1
+	// 1. Write on Timeline 0 (Default)
 	tx1 := db.NewTransaction(true)
 	tx1.Put([]byte("t1_key"), []byte("val1"))
 	if err := tx1.Commit(); err != nil {
 		t.Fatal(err)
 	}
 
-	// 2. Promote
+	// 2. Promote (0 -> 1)
 	if err := db.Promote(); err != nil {
 		t.Fatalf("Promote failed: %v", err)
 	}
 
-	// 3. Write on Timeline 2
+	// 3. Write on Timeline 1
 	tx2 := db.NewTransaction(true)
 	tx2.Put([]byte("t2_key"), []byte("val2"))
 	if err := tx2.Commit(); err != nil {
@@ -89,11 +89,11 @@ func TestDB_Promote_Integration(t *testing.T) {
 	rtx := db.NewTransaction(false)
 	v1, _ := rtx.Get([]byte("t1_key"))
 	if string(v1) != "val1" {
-		t.Error("Lost data from Timeline 1")
+		t.Error("Lost data from Timeline 0")
 	}
 	v2, _ := rtx.Get([]byte("t2_key"))
 	if string(v2) != "val2" {
-		t.Error("Missing data from Timeline 2")
+		t.Error("Missing data from Timeline 1")
 	}
 	rtx.Discard()
 
@@ -107,20 +107,21 @@ func TestDB_Promote_Integration(t *testing.T) {
 	}
 	defer db2.Close()
 
-	// Check if current timeline is persisted
-	if db2.timelineMeta.CurrentTimeline != 2 {
-		t.Errorf("Expected CurrentTimeline 2, got %d", db2.timelineMeta.CurrentTimeline)
+	// Check if current timeline is persisted.
+	// Starts at 0, Promoted once -> 1
+	if db2.timelineMeta.CurrentTimeline != 1 {
+		t.Errorf("Expected CurrentTimeline 1, got %d", db2.timelineMeta.CurrentTimeline)
 	}
 
 	// Verify data access after recovery
 	rtx2 := db2.NewTransaction(false)
 	v1r, _ := rtx2.Get([]byte("t1_key"))
 	if string(v1r) != "val1" {
-		t.Error("Recovery lost T1 data")
+		t.Error("Recovery lost T0 data")
 	}
 	v2r, _ := rtx2.Get([]byte("t2_key"))
 	if string(v2r) != "val2" {
-		t.Error("Recovery lost T2 data")
+		t.Error("Recovery lost T1 data")
 	}
 	rtx2.Discard()
 }
@@ -589,6 +590,7 @@ func TestLocateWALStart_LevelDBFallback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer db.Close()
 
 	// Write enough data to trigger rotations and create WAL index entries in LevelDB
 	for i := 0; i < 50; i++ {

@@ -13,7 +13,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 )
 
 // WriteAheadLog handles append-only log files for crash recovery.
@@ -48,8 +47,6 @@ func OpenWriteAheadLog(dir string, maxSize uint32, requestedTL uint64, logger *s
 	if err != nil {
 		return nil, err
 	}
-
-	// NOTE: Removed default override of 0 -> 1 for timeline. 0 is valid.
 
 	var activePath string
 	var currentStartOffset uint64
@@ -130,7 +127,7 @@ func parseWALFilename(name string) (uint64, uint64, error) {
 	if err != nil {
 		return 0, 0, err
 	}
-	return 0, off, nil // Changed default legacy timeline from 1 to 0
+	return 0, off, nil
 }
 
 func sortWALFiles(paths []string) {
@@ -438,53 +435,6 @@ func (wal *WriteAheadLog) Scan(startLoc WALLocation, fn func([]ValueLogEntry) er
 		}
 	}
 
-	return nil
-}
-
-func (wal *WriteAheadLog) PurgeExpired(retention time.Duration, safeOpID uint64) error {
-	wal.mu.Lock()
-	defer wal.mu.Unlock()
-
-	matches, err := filepath.Glob(filepath.Join(wal.dir, "*.wal"))
-	if err != nil {
-		return err
-	}
-
-	sortWALFiles(matches)
-
-	if len(matches) <= 1 {
-		return nil
-	}
-
-	now := time.Now()
-
-	for i := 0; i < len(matches)-1; i++ {
-		currentPath := matches[i]
-		nextPath := matches[i+1]
-
-		info, err := os.Stat(currentPath)
-		if err != nil {
-			return err
-		}
-		if now.Sub(info.ModTime()) < retention {
-			break
-		}
-
-		nextStartOpID, err := wal.readFirstOpID(nextPath)
-		if err != nil {
-			break
-		}
-
-		if nextStartOpID <= safeOpID {
-			// INFO: Garbage Collection
-			wal.logger.Info("Purging expired WAL file", "file", filepath.Base(currentPath))
-			if err := os.Remove(currentPath); err != nil {
-				return err
-			}
-		} else {
-			break
-		}
-	}
 	return nil
 }
 

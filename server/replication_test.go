@@ -62,7 +62,8 @@ func startServerNode(t *testing.T, baseDir, name string, sharedTLS *tls.Config) 
 	stores := make(map[string]*store.Store)
 	for _, dbName := range []string{"0", "1", "2", "3"} {
 		partPath := filepath.Join(nodeDir, "data", dbName)
-		st, err := store.NewStore(partPath, logger, 0, dbName == "0", "time", 90, 0)
+		// Removed isSystem (4th arg), using default 0 minReplicas
+		st, err := store.NewStore(partPath, logger, 0, "time", 90, 0)
 		if err != nil {
 			t.Fatalf("Failed to init store %s: %v", dbName, err)
 		}
@@ -339,9 +340,21 @@ func TestReplication_Cascading_Rejected(t *testing.T) {
 	configureReplication(t, adminB, addrA, "1")
 
 	// Configure C -> B (Database 1)
-	// This should successfully send the config command, but the ACTUAL connection from C to B
-	// will be rejected by B during handshake.
-	configureReplication(t, adminC, addrB, "1")
+	// This should send the config command, but since AddReplica now performs
+	// a synchronous handshake check, and B detects it is a replica, B will reject
+	// the handshake. Thus, `REPLICAOF` should return an ERROR.
+	//
+	// Note: B is a Replica of A. A replica cannot accept downstream replicas (Cascading disabled).
+
+	// Construct manual payload to Assert Err status
+	addrBytes := []byte(addrB)
+	dbBytes := []byte("1")
+	payload := make([]byte, 4+len(addrBytes)+len(dbBytes))
+	binary.BigEndian.PutUint32(payload[0:4], uint32(len(addrBytes)))
+	copy(payload[4:], addrBytes)
+	copy(payload[4+len(addrBytes):], dbBytes)
+
+	adminC.AssertStatus(protocol.OpCodeReplicaOf, payload, protocol.ResStatusErr)
 
 	// Write to A (Database 1)
 	writeKeyVal(t, clientA, "cascadeKey", "cascadeVal")
@@ -530,7 +543,13 @@ func TestReplication_FullSync_Integration(t *testing.T) {
 
 	// 3. Force WAL Purge on Primary to make logs unavailable using Promote (Forces rotation)
 	st1 := primarySrv.stores["1"]
-	if err := st1.DB.Promote(); err != nil {
+	// StepDown first because Promote now requires it if already Primary
+	cAdmin := connectClient(t, primaryAddr, adminTLS)
+	selectDatabase(t, cAdmin, "1")
+	cAdmin.AssertStatus(protocol.OpCodeStepDown, nil, protocol.ResStatusOK)
+	cAdmin.Close()
+
+	if err := st1.Promote(); err != nil {
 		t.Fatalf("Promote failed: %v", err)
 	}
 
@@ -651,6 +670,13 @@ func TestReplication_TimelineFork_Recovery(t *testing.T) {
 	// 4. Force Timeline Switch on Primary
 	// This simulates a promotion event or a history fork.
 	st1 := primarySrv.stores["1"]
+
+	// StepDown first because Promote now requires it if already Primary
+	cAdmin := connectClient(t, primaryAddr, adminTLS)
+	selectDatabase(t, cAdmin, "1")
+	cAdmin.AssertStatus(protocol.OpCodeStepDown, nil, protocol.ResStatusOK)
+	cAdmin.Close()
+
 	if err := st1.Promote(); err != nil {
 		t.Fatalf("Primary promote failed: %v", err)
 	}
@@ -686,7 +712,7 @@ func startServerNodeWithReplicas(t *testing.T, baseDir, name string, sharedTLS *
 	for _, dbName := range []string{"0", "1", "2", "3"} {
 		partPath := filepath.Join(nodeDir, "data", dbName)
 		// Use minReplicas here
-		st, err := store.NewStore(partPath, logger, minReplicas, dbName == "0", "time", 90, 0)
+		st, err := store.NewStore(partPath, logger, minReplicas, "time", 90, 0)
 		if err != nil {
 			t.Fatalf("Failed to init store %s: %v", dbName, err)
 		}

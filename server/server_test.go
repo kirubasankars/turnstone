@@ -61,7 +61,7 @@ func setupTestEnv(t *testing.T) (string, map[string]*store.Store, *Server, func(
 		TLSCertFile:       "certs/server.crt",
 		TLSKeyFile:        "certs/server.key",
 		TLSCAFile:         "certs/ca.crt",
-		NumberOfDatabases: 4, // 0 (Read-Only), 1, 2, 3 (Writable)
+		NumberOfDatabases: 4, // 0-3 All Writable
 	}, filepath.Join(dir, "config.json")); err != nil {
 		t.Fatalf("Failed to generate artifacts: %v", err)
 	}
@@ -70,7 +70,7 @@ func setupTestEnv(t *testing.T) (string, map[string]*store.Store, *Server, func(
 	stores := make(map[string]*store.Store)
 	for i := 0; i < 4; i++ {
 		dbName := strconv.Itoa(i)
-		s, err := store.NewStore(filepath.Join(dir, "data", dbName), logger, 0, i == 0, "time", 90, 0)
+		s, err := store.NewStore(filepath.Join(dir, "data", dbName), logger, 0, "time", 90, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -344,7 +344,7 @@ func TestServer_Lifecycle_And_Ping(t *testing.T) {
 	}
 }
 
-func TestServer_SystemDB_AccessControl(t *testing.T) {
+func TestServer_DB0_AccessControl(t *testing.T) {
 	dir, _, srv, cleanup := setupTestEnv(t)
 	defer cleanup()
 
@@ -355,7 +355,7 @@ func TestServer_SystemDB_AccessControl(t *testing.T) {
 
 	addr := srv.listener.Addr().String()
 
-	// 1. Client attempts to access Database 0 -> Should Fail
+	// 1. Client attempts to access Database 0 -> Should Succeed now (DB 0 is normal)
 	client := connectClient(t, addr, getClientTLS(t, dir))
 	defer client.Close()
 
@@ -369,16 +369,9 @@ func TestServer_SystemDB_AccessControl(t *testing.T) {
 	copy(setPayload[4+len(key):], val)
 
 	client.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
-	// Server returns Error because Role is Client and DB 0 is read-only
-	// Updated error string matches server.go
-	client.AssertStatus(protocol.OpCodeSet, setPayload, protocol.ResStatusErr)
-
-	// 2. Admin attempts to access Database 0 -> Should Succeed
-	admin := connectClient(t, addr, getRoleTLS(t, dir, "admin"))
-	defer admin.Close()
-
-	admin.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
-	// Admin is allowed to write to DB 0, logic confirmed in server.go handles
+	// Success
+	client.AssertStatus(protocol.OpCodeSet, setPayload, protocol.ResStatusOK)
+	client.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusOK)
 }
 
 func TestServer_CRUD(t *testing.T) {
@@ -862,6 +855,11 @@ func TestPromote_QuorumBehavior(t *testing.T) {
 	// Should succeed IMMEDIATELY even with 0 replicas.
 	promotePayload := make([]byte, 4)
 	binary.BigEndian.PutUint32(promotePayload, 1)
+	// We must StepDown first because setupTestEnv makes it Primary
+	admin.AssertStatus(protocol.OpCodeStepDown, nil, protocol.ResStatusOK)
+	// Reconnect admin as it gets disconnected
+	admin = connectClient(t, addr, getRoleTLS(t, dir, "admin"))
+	selectDatabase(t, admin, "1")
 	admin.AssertStatus(protocol.OpCodePromote, promotePayload, protocol.ResStatusOK)
 
 	// 2. Write should BLOCK
