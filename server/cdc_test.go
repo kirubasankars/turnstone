@@ -282,6 +282,7 @@ func TestCDC_PurgedWAL_TriggersSnapshot(t *testing.T) {
 	promoteNode(t, dir, addr, "1")
 	clientTLS := getClientTLS(t, dir)
 	cdcTLS := getRoleTLS(t, dir, "cdc")
+	adminTLS := getRoleTLS(t, dir, "admin")
 
 	// Helper to create SET payload
 	makeSet := func(k, v string) []byte {
@@ -303,11 +304,21 @@ func TestCDC_PurgedWAL_TriggersSnapshot(t *testing.T) {
 	c1.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusOK)
 
 	// 2. Force WAL Rotation using Promote() (File 1 -> File 2)
-	// We use Promote because Checkpoint() only rotates VLog, not WAL.
+	// Note: We use the internal store method to bypass the "Must be UNDEFINED" check
+	// because we just want to force a rotation for testing, not change topology.
 	st1 := stores["1"]
-	if err := st1.DB.Promote(); err != nil {
-		t.Fatal(err)
-	}
+	
+	// FIX: StepDown first before calling Promote via admin client
+	cAdmin := connectClient(t, addr, adminTLS)
+	selectDatabase(t, cAdmin, "1")
+	cAdmin.AssertStatus(protocol.OpCodeStepDown, nil, protocol.ResStatusOK)
+	cAdmin.Close()
+
+	// Re-promote (Forces new timeline/rotation)
+	cAdmin2 := connectClient(t, addr, adminTLS)
+	selectDatabase(t, cAdmin2, "1")
+	cAdmin2.AssertStatus(protocol.OpCodePromote, make([]byte, 4), protocol.ResStatusOK)
+	cAdmin2.Close()
 
 	// 3. Write more data (OpID 2) into File 2
 	c1.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
@@ -315,13 +326,18 @@ func TestCDC_PurgedWAL_TriggersSnapshot(t *testing.T) {
 	c1.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusOK)
 
 	// 4. Force WAL Rotation again (File 2 -> File 3)
-	if err := st1.DB.Promote(); err != nil {
-		t.Fatal(err)
-	}
+	// Again, StepDown first
+	cAdmin3 := connectClient(t, addr, adminTLS)
+	selectDatabase(t, cAdmin3, "1")
+	cAdmin3.AssertStatus(protocol.OpCodeStepDown, nil, protocol.ResStatusOK)
+	cAdmin3.Close()
+
+	cAdmin4 := connectClient(t, addr, adminTLS)
+	selectDatabase(t, cAdmin4, "1")
+	cAdmin4.AssertStatus(protocol.OpCodePromote, make([]byte, 4), protocol.ResStatusOK)
+	cAdmin4.Close()
 
 	// 5. Purge logs older than OpID 2. This deletes File 1.
-	// OpID 2 is in File 2. File 2 StartOpID is 2.
-	// 2 <= 2 -> File 1 is purged.
 	if err := st1.DB.PurgeWAL(2); err != nil {
 		t.Fatal(err)
 	}

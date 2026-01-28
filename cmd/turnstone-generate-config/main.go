@@ -45,7 +45,6 @@ func main() {
 		TLSClientCertFile:    "certs/client.crt",
 		TLSClientKeyFile:     "certs/client.key",
 		MetricsAddr:          ":9090",
-		WALRetention:         "2h",
 		WALRetentionStrategy: "replication",
 		BlockCacheSize:       "64MB",
 	}
@@ -53,7 +52,6 @@ func main() {
 	configPath := filepath.Join(*homeDir, "turnstone.json")
 
 	// 2. Generate Artifacts (Directories, Certs, Server Config)
-	// Passed extraHosts as variadic arguments
 	if err := config.GenerateConfigArtifacts(*homeDir, defaultCfg, configPath, extraHosts...); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to generate artifacts: %v\n", err)
 		os.Exit(1)
