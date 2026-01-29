@@ -20,16 +20,16 @@ type ValueLog struct {
 	dir          string
 	currentFile  *os.File
 	currentFid   uint32
-	writeOffset  uint32
+	writeOffset  int64 // Updated to int64 for 64-bit offsets
 	fileCache    map[uint32]*os.File
 	lruOrder     []uint32 // Ordered list of fileIDs for eviction (newest at end)
 	maxOpenFiles int
-	maxSize      uint32
-	mu           sync.RWMutex // Note: Lock() is used for LRU updates
+	maxSize      int64 // Updated to int64
+	mu           sync.RWMutex
 	logger       *slog.Logger
 }
 
-func OpenValueLog(dir string, maxSize uint32, logger *slog.Logger) (*ValueLog, error) {
+func OpenValueLog(dir string, maxSize int64, logger *slog.Logger) (*ValueLog, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
@@ -38,13 +38,9 @@ func OpenValueLog(dir string, maxSize uint32, logger *slog.Logger) (*ValueLog, e
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 
-	// PATCH 1: Enforce Hard Cap to prevent 32-bit overflow
-	// We limit to 2GB to be safe with signed 32-bit integers often used in offsets/syscalls.
-	// If the offset exceeds MaxUint32, the index (which uses uint32 for offset) will wrap around
-	// and point to incorrect data, causing silent corruption.
-	const HardMaxFileSize = 2 * 1024 * 1024 * 1024
-	if maxSize > HardMaxFileSize {
-		return nil, fmt.Errorf("MaxVLogSize %d exceeds hard limit of %d (2GB) to prevent integer overflow", maxSize, HardMaxFileSize)
+	// Safety check: ensure maxSize is reasonable (e.g. > 1MB)
+	if maxSize <= 1024*1024 {
+		maxSize = 200 * 1024 * 1024 // Default 200MB if invalid
 	}
 
 	matches, err := filepath.Glob(filepath.Join(dir, "*.vlog"))
@@ -79,7 +75,7 @@ func OpenValueLog(dir string, maxSize uint32, logger *slog.Logger) (*ValueLog, e
 		dir:          dir,
 		currentFile:  f,
 		currentFid:   maxFid,
-		writeOffset:  uint32(stat.Size()),
+		writeOffset:  stat.Size(), // int64
 		fileCache:    make(map[uint32]*os.File),
 		lruOrder:     make([]uint32, 0),
 		maxOpenFiles: DefaultValueLogMaxOpenFiles,
@@ -123,15 +119,17 @@ func (vl *ValueLog) Recover() (uint64, uint64, error) {
 		}
 
 		if err != nil {
-			if err == ErrChecksum || err == io.ErrUnexpectedEOF {
+			// FIX: Handle ErrCorruptData (Garbage Header) as a truncate-able error if it's the last file.
+			// This prevents crash loops when a header partial write results in huge length values.
+			if err == ErrChecksum || err == io.ErrUnexpectedEOF || err == ErrCorruptData {
 				if isLastFile {
-					vl.logger.Warn("ValueLog corruption detected in last file. Truncating.", "file", path, "offset", validOffset)
+					vl.logger.Warn("ValueLog corruption detected in last file. Truncating.", "file", path, "offset", validOffset, "err", err)
 					if err := os.Truncate(path, validOffset); err != nil {
 						return 0, 0, err
 					}
 					// If we just truncated the current file, update write offset
 					if filepath.Base(path) == filepath.Base(vl.currentFile.Name()) {
-						vl.writeOffset = uint32(validOffset)
+						vl.writeOffset = validOffset
 						// Need to re-seek current handle
 						vl.currentFile.Seek(validOffset, 0)
 					}
@@ -313,7 +311,7 @@ func (vl *ValueLog) stream(r io.Reader, onEntry func(offset int64, e ValueLogEnt
 
 		meta := EntryMeta{
 			// FileID must be set by caller usually
-			ValueOffset:   uint32(validOffset),
+			ValueOffset:   validOffset, // int64
 			ValueLen:      valLen,
 			TransactionID: txID,
 			OperationID:   opID,
@@ -328,15 +326,14 @@ func (vl *ValueLog) stream(r io.Reader, onEntry func(offset int64, e ValueLogEnt
 	}
 }
 
-func (vl *ValueLog) AppendEntries(entries []ValueLogEntry) (uint32, uint32, error) {
+// AppendEntries writes entries to the active ValueLog file.
+// Returns FileID, StartOffset, Error.
+func (vl *ValueLog) AppendEntries(entries []ValueLogEntry) (uint32, int64, error) {
 	vl.mu.Lock()
 	defer vl.mu.Unlock()
 
 	// Rotation Trigger: Max Size Check
-	// If the file is already over the limit, rotate BEFORE writing the new batch.
-	// This ensures the new batch goes entirely into the new file.
 	if vl.writeOffset > vl.maxSize {
-		// Replicating rotate logic inline to avoid deadlock recursion
 		if err := vl.currentFile.Sync(); err != nil {
 			return 0, 0, err
 		}
@@ -388,18 +385,18 @@ func (vl *ValueLog) AppendEntries(entries []ValueLogEntry) (uint32, uint32, erro
 		return 0, 0, err
 	}
 
-	vl.writeOffset += uint32(n)
+	vl.writeOffset += int64(n)
 	return vl.currentFid, startOffset, nil
 }
 
-func (vl *ValueLog) ReadValue(fileID uint32, offset uint32, valLen uint32) ([]byte, error) {
+func (vl *ValueLog) ReadValue(fileID uint32, offset int64, valLen uint32) ([]byte, error) {
 	f, err := vl.getFileHandle(fileID)
 	if err != nil {
 		return nil, err
 	}
 
 	header := make([]byte, ValueLogHeaderSize)
-	if _, err := f.ReadAt(header, int64(offset)); err != nil {
+	if _, err := f.ReadAt(header, offset); err != nil {
 		return nil, err
 	}
 
@@ -409,7 +406,7 @@ func (vl *ValueLog) ReadValue(fileID uint32, offset uint32, valLen uint32) ([]by
 	totalLen := ValueLogHeaderSize + keyLen + valLen
 	data := make([]byte, totalLen)
 
-	if _, err := f.ReadAt(data, int64(offset)); err != nil {
+	if _, err := f.ReadAt(data, offset); err != nil {
 		return nil, err
 	}
 
@@ -521,17 +518,17 @@ func (vl *ValueLog) Replay(maxTxID uint64, fn func(ValueLogEntry, EntryMeta) err
 	return nil
 }
 
-func (vl *ValueLog) Truncate(offset uint32) error {
+func (vl *ValueLog) Truncate(offset int64) error {
 	vl.mu.Lock()
 	defer vl.mu.Unlock()
 
 	// 1. Truncate the file physically
-	if err := vl.currentFile.Truncate(int64(offset)); err != nil {
+	if err := vl.currentFile.Truncate(offset); err != nil {
 		return err
 	}
 
 	// 2. Reset the file pointer (crucial for next write)
-	if _, err := vl.currentFile.Seek(int64(offset), 0); err != nil {
+	if _, err := vl.currentFile.Seek(offset, 0); err != nil {
 		return err
 	}
 

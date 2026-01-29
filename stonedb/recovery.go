@@ -23,14 +23,16 @@ func (db *DB) recoverValueLog() error {
 	return nil
 }
 
-func (db *DB) syncWALToValueLog(truncateCorrupt bool) error {
+// syncWALToValueLog replays WAL entries that are newer than the VLog state.
+// It uses history to skip orphaned writes from stale timelines.
+func (db *DB) syncWALToValueLog(truncateCorrupt bool, history []TimelineHistoryItem) error {
 	onTruncate := func() error {
 		indexPath := filepath.Join(db.dir, "index")
 		db.logger.Warn("WAL truncated due to corruption. Deleting LevelDB index to ensure consistency", "path", indexPath)
 		return os.RemoveAll(indexPath)
 	}
 
-	return db.writeAheadLog.ReplaySinceTx(db.valueLog, db.transactionID, truncateCorrupt, func(entries []ValueLogEntry) {
+	return db.writeAheadLog.ReplaySinceTx(db.valueLog, db.transactionID, history, truncateCorrupt, func(entries []ValueLogEntry) {
 		replayCount := 0
 		for _, e := range entries {
 			if e.TransactionID > db.transactionID {
