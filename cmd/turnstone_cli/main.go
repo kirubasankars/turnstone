@@ -58,6 +58,12 @@ func main() {
 	}
 	defer cl.Close()
 
+	// Verify connection with a Ping
+	if err := cl.Ping(); err != nil {
+		fmt.Printf("Failed to ping server: %v\n", err)
+		os.Exit(1)
+	}
+
 	fmt.Println("Connected.")
 	fmt.Println("Commands: select <db>, replicaof <host:port> <remote_db>, get <k>, set <k> <v>, del <k>, begin, commit, abort, stat, clear, quit")
 	fmt.Print("> ")
@@ -198,6 +204,9 @@ func handleCommand(cl *client.Client, cmd string, parts []string) {
 
 func printError(err error) {
 	switch {
+	case errors.Is(err, client.ErrConnection):
+		fmt.Println("ERR: Connection closed by server")
+		os.Exit(1)
 	case errors.Is(err, client.ErrNotFound):
 		fmt.Println("(nil)")
 	case errors.Is(err, client.ErrTxRequired):
