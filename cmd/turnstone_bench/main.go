@@ -13,6 +13,7 @@ import (
 	"math/big"
 	mrand "math/rand"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,9 +24,7 @@ import (
 
 var (
 	addr          = flag.String("addr", "localhost:6379", "Server address")
-	caFile        = flag.String("ca", "certs/ca.crt", "Path to CA certificate")
-	certFile      = flag.String("cert", "certs/client.crt", "Path to Client certificate")
-	keyFile       = flag.String("key", "certs/client.key", "Path to Client key")
+	home          = flag.String("home", ".", "Path to home directory containing certs/")
 	concurrency   = flag.Int("c", 50, "Number of concurrent clients")
 	totalOps      = flag.Int("n", 10000, "Total number of operations per phase")
 	valueSize     = flag.Int("v", 128, "Value size in bytes (for SET operations)")
@@ -52,6 +51,7 @@ func main() {
 
 	fmt.Printf("--- TurnstoneDB Benchmark (Async Pipeline) ---\n")
 	fmt.Printf("Server:       %s\n", *addr)
+	fmt.Printf("Home:         %s\n", *home)
 	fmt.Printf("Database:     %d\n", *dbNum)
 	fmt.Printf("Concurrency:  %d clients\n", *concurrency)
 	fmt.Printf("Total Ops:    %d\n", *totalOps)
@@ -81,16 +81,20 @@ func main() {
 }
 
 func loadTLSConfig() (*tls.Config, error) {
-	caCert, err := os.ReadFile(*caFile)
+	caPath := filepath.Join(*home, "certs", "ca.crt")
+	certPath := filepath.Join(*home, "certs", "client.crt")
+	keyPath := filepath.Join(*home, "certs", "client.key")
+
+	caCert, err := os.ReadFile(caPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read CA: %w", err)
+		return nil, fmt.Errorf("failed to read CA at %s: %w", caPath, err)
 	}
 	pool := x509.NewCertPool()
 	pool.AppendCertsFromPEM(caCert)
 
-	cert, err := tls.LoadX509KeyPair(*certFile, *keyFile)
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to load certs: %w", err)
+		return nil, fmt.Errorf("failed to load certs at %s/%s: %w", certPath, keyPath, err)
 	}
 
 	return &tls.Config{

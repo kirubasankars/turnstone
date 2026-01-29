@@ -8,17 +8,16 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
-	"turnstone/client" // Imports the local client package
+	"turnstone/client"
 )
 
 func main() {
 	host := flag.String("host", "localhost:6379", "Server address")
-	caFile := flag.String("ca", "", "CA Certificate file")
-	certFile := flag.String("cert", "", "Client Certificate file")
-	keyFile := flag.String("key", "", "Client Key file")
+	home := flag.String("home", ".", "Path to home directory containing certs/")
 	debug := flag.Bool("debug", false, "Enable debug logging")
 	flag.Parse()
 
@@ -34,11 +33,18 @@ func main() {
 	var err error
 
 	// 1. Connection Setup
-	if *caFile != "" && *certFile != "" && *keyFile != "" {
-		fmt.Printf("Connecting to %s via mTLS...\n", *host)
-		cl, err = client.NewMTLSClientHelper(*host, *caFile, *certFile, *keyFile, logger)
+	// Resolve certificate paths relative to home directory
+	caPath := filepath.Join(*home, "certs", "ca.crt")
+	certPath := filepath.Join(*home, "certs", "client.crt")
+	keyPath := filepath.Join(*home, "certs", "client.key")
+
+	// Check if certificates exist to determine connection mode
+	if _, err := os.Stat(caPath); err == nil {
+		fmt.Printf("Connecting to %s via mTLS (Home: %s)...\n", *host, *home)
+		cl, err = client.NewMTLSClientHelper(*host, caPath, certPath, keyPath, logger)
 	} else {
-		fmt.Printf("Connecting to %s via insecure TCP...\n", *host)
+		// Fallback to insecure if certs are missing in the expected location
+		fmt.Printf("Certificates not found at %s/certs. Connecting to %s via insecure TCP...\n", *home, *host)
 		cl, err = client.NewClient(client.Config{
 			Address:        *host,
 			ConnectTimeout: 5 * time.Second,
