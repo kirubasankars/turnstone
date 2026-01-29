@@ -15,13 +15,18 @@ import (
 	"sync"
 )
 
+const (
+	// DefaultMaxWALSize is 1GB. Large enough to batch IO, small enough to manage.
+	DefaultMaxWALSize = 1 * 1024 * 1024 * 1024
+)
+
 // WriteAheadLog handles append-only log files for crash recovery.
 type WriteAheadLog struct {
 	dir                string
 	currentFile        *os.File
 	currentStartOffset uint64 // Virtual offset of the start of the current file
 	writeOffset        uint32 // Offset within the current file
-	maxSize            uint32
+	maxSize            uint32 // Size threshold for rotation
 	mu                 sync.Mutex
 	logger             *slog.Logger
 
@@ -41,6 +46,10 @@ func OpenWriteAheadLog(dir string, maxSize uint32, requestedTL uint64, logger *s
 
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+
+	if maxSize == 0 {
+		maxSize = DefaultMaxWALSize
 	}
 
 	matches, err := filepath.Glob(filepath.Join(dir, "*.wal"))
@@ -173,7 +182,8 @@ func (wal *WriteAheadLog) AppendBatch(payload []byte) error {
 	wal.mu.Lock()
 	defer wal.mu.Unlock()
 
-	if wal.writeOffset > wal.maxSize {
+	// Check rotation threshold
+	if wal.writeOffset >= wal.maxSize {
 		if err := wal.rotate(); err != nil {
 			return err
 		}
@@ -190,78 +200,101 @@ func (wal *WriteAheadLog) AppendBatches(payloads [][]byte) error {
 	wal.mu.Lock()
 	defer wal.mu.Unlock()
 
-	// Capture state to attempt rollback on failure if possible
-	startFile := wal.currentFile
-	startOffset := wal.writeOffset
-	rotated := false
-
-	for _, payload := range payloads {
-		if wal.writeOffset > wal.maxSize {
-			if err := wal.rotate(); err != nil {
-				return err
-			}
-			rotated = true
-		}
-
-		if err := wal.writeFrame(payload); err != nil {
-			// If we haven't rotated, we can safely truncate back to the start of this batch group.
-			// This prevents "Phantom Data" where WAL has entries but client was told failure.
-			if !rotated && wal.currentFile == startFile {
-				wal.truncateSilent(int64(startOffset))
-				wal.writeOffset = startOffset
-			}
+	// Check rotation threshold before writing the group
+	if wal.writeOffset >= wal.maxSize {
+		if err := wal.rotate(); err != nil {
 			return err
 		}
 	}
 
+	// Track start offset for internal rollback if needed within this loop
+	startOffset := wal.writeOffset
+
+	for _, payload := range payloads {
+		if err := wal.writeFrame(payload); err != nil {
+			// If a write fails mid-batch, we attempt to clean up internally first.
+			_ = wal.truncateTailLocked(int64(wal.writeOffset - startOffset))
+			return err
+		}
+	}
+
+	// Sync only once for the whole group
 	return wal.currentFile.Sync()
 }
 
+// writeFrame writes a single frame atomically (header + payload).
+// It assumes the lock is held.
 func (wal *WriteAheadLog) writeFrame(payload []byte) error {
-	startOffset := wal.writeOffset
-
-	var header [8]byte
 	length := uint32(len(payload))
 	checksum := crc32.Checksum(payload, Crc32Table)
+	totalLen := WALHeaderSize + int(length)
 
-	binary.BigEndian.PutUint32(header[0:], length)
-	binary.BigEndian.PutUint32(header[4:], checksum)
+	// Combine Header and Payload into one buffer to reduce syscalls and partial writes
+	buf := make([]byte, totalLen)
+	binary.BigEndian.PutUint32(buf[0:], length)
+	binary.BigEndian.PutUint32(buf[4:], checksum)
+	copy(buf[8:], payload)
 
-	// Critical Section: Write I/O
-	// If any write fails, we must truncate back to startOffset to prevent corrupt/partial frames.
-	n1, err := wal.currentFile.Write(header[:])
+	n, err := wal.currentFile.Write(buf)
 	if err != nil {
-		wal.truncateSilent(int64(startOffset))
-		return err
-	}
-	n2, err := wal.currentFile.Write(payload)
-	if err != nil {
-		wal.truncateSilent(int64(startOffset))
 		return err
 	}
 
 	// Only update offsets and index on success
-	wal.writeOffset += uint32(n1 + n2)
+	currentFileOffset := wal.writeOffset
+	wal.writeOffset += uint32(n)
 
 	if len(payload) >= 16 {
 		startOpID := binary.BigEndian.Uint64(payload[8:])
 		wal.batchIndex[startOpID] = WALLocation{
 			FileStartOffset: wal.currentStartOffset,
-			RelativeOffset:  startOffset,
+			RelativeOffset:  currentFileOffset,
 		}
 	}
 
 	return nil
 }
 
-// truncateSilent attempts to revert the file to a specific size.
-// Errors are ignored as this is best-effort cleanup during an error path.
-func (wal *WriteAheadLog) truncateSilent(offset int64) {
-	_ = wal.currentFile.Truncate(offset)
-	_, _ = wal.currentFile.Seek(offset, 0)
+// TruncateTail removes the last N bytes from the active WAL file.
+// Used by the DB to rollback if the VLog write fails.
+func (wal *WriteAheadLog) TruncateTail(bytesToRemove int64) error {
+	wal.mu.Lock()
+	defer wal.mu.Unlock()
+	return wal.truncateTailLocked(bytesToRemove)
+}
+
+func (wal *WriteAheadLog) truncateTailLocked(bytesToRemove int64) error {
+	currentSize := int64(wal.writeOffset)
+	if currentSize < bytesToRemove {
+		return fmt.Errorf("cannot rollback across file boundary (offset %d < remove %d)", currentSize, bytesToRemove)
+	}
+
+	newOffset := currentSize - bytesToRemove
+	if err := wal.currentFile.Truncate(newOffset); err != nil {
+		return fmt.Errorf("truncate failed: %w", err)
+	}
+	if _, err := wal.currentFile.Seek(newOffset, 0); err != nil {
+		return fmt.Errorf("seek failed: %w", err)
+	}
+	wal.writeOffset = uint32(newOffset)
+	if err := wal.currentFile.Sync(); err != nil {
+		return fmt.Errorf("sync failed: %w", err)
+	}
+	return nil
+}
+
+func (wal *WriteAheadLog) Rotate() error {
+	wal.mu.Lock()
+	defer wal.mu.Unlock()
+	return wal.rotate()
 }
 
 func (wal *WriteAheadLog) rotate() error {
+	// Optimization: Do not rotate empty files
+	if wal.writeOffset == 0 {
+		return nil
+	}
+
 	if wal.onRotate != nil && len(wal.batchIndex) > 0 {
 		if err := wal.onRotate(wal.batchIndex); err != nil {
 			return fmt.Errorf("wal rotate hook failed: %w", err)
@@ -457,9 +490,38 @@ func (wal *WriteAheadLog) PurgeOlderThan(minOpID uint64) error {
 		currentPath := matches[i]
 		nextPath := matches[i+1]
 
+		// FIX 1: Clean up empty garbage files first
+		// This handles files accumulated from rapid restarts (Dev Mode)
+		if stat, err := os.Stat(currentPath); err == nil && stat.Size() == 0 {
+			wal.logger.Info("Purging empty WAL file", "file", filepath.Base(currentPath))
+			if err := os.Remove(currentPath); err != nil {
+				return err
+			}
+			continue
+		}
+
+		// FIX 2: Gracefully handle empty/unreadable NEXT file
 		nextStartOpID, err := wal.readFirstOpID(nextPath)
 		if err != nil {
-			break
+			// If we can't read the next file header, check if it's empty
+			if stat, sErr := os.Stat(nextPath); sErr == nil && stat.Size() == 0 {
+				// If next is the LAST file, it is the active head (just created).
+				// We cannot delete 'current' yet because 'next' has no ops to bound it.
+				// Stop the purge loop cleanly without error.
+				if i+1 == len(matches)-1 {
+					wal.logger.Debug("Next WAL file is active and empty, stopping purge", "current", filepath.Base(currentPath), "next", filepath.Base(nextPath))
+					break
+				}
+				// If next is NOT the last file, it is an empty intermediate file (garbage).
+				// We continue the loop. The next iteration will pick it up as 'currentPath'
+				// and delete it via FIX 1 above.
+				wal.logger.Info("Next WAL file is empty (intermediate), skipping boundary check", "next", filepath.Base(nextPath))
+				continue
+			}
+
+			// Genuine read error
+			wal.logger.Warn("Cannot read next WAL file header, skipping purge check for current file", "current", filepath.Base(currentPath), "next", filepath.Base(nextPath), "err", err)
+			continue
 		}
 
 		if nextStartOpID <= minOpID {
@@ -488,7 +550,8 @@ func (wal *WriteAheadLog) readFirstOpID(path string) (uint64, error) {
 	}
 
 	length := binary.BigEndian.Uint32(header[0:])
-	if length < WALBatchHeaderSize || uint32(length) > wal.maxSize+1024*1024 {
+	// Sanity Check: a batch must be at least as big as its header
+	if length < WALBatchHeaderSize {
 		return 0, fmt.Errorf("invalid batch length: %d", length)
 	}
 
@@ -598,6 +661,9 @@ func (wal *WriteAheadLog) replayFile(f *os.File, path string, vl *ValueLog, minT
 
 func (wal *WriteAheadLog) stream(r io.Reader, onPayload func(offset int64, payload []byte) error) (int64, error) {
 	validOffset := int64(0)
+	// Safety limit for a single frame read to prevent OOM on corrupt headers
+	const maxReadSize = 1 * 1024 * 1024 * 1024 // 1GB
+
 	for {
 		header := make([]byte, WALHeaderSize)
 		if _, err := io.ReadFull(r, header); err != nil {
@@ -610,7 +676,7 @@ func (wal *WriteAheadLog) stream(r io.Reader, onPayload func(offset int64, paylo
 		length := binary.BigEndian.Uint32(header[0:])
 		checksum := binary.BigEndian.Uint32(header[4:])
 
-		if uint32(length) > wal.maxSize+1024*1024 {
+		if length > maxReadSize {
 			return validOffset, ErrCorruptData
 		}
 
