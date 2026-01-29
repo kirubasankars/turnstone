@@ -33,7 +33,7 @@ type commitBatch struct {
 
 	// Persistence results needed for Index Update
 	fileID     uint32
-	baseOffset uint32
+	baseOffset int64 // Changed to int64
 }
 
 // processCommitBatch executes the 3-stage commit pipeline: Prepare -> Persist -> Apply.
@@ -94,26 +94,40 @@ func (db *DB) processCommitBatch(requests []commitRequest) {
 	batch.successAll()
 }
 
-func (db *DB) attemptRollbackAndFail(batch *commitBatch, originalErr error, vlogOffset uint32, walBytes int64) {
-	// Try VLog Truncate
-	if vErr := db.valueLog.Truncate(vlogOffset); vErr != nil {
-		// VLog truncate failed. This is bad but maybe effectively appended garbage if index wasn't updated.
-		// However, if we can't seek back, we are in trouble for next writes.
-		db.logger.Error("CRITICAL: Index failed and VLog rollback failed. Marking DB Corrupt.", "index_err", originalErr, "vlog_err", vErr)
-		atomic.StoreInt32(&db.isCorrupt, 1)
-		batch.failAll(fmt.Errorf("CRITICAL: Index failed and VLog rollback failed: %v", vErr))
-		return
+func (db *DB) attemptRollbackAndFail(batch *commitBatch, originalErr error, vlogOffset int64, walBytes int64) {
+	// Crash-Only Architecture:
+	// We attempt to rollback the disk state to ensure consistency.
+	// If rollback fails due to I/O errors (e.g. disk busy, permissions), we try a few times.
+	// If it still fails, we PANIC. This causes the process to exit.
+	// On restart, the DB recovery sequence (WAL replay/truncation) will automatically fix the torn state.
+	// We DO NOT mark the DB as "corrupt" and keep running, because that leaves it in a zombie state requiring manual intervention.
+
+	// 1. Rollback VLog
+	for i := 0; i < 10; i++ {
+		if vErr := db.valueLog.Truncate(vlogOffset); vErr == nil {
+			break
+		} else {
+			db.logger.Warn("VLog rollback failed, retrying...", "err", vErr, "attempt", i+1)
+			time.Sleep(500 * time.Millisecond)
+		}
+		if i == 9 {
+			db.logger.Error("CRITICAL: VLog Rollback failed after retries. Panicking to trigger recovery.")
+			panic("CRITICAL: VLog Rollback Failed - Storage Inconsistent")
+		}
 	}
 
-	// Try WAL Rollback
-	if wErr := db.rollbackWAL(walBytes); wErr != nil {
-		// WAL rollback failed (e.g. rotation boundary violation).
-		// We MUST mark the DB as corrupt to prevent further writes effectively relying on this WAL state
-		// or if we are in an inconsistent state where WAL has data but VLog/Index doesn't.
-		db.logger.Error("CRITICAL: Index failed, VLog rolled back, but WAL rollback failed. Marking DB Corrupt.", "index_err", originalErr, "wal_err", wErr)
-		atomic.StoreInt32(&db.isCorrupt, 1)
-		batch.failAll(fmt.Errorf("CRITICAL: WAL rollback failed: %v", wErr))
-		return
+	// 2. Rollback WAL
+	for i := 0; i < 10; i++ {
+		if wErr := db.rollbackWAL(walBytes); wErr == nil {
+			break
+		} else {
+			db.logger.Warn("WAL rollback failed, retrying...", "err", wErr, "attempt", i+1)
+			time.Sleep(500 * time.Millisecond)
+		}
+		if i == 9 {
+			db.logger.Error("CRITICAL: WAL Rollback failed after retries. Panicking to trigger recovery.")
+			panic("CRITICAL: WAL Rollback Failed - Storage Inconsistent")
+		}
 	}
 
 	// INFO: Successful recovery
@@ -189,10 +203,10 @@ func (db *DB) persistBatch(batch *commitBatch) (int64, error) {
 
 	fileID, offset, err := db.valueLog.AppendEntries(batch.combinedVLog)
 	if err != nil {
+		// Try immediate rollback if VLog write fails
 		if rbErr := db.rollbackWAL(walBytesWritten); rbErr != nil {
-			db.logger.Error("CRITICAL: Consistency violation in persistBatch. Marking Corrupt.", "wal_written", true, "vlog_err", err, "rollback_err", rbErr)
-			atomic.StoreInt32(&db.isCorrupt, 1) // Mark corrupt immediately
-			return 0, fmt.Errorf("CRITICAL: vlog write failed AND rollback failed: %v | Original Err: %w", rbErr, err)
+			db.logger.Error("CRITICAL: Consistency violation in persistBatch. Panicking.", "wal_written", true, "vlog_err", err, "rollback_err", rbErr)
+			panic(fmt.Sprintf("CRITICAL: vlog write failed AND rollback failed: %v", rbErr))
 		}
 		return 0, fmt.Errorf("vlog write failed (wal rolled back): %w", err)
 	}

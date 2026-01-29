@@ -9,17 +9,17 @@ import (
 // --- Constants ---
 
 const (
-	DefaultPort             = ":6379"
-	DefaultReadTimeout      = 5 * time.Second
-	DefaultWriteTimeout     = 5 * time.Second
-	IdleTimeout             = 3 * 60 * time.Second
-	ShutdownTimeout         = 10 * time.Second
-	MaxTxDuration           = 5 * time.Second        // Strict 5s limit
-	MaxTxSize               = 200 * 1024 * 1024      // 200MB Limit
-	MaxValueSize            = 64 * 1024              // 64KB Limit
-	MaxCommandSize          = 66 * 1024              // Val(64k) + Key(1k) + Overhead
-	MaxTransactionBufferSize = 64 * 1024 * 1024      // 64MB Limit for buffering a tx in memory (replication/server)
-	HeaderSize              = 16                     // Meta(4) + LogSeq(8) + CRC(4)
+	DefaultPort              = ":6379"
+	DefaultReadTimeout       = 5 * time.Second
+	DefaultWriteTimeout      = 5 * time.Second
+	IdleTimeout              = 3 * 60 * time.Second
+	ShutdownTimeout          = 10 * time.Second
+	MaxTxDuration            = 30 * time.Second        // Strict 30s limit
+	MaxTxSize                = 200 * 1024 * 1024       // 200MB Limit
+	MaxValueSize             = 4 * 1024 * 1024         // 4MB Limit
+	MaxCommandSize           = 512 * 1024 * 1024       // 512MB Limit (Must fit in uint32)
+	MaxTransactionBufferSize = 64 * 1024 * 1024        // 64MB Limit for buffering a tx in memory (replication/server)
+	HeaderSize               = 16                      // Meta(4) + LogSeq(8) + CRC(4)
 
 	ProtoHeaderSize      = 5
 	CheckpointInterval   = 512 * 1024 * 1024

@@ -54,7 +54,7 @@ func (db *DB) RunCompaction() (bool, error) {
 		if staleBatch.Len() > 0 {
 			if err := db.ldb.Write(staleBatch, &opt.WriteOptions{Sync: true}); err != nil {
 				return err
-						}
+			}
 			staleBatch.Reset()
 		}
 		return nil
@@ -241,7 +241,7 @@ func (db *DB) rewriteBatch(entries []ValueLogEntry) error {
 			// Update Index to point to NEW VLog location
 			meta := EntryMeta{
 				FileID:        fileID,
-				ValueOffset:   currentOffset,
+				ValueOffset:   currentOffset, // int64
 				ValueLen:      uint32(len(e.Value)),
 				TransactionID: e.TransactionID,
 				OperationID:   e.OperationID,
@@ -257,7 +257,7 @@ func (db *DB) rewriteBatch(entries []ValueLogEntry) error {
 			batch.Delete(encodeIndexKey(e.Key, e.TransactionID))
 		}
 
-		currentOffset += uint32(recSize)
+		currentOffset += int64(recSize)
 	}
 
 	if batch.Len() > 0 {

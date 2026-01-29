@@ -7,6 +7,7 @@ import (
 	"hash/crc32"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -364,7 +365,9 @@ func (wal *WriteAheadLog) ForceNewTimeline(newTimelineID uint64) error {
 	return nil
 }
 
-func (wal *WriteAheadLog) ReplaySinceTx(vl *ValueLog, minTxID uint64, truncateCorrupt bool, onReplay func([]ValueLogEntry), onTruncate func() error) error {
+// ReplaySinceTx replays WAL entries from the given txID.
+// It accepts a timeline history to ensure we don't replay "zombie" writes from abandoned timelines.
+func (wal *WriteAheadLog) ReplaySinceTx(vl *ValueLog, minTxID uint64, history []TimelineHistoryItem, truncateCorrupt bool, onReplay func([]ValueLogEntry), onTruncate func() error) error {
 	wal.mu.Lock()
 	defer wal.mu.Unlock()
 
@@ -383,7 +386,7 @@ func (wal *WriteAheadLog) ReplaySinceTx(vl *ValueLog, minTxID uint64, truncateCo
 
 		isLastFile := (i == len(matches)-1)
 
-		err = wal.replayFile(f, path, vl, minTxID, truncateCorrupt, isLastFile, onReplay, onTruncate)
+		err = wal.replayFile(f, path, vl, minTxID, history, truncateCorrupt, isLastFile, onReplay, onTruncate)
 		f.Close()
 
 		if err != nil {
@@ -590,8 +593,21 @@ func (wal *WriteAheadLog) scanFile(f *os.File, startOffset int64, fn func([]Valu
 	return err
 }
 
-func (wal *WriteAheadLog) replayFile(f *os.File, path string, vl *ValueLog, minTxID uint64, truncateCorrupt bool, isLastFile bool, onReplay func([]ValueLogEntry), onTruncate func() error) error {
+func (wal *WriteAheadLog) replayFile(f *os.File, path string, vl *ValueLog, minTxID uint64, history []TimelineHistoryItem, truncateCorrupt bool, isLastFile bool, onReplay func([]ValueLogEntry), onTruncate func() error) error {
 	reader := bufio.NewReader(f)
+
+	// FIX: Parse timeline from filename to support history pruning
+	fileTL, _, _ := parseWALFilename(path)
+
+	// FIX: Find the Cutoff OpID for this timeline from history
+	var cutoffOp uint64 = math.MaxUint64
+	for _, h := range history {
+		if h.TLI == fileTL {
+			cutoffOp = h.EndOp
+			break
+		}
+	}
+
 	validOffset, err := wal.stream(reader, func(offset int64, payload []byte) error {
 		txID, startOpID, entries := decodeWALBatchEntries(payload)
 
@@ -600,6 +616,16 @@ func (wal *WriteAheadLog) replayFile(f *os.File, path string, vl *ValueLog, minT
 				FileStartOffset: wal.currentStartOffset,
 				RelativeOffset:  uint32(offset),
 			}
+		}
+
+		// FIX: Check if this batch is orphaned (belongs to a dead branch of history)
+		if startOpID > cutoffOp {
+			wal.logger.Warn("Skipping orphaned WAL batch (exceeds timeline history)",
+				"file", filepath.Base(path),
+				"file_tl", fileTL,
+				"op_id", startOpID,
+				"cutoff", cutoffOp)
+			return nil
 		}
 
 		if txID > minTxID {

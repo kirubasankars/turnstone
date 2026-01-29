@@ -14,6 +14,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -269,6 +270,17 @@ type connState struct {
 func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 	// Base logger with remote IP (available immediately)
 	connLogger := s.logger.With("remote", conn.RemoteAddr().String())
+
+	// PANIC RECOVERY Middleware
+	defer func() {
+		if r := recover(); r != nil {
+			connLogger.Error("CRITICAL: Panic recovered in client handler",
+				"err", r,
+				"stack", string(debug.Stack()))
+			// Close connection explicitly to prevent leaks
+			_ = conn.Close()
+		}
+	}()
 
 	defer func() {
 		_ = conn.Close()

@@ -23,6 +23,13 @@ var (
 	ErrBatchFull            = errors.New("replication batch full")
 )
 
+const (
+	// ReplicaWriteTimeout ensures we don't block indefinitely on a hung consumer.
+	ReplicaWriteTimeout = 10 * time.Second
+	// SnapshotRateLimit caps the full-sync bandwidth to prevent disk/network thrashing (32MB/s).
+	SnapshotRateLimit = 32 * 1024 * 1024
+)
+
 type replPacket struct {
 	dbName string
 	opCode uint8
@@ -33,11 +40,9 @@ type replPacket struct {
 // HandleReplicaConnection handles the handshake for incoming replicas (Followers or CDC).
 // It now uses the context-aware logger from the connection state (*connState).
 func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []byte, st *connState) {
-	// Clear deadlines for long-lived replication stream
-	if err := conn.SetDeadline(time.Time{}); err != nil {
-		st.logger.Error("Failed to clear deadlines", "err", err)
-		return
-	}
+	// We do NOT clear deadlines globally anymore. We set them per-operation.
+	// However, for the READER, we might want a long idle timeout (handled in heartbeat logic usually),
+	// but for the WRITER, we must be strict.
 
 	// 1. Parse Hello: [Ver:4][IDLen:4][ID][NumDBs:4] ...
 	if len(payload) < 8 {
@@ -174,7 +179,7 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 	outCh := make(chan replPacket, 10)
 	errCh := make(chan error, 1)
 	done := make(chan struct{})
-	defer close(done)
+	defer close(done) // Closing done signals streamDB producers to stop
 
 	var wg sync.WaitGroup
 
@@ -194,10 +199,12 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 		}
 	}
 
-	// ACK Reader
+	// ACK Reader (KeepAlive & Progress)
 	go func() {
 		h := make([]byte, 5)
 		for {
+			// Allow a generous read deadline for heartbeats, but not infinite
+			_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 			if _, err := io.ReadFull(r, h); err != nil {
 				select {
 				case errCh <- err:
@@ -231,6 +238,7 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 	}()
 
 	// Central Writer
+	// This loop multiplexes packets from all DB streams into the single net.Conn.
 	for {
 		select {
 		case <-mergedKill:
@@ -260,8 +268,16 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 			header[0] = p.opCode
 			binary.BigEndian.PutUint32(header[1:], uint32(finalPayloadLen))
 
-			// Write strictly without Deadlines to allow slow consumers
+			// Enforce strict Write Deadline to prevent blocking streamDB
+			// If the client is slow/hung, we drop them.
+			if err := conn.SetWriteDeadline(time.Now().Add(ReplicaWriteTimeout)); err != nil {
+				st.logger.Warn("Failed to set write deadline", "err", err)
+				return
+			}
+
+			// Write Header
 			if _, err := conn.Write(header); err != nil {
+				st.logger.Warn("Replica write failed (header)", "err", err)
 				return
 			}
 
@@ -269,11 +285,13 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 			crcBuf := make([]byte, 4)
 			binary.BigEndian.PutUint32(crcBuf, crc)
 			if _, err := conn.Write(crcBuf); err != nil {
+				st.logger.Warn("Replica write failed (crc)", "err", err)
 				return
 			}
 
 			// Write Body
 			if _, err := conn.Write(rawBody); err != nil {
+				st.logger.Warn("Replica write failed (body)", "err", err)
 				return
 			}
 		}
@@ -299,7 +317,7 @@ func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh c
 		return nil
 	}
 
-	// Retry loop for WAL Streaming vs Snapshot Fallback (Patch 2)
+	// Retry loop for WAL Streaming vs Snapshot Fallback
 	for {
 		// 1. Snapshot Check / WAL Availability
 		// If WAL is unavailable, we MUST snapshot.
@@ -313,6 +331,10 @@ func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh c
 			// INFO: Snapshot required
 			logger.Info("Replica lag exceeds WAL retention. Starting Full Snapshot.", "db", name, "req_seq", currentLogID, "head", st.LastOpID())
 
+			// Rate Limiting State
+			var bytesSent int64
+			startTime := time.Now()
+
 			snapTxID, snapOpID, snapErr := st.StreamSnapshot(func(batch []stonedb.SnapshotEntry) error {
 				var buf bytes.Buffer
 				for _, e := range batch {
@@ -321,6 +343,18 @@ func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh c
 					binary.Write(&buf, binary.BigEndian, uint32(len(e.Value)))
 					buf.Write(e.Value)
 				}
+
+				// Rate Limiting Logic:
+				// Calculate expected duration for bytes sent so far.
+				// If actual duration is less, sleep the difference.
+				payloadSize := int64(buf.Len())
+				bytesSent += payloadSize
+				expectedDuration := time.Duration((float64(bytesSent) / float64(SnapshotRateLimit)) * float64(time.Second))
+				if elapsed := time.Since(startTime); elapsed < expectedDuration {
+					// Throttle
+					time.Sleep(expectedDuration - elapsed)
+				}
+
 				select {
 				case outCh <- replPacket{
 					dbName: name,
