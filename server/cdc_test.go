@@ -279,7 +279,8 @@ func TestCDC_PurgedWAL_TriggersSnapshot(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	addr := srv.listener.Addr().String()
-	promoteNode(t, dir, addr, "1")
+	// Removed redundant promoteNode call as setupTestEnv already sets Primary state
+	
 	clientTLS := getClientTLS(t, dir)
 	cdcTLS := getRoleTLS(t, dir, "cdc")
 	adminTLS := getRoleTLS(t, dir, "admin")
@@ -304,11 +305,9 @@ func TestCDC_PurgedWAL_TriggersSnapshot(t *testing.T) {
 	c1.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusOK)
 
 	// 2. Force WAL Rotation using Promote() (File 1 -> File 2)
-	// Note: We use the internal store method to bypass the "Must be UNDEFINED" check
-	// because we just want to force a rotation for testing, not change topology.
 	st1 := stores["1"]
 	
-	// FIX: StepDown first before calling Promote via admin client
+	// FIX: StepDown first before calling Promote via admin client to satisfy UNDEFINED requirement
 	cAdmin := connectClient(t, addr, adminTLS)
 	selectDatabase(t, cAdmin, "1")
 	cAdmin.AssertStatus(protocol.OpCodeStepDown, nil, protocol.ResStatusOK)

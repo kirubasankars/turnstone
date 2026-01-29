@@ -40,14 +40,14 @@ var (
 )
 
 var (
-	ErrTxnFinished    = errors.New("transaction is already finished")
-	ErrWriteConflict  = errors.New("write conflict detected")
-	ErrKeyNotFound    = errors.New("key not found")
-	ErrChecksum       = errors.New("checksum mismatch")
-	ErrCorruptData    = errors.New("data corruption detected")
-	ErrTruncated      = errors.New("wal truncated due to corruption")
-	ErrLogUnavailable = errors.New("wal log unavailable for requested operation id")
-	ErrDiskFull       = errors.New("disk usage exceeds threshold")
+	ErrTxnFinished      = errors.New("transaction is already finished")
+	ErrWriteConflict    = errors.New("write conflict detected")
+	ErrKeyNotFound      = errors.New("key not found")
+	ErrChecksum         = errors.New("checksum mismatch")
+	ErrCorruptData      = errors.New("data corruption detected")
+	ErrTruncated        = errors.New("wal truncated due to corruption")
+	ErrLogUnavailable   = errors.New("wal log unavailable for requested operation id")
+	ErrDiskFull         = errors.New("disk usage exceeds threshold")
 )
 
 // Options allows configuring the store behavior on Open
@@ -57,9 +57,9 @@ type Options struct {
 	// If false, Open will return an error on corruption.
 	TruncateCorruptWAL bool
 
-	// MaxWALSize is the threshold in bytes at which the WAL file is rotated.
-	// If 0, a default of 10MB is used.
-	MaxWALSize uint32
+	// MaxVLogSize is the threshold in bytes at which the ValueLog file is rotated.
+	// If 0, defaults to 200MB.
+	MaxVLogSize uint32
 
 	// CompactionMinGarbage is the minimum amount of stale data (in bytes)
 	// required in a file before it becomes a candidate for compaction.
