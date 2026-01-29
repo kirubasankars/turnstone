@@ -17,6 +17,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"turnstone/protocol"
+
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/opt"
 	"github.com/syndtr/goleveldb/leveldb/util"
@@ -92,8 +94,8 @@ func Open(dir string, opts Options) (*DB, error) {
 		return nil, err
 	}
 
-	if opts.MaxWALSize == 0 {
-		opts.MaxWALSize = 10 * 1024 * 1024
+	if opts.MaxVLogSize == 0 {
+		opts.MaxVLogSize = protocol.DefaultMaxVLogSize
 	}
 	if opts.CompactionMinGarbage == 0 {
 		opts.CompactionMinGarbage = 1024 * 1024
@@ -121,12 +123,13 @@ func Open(dir string, opts Options) (*DB, error) {
 		return nil, fmt.Errorf("load timeline meta: %w", err)
 	}
 
-	wal, err := OpenWriteAheadLog(filepath.Join(dir, "wal"), opts.MaxWALSize, meta.CurrentTimeline, logger)
+	// WAL now depends on explicit rotation, MaxWALSize used for safety check only
+	wal, err := OpenWriteAheadLog(filepath.Join(dir, "wal"), 0, meta.CurrentTimeline, logger)
 	if err != nil {
 		return nil, fmt.Errorf("open wal: %w", err)
 	}
 
-	vl, err := OpenValueLog(filepath.Join(dir, "vlog"), logger)
+	vl, err := OpenValueLog(filepath.Join(dir, "vlog"), opts.MaxVLogSize, logger)
 	if err != nil {
 		_ = wal.Close()
 		return nil, fmt.Errorf("open vlog: %w", err)
@@ -150,8 +153,7 @@ func Open(dir string, opts Options) (*DB, error) {
 		logger:                 logger,
 	}
 
-	// CHANGED: Reduced from INFO to DEBUG to prevent log spam on startup
-	logger.Debug("Opening Database", "wal_max_size", opts.MaxWALSize)
+	logger.Debug("Opening Database", "vlog_max_size", opts.MaxVLogSize)
 
 	if err := db.recoverValueLog(); err != nil {
 		db.Close()
@@ -354,6 +356,17 @@ func (db *DB) startBackgroundTasks() {
 
 func (db *DB) KeyCount() (int64, error) {
 	return atomic.LoadInt64(&db.keyCount), nil
+}
+
+// TotalGarbageBytes calculates the total number of stale bytes in the ValueLog.
+func (db *DB) TotalGarbageBytes() int64 {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	var total int64
+	for _, size := range db.deletedBytesByFile {
+		total += size
+	}
+	return total
 }
 
 func (db *DB) scanKeyCount() (int64, error) {
@@ -802,7 +815,6 @@ func (db *DB) Checkpoint() error {
 	}
 
 	// FIX: Clean up ALL existing garbage stats first to prevent resurrection of deleted files
-	// This ensures we only persist what is currently in memory
 	iter := db.ldb.NewIterator(util.BytesPrefix(sysStaleBytesPrefix), nil)
 	cleanupBatch := new(leveldb.Batch)
 	for iter.Next() {
@@ -824,11 +836,22 @@ func (db *DB) Checkpoint() error {
 		binary.BigEndian.PutUint64(v, uint64(size))
 		batch.Put(k, v)
 	}
-	if err := db.valueLog.Rotate(); err != nil {
-		return err
+
+	// Rotate VLog only if it has reached the size threshold.
+	// This prevents rotating small files during frequent checkpoints,
+	// while ensuring full files become immutable for compaction.
+	if db.valueLog.writeOffset >= db.valueLog.maxSize {
+		if err := db.valueLog.Rotate(); err != nil {
+			return fmt.Errorf("vlog rotate failed: %w", err)
+		}
 	}
+
+	// Always rotate WAL during checkpoint
+	if err := db.writeAheadLog.Rotate(); err != nil {
+		return fmt.Errorf("wal rotate failed: %w", err)
+	}
+
 	atomic.StoreUint64(&db.lastCkptOpID, atomic.LoadUint64(&db.operationID))
-	// Always sync sequences during checkpoint to be safe
 	db.persistSequences()
 
 	if batch.Len() == 0 {
