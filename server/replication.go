@@ -25,7 +25,7 @@ var (
 
 const (
 	// ReplicaWriteTimeout ensures we don't block indefinitely on a hung consumer.
-	ReplicaWriteTimeout = 10 * time.Second
+	ReplicaWriteTimeout = 10 * 60 * time.Second
 	// SnapshotRateLimit caps the full-sync bandwidth to prevent disk/network thrashing (32MB/s).
 	SnapshotRateLimit = 32 * 1024 * 1024
 )
@@ -320,14 +320,13 @@ func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh c
 	// Retry loop for WAL Streaming vs Snapshot Fallback
 	for {
 		// 1. Snapshot Check / WAL Availability
-		// If WAL is unavailable, we MUST snapshot.
-		// If WAL is available, we proceed to stream it.
-		// We use a check + loop structure to handle race conditions where WAL disappears.
+		// Use the Store method to check if we are out of sync with the WAL
+		snapshotRequired, err := st.IsSnapshotRequired(currentLogID)
+		if err != nil {
+			return err
+		}
 
-		// Check WAL Availability first
-		err := st.ScanWAL(currentLogID+1, func([]stonedb.ValueLogEntry) error { return nil })
-
-		if err == stonedb.ErrLogUnavailable && currentLogID < st.LastOpID() {
+		if snapshotRequired {
 			// INFO: Snapshot required
 			logger.Info("Replica lag exceeds WAL retention. Starting Full Snapshot.", "db", name, "req_seq", currentLogID, "head", st.LastOpID())
 
@@ -407,7 +406,7 @@ func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh c
 
 		// 2. WAL Streaming Loop
 		if err := s.runWALStreamLoop(name, st, currentLogID, outCh, done, logger); err != nil {
-			// If error is ErrLogUnavailable, break inner loop and retry outer loop (which will trigger snapshot)
+			// If error is OUT_OF_SYNC or ErrLogUnavailable, break inner loop and retry outer loop (which will trigger snapshot)
 			// This handles the race condition where WAL was purged between check and stream.
 			if err.Error() == "OUT_OF_SYNC" || errors.Is(err, stonedb.ErrLogUnavailable) {
 				logger.Warn("WAL unavailable during stream, falling back to snapshot", "db", name)

@@ -91,7 +91,7 @@ func NewStore(dir string, logger *slog.Logger, minReplicas int, walStrategy stri
 
 	opts := stonedb.Options{
 		// MaxWALSize removed - handled by time-based checkpointing
-		CompactionMinGarbage: 4 * 1024 * 1024,
+		CompactionMinGarbage: 64 * 1024 * 1024,
 		TruncateCorruptWAL:   truncateWAL,
 		MaxDiskUsagePercent:  maxDiskUsage,
 		BlockCacheSize:       blockCacheSize,
@@ -137,10 +137,11 @@ func NewStore(dir string, logger *slog.Logger, minReplicas int, walStrategy stri
 	return s, nil
 }
 
-// Reset wipes the database and restarts it. This is used when a full snapshot
-// is received from the leader, requiring a clean slate.
+// Reset performs a hard wipe of the database.
+// WARNING: This operation deletes all data on disk and starts fresh.
+// As per configuration, no backup is created.
 func (s *Store) Reset() error {
-	s.logger.Warn("Resetting database state (Snapshot detected)")
+	s.logger.Warn("Resetting database (Destructive wipe requested)")
 
 	// 1. Disconnect any downstream consumers to prevent them from reading invalid state
 	s.RemoveAllReplicas()
@@ -154,26 +155,25 @@ func (s *Store) Reset() error {
 		return fmt.Errorf("close failed during reset: %w", err)
 	}
 
-	// 4. Wipe Data Files
-	// We preserve the directory but remove all contents
+	// 4. Delete Data
+	// Iterate and delete to preserve the root folder permissions if possible,
+	// but failing that, we just recreate.
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
 		return fmt.Errorf("read dir failed: %w", err)
 	}
 
 	for _, e := range entries {
-		// Delete everything including replication slots, logs, and index
 		path := filepath.Join(s.dir, e.Name())
 		if err := os.RemoveAll(path); err != nil {
-			s.logger.Error("Failed to delete file during reset", "path", path, "err", err)
-			return err
+			return fmt.Errorf("failed to wipe path %s: %w", path, err)
 		}
 	}
 
 	// 5. Re-Open Database
 	newDB, err := stonedb.Open(s.dir, s.dbOpts)
 	if err != nil {
-		return fmt.Errorf("reopen failed during reset: %w", err)
+		return fmt.Errorf("reopen failed after wipe: %w", err)
 	}
 
 	// 6. Swap Pointer
@@ -182,8 +182,34 @@ func (s *Store) Reset() error {
 	// Reset leader constraint on reset (we are starting fresh)
 	s.SetLeaderSafeSeq(math.MaxUint64)
 
-	s.logger.Info("Database reset complete")
+	s.logger.Info("Database reset complete (Data wiped)")
 	return nil
+}
+
+// IsSnapshotRequired determines if a replica needs a full snapshot.
+// Returns true if the requested log sequence (plus one) is no longer available in the WAL.
+func (s *Store) IsSnapshotRequired(reqLogID uint64) (bool, error) {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+
+	lastOp := s.DB.LastOpID()
+
+	// If up to date or ahead, no snapshot required.
+	if reqLogID >= lastOp {
+		return false, nil
+	}
+
+	// We are behind. Check if we can stream from WAL.
+	err := s.DB.ScanWAL(reqLogID+1, func([]stonedb.ValueLogEntry) error { return nil })
+
+	if err == stonedb.ErrLogUnavailable {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+
+	return false, nil
 }
 
 // SetLeaderSafeSeq updates the retention barrier received from the upstream leader.

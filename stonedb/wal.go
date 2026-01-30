@@ -11,9 +11,11 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"errors"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 )
 
 const (
@@ -169,7 +171,7 @@ func (wal *WriteAheadLog) FindInMemory(opID uint64) (WALLocation, bool) {
 			if !found || op > bestOp {
 				bestOp = op
 				found = true
-			}
+						}
 		}
 	}
 
@@ -177,6 +179,24 @@ func (wal *WriteAheadLog) FindInMemory(opID uint64) (WALLocation, bool) {
 		return wal.batchIndex[bestOp], true
 	}
 	return WALLocation{}, false
+}
+
+// strictSync enforces durability. If the disk fails, the process dies.
+// This prevents "The False Success" where the OS marks dirty pages as clean after an error.
+func (wal *WriteAheadLog) strictSync() error {
+	err := wal.currentFile.Sync()
+	if err != nil {
+		// 1. Transient errors (interrupted system call) can be retried.
+		if errors.Is(err, syscall.EINTR) {
+			return wal.strictSync()
+		}
+
+		// 2. CRITICAL HARDWARE FAILURE (EIO, EROFS, ENOSPC).
+		// We cannot trust the OS page cache. We must crash immediately.
+		wal.logger.Error("CRITICAL: fsync failed. Storage integrity compromised. Panicking.", "err", err)
+		panic(fmt.Sprintf("CRITICAL STORAGE FAILURE: %v", err))
+	}
+	return nil
 }
 
 func (wal *WriteAheadLog) AppendBatch(payload []byte) error {
@@ -194,7 +214,7 @@ func (wal *WriteAheadLog) AppendBatch(payload []byte) error {
 		return err
 	}
 
-	return wal.currentFile.Sync()
+	return wal.strictSync()
 }
 
 func (wal *WriteAheadLog) AppendBatches(payloads [][]byte) error {
@@ -220,7 +240,7 @@ func (wal *WriteAheadLog) AppendBatches(payloads [][]byte) error {
 	}
 
 	// Sync only once for the whole group
-	return wal.currentFile.Sync()
+	return wal.strictSync()
 }
 
 // writeFrame writes a single frame atomically (header + payload).
@@ -278,7 +298,8 @@ func (wal *WriteAheadLog) truncateTailLocked(bytesToRemove int64) error {
 		return fmt.Errorf("seek failed: %w", err)
 	}
 	wal.writeOffset = uint32(newOffset)
-	if err := wal.currentFile.Sync(); err != nil {
+	// Rollback also requires sync to be durable
+	if err := wal.strictSync(); err != nil {
 		return fmt.Errorf("sync failed: %w", err)
 	}
 	return nil
@@ -303,7 +324,7 @@ func (wal *WriteAheadLog) rotate() error {
 	}
 	wal.batchIndex = make(map[uint64]WALLocation)
 
-	if err := wal.currentFile.Sync(); err != nil {
+	if err := wal.strictSync(); err != nil {
 		return err
 	}
 	if err := wal.currentFile.Close(); err != nil {
@@ -334,7 +355,7 @@ func (wal *WriteAheadLog) ForceNewTimeline(newTimelineID uint64) error {
 		return fmt.Errorf("new timeline %d must be greater than current %d", newTimelineID, wal.timelineID)
 	}
 
-	if err := wal.currentFile.Sync(); err != nil {
+	if err := wal.strictSync(); err != nil {
 		return err
 	}
 	if err := wal.currentFile.Close(); err != nil {
@@ -640,45 +661,17 @@ func (wal *WriteAheadLog) replayFile(f *os.File, path string, vl *ValueLog, minT
 	})
 
 	if err != nil {
-		needsTruncate := false
 		if err == io.ErrUnexpectedEOF || err == ErrChecksum || err == ErrCorruptData {
-			if truncateCorrupt && isLastFile {
-				// WARN: Corruption handled
-				wal.logger.Warn("WAL corruption detected in LAST file (truncating)", "file", filepath.Base(path), "offset", validOffset, "err", err)
-				needsTruncate = true
-			} else {
-				msg := "WAL corruption"
-				if !isLastFile {
-					msg = "WAL corruption in middle file (truncation forbidden)"
-				}
-				// ERROR: Fatal corruption
-				wal.logger.Error(msg, "file", filepath.Base(path), "offset", validOffset, "err", err)
-				return fmt.Errorf("%s in %s at offset %d: %w", msg, path, validOffset, err)
-			}
+			// Prioritize Durability: Do not truncate. Treat as fatal corruption.
+			// This forces manual intervention (admin decision) rather than silent data loss.
+			// Exception: Standard EOF is handled by stream return value.
+			wal.logger.Error("WAL corruption detected. Refusing to truncate automatically.",
+				"file", filepath.Base(path),
+				"offset", validOffset,
+				"err", err)
+			return fmt.Errorf("FATAL: WAL corruption at offset %d in %s: %w. Manual intervention required.", validOffset, path, err)
 		} else if err != io.EOF {
 			return err
-		}
-
-		if needsTruncate {
-			fTrunc, err := os.OpenFile(path, os.O_RDWR, 0o644)
-			if err != nil {
-				return err
-			}
-			defer fTrunc.Close()
-			if err := fTrunc.Truncate(validOffset); err != nil {
-				return err
-			}
-
-			if path == wal.currentFile.Name() {
-				wal.writeOffset = uint32(validOffset)
-			}
-
-			if onTruncate != nil {
-				if err := onTruncate(); err != nil {
-					return err
-				}
-			}
-			return ErrTruncated
 		}
 	}
 

@@ -63,6 +63,9 @@ type Server struct {
 	// Active connections object tracking for StepDown
 	activeClientsMu sync.Mutex
 	activeClients   map[string]map[net.Conn]struct{}
+
+	// Buffer Pool for Request Reading to prevent DoS via allocation churn
+	bufPool sync.Pool
 }
 
 func NewServer(id string, addr string, stores map[string]*store.Store, logger *slog.Logger, maxConns int, tlsCert, tlsKey, tlsCA string, rm *replication.ReplicationManager, devMode bool) (*Server, error) {
@@ -95,6 +98,14 @@ func NewServer(id string, addr string, stores map[string]*store.Store, logger *s
 		devMode:       devMode,
 		dbConns:       make(map[string]int64),
 		activeClients: make(map[string]map[net.Conn]struct{}),
+		// Initialize Buffer Pool for standard requests
+		bufPool: sync.Pool{
+			New: func() interface{} {
+				// Default 4KB buffer covers 99% of GET/PING/SELECT requests
+				b := make([]byte, 4096)
+				return &b
+			},
+		},
 	}
 
 	if err := s.ReloadTLS(); err != nil {
@@ -371,13 +382,41 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 
 		opCode := header[0]
 		payloadLen := binary.BigEndian.Uint32(header[1:])
+
+		// 1. Safety Check: Enforce Protocol Limit BEFORE allocation
 		if payloadLen > protocol.MaxCommandSize {
 			connLogger.Warn("Protocol violation: entity too large", "size", payloadLen, "limit", protocol.MaxCommandSize)
 			_ = s.writeBinaryResponse(conn, protocol.ResStatusEntityTooLarge, nil)
 			return
 		}
 
-		payload := make([]byte, payloadLen)
+		var payload []byte
+		var bufPtr *[]byte
+
+		// 2. Allocation Strategy: Use Pool for standard requests to prevent GC churn
+		// Only use pool if request is reasonably small (<= 4MB).
+		// Huge payloads (e.g. 50MB bulk load) should be allocated directly
+		// to avoid polluting the pool with oversized buffers that won't be reused often.
+		const MaxPoolableSize = 4 * 1024 * 1024
+
+		if payloadLen <= MaxPoolableSize {
+			bufPtr = s.bufPool.Get().(*[]byte)
+			buf := *bufPtr
+
+			// Grow buffer if needed, but respect cap limits
+			if uint32(cap(buf)) < payloadLen {
+				// Too small, make a new one. The old one in bufPtr is lost to GC, which is fine.
+				buf = make([]byte, payloadLen)
+			} else {
+				buf = buf[:payloadLen]
+			}
+			payload = buf
+		} else {
+			// Direct allocation for huge payloads
+			payload = make([]byte, payloadLen)
+		}
+
+		// 3. Read Body
 		if _, err := io.ReadFull(r, payload); err != nil {
 			connLogger.Warn("Read payload failed (truncated)", "err", err)
 			return
@@ -388,6 +427,12 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 		if s.dispatchCommand(conn, r, opCode, payload, state) {
 			return
 		}
+
+		// 4. Return to Pool (if used and still efficient)
+		if bufPtr != nil && uint32(cap(payload)) <= MaxPoolableSize {
+			*bufPtr = payload
+			s.bufPool.Put(bufPtr)
+		}
 	}
 }
 
@@ -397,6 +442,17 @@ func (s *Server) dispatchCommand(conn net.Conn, r io.Reader, opCode uint8, paylo
 		st.logger.Warn("Access denied", "opcode", fmt.Sprintf("0x%02x", opCode))
 		_ = s.writeBinaryResponse(conn, protocol.ResStatusErr, []byte("Permission Denied for role: "+st.role))
 		return false
+	}
+
+	// Transaction Context Check: Ensure state-changing or administrative commands are not executed inside a transaction
+	if st.tx != nil {
+		switch opCode {
+		case protocol.OpCodeSelect, protocol.OpCodeReplicaOf, protocol.OpCodeStepDown,
+			protocol.OpCodePromote, protocol.OpCodeFlushDB, protocol.OpCodeCheckpoint,
+			protocol.OpCodeStat, protocol.OpCodeQuit:
+			_ = s.writeBinaryResponse(conn, protocol.ResStatusErr, []byte("Command not allowed inside a transaction"))
+			return false
+		}
 	}
 
 	// DEBUG: Verbose protocol logging (usually disabled)
@@ -437,6 +493,8 @@ func (s *Server) dispatchCommand(conn net.Conn, r io.Reader, opCode uint8, paylo
 		s.handleStepDown(conn, st)
 	case protocol.OpCodeCheckpoint:
 		s.handleCheckpoint(conn, st)
+	case protocol.OpCodeFlushDB:
+		s.handleFlushDB(conn, st)
 	case protocol.OpCodeStat:
 		s.handleStat(conn, st)
 	case protocol.OpCodeReplHello:
@@ -933,12 +991,6 @@ func (s *Server) handleReplicaOf(w io.Writer, payload []byte, st *connState) {
 		return
 	}
 
-	// Transaction Check
-	if st.tx != nil {
-		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Cannot call REPLICAOF inside a transaction"))
-		return
-	}
-
 	// VALID ONLY IF UNDEFINED
 	if st.db.GetState() != store.StateUndefined {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Must be in UNDEFINED state to call REPLICAOF"))
@@ -983,12 +1035,6 @@ func (s *Server) handleReplicaOf(w io.Writer, payload []byte, st *connState) {
 }
 
 func (s *Server) handlePromote(w io.Writer, payload []byte, st *connState) {
-	// Transaction Check
-	if st.tx != nil {
-		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Cannot call PROMOTE inside a transaction"))
-		return
-	}
-
 	currentState := st.db.GetState()
 
 	// Consolidated check for consistency with REPLICAOF message style
@@ -1023,12 +1069,6 @@ func (s *Server) handlePromote(w io.Writer, payload []byte, st *connState) {
 }
 
 func (s *Server) handleStepDown(w io.Writer, st *connState) {
-	// Transaction Check
-	if st.tx != nil {
-		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Cannot call STEPDOWN inside a transaction"))
-		return
-	}
-
 	// Only allow StepDown if actively running as Primary or Replica
 	currentState := st.db.GetState()
 	if currentState != store.StatePrimary && currentState != store.StateReplica {
@@ -1105,15 +1145,59 @@ func (s *Server) handleCheckpoint(w io.Writer, st *connState) {
 	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
 }
 
+func (s *Server) handleFlushDB(w io.Writer, st *connState) {
+	if st.db == nil {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Database selected"))
+		return
+	}
+
+	if st.role != RoleAdmin && st.role != RoleServer {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Permission Denied: FLUSHDB requires admin role"))
+		return
+	}
+
+	st.logger.Warn("FLUSHDB requested", "db", st.dbName, "client", st.clientID)
+
+	// 1. Stop Upstream Replication (Remove REPLICAOF)
+	if s.replManager != nil && s.replManager.IsReplicating(st.dbName) {
+		s.replManager.StopReplication(st.dbName)
+	}
+
+	// 2. Perform Reset (Wipes data, disconnects downstream replicas)
+	// Reset() inside store.go handles s.RemoveAllReplicas() which kills existing downstream connections.
+	if err := st.db.Reset(); err != nil {
+		st.logger.Error("FLUSHDB failed", "err", err)
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte(fmt.Sprintf("FLUSHDB failed: %v", err)))
+		return
+	}
+
+	// 3. Transition to UNDEFINED
+	// The database is now empty and has no role. It requires explicit promotion or replication configuration.
+	st.db.SetState(store.StateUndefined)
+
+	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
+}
+
 func (s *Server) handleStat(w io.Writer, st *connState) {
 	if st.db == nil {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Database selected"))
 		return
 	}
+
 	stats := st.db.Stats()
 	conns := s.DatabaseConns(st.dbName)
+	dbState := st.db.GetState()
+	minReplicas := st.db.MinReplicas()
+
+	if dbState == store.StateReplica && s.replManager != nil {
+		addr, remoteDB := s.replManager.GetReplicationSource(st.dbName)
+		if addr != "" {
+			dbState = fmt.Sprintf("REPLICAOF %s %s", addr, remoteDB)
+		}
+	}
 
 	response := struct {
+		State             string `json:"state"`
 		KeyCount          int64  `json:"key_count"`
 		GarbageBytes      int64  `json:"garbage_bytes"`
 		Conflicts         uint64 `json:"conflicts"`
@@ -1123,7 +1207,9 @@ func (s *Server) handleStat(w io.Writer, st *connState) {
 		ActiveTxs         int    `json:"active_txs"`
 		ReplicaLag        uint64 `json:"replica_lag"`
 		Uptime            string `json:"uptime"`
+		MinReplicas       int    `json:"min_replicas"`
 	}{
+		State:             dbState,
 		KeyCount:          stats.KeyCount,
 		GarbageBytes:      stats.GarbageBytes,
 		Conflicts:         stats.Conflicts,
@@ -1133,6 +1219,7 @@ func (s *Server) handleStat(w io.Writer, st *connState) {
 		ActiveTxs:         stats.ActiveTxs,
 		ReplicaLag:        stats.ReplicaLag,
 		Uptime:            stats.Uptime,
+		MinReplicas:       minReplicas,
 	}
 
 	data, err := json.Marshal(response)

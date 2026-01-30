@@ -67,21 +67,33 @@ func (db *DB) processCommitBatch(requests []commitRequest) {
 		return
 	}
 
-	vlogPreOffset := db.valueLog.writeOffset
-
 	// Stage 2: Persistence (IO)
 	walBytesWritten, err := db.persistBatch(batch)
 	if err != nil || walBytesWritten == 0 {
-		db.logger.Error("Batch persistence failed", "err", err, "wal_bytes", walBytesWritten)
+		// If WAL write fails, we mark the DB as corrupt immediately.
+		// We do NOT attempt to proceed.
+		atomic.StoreInt32(&db.isCorrupt, 1)
+
+		db.logger.Error("CRITICAL: WAL Persistence failed. Database entering CORRUPT state.", "err", err)
+
+		// Fail the batch. The client receives an error.
+		// Future writes will be rejected by the gatekeeper check in prepareBatch.
 		batch.failAll(err)
 		return
 	}
 
 	// Stage 3: Application (Memory/Index)
+	// Only proceed if WAL is guaranteed on disk (handled by strictSync in persistence layer).
 	if err := db.applyBatchIndex(batch); err != nil {
-		db.logger.Error("Index application failed, attempting rollback", "err", err)
-		db.attemptRollbackAndFail(batch, err, vlogPreOffset, walBytesWritten)
-		return
+		// If Index update fails (memory/logic error), we must crash or mark corrupt.
+		// We cannot have the WAL say "Committed" but the Index say "Not Found".
+		atomic.StoreInt32(&db.isCorrupt, 1)
+		db.logger.Error("CRITICAL: Index application failed after WAL commit. Database CORRUPT.", "err", err)
+
+		// Note: We intentionally do NOT fail the batch here because the data IS in the WAL.
+		// It is durable. The Index is just broken. Recovery can fix the Index.
+		// We crash to force that recovery.
+		panic("CRITICAL: Index inconsistent with WAL. Crashing to trigger Index Rebuild.")
 	}
 
 	// WARN: Slow operations
@@ -222,23 +234,7 @@ func (db *DB) rollbackWAL(bytesToRemove int64) error {
 	wal.mu.Lock()
 	defer wal.mu.Unlock()
 
-	currentSize := int64(wal.writeOffset)
-	if currentSize < bytesToRemove {
-		return fmt.Errorf("cannot rollback across file boundary (offset %d < remove %d)", currentSize, bytesToRemove)
-	}
-
-	newOffset := currentSize - bytesToRemove
-	if err := wal.currentFile.Truncate(newOffset); err != nil {
-		return fmt.Errorf("truncate failed: %w", err)
-	}
-	if _, err := wal.currentFile.Seek(newOffset, 0); err != nil {
-		return fmt.Errorf("seek failed: %w", err)
-	}
-	wal.writeOffset = uint32(newOffset)
-	if err := wal.currentFile.Sync(); err != nil {
-		return fmt.Errorf("sync failed: %w", err)
-	}
-	return nil
+	return wal.truncateTailLocked(bytesToRemove)
 }
 
 func (db *DB) applyBatchIndex(batch *commitBatch) error {
