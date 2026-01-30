@@ -37,6 +37,7 @@ const (
 	OpCodePromote          = 0x34
 	OpCodeStepDown         = 0x35
 	OpCodeCheckpoint       = 0x36
+	OpCodeFlushDB          = 0x37
 	OpCodeReplHello        = 0x50
 	OpCodeReplBatch        = 0x51
 	OpCodeReplAck          = 0x52
@@ -66,16 +67,16 @@ const (
 )
 
 var (
-	ErrNotFound       = errors.New("key not found")
-	ErrInvalidKey     = errors.New("key must contain only ASCII characters")
-	ErrTxRequired     = errors.New("transaction required for this operation")
-	ErrTxTimeout      = errors.New("transaction timed out")
-	ErrTxConflict     = errors.New("transaction conflict detected")
-	ErrTxInProgress   = errors.New("transaction already in progress")
-	ErrServerBusy     = errors.New("server is busy")
-	ErrEntityTooLarge = errors.New("entity too large")
-	ErrMemoryLimit    = errors.New("server memory limit exceeded")
-	ErrConnection     = errors.New("connection error")
+	ErrNotFound        = errors.New("key not found")
+	ErrInvalidKey      = errors.New("key must contain only ASCII characters")
+	ErrTxRequired      = errors.New("transaction required for this operation")
+	ErrTxTimeout       = errors.New("transaction timed out")
+	ErrTxConflict      = errors.New("transaction conflict detected")
+	ErrTxInProgress    = errors.New("transaction already in progress")
+	ErrServerBusy      = errors.New("server is busy")
+	ErrEntityTooLarge  = errors.New("entity too large")
+	ErrMemoryLimit     = errors.New("server memory limit exceeded")
+	ErrConnection      = errors.New("connection error")
 )
 
 var Crc32Table = crc32.MakeTable(crc32.Castagnoli)
@@ -393,6 +394,11 @@ func (c *Client) StepDown() error {
 
 func (c *Client) Checkpoint() error {
 	_, err := c.roundTrip(OpCodeCheckpoint, nil)
+	return err
+}
+
+func (c *Client) FlushDB() error {
+	_, err := c.roundTrip(OpCodeFlushDB, nil)
 	return err
 }
 
