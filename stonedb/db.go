@@ -20,11 +20,6 @@ import (
 	"github.com/syndtr/goleveldb/leveldb/util"
 )
 
-type commitRequest struct {
-	tx   *Transaction
-	resp chan error
-}
-
 // DB is the main database struct (formerly Store)
 type DB struct {
 	dir                string
@@ -57,6 +52,11 @@ type DB struct {
 	// Config
 	minGarbageThreshold int64
 	checksumInterval    time.Duration
+}
+
+type commitRequest struct {
+	tx   *Transaction
+	resp chan error
 }
 
 // Open initializes the DB
@@ -176,11 +176,10 @@ func Open(dir string, opts Options) (*DB, error) {
 		fmt.Printf("Warning: failed to load garbage stats: %v\n", err)
 	}
 
-	if db.operationID == 0 {
-		db.operationID = 1
-	}
+	// REMOVED: initialization of operationID to 1.
+	// Group commit logic pre-increments, so starting at 0 gives ID 1 for first op.
 
-	// 8. Initialize Auto-Checkpoint, Compaction, Checksumming & Group Commit
+	// 8. Initialize Auto-Checkpoint, Compaction & Checksumming
 	db.lastCkptOpID = db.operationID
 
 	waitCount := 3 // checkpoint + compaction + groupCommit
@@ -215,7 +214,6 @@ func (db *DB) runGroupCommits() {
 		}
 
 		// 2. Drain pending items (non-blocking) up to max batch size
-		// 128 is a reasonable batch size to balance latency and throughput
 	Loop:
 		for len(batch) < 128 {
 			select {
@@ -321,7 +319,7 @@ func (db *DB) commitGroup(requests []commitRequest) {
 	}
 
 	// Phase 3: Update Index & Clocks
-	// Calculate stale bytes (requires iterating Index, similar to single commit)
+	// Calculate stale bytes
 	iter := db.ldb.NewIterator(nil, nil)
 	for _, entry := range combinedVLog {
 		seekKey := encodeIndexKey(entry.Key, math.MaxUint64)
@@ -365,7 +363,6 @@ func (db *DB) SetCompactionMinGarbage(minGarbage int64) {
 }
 
 // runAutoCheckpoint triggers a checkpoint every 60 seconds if new mutations have occurred.
-// It also purges old WAL files that are safely persisted in the ValueLog/Index.
 func (db *DB) runAutoCheckpoint() {
 	defer db.wg.Done()
 	ticker := time.NewTicker(60 * time.Second)
@@ -494,7 +491,6 @@ func (db *DB) NewTransaction(update bool) *Transaction {
 		update:     update,
 	}
 
-	// Register in the active transactions map (Fast O(1) insert)
 	db.activeTxnsMu.Lock()
 	db.activeTxns[tx] = readTxID
 	db.activeTxnsMu.Unlock()
@@ -738,59 +734,4 @@ func (db *DB) UpdateIndexForEntries(entries []ValueLogEntry, fileID uint32, base
 		db.mu.Unlock()
 	}
 	return nil
-}
-
-// KeyCount returns the number of live keys in the database.
-// This operation iterates over the index and can be slow for large datasets.
-func (db *DB) KeyCount() (int64, error) {
-	// Acquire a snapshot to ensure a consistent view
-	snap, err := db.ldb.GetSnapshot()
-	if err != nil {
-		return 0, err
-	}
-	defer snap.Release()
-
-	iter := snap.NewIterator(nil, nil)
-	defer iter.Release()
-
-	var count int64
-	var lastKey []byte
-
-	for iter.Next() {
-		rawKey := iter.Key()
-
-		// Skip system keys (starting with '!')
-		if len(rawKey) > 0 && rawKey[0] == '!' {
-			continue
-		}
-
-		// Decode the Index Key: UserKey + 0x00 + InvTxID
-		// We only want to count the latest version of each key.
-		uKey, _, err := decodeIndexKey(rawKey)
-		if err != nil {
-			continue
-		}
-
-		// Since iteration is sorted, versions of the same key appear consecutively.
-		// If this UserKey matches the last one we saw, it's an older version. Skip it.
-		if bytes.Equal(uKey, lastKey) {
-			continue
-		}
-
-		// This is the latest version of a new key.
-		// Make a copy because iter.Key() buffer is reused.
-		lastKey = append([]byte{}, uKey...)
-
-		// Check if it's a tombstone
-		meta, err := decodeEntryMeta(iter.Value())
-		if err != nil {
-			continue
-		}
-
-		if !meta.IsTombstone {
-			count++
-		}
-	}
-
-	return count, iter.Error()
 }
