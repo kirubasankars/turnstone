@@ -137,18 +137,21 @@ func (tx *Transaction) Commit() error {
 	return <-req.resp
 }
 
-// checkConflicts verifies that none of the keys read by this transaction
+// checkConflicts verifies that none of the keys read OR written by this transaction
 // have been modified by another transaction that committed after this transaction started.
+// This enforces Snapshot Isolation (First-Committer-Wins) and Serializability (Stale Read Protection).
 func (tx *Transaction) checkConflicts() error {
-	if len(tx.readSet) == 0 {
+	if len(tx.readSet) == 0 && len(tx.pendingOps) == 0 {
 		return nil
 	}
 
 	iter := tx.db.ldb.NewIterator(nil, nil)
 	defer iter.Release()
 
-	for k := range tx.readSet {
+	// Helper to check a single key against the index
+	check := func(k string) error {
 		keyBytes := []byte(k)
+		// Search for the latest committed version of this key
 		seekKey := encodeIndexKey(keyBytes, math.MaxUint64)
 
 		if iter.Seek(seekKey) {
@@ -156,13 +159,35 @@ func (tx *Transaction) checkConflicts() error {
 			uKey, version, err := decodeIndexKey(foundKey)
 
 			if err == nil && bytes.Equal(uKey, keyBytes) {
+				// If the latest version in DB is newer than our snapshot (readTxID),
+				// it means someone else committed a change concurrently.
 				if version > tx.readTxID {
 					return ErrWriteConflict
 				}
 			}
 		}
+		return nil
 	}
+
+	// 1. Validate Read Set (Prevent Stale Reads / Write Skew)
+	for k := range tx.readSet {
+		if err := check(k); err != nil {
+			return err
+		}
+	}
+
+	// 2. Validate Write Set (Prevent Lost Updates / First-Committer-Wins)
+	// We must ensure that we are not overwriting a value committed by a concurrent transaction,
+	// even if we didn't read it (Blind Writes).
+	for k := range tx.pendingOps {
+		// Optimization: if k in readSet, we already checked it above.
+		if _, ok := tx.readSet[k]; ok {
+			continue
+		}
+		if err := check(k); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
-
-// Removed prepareCommitBatches from here since it's now handled in db.go commitGroup
