@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"turnstone/protocol"
+	"turnstone/replication"
 	"turnstone/stonedb"
 	"turnstone/store"
 )
@@ -40,9 +41,10 @@ type Server struct {
 	tlsKeyFile       string
 	tlsCAFile        string
 	currentTLSConfig atomic.Value
+	replManager      *replication.ReplicationManager
 }
 
-func NewServer(addr string, stores map[string]*store.Store, logger *slog.Logger, maxConns int, tlsCert, tlsKey, tlsCA string) (*Server, error) {
+func NewServer(addr string, stores map[string]*store.Store, logger *slog.Logger, maxConns int, tlsCert, tlsKey, tlsCA string, rm *replication.ReplicationManager) (*Server, error) {
 	if tlsCert == "" || tlsKey == "" || tlsCA == "" {
 		return nil, fmt.Errorf("tls cert, key, and ca required")
 	}
@@ -67,6 +69,7 @@ func NewServer(addr string, stores map[string]*store.Store, logger *slog.Logger,
 		tlsCertFile:      tlsCert,
 		tlsKeyFile:       tlsKey,
 		tlsCAFile:        tlsCA,
+		replManager:      rm,
 	}
 
 	if err := s.ReloadTLS(); err != nil {
@@ -79,6 +82,11 @@ func NewServer(addr string, stores map[string]*store.Store, logger *slog.Logger,
 		},
 		MinVersion: tls.VersionTLS12,
 		ClientAuth: tls.RequireAndVerifyClientCert,
+	}
+
+	// Start Replication Manager if present
+	if s.replManager != nil {
+		go s.replManager.Start()
 	}
 
 	return s, nil
@@ -208,13 +216,13 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 
 		_ = conn.SetWriteDeadline(time.Now().Add(protocol.DefaultWriteTimeout))
 
-		if s.dispatchCommand(conn, opCode, payload, state) {
+		if s.dispatchCommand(conn, r, opCode, payload, state) {
 			return
 		}
 	}
 }
 
-func (s *Server) dispatchCommand(conn net.Conn, opCode uint8, payload []byte, st *connState) bool {
+func (s *Server) dispatchCommand(conn net.Conn, r io.Reader, opCode uint8, payload []byte, st *connState) bool {
 	switch opCode {
 	case protocol.OpCodePing:
 		_ = s.writeBinaryResponse(conn, protocol.ResStatusOK, []byte("PONG"))
@@ -236,8 +244,12 @@ func (s *Server) dispatchCommand(conn net.Conn, opCode uint8, payload []byte, st
 		s.handleDel(conn, payload, st)
 	case protocol.OpCodeStat:
 		s.handleStat(conn, st)
-	case protocol.OpCodeReplicaOf, protocol.OpCodeReplHello:
-		_ = s.writeBinaryResponse(conn, protocol.ResStatusErr, []byte("Replication not supported in simple mode"))
+	case protocol.OpCodeReplicaOf:
+		s.handleReplicaOf(conn, payload, st)
+	case protocol.OpCodeReplHello:
+		// Hand off control to specialized handler
+		s.HandleReplicaConnection(conn, r, payload)
+		return true // Connection takeover
 	default:
 		_ = s.writeBinaryResponse(conn, protocol.ResStatusErr, []byte("Unknown OpCode"))
 	}
@@ -396,15 +408,6 @@ func (s *Server) handleDel(w io.Writer, payload []byte, st *connState) {
 	}
 }
 
-func isASCII(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if s[i] > 127 {
-			return false
-		}
-	}
-	return true
-}
-
 func (s *Server) handleStat(w io.Writer, st *connState) {
 	if st.partition == nil {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Partition selected"))
@@ -415,6 +418,34 @@ func (s *Server) handleStat(w io.Writer, st *connState) {
 	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, []byte(msg))
 }
 
+func (s *Server) handleReplicaOf(w io.Writer, payload []byte, st *connState) {
+	if s.replManager == nil {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Replication disabled on server"))
+		return
+	}
+	// Decode: [AddrLen][Addr][RemotePartitionName]
+	if len(payload) < 4 {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Invalid payload"))
+		return
+	}
+	addrLen := binary.BigEndian.Uint32(payload[:4])
+	if len(payload) < 4+int(addrLen) {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Invalid payload addr len"))
+		return
+	}
+	addr := string(payload[4 : 4+addrLen])
+	remotePart := string(payload[4+addrLen:])
+
+	if addr == "" && addrLen == 0 {
+		// Stop replication
+		s.replManager.StopReplication(st.partitionName)
+	} else {
+		// Start replication
+		s.replManager.AddReplica(st.partitionName, addr, remotePart)
+	}
+	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
+}
+
 func (s *Server) CloseAll() {
 	if s.listener != nil {
 		_ = s.listener.Close()
@@ -422,6 +453,15 @@ func (s *Server) CloseAll() {
 	for _, store := range s.stores {
 		_ = store.Close()
 	}
+}
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] > 127 {
+			return false
+		}
+	}
+	return true
 }
 
 // ActiveConns returns number of activeConns
@@ -436,6 +476,5 @@ func (s *Server) TotalConns() uint64 {
 
 // ActiveTxs return number of active transactions (only those with open txn objects)
 func (s *Server) ActiveTxs() int64 {
-	// Not explicitly tracking count in this simplified version
 	return 0
 }

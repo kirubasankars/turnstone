@@ -623,7 +623,7 @@ func decodeWALBatchEntries(payload []byte) (uint64, uint64, []ValueLogEntry) {
 			Key:           append([]byte{}, key...),
 			Value:         append([]byte{}, val...),
 			TransactionID: txID,
-			OperationID:   startOpID + opIdx + 1,
+			OperationID:   startOpID + opIdx, // FIXED: Removed +1 to match encoding
 			IsDelete:      isDelete,
 		})
 		opIdx++
