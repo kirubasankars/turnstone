@@ -187,9 +187,32 @@ func (db *DB) KeyCount() (int64, error) {
 	}
 	iter := db.ldb.NewIterator(nil, nil)
 	defer iter.Release()
+
+	var lastKey []byte
+
 	for iter.Next() {
-		if !bytes.HasPrefix(iter.Key(), []byte("!sys!")) {
-			count++
+		if bytes.HasPrefix(iter.Key(), []byte("!sys!")) {
+			continue
+		}
+
+		// Decode index key to get the logical key
+		key, _, err := decodeIndexKey(iter.Key())
+		if err != nil {
+			continue
+		}
+
+		// Check if we have seen this key before.
+		// Since LevelDB is sorted (Key ASC, Version DESC), the first time we see a key
+		// it is the latest version.
+		if !bytes.Equal(key, lastKey) {
+			// It's a new key (or the first one). Check if it's alive.
+			meta, err := decodeEntryMeta(iter.Value())
+			if err == nil && !meta.IsTombstone {
+				count++
+			}
+
+			// Update lastKey. Must copy because iter buffer is reused.
+			lastKey = append([]byte(nil), key...)
 		}
 	}
 	return count, nil
