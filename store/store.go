@@ -31,9 +31,10 @@ import (
 
 // StoreStats holds basic metrics.
 type StoreStats struct {
-	KeyCount int
-	Uptime   string
-	Offset   int64 // Represents the WAL/VLog offset or similar metric
+	KeyCount  int
+	Uptime    string
+	Offset    int64 // Represents the WAL/VLog offset or similar metric
+	Conflicts uint64
 }
 
 // Store wraps stonedb.DB to provide a compatibility layer, stats, and replication logic.
@@ -54,7 +55,8 @@ func NewStore(dir string, logger *slog.Logger, walSync bool, minReplicas int, is
 	opts := stonedb.Options{
 		MaxWALSize:           10 * 1024 * 1024,
 		CompactionMinGarbage: 4 * 1024 * 1024,
-		// walSync isn't directly exposed in Options yet, assuming fsync is default in stonedb
+		// Enable truncation to recover from partial writes/corruption automatically
+		TruncateCorruptWAL: true,
 	}
 
 	db, err := stonedb.Open(dir, opts)
@@ -162,10 +164,16 @@ func (s *Store) Close() error {
 func (s *Store) Stats() StoreStats {
 	count, _ := s.DB.KeyCount()
 	return StoreStats{
-		KeyCount: int(count),
-		Uptime:   time.Since(s.startTime).Round(time.Second).String(),
-		Offset:   int64(s.DB.LastOpID()),
+		KeyCount:  int(count),
+		Uptime:    time.Since(s.startTime).Round(time.Second).String(),
+		Offset:    int64(s.DB.LastOpID()),
+		Conflicts: s.DB.GetConflicts(),
 	}
+}
+
+// ActiveTransactionCount returns the number of active transactions in the underlying DB.
+func (s *Store) ActiveTransactionCount() int {
+	return s.DB.ActiveTransactionCount()
 }
 
 // RegisterReplica adds a replica to the tracking map.

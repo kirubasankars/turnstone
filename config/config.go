@@ -32,6 +32,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 )
 
@@ -78,6 +79,17 @@ func GenerateConfigArtifacts(homeDir string, defaultCfg Config, configPath strin
 	for _, d := range []string{"certs"} {
 		if err := os.MkdirAll(ResolvePath(homeDir, d), 0o755); err != nil {
 			return fmt.Errorf("failed to create %s directory: %w", d, err)
+		}
+	}
+
+	// Create data directories for partitions.
+	// Partition 0 is reserved for internal purposes.
+	// If NumberOfPartitions is N, we create partitions 0, 1, ..., N.
+	for i := 0; i <= defaultCfg.NumberOfPartitions; i++ {
+		partID := strconv.Itoa(i)
+		partPath := filepath.Join(homeDir, "data", partID)
+		if err := os.MkdirAll(partPath, 0o755); err != nil {
+			return fmt.Errorf("failed to create data directory for partition %s: %w", partID, err)
 		}
 	}
 

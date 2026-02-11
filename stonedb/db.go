@@ -45,7 +45,7 @@ type commitRequest struct {
 	resp chan error
 }
 
-// DB is the main database struct (formerly Store)
+// DB is the main database struct.
 type DB struct {
 	dir                string
 	ldb                *leveldb.DB
@@ -56,22 +56,25 @@ type DB struct {
 	mu       sync.RWMutex
 	commitMu sync.Mutex
 
-	// Two clocks:
-	transactionID uint64 // Clock for Transactions (Batch ID)
-	operationID   uint64 // Clock for Every Operation (Global Op ID)
+	// Clocks
+	transactionID uint64
+	operationID   uint64
 
-	// Transaction Lifecycle & Garbage Collection
+	// Metrics (Atomic counters)
+	metricsConflicts uint64
+
+	// Transaction State
 	activeTxnsMu   sync.Mutex
-	activeTxns     map[*Transaction]uint64 // Map active Tx -> ReadTxID (Restored for O(1) performance)
-	pendingDeletes []pendingFile           // Files waiting for active txns to finish
+	activeTxns     map[*Transaction]uint64
+	pendingDeletes []pendingFile
 
-	// Auto-Checkpoint & Background Tasks
+	// Background Tasks
 	closeCh      chan struct{}
 	wg           sync.WaitGroup
 	lastCkptOpID uint64
-	closed       int32 // Atomic flag to ensure idempotent Close
+	closed       int32
 
-	// Group Commit
+	// Group Commit Pipeline
 	commitCh chan commitRequest
 
 	// Config
@@ -79,27 +82,25 @@ type DB struct {
 	checksumInterval    time.Duration
 }
 
-// Open initializes the DB
+// Open initializes the DB.
 func Open(dir string, opts Options) (*DB, error) {
 	if err := os.MkdirAll(dir, dirMode); err != nil {
 		return nil, err
 	}
 
 	if opts.MaxWALSize == 0 {
-		opts.MaxWALSize = 10 * 1024 * 1024 // 10MB Default
+		opts.MaxWALSize = 10 * 1024 * 1024
 	}
-
 	if opts.CompactionMinGarbage == 0 {
-		opts.CompactionMinGarbage = 1024 * 1024 // 1MB Default
+		opts.CompactionMinGarbage = 1024 * 1024
 	}
 
-	// 1. Open WriteAheadLog (Directory based now)
+	// 1. Storage Components
 	wal, err := OpenWriteAheadLog(filepath.Join(dir, "wal"), opts.MaxWALSize)
 	if err != nil {
 		return nil, fmt.Errorf("open wal: %w", err)
 	}
 
-	// 2. Open ValueLog
 	vl, err := OpenValueLog(filepath.Join(dir, "vlog"))
 	if err != nil {
 		wal.Close()
@@ -113,31 +114,50 @@ func Open(dir string, opts Options) (*DB, error) {
 		deletedBytesByFile:  make(map[uint32]int64),
 		activeTxns:          make(map[*Transaction]uint64),
 		closeCh:             make(chan struct{}),
-		commitCh:            make(chan commitRequest, 500), // Buffer for concurrency
+		commitCh:            make(chan commitRequest, 500),
 		minGarbageThreshold: opts.CompactionMinGarbage,
 		checksumInterval:    opts.ChecksumInterval,
 	}
 
-	// 3. Recover ValueLog (Source of Truth #1)
+	// 2. Recovery (VLog -> WAL -> Index)
 	if err := db.recoverValueLog(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("recover vlog: %w", err)
 	}
 
-	// 4. Sync WAL to ValueLog (Source of Truth #2)
-	// We pass the option to allow truncation of corrupt WAL tails
 	if err := db.syncWALToValueLog(opts.TruncateCorruptWAL); err != nil {
-		db.Close() // Will handle nil ldb gracefully now
+		db.Close()
 		return nil, fmt.Errorf("sync wal: %w", err)
 	}
 
-	// 5. Open LevelDB (Index)
+	// 3. Index Init
+	if err := db.openLevelDB(dir); err != nil {
+		db.Close()
+		return nil, err
+	}
+
+	// 4. Hook WAL Rotation
+	db.writeAheadLog.SetOnRotate(db.onWALRotate)
+
+	// 5. Load Metadata
+	if err := db.loadDeletedBytesStats(); err != nil {
+		fmt.Printf("Warning: failed to load garbage stats: %v\n", err)
+	}
+
+	// 6. Start Background Routines
+	db.startBackgroundTasks()
+
+	return db, nil
+}
+
+func (db *DB) openLevelDB(dir string) error {
 	indexPath := filepath.Join(dir, "index")
 	ldbOpts := &opt.Options{
 		BlockCacheCapacity: 64 * 1024 * 1024,
 		Compression:        opt.SnappyCompression,
 	}
 
+	var err error
 	db.ldb, err = leveldb.OpenFile(indexPath, ldbOpts)
 
 	needsRebuild := false
@@ -147,59 +167,24 @@ func Open(dir string, opts Options) (*DB, error) {
 		os.RemoveAll(indexPath)
 		db.ldb, err = leveldb.OpenFile(indexPath, ldbOpts)
 		if err != nil {
-			db.Close()
-			return nil, fmt.Errorf("open fresh leveldb: %w", err)
+			return fmt.Errorf("open fresh leveldb: %w", err)
 		}
-	} else {
-		if !db.isIndexConsistent() {
-			fmt.Println("Index is stale/inconsistent, rebuilding from ValueLog...")
-			needsRebuild = true
-		}
+	} else if !db.isIndexConsistent() {
+		fmt.Println("Index is stale, rebuilding...")
+		needsRebuild = true
 	}
 
 	if needsRebuild {
 		if err := db.RebuildIndexFromVLog(); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("rebuild index: %w", err)
+			return fmt.Errorf("rebuild index: %w", err)
 		}
 	}
+	return nil
+}
 
-	// 6. Connect WAL Rotation to LevelDB
-	db.writeAheadLog.SetOnRotate(func(index map[uint64]WALLocation) error {
-		if len(index) == 0 {
-			return nil
-		}
-		if db.ldb == nil {
-			return nil
-		}
-
-		batch := new(leveldb.Batch)
-		var keys []uint64
-		for k := range index {
-			keys = append(keys, k)
-		}
-		sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
-
-		for _, opID := range keys {
-			loc := index[opID]
-			locBytes, err := json.Marshal(loc)
-			if err != nil {
-				return err
-			}
-			batch.Put(encodeWALIndexKey(opID), locBytes)
-		}
-		return db.ldb.Write(batch, nil)
-	})
-
-	// 7. Load persisted deleted bytes stats
-	if err := db.loadDeletedBytesStats(); err != nil {
-		fmt.Printf("Warning: failed to load garbage stats: %v\n", err)
-	}
-
-	// 8. Initialize Auto-Checkpoint, Compaction & Checksumming
+func (db *DB) startBackgroundTasks() {
 	db.lastCkptOpID = db.operationID
-
-	waitCount := 3 // checkpoint + compaction + groupCommit
+	waitCount := 3
 	if db.checksumInterval > 0 {
 		waitCount++
 	}
@@ -212,21 +197,17 @@ func Open(dir string, opts Options) (*DB, error) {
 	if db.checksumInterval > 0 {
 		go db.runBackgroundChecksum()
 	}
-
-	return db, nil
 }
 
-// KeyCount returns the approximate number of keys in the database.
+// KeyCount returns approximate key count.
 func (db *DB) KeyCount() (int64, error) {
 	count := int64(0)
-	// Guard against nil LDB if called during partial Open/Close
 	if db.ldb == nil {
 		return 0, nil
 	}
 	iter := db.ldb.NewIterator(nil, nil)
 	defer iter.Release()
 	for iter.Next() {
-		// Filter out system keys
 		if !bytes.HasPrefix(iter.Key(), []byte("!sys!")) {
 			count++
 		}
@@ -234,18 +215,28 @@ func (db *DB) KeyCount() (int64, error) {
 	return count, nil
 }
 
-// LastOpID returns the most recent committed Operation ID.
 func (db *DB) LastOpID() uint64 {
 	return atomic.LoadUint64(&db.operationID)
 }
 
-// runGroupCommits aggregates concurrent commits into batches to amortize fsync cost.
+// Metric Getters
+func (db *DB) GetConflicts() uint64 {
+	return atomic.LoadUint64(&db.metricsConflicts)
+}
+
+// ActiveTransactionCount returns number of active transactions.
+func (db *DB) ActiveTransactionCount() int {
+	db.activeTxnsMu.Lock()
+	defer db.activeTxnsMu.Unlock()
+	return len(db.activeTxns)
+}
+
+// runGroupCommits consumes the commit channel and processes batches.
 func (db *DB) runGroupCommits() {
 	defer db.wg.Done()
 	var batch []commitRequest
 
 	for {
-		// 1. Fetch first item (blocking)
 		select {
 		case <-db.closeCh:
 			return
@@ -253,7 +244,7 @@ func (db *DB) runGroupCommits() {
 			batch = append(batch, req)
 		}
 
-		// 2. Drain pending items (non-blocking) up to max batch size
+		// Drain loop
 	Loop:
 		for len(batch) < 128 {
 			select {
@@ -264,181 +255,20 @@ func (db *DB) runGroupCommits() {
 			}
 		}
 
-		// 3. Commit the batch
-		db.commitGroup(batch)
+		// Process via the refactored committer pipeline
+		db.processCommitBatch(batch)
 		batch = batch[:0]
 	}
 }
 
-// commitGroup processes a batch of transactions.
-func (db *DB) commitGroup(requests []commitRequest) {
-	db.commitMu.Lock()
-	defer db.commitMu.Unlock()
-
-	var validRequests []commitRequest
-	var walPayloads [][]byte
-	var combinedVLog []ValueLogEntry
-
-	// Track stats for index update
-	staleBytes := make(map[uint32]int64)
-
-	// Reserve sequences
-	currentTxID := atomic.LoadUint64(&db.transactionID)
-	currentOpID := atomic.LoadUint64(&db.operationID)
-
-	// Intra-batch Conflict Detection
-	// We must track keys written by accepted transactions in this batch
-	// to prevent conflicts within the batch itself.
-	batchWrites := make(map[string]uint64) // Key -> TxID that wrote it (reserved TxID)
-
-	// Phase 1: Validation & Preparation
-	for _, req := range requests {
-		tx := req.tx
-
-		// 1. Check against DB history (Standard Conflict Detection)
-		if err := tx.checkConflicts(); err != nil {
-			req.resp <- err
-			continue
-		}
-
-		// 2. Check against previous transactions in this batch (Intra-batch Isolation)
-		intraBatchConflict := false
-
-		// Check Read Set against Batch Writes
-		for k := range tx.readSet {
-			if _, exists := batchWrites[k]; exists {
-				intraBatchConflict = true
-				break
-			}
-		}
-
-		// Check Write Set against Batch Writes (Blind Write conflict check)
-		if !intraBatchConflict {
-			for k := range tx.pendingOps {
-				if _, exists := batchWrites[k]; exists {
-					intraBatchConflict = true
-					break
-				}
-			}
-		}
-
-		if intraBatchConflict {
-			req.resp <- ErrWriteConflict
-			continue
-		}
-
-		// Success: Assign IDs
-		currentTxID++
-		startOpID := currentOpID + 1
-		opsCount := uint64(len(tx.pendingOps))
-		currentOpID += opsCount
-
-		// Register writes for subsequent intra-batch checks
-		for k := range tx.pendingOps {
-			batchWrites[k] = currentTxID
-		}
-
-		// Serialize to WAL buffer
-		var walBuf bytes.Buffer
-		binary.Write(&walBuf, binary.BigEndian, currentTxID)
-		binary.Write(&walBuf, binary.BigEndian, startOpID)
-		binary.Write(&walBuf, binary.BigEndian, uint32(len(tx.pendingOps)))
-
-		opIdx := uint64(0)
-		for k, op := range tx.pendingOps {
-			key := []byte(k)
-			entry := ValueLogEntry{
-				Key:           key,
-				Value:         op.Value,
-				TransactionID: currentTxID,
-				OperationID:   startOpID + opIdx,
-				IsDelete:      op.IsDelete,
-			}
-			combinedVLog = append(combinedVLog, entry)
-			opIdx++
-
-			binary.Write(&walBuf, binary.BigEndian, uint32(len(key)))
-			walBuf.Write(key)
-			binary.Write(&walBuf, binary.BigEndian, uint32(len(op.Value)))
-			walBuf.Write(op.Value)
-			if op.IsDelete {
-				walBuf.WriteByte(1)
-			} else {
-				walBuf.WriteByte(0)
-			}
-		}
-
-		walPayloads = append(walPayloads, walBuf.Bytes())
-		validRequests = append(validRequests, req)
-	}
-
-	if len(validRequests) == 0 {
-		return
-	}
-
-	// Phase 2: IO (WAL & VLog)
-	if err := db.writeAheadLog.AppendBatches(walPayloads); err != nil {
-		err = fmt.Errorf("wal group error: %w", err)
-		for _, req := range validRequests {
-			req.resp <- err
-		}
-		return
-	}
-
-	fileID, baseOffset, err := db.valueLog.AppendEntries(combinedVLog)
-	if err != nil {
-		err = fmt.Errorf("vlog group error: %w", err)
-		for _, req := range validRequests {
-			req.resp <- err
-		}
-		return
-	}
-
-	// Phase 3: Update Index & Clocks
-	// Calculate stale bytes
-	iter := db.ldb.NewIterator(nil, nil)
-	for _, entry := range combinedVLog {
-		seekKey := encodeIndexKey(entry.Key, math.MaxUint64)
-		if iter.Seek(seekKey) {
-			foundKey := iter.Key()
-			uKey, _, err := decodeIndexKey(foundKey)
-			if err == nil && bytes.Equal(uKey, entry.Key) {
-				meta, err := decodeEntryMeta(iter.Value())
-				if err == nil {
-					size := int64(ValueLogHeaderSize) + int64(len(entry.Key)) + int64(meta.ValueLen)
-					staleBytes[meta.FileID] += size
-				}
-			}
-		}
-	}
-	iter.Release()
-
-	if err := db.UpdateIndexForEntries(combinedVLog, fileID, baseOffset, staleBytes); err != nil {
-		err = fmt.Errorf("index group error: %w", err)
-		for _, req := range validRequests {
-			req.resp <- err
-		}
-		return
-	}
-
-	// Update Global Clocks
-	atomic.StoreUint64(&db.transactionID, currentTxID)
-	atomic.StoreUint64(&db.operationID, currentOpID)
-
-	// Phase 4: Notify Success
-	for _, req := range validRequests {
-		req.resp <- nil
-	}
-}
-
-// SetCompactionMinGarbage updates the minimum garbage threshold required to trigger compaction on a file.
+// SetCompactionMinGarbage updates threshold.
 func (db *DB) SetCompactionMinGarbage(minGarbage int64) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	db.minGarbageThreshold = minGarbage
 }
 
-// runAutoCheckpoint triggers a checkpoint every 60 seconds if new mutations have occurred.
+// Background Task: Auto Checkpoint
 func (db *DB) runAutoCheckpoint() {
 	defer db.wg.Done()
 	ticker := time.NewTicker(60 * time.Second)
@@ -454,26 +284,19 @@ func (db *DB) runAutoCheckpoint() {
 
 			if currentOp > lastOp {
 				if err := db.Checkpoint(); err != nil {
-					errMsg := err.Error()
-					if strings.Contains(errMsg, "file already closed") ||
-						strings.Contains(errMsg, "no such file or directory") {
-						return
+					// Ignore expected errors during shutdown
+					if !strings.Contains(err.Error(), "closed") {
+						fmt.Printf("Auto-checkpoint failed: %v\n", err)
 					}
-					fmt.Printf("Auto-checkpoint failed: %v\n", err)
 				} else {
-					safeOpID := atomic.LoadUint64(&db.lastCkptOpID)
-					if err := db.PurgeWAL(safeOpID); err != nil {
-						if !strings.Contains(err.Error(), "no such file") {
-							fmt.Printf("Auto-purge failed: %v\n", err)
-						}
-					}
+					_ = db.PurgeWAL(atomic.LoadUint64(&db.lastCkptOpID))
 				}
 			}
 		}
 	}
 }
 
-// runAutoCompaction triggers compaction every 2 minutes.
+// Background Task: Auto Compaction
 func (db *DB) runAutoCompaction() {
 	defer db.wg.Done()
 	ticker := time.NewTicker(2 * time.Minute)
@@ -485,19 +308,15 @@ func (db *DB) runAutoCompaction() {
 			return
 		case <-ticker.C:
 			if err := db.RunCompaction(); err != nil {
-				errMsg := err.Error()
-				if strings.Contains(errMsg, "file already closed") ||
-					strings.Contains(errMsg, "closed") ||
-					strings.Contains(errMsg, "no such file or directory") {
-					return
+				if !strings.Contains(err.Error(), "closed") {
+					fmt.Printf("Auto-compaction failed: %v\n", err)
 				}
-				fmt.Printf("Auto-compaction failed: %v\n", err)
 			}
 		}
 	}
 }
 
-// runBackgroundChecksum runs periodic checksum verification on ValueLog files.
+// Background Task: Checksum
 func (db *DB) runBackgroundChecksum() {
 	defer db.wg.Done()
 	if db.checksumInterval <= 0 {
@@ -512,51 +331,47 @@ func (db *DB) runBackgroundChecksum() {
 			return
 		case <-ticker.C:
 			if err := db.VerifyChecksums(); err != nil {
-				errMsg := err.Error()
-				if strings.Contains(errMsg, "file already closed") ||
-					strings.Contains(errMsg, "no such file") ||
-					strings.Contains(errMsg, "closed") {
-					return
+				if !strings.Contains(err.Error(), "closed") {
+					fmt.Printf("Checksum verification failed: %v\n", err)
 				}
-				fmt.Printf("Background checksum verification failed: %v\n", err)
 			}
 		}
 	}
 }
 
-// VerifyChecksums iterates over all immutable VLog files and verifies their CRCs.
+// VerifyChecksums checks data integrity.
 func (db *DB) VerifyChecksums() error {
 	fids, err := db.valueLog.GetImmutableFileIDs()
 	if err != nil {
 		return err
 	}
-
 	for _, fid := range fids {
-		select {
-		case <-db.closeCh:
+		if isClosed(db.closeCh) {
 			return nil
-		default:
 		}
-
 		err := db.valueLog.IterateFile(fid, func(_ ValueLogEntry, _ EntryMeta) error {
-			select {
-			case <-db.closeCh:
-				return errors.New("database closed")
-			default:
+			if isClosed(db.closeCh) {
+				return errors.New("closed")
 			}
 			return nil
 		})
-		if err != nil {
-			if strings.Contains(err.Error(), "closed") {
-				return nil
-			}
-			fmt.Printf("Data Integrity Error: File %04d.vlog corrupt: %v\n", fid, err)
+		if err != nil && !strings.Contains(err.Error(), "closed") {
+			fmt.Printf("Corrupt VLog %d: %v\n", fid, err)
 		}
 	}
 	return nil
 }
 
-// NewTransaction creates a new transaction.
+func isClosed(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
+// Transaction & Operation Access
 func (db *DB) NewTransaction(update bool) *Transaction {
 	readTxID := atomic.LoadUint64(&db.transactionID)
 	tx := &Transaction{
@@ -566,16 +381,12 @@ func (db *DB) NewTransaction(update bool) *Transaction {
 		readTxID:   readTxID,
 		update:     update,
 	}
-
-	// Register in the active transactions map (Fast O(1) insert)
 	db.activeTxnsMu.Lock()
 	db.activeTxns[tx] = readTxID
 	db.activeTxnsMu.Unlock()
-
 	return tx
 }
 
-// ScanWAL iterates over the WAL starting from the specified operationId.
 func (db *DB) ScanWAL(startOpID uint64, fn func([]ValueLogEntry) error) error {
 	loc, found, err := db.locateWALStart(startOpID)
 	if err != nil {
@@ -598,24 +409,24 @@ func (db *DB) ScanWAL(startOpID uint64, fn func([]ValueLogEntry) error) error {
 	})
 }
 
-// PurgeWAL removes WAL files that strictly contain operations older than minOpID.
 func (db *DB) PurgeWAL(minOpID uint64) error {
 	return db.writeAheadLog.PurgeOlderThan(minOpID)
 }
 
-// ApplyBatch writes a batch of external entries (e.g. from replication) to the WAL, VLog, and Index.
+// ApplyBatch applies entries directly (for replication).
 func (db *DB) ApplyBatch(entries []ValueLogEntry) error {
 	if len(entries) == 0 {
 		return nil
 	}
-
 	db.commitMu.Lock()
 	defer db.commitMu.Unlock()
 
+	// Direct write pipeline (simplified version of processCommitBatch for single batch)
 	first := entries[0]
 	txID := first.TransactionID
 	startOpID := first.OperationID
 
+	// 1. Serialize WAL
 	var walBuf bytes.Buffer
 	binary.Write(&walBuf, binary.BigEndian, txID)
 	binary.Write(&walBuf, binary.BigEndian, startOpID)
@@ -626,13 +437,14 @@ func (db *DB) ApplyBatch(entries []ValueLogEntry) error {
 		walBuf.Write(e.Key)
 		binary.Write(&walBuf, binary.BigEndian, uint32(len(e.Value)))
 		walBuf.Write(e.Value)
+		val := byte(0)
 		if e.IsDelete {
-			walBuf.WriteByte(1)
-		} else {
-			walBuf.WriteByte(0)
+			val = 1
 		}
+		walBuf.WriteByte(val)
 	}
 
+	// 2. Persist
 	if err := db.writeAheadLog.AppendBatch(walBuf.Bytes()); err != nil {
 		return fmt.Errorf("wal append: %w", err)
 	}
@@ -642,44 +454,38 @@ func (db *DB) ApplyBatch(entries []ValueLogEntry) error {
 		return fmt.Errorf("vlog append: %w", err)
 	}
 
+	// 3. Update Index
 	staleBytes := make(map[uint32]int64)
-	iter := db.ldb.NewIterator(nil, nil)
-	defer iter.Release()
-
-	for _, e := range entries {
-		seekKey := encodeIndexKey(e.Key, math.MaxUint64)
-		if iter.Seek(seekKey) {
-			foundKey := iter.Key()
-			uKey, _, err := decodeIndexKey(foundKey)
-			if err == nil && bytes.Equal(uKey, e.Key) {
-				meta, err := decodeEntryMeta(iter.Value())
-				if err == nil {
-					size := int64(ValueLogHeaderSize) + int64(len(e.Key)) + int64(meta.ValueLen)
-					staleBytes[meta.FileID] += size
-				}
-			}
-		}
-	}
+	db.calculateStaleBytesSimple(entries, staleBytes)
 
 	if err := db.UpdateIndexForEntries(entries, fileID, baseOffset, staleBytes); err != nil {
 		return fmt.Errorf("index update: %w", err)
 	}
 
+	// 4. Update Clocks
+	maxTxID := uint64(0)
+	maxOpID := uint64(0)
+	for _, e := range entries {
+		if e.TransactionID > maxTxID {
+			maxTxID = e.TransactionID
+		}
+		if e.OperationID > maxOpID {
+			maxOpID = e.OperationID
+		}
+	}
+
 	currentTx := atomic.LoadUint64(&db.transactionID)
-	if txID > currentTx {
-		atomic.StoreUint64(&db.transactionID, txID)
+	if maxTxID > currentTx {
+		atomic.StoreUint64(&db.transactionID, maxTxID)
 	}
-
-	lastOp := entries[len(entries)-1].OperationID
 	currentOp := atomic.LoadUint64(&db.operationID)
-	if lastOp > currentOp {
-		atomic.StoreUint64(&db.operationID, lastOp)
+	if maxOpID > currentOp {
+		atomic.StoreUint64(&db.operationID, maxOpID)
 	}
-
 	return nil
 }
 
-// locateWALStart finds the WALLocation for the batch containing or immediately preceding startOpID
+// locateWALStart finds WAL location.
 func (db *DB) locateWALStart(targetOpID uint64) (WALLocation, bool, error) {
 	if loc, ok := db.writeAheadLog.FindInMemory(targetOpID); ok {
 		return loc, true, nil
@@ -692,35 +498,28 @@ func (db *DB) locateWALStart(targetOpID uint64) (WALLocation, bool, error) {
 	seekKey := encodeWALIndexKey(targetOpID)
 	if iter.Seek(seekKey) {
 		key := iter.Key()
-		foundOpID := decodeWALIndexKey(key)
-		if foundOpID == targetOpID {
+		if decodeWALIndexKey(key) == targetOpID {
 			var loc WALLocation
 			err := json.Unmarshal(iter.Value(), &loc)
 			return loc, true, err
 		}
-		if iter.Prev() {
-			if bytes.HasPrefix(iter.Key(), sysWALIndexPrefix) {
-				var loc WALLocation
-				err := json.Unmarshal(iter.Value(), &loc)
-				return loc, true, err
-			}
-		}
-	} else {
-		if iter.Last() && bytes.HasPrefix(iter.Key(), sysWALIndexPrefix) {
+		if iter.Prev() && bytes.HasPrefix(iter.Key(), sysWALIndexPrefix) {
 			var loc WALLocation
 			err := json.Unmarshal(iter.Value(), &loc)
 			return loc, true, err
 		}
+	} else if iter.Last() && bytes.HasPrefix(iter.Key(), sysWALIndexPrefix) {
+		var loc WALLocation
+		err := json.Unmarshal(iter.Value(), &loc)
+		return loc, true, err
 	}
 	return WALLocation{}, false, nil
 }
 
-// Close closes the database. It is safe to call multiple times.
 func (db *DB) Close() error {
 	if !atomic.CompareAndSwapInt32(&db.closed, 0, 1) {
 		return nil
 	}
-
 	close(db.closeCh)
 	db.wg.Wait()
 
@@ -728,34 +527,33 @@ func (db *DB) Close() error {
 	defer db.commitMu.Unlock()
 
 	if err := db.Checkpoint(); err != nil {
-		errMsg := err.Error()
-		if !strings.Contains(errMsg, "file already closed") && !strings.Contains(errMsg, "no such file or directory") {
+		if !strings.Contains(err.Error(), "closed") {
 			fmt.Printf("Error checkpointing on close: %v\n", err)
 		}
 	}
-
 	db.persistSequences()
 
-	var err1, err2, err3 error
-
+	var errs []string
 	if db.writeAheadLog != nil {
-		err1 = db.writeAheadLog.Close()
+		if err := db.writeAheadLog.Close(); err != nil {
+			errs = append(errs, err.Error())
+		}
 	}
 	if db.valueLog != nil {
-		err2 = db.valueLog.Close()
+		if err := db.valueLog.Close(); err != nil {
+			errs = append(errs, err.Error())
+		}
 	}
 	if db.ldb != nil {
-		err3 = db.ldb.Close()
+		if err := db.ldb.Close(); err != nil {
+			errs = append(errs, err.Error())
+		}
 		db.ldb = nil
 	}
-
-	if err1 != nil {
-		return err1
+	if len(errs) > 0 {
+		return fmt.Errorf("close errors: %s", strings.Join(errs, "; "))
 	}
-	if err2 != nil {
-		return err2
-	}
-	return err3
+	return nil
 }
 
 func (db *DB) Checkpoint() error {
@@ -774,10 +572,9 @@ func (db *DB) Checkpoint() error {
 		batch.Put(k, v)
 	}
 	if err := db.valueLog.Rotate(); err != nil {
-		return fmt.Errorf("vlog rotate: %w", err)
+		return err
 	}
-	currentOp := atomic.LoadUint64(&db.operationID)
-	atomic.StoreUint64(&db.lastCkptOpID, currentOp)
+	atomic.StoreUint64(&db.lastCkptOpID, atomic.LoadUint64(&db.operationID))
 	if batch.Len() == 0 {
 		return nil
 	}
@@ -811,4 +608,43 @@ func (db *DB) UpdateIndexForEntries(entries []ValueLogEntry, fileID uint32, base
 		db.mu.Unlock()
 	}
 	return nil
+}
+
+func (db *DB) onWALRotate(index map[uint64]WALLocation) error {
+	if len(index) == 0 || db.ldb == nil {
+		return nil
+	}
+	batch := new(leveldb.Batch)
+	// Sort for deterministic write
+	var keys []uint64
+	for k := range index {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+
+	for _, opID := range keys {
+		locBytes, _ := json.Marshal(index[opID])
+		batch.Put(encodeWALIndexKey(opID), locBytes)
+	}
+	return db.ldb.Write(batch, nil)
+}
+
+// calculateStaleBytesSimple is a helper for ApplyBatch (direct batch).
+func (db *DB) calculateStaleBytesSimple(entries []ValueLogEntry, staleBytes map[uint32]int64) {
+	iter := db.ldb.NewIterator(nil, nil)
+	defer iter.Release()
+	for _, entry := range entries {
+		seekKey := encodeIndexKey(entry.Key, math.MaxUint64)
+		if iter.Seek(seekKey) {
+			foundKey := iter.Key()
+			uKey, _, err := decodeIndexKey(foundKey)
+			if err == nil && bytes.Equal(uKey, entry.Key) {
+				meta, err := decodeEntryMeta(iter.Value())
+				if err == nil {
+					size := int64(ValueLogHeaderSize) + int64(len(entry.Key)) + int64(meta.ValueLen)
+					staleBytes[meta.FileID] += size
+				}
+			}
+		}
+	}
 }
