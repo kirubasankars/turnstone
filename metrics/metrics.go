@@ -23,24 +23,32 @@ type ServerStatsProvider interface {
 type TurnstoneCollector struct {
 	stores      map[string]*store.Store
 	serverStats ServerStatsProvider
-	keys        *prometheus.Desc
-	activeConns *prometheus.Desc
-	totalConns  *prometheus.Desc
-	activeTxs   *prometheus.Desc
 
-	// Storage Metrics
-	conflicts *prometheus.Desc
+	// Server-wide metrics
+	activeConns    *prometheus.Desc
+	totalConns     *prometheus.Desc
+	totalActiveTxs *prometheus.Desc // Aggregate server-wide active transactions
+
+	// Per-partition metrics
+	partitionKeys      *prometheus.Desc
+	partitionActiveTxs *prometheus.Desc
+	partitionConflicts *prometheus.Desc
+	partitionOffset    *prometheus.Desc
 }
 
 func NewTurnstoneCollector(stores map[string]*store.Store, stats ServerStatsProvider) *TurnstoneCollector {
 	return &TurnstoneCollector{
 		stores:      stores,
 		serverStats: stats,
-		keys:        newDesc("store", "keys_total", "Total keys"),
-		activeConns: newDesc("server", "connections_active", "Active connections"),
-		totalConns:  newDesc("server", "connections_accepted_total", "Total connections"),
-		activeTxs:   newDesc("server", "transactions_active", "Active transactions"),
-		conflicts:   newDesc("store", "conflicts_total", "Total transaction conflicts"),
+
+		activeConns:    newDesc("server", "connections_active", "Active connections"),
+		totalConns:     newDesc("server", "connections_accepted_total", "Total connections"),
+		totalActiveTxs: newDesc("server", "transactions_active", "Total active transactions across server"),
+
+		partitionKeys:      newDescWithLabels("partition", "keys", "Total keys in partition", []string{"partition"}),
+		partitionActiveTxs: newDescWithLabels("partition", "active_txs", "Active transactions in partition", []string{"partition"}),
+		partitionConflicts: newDescWithLabels("partition", "conflicts_total", "Total transaction conflicts in partition", []string{"partition"}),
+		partitionOffset:    newDescWithLabels("partition", "offset", "Current WAL/VLog offset (LogID)", []string{"partition"}),
 	}
 }
 
@@ -48,31 +56,34 @@ func newDesc(sub, name, help string) *prometheus.Desc {
 	return prometheus.NewDesc(prometheus.BuildFQName(namespace, sub, name), help, nil, nil)
 }
 
+func newDescWithLabels(sub, name, help string, labels []string) *prometheus.Desc {
+	return prometheus.NewDesc(prometheus.BuildFQName(namespace, sub, name), help, labels, nil)
+}
+
 func (c *TurnstoneCollector) Describe(ch chan<- *prometheus.Desc) {
-	ch <- c.keys
 	ch <- c.activeConns
 	ch <- c.totalConns
-	ch <- c.activeTxs
-	ch <- c.conflicts
+	ch <- c.totalActiveTxs
+	ch <- c.partitionKeys
+	ch <- c.partitionActiveTxs
+	ch <- c.partitionConflicts
+	ch <- c.partitionOffset
 }
 
 func (c *TurnstoneCollector) Collect(ch chan<- prometheus.Metric) {
-	var keys float64
-	var conflicts float64
-
-	for _, db := range c.stores {
-		stats := db.Stats()
-		keys += float64(stats.KeyCount)
-		conflicts += float64(stats.Conflicts)
-	}
-
-	ch <- prometheus.MustNewConstMetric(c.keys, prometheus.GaugeValue, keys)
-	ch <- prometheus.MustNewConstMetric(c.conflicts, prometheus.CounterValue, conflicts)
-
 	if c.serverStats != nil {
 		ch <- prometheus.MustNewConstMetric(c.activeConns, prometheus.GaugeValue, float64(c.serverStats.ActiveConns()))
 		ch <- prometheus.MustNewConstMetric(c.totalConns, prometheus.CounterValue, float64(c.serverStats.TotalConns()))
-		ch <- prometheus.MustNewConstMetric(c.activeTxs, prometheus.GaugeValue, float64(c.serverStats.ActiveTxs()))
+		ch <- prometheus.MustNewConstMetric(c.totalActiveTxs, prometheus.GaugeValue, float64(c.serverStats.ActiveTxs()))
+	}
+
+	for name, db := range c.stores {
+		stats := db.Stats()
+
+		ch <- prometheus.MustNewConstMetric(c.partitionKeys, prometheus.GaugeValue, float64(stats.KeyCount), name)
+		ch <- prometheus.MustNewConstMetric(c.partitionActiveTxs, prometheus.GaugeValue, float64(stats.ActiveTxs), name)
+		ch <- prometheus.MustNewConstMetric(c.partitionConflicts, prometheus.CounterValue, float64(stats.Conflicts), name)
+		ch <- prometheus.MustNewConstMetric(c.partitionOffset, prometheus.GaugeValue, float64(stats.Offset), name)
 	}
 }
 

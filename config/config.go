@@ -79,6 +79,11 @@ func GenerateConfigArtifacts(homeDir string, defaultCfg Config, configPath strin
 	}
 	fmt.Printf("Certificates generated in: %s\n", certsDir)
 
+	// Update default config to use server cert for replication client (needs high privs)
+	// instead of the restricted 'client' cert.
+	defaultCfg.TLSClientCertFile = "certs/server.crt"
+	defaultCfg.TLSClientKeyFile = "certs/server.key"
+
 	data, err := json.MarshalIndent(defaultCfg, "", "  ")
 	if err != nil {
 		return fmt.Errorf("error generating config json: %w", err)
@@ -123,14 +128,15 @@ func generateCerts(outDir string) error {
 		return err
 	}
 
-	genLeaf := func(name string, sn int64, hosts []string) error {
+	genLeaf := func(role string, sn int64, hosts []string) error {
 		priv, err := rsa.GenerateKey(rand.Reader, 2048)
 		if err != nil {
 			return err
 		}
+		// Organization field used for Role Based Access Control (RBAC)
 		tmpl := x509.Certificate{
 			SerialNumber: big.NewInt(sn),
-			Subject:      pkix.Name{Organization: []string{"TurnstoneDB " + name}},
+			Subject:      pkix.Name{Organization: []string{"TurnstoneDB " + role}, CommonName: role},
 			NotBefore:    time.Now(),
 			NotAfter:     time.Now().Add(365 * 24 * time.Hour),
 			KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
@@ -142,14 +148,20 @@ func generateCerts(outDir string) error {
 		if err != nil {
 			return err
 		}
-		if err := writePEM(name+".crt", "CERTIFICATE", b); err != nil {
+		if err := writePEM(role+".crt", "CERTIFICATE", b); err != nil {
 			return err
 		}
-		return writePEM(name+".key", "RSA PRIVATE KEY", x509.MarshalPKCS1PrivateKey(priv))
+		return writePEM(role+".key", "RSA PRIVATE KEY", x509.MarshalPKCS1PrivateKey(priv))
 	}
 
 	if err := genLeaf("server", 2, []string{"localhost"}); err != nil {
 		return err
 	}
-	return genLeaf("client", 3, nil)
+	if err := genLeaf("client", 3, nil); err != nil {
+		return err
+	}
+	if err := genLeaf("admin", 4, nil); err != nil {
+		return err
+	}
+	return genLeaf("cdc", 5, nil)
 }
