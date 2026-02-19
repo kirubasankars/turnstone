@@ -292,7 +292,8 @@ func (db *DB) runAutoCheckpoint() {
 						fmt.Printf("Auto-checkpoint failed: %v\n", err)
 					}
 				} else {
-					_ = db.PurgeWAL(atomic.LoadUint64(&db.lastCkptOpID))
+					// NOTE: WAL Purge Disabled to support extended CDC retention.
+					// Previously: _ = db.PurgeWAL(atomic.LoadUint64(&db.lastCkptOpID))
 				}
 			}
 		}
