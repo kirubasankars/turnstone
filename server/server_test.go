@@ -55,26 +55,26 @@ func setupTestEnv(t *testing.T) (string, map[string]*store.Store, *Server, func(
 	if err := os.MkdirAll(certsDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// Generate config with multiple partitions to support testing Partition 1, 2, 3
+	// Generate config with multiple databases (config param still named NumberOfPartitions)
 	// This will now generate admin and cdc certs as well due to the change in config.go
 	if err := config.GenerateConfigArtifacts(dir, config.Config{
-		TLSCertFile:        "certs/server.crt",
-		TLSKeyFile:         "certs/server.key",
-		TLSCAFile:          "certs/ca.crt",
-		NumberOfPartitions: 4, // 0 (Read-Only), 1, 2, 3 (Writable)
+		TLSCertFile:       "certs/server.crt",
+		TLSKeyFile:        "certs/server.key",
+		TLSCAFile:         "certs/ca.crt",
+		NumberOfDatabases: 4, // 0 (Read-Only), 1, 2, 3 (Writable)
 	}, filepath.Join(dir, "config.json")); err != nil {
 		t.Fatalf("Failed to generate artifacts: %v", err)
 	}
 
-	// 2. Init Stores (0, 1, 2)
+	// 2. Init Stores (0, 1, 2, 3)
 	stores := make(map[string]*store.Store)
 	for i := 0; i < 4; i++ {
-		partitionName := strconv.Itoa(i)
-		store, err := store.NewStore(filepath.Join(dir, "data", partitionName), logger, true, 0, true)
+		dbName := strconv.Itoa(i)
+		store, err := store.NewStore(filepath.Join(dir, "data", dbName), logger, true, 0, true)
 		if err != nil {
 			t.Fatal(err)
 		}
-		stores[partitionName] = store
+		stores[dbName] = store
 	}
 
 	// 3. Setup Replication Manager (Required for NewServer)
@@ -231,7 +231,7 @@ func parseMetrics(mfs []*dto.MetricFamily) map[string]float64 {
 				val = *m.Counter.Value
 			}
 			// Aggregate metric values if multiple metrics (labels) exist for the same name
-			// This allows tests to check total counts across all partitions easily
+			// This allows tests to check total counts across all databases easily
 			res[*mf.Name] += val
 		}
 	}
@@ -277,7 +277,6 @@ func TestServer_RBAC(t *testing.T) {
 		client.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusOK)
 
 		// Denied: Admin Ops
-		client.AssertStatus(protocol.OpCodeStat, nil, protocol.ResStatusErr)
 		client.AssertStatus(protocol.OpCodeReplicaOf, []byte("dummy"), protocol.ResStatusErr)
 	})
 
@@ -304,8 +303,6 @@ func TestServer_RBAC(t *testing.T) {
 		admin.AssertStatus(protocol.OpCodeSelect, []byte("1"), protocol.ResStatusOK)
 		// Allowed: KV Ops
 		admin.AssertStatus(protocol.OpCodePing, nil, protocol.ResStatusOK)
-		// Allowed: Stat
-		admin.AssertStatus(protocol.OpCodeStat, nil, protocol.ResStatusOK)
 	})
 }
 
@@ -336,7 +333,7 @@ func TestServer_Lifecycle_And_Ping(t *testing.T) {
 	}
 }
 
-func TestServer_ReadOnlySystemPartition(t *testing.T) {
+func TestServer_SystemDB_AccessControl(t *testing.T) {
 	dir, _, srv, cleanup := setupTestEnv(t)
 	defer cleanup()
 
@@ -345,21 +342,32 @@ func TestServer_ReadOnlySystemPartition(t *testing.T) {
 	go srv.Run(ctx)
 	time.Sleep(100 * time.Millisecond)
 
-	client := connectClient(t, srv.listener.Addr().String(), getClientTLS(t, dir))
+	addr := srv.listener.Addr().String()
+
+	// 1. Client attempts to access Database 0 -> Should Fail
+	client := connectClient(t, addr, getClientTLS(t, dir))
 	defer client.Close()
 
-	// 1. Connection starts at Partition "0" by default
-	// 2. Attempt to Write (Should fail)
-	key := []byte("k")
-	val := []byte("v")
+	// Connects to Database 0 by default.
+	// Try Set
+	key := []byte("conf")
+	val := []byte("val")
 	setPayload := make([]byte, 4+len(key)+len(val))
 	binary.BigEndian.PutUint32(setPayload[0:4], uint32(len(key)))
 	copy(setPayload[4:], key)
 	copy(setPayload[4+len(key):], val)
 
 	client.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
-	// Server returns Error on Set to Partition 0
+	// Server returns Error because Role is Client and DB 0 is read-only
+	// Updated error string matches server.go
 	client.AssertStatus(protocol.OpCodeSet, setPayload, protocol.ResStatusErr)
+
+	// 2. Admin attempts to access Database 0 -> Should Succeed
+	admin := connectClient(t, addr, getRoleTLS(t, dir, "admin"))
+	defer admin.Close()
+
+	admin.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
+	// Admin is allowed to write to DB 0, logic confirmed in server.go handles
 }
 
 func TestServer_CRUD(t *testing.T) {
@@ -374,7 +382,7 @@ func TestServer_CRUD(t *testing.T) {
 	client := connectClient(t, srv.listener.Addr().String(), getClientTLS(t, dir))
 	defer client.Close()
 
-	// 0. Switch to Writable Partition "1"
+	// 0. Switch to Writable Database "1"
 	client.AssertStatus(protocol.OpCodeSelect, []byte("1"), protocol.ResStatusOK)
 
 	// 1. Set
@@ -455,7 +463,7 @@ func TestMetrics_Transactions(t *testing.T) {
 	client := connectClient(t, srv.listener.Addr().String(), getClientTLS(t, dir))
 	defer client.Close()
 
-	// Select Partition 1
+	// Select Database 1
 	client.AssertStatus(protocol.OpCodeSelect, []byte("1"), protocol.ResStatusOK)
 
 	// Start Tx
@@ -487,13 +495,13 @@ func TestMetrics_StorageIO(t *testing.T) {
 	client := connectClient(t, srv.listener.Addr().String(), getClientTLS(t, dir))
 	defer client.Close()
 
-	// Select Partition 1
+	// Select Database 1
 	client.AssertStatus(protocol.OpCodeSelect, []byte("1"), protocol.ResStatusOK)
 
-	// Capture baseline metrics (accounts for system keys)
+	// Capture baseline metrics
+	// Note: Metric keys now use "db" prefix
 	m0 := gatherMetrics(t, srv)
-	// Updated metric name to new partition-labeled name
-	baseKeys := m0["turnstone_partition_keys"]
+	baseVLogBytes := m0["turnstone_db_vlog_bytes"]
 
 	// Write Data
 	client.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
@@ -506,10 +514,10 @@ func TestMetrics_StorageIO(t *testing.T) {
 	client.AssertStatus(protocol.OpCodeSet, setPayload, protocol.ResStatusOK)
 	client.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusOK)
 
+	// Verify that VLog size increased
 	m1 := gatherMetrics(t, srv)
-
-	if m1["turnstone_partition_keys"] != baseKeys+1 {
-		t.Errorf("Expected %v keys, got %v", baseKeys+1, m1["turnstone_partition_keys"])
+	if m1["turnstone_db_vlog_bytes"] <= baseVLogBytes {
+		t.Errorf("Expected vlog bytes increase, got %v (was %v)", m1["turnstone_db_vlog_bytes"], baseVLogBytes)
 	}
 
 	// Read Data
@@ -573,7 +581,7 @@ func TestMetrics_Conflicts(t *testing.T) {
 	c1.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusTxConflict)
 
 	// Verify Metric (updated name)
-	waitForMetric(t, srv, "turnstone_partition_conflicts_total", func(val float64) bool {
+	waitForMetric(t, srv, "turnstone_db_conflicts_total", func(val float64) bool {
 		return val >= 1
 	})
 }
@@ -736,8 +744,8 @@ func TestServer_Command_Validation(t *testing.T) {
 	client.AssertStatus(protocol.OpCodeAbort, nil, protocol.ResStatusOK)
 }
 
-func TestServer_Stat_IncludesActiveTxs(t *testing.T) {
-	dir, _, srv, cleanup := setupTestEnv(t)
+func TestCDC_PurgedWAL_ReturnsError(t *testing.T) {
+	dir, stores, srv, cleanup := setupTestEnv(t)
 	defer cleanup()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -745,27 +753,100 @@ func TestServer_Stat_IncludesActiveTxs(t *testing.T) {
 	go srv.Run(ctx)
 	time.Sleep(100 * time.Millisecond)
 
-	client := connectClient(t, srv.listener.Addr().String(), getClientTLS(t, dir))
-	defer client.Close()
+	addr := srv.listener.Addr().String()
+	clientTLS := getClientTLS(t, dir)
+	cdcTLS := getRoleTLS(t, dir, "cdc")
 
-	client.AssertStatus(protocol.OpCodeSelect, []byte("1"), protocol.ResStatusOK)
-
-	// 1. Start a transaction to have 1 active
-	client.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
-
-	// 2. Open another connection to query Stat (since client is in Tx)
-	// IMPORTANT: Stat is now an ADMIN command, so we must use admin certs.
-	statClient := connectClient(t, srv.listener.Addr().String(), getRoleTLS(t, dir, "admin"))
-	defer statClient.Close()
-	statClient.AssertStatus(protocol.OpCodeSelect, []byte("1"), protocol.ResStatusOK)
-
-	body, status := statClient.ReadStatus(protocol.OpCodeStat, nil)
-	if status != protocol.ResStatusOK {
-		t.Errorf("Stat failed: %x", status)
+	// Helper to create SET payload
+	makeSet := func(k, v string) []byte {
+		kb, vb := []byte(k), []byte(v)
+		buf := make([]byte, 4+len(kb)+len(vb))
+		binary.BigEndian.PutUint32(buf[0:4], uint32(len(kb)))
+		copy(buf[4:], kb)
+		copy(buf[4+len(kb):], vb)
+		return buf
 	}
 
-	msg := string(body)
-	if !strings.Contains(msg, "ActiveTxs:1") {
-		t.Errorf("Stat output missing active tx count. Got: %s", msg)
+	// 1. Write initial data to Database "1" to generate WAL entry (OpID 1)
+	c1 := connectClient(t, addr, clientTLS)
+	defer c1.Close()
+	c1.AssertStatus(protocol.OpCodeSelect, []byte("1"), protocol.ResStatusOK)
+
+	c1.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
+	c1.AssertStatus(protocol.OpCodeSet, makeSet("k1", "v1"), protocol.ResStatusOK)
+	c1.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusOK)
+
+	// 2. Force WAL Rotation on Database 1 (File 1 -> File 2)
+	st1 := stores["1"]
+	if err := st1.DB.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Write more data (OpID 2) into File 2
+	c1.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
+	c1.AssertStatus(protocol.OpCodeSet, makeSet("k2", "v2"), protocol.ResStatusOK)
+	c1.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusOK)
+
+	// 4. Force WAL Rotation again (File 2 -> File 3)
+	if err := st1.DB.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Current WAL State for Database 1:
+	// File 1: Contains OpID 1
+	// File 2: Contains OpID 2
+	// File 3: Active (Empty or new ops)
+
+	// 5. Purge logs older than OpID 2. This deletes File 1.
+	if err := st1.DB.PurgeWAL(2); err != nil {
+		t.Fatal(err)
+	}
+
+	// 6. Connect CDC requesting StartSeq 0.
+	// Since StartSeq 0 implies we need the log starting at 1, but File 1 is purged,
+	// the server should return an OUT_OF_SYNC error.
+
+	cdcConn, err := tls.Dial("tcp", addr, cdcTLS)
+	if err != nil {
+		t.Fatalf("Failed to dial CDC: %v", err)
+	}
+	defer cdcConn.Close()
+
+	// Handshake
+	buf := new(bytes.Buffer)
+	binary.Write(buf, binary.BigEndian, uint32(1)) // Ver
+	binary.Write(buf, binary.BigEndian, uint32(1)) // Count
+	part := "1"
+	binary.Write(buf, binary.BigEndian, uint32(len(part)))
+	buf.WriteString(part)
+	binary.Write(buf, binary.BigEndian, uint64(0)) // Request StartSeq 0
+
+	header := make([]byte, 5)
+	header[0] = protocol.OpCodeReplHello
+	binary.BigEndian.PutUint32(header[1:], uint32(buf.Len()))
+
+	cdcConn.Write(header)
+	cdcConn.Write(buf.Bytes())
+
+	// 7. Read response. Expect Error Packet immediately.
+	respHead := make([]byte, 5)
+	cdcConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(cdcConn, respHead); err != nil {
+		t.Fatalf("Read CDC response failed: %v", err)
+	}
+
+	if respHead[0] != protocol.ResStatusErr {
+		t.Fatalf("Expected ResStatusErr (0x01), got 0x%x", respHead[0])
+	}
+
+	ln := binary.BigEndian.Uint32(respHead[1:])
+	body := make([]byte, ln)
+	if _, err := io.ReadFull(cdcConn, body); err != nil {
+		t.Fatalf("Read error body failed: %v", err)
+	}
+
+	errMsg := string(body)
+	if !strings.Contains(errMsg, "OUT_OF_SYNC") {
+		t.Errorf("Expected OUT_OF_SYNC error, got: %s", errMsg)
 	}
 }

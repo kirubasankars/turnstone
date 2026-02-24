@@ -33,11 +33,11 @@ func TestCDC_Streaming_WithIdle(t *testing.T) {
 	// Format: [Ver:4][NumDBs:4] ... [NameLen:4][Name][LogID:8]
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.BigEndian, uint32(1)) // Version
-	binary.Write(buf, binary.BigEndian, uint32(1)) // Partition Count
+	binary.Write(buf, binary.BigEndian, uint32(1)) // Database Count
 
-	partition := "1"
-	binary.Write(buf, binary.BigEndian, uint32(len(partition)))
-	buf.WriteString(partition)
+	dbName := "1"
+	binary.Write(buf, binary.BigEndian, uint32(len(dbName)))
+	buf.WriteString(dbName)
 	binary.Write(buf, binary.BigEndian, uint64(0)) // StartSeq
 
 	helloHeader := make([]byte, 5)
@@ -73,7 +73,7 @@ func TestCDC_Streaming_WithIdle(t *testing.T) {
 	// 4. Write Data via standard client
 	client := connectReplClient(t, addr, clientTLS)
 	defer client.Close()
-	selectPartition(t, client, "1")
+	selectDatabase(t, client, "1")
 	writeKeyVal(t, client, "cdc_key_1", "val_1")
 
 	// 5. Verify CDC receipt
@@ -117,9 +117,9 @@ func TestCDC_MessageContent(t *testing.T) {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.BigEndian, uint32(1))
 	binary.Write(buf, binary.BigEndian, uint32(1))
-	partition := "1"
-	binary.Write(buf, binary.BigEndian, uint32(len(partition)))
-	buf.WriteString(partition)
+	dbName := "1"
+	binary.Write(buf, binary.BigEndian, uint32(len(dbName)))
+	buf.WriteString(dbName)
 	binary.Write(buf, binary.BigEndian, uint64(0))
 
 	h := make([]byte, 5)
@@ -131,7 +131,7 @@ func TestCDC_MessageContent(t *testing.T) {
 	// 3. Perform Operations
 	client := connectReplClient(t, addr, clientTLS)
 	defer client.Close()
-	selectPartition(t, client, "1")
+	selectDatabase(t, client, "1")
 
 	// Op 1: Set
 	writeKeyVal(t, client, "test_key", "test_val")

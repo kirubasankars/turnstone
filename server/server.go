@@ -35,7 +35,7 @@ const (
 
 type Server struct {
 	stores           map[string]*store.Store
-	defaultPartition string
+	defaultDB        string // Renamed from defaultPartition
 	addr             string
 	logger           *slog.Logger
 	listener         net.Listener
@@ -50,6 +50,10 @@ type Server struct {
 	tlsCAFile        string
 	currentTLSConfig atomic.Value
 	replManager      *replication.ReplicationManager
+
+	// Metrics per database
+	connsMu sync.Mutex
+	dbConns map[string]int64 // Renamed from partitionConns
 }
 
 func NewServer(addr string, stores map[string]*store.Store, logger *slog.Logger, maxConns int, tlsCert, tlsKey, tlsCA string, rm *replication.ReplicationManager) (*Server, error) {
@@ -57,27 +61,28 @@ func NewServer(addr string, stores map[string]*store.Store, logger *slog.Logger,
 		return nil, fmt.Errorf("tls cert, key, and ca required")
 	}
 
-	var partitionNames []string
+	var dbNames []string
 	for k := range stores {
-		partitionNames = append(partitionNames, k)
+		dbNames = append(dbNames, k)
 	}
-	sort.Strings(partitionNames)
-	defPartition := ""
-	if len(partitionNames) > 0 {
-		defPartition = partitionNames[0]
+	sort.Strings(dbNames)
+	defDB := ""
+	if len(dbNames) > 0 {
+		defDB = dbNames[0]
 	}
 
 	s := &Server{
-		addr:             addr,
-		stores:           stores,
-		defaultPartition: defPartition,
-		logger:           logger,
-		maxConns:         maxConns,
-		sem:              make(chan struct{}, maxConns),
-		tlsCertFile:      tlsCert,
-		tlsKeyFile:       tlsKey,
-		tlsCAFile:        tlsCA,
-		replManager:      rm,
+		addr:        addr,
+		stores:      stores,
+		defaultDB:   defDB,
+		logger:      logger,
+		maxConns:    maxConns,
+		sem:         make(chan struct{}, maxConns),
+		tlsCertFile: tlsCert,
+		tlsKeyFile:  tlsKey,
+		tlsCAFile:   tlsCA,
+		replManager: rm,
+		dbConns:     make(map[string]int64),
 	}
 
 	if err := s.ReloadTLS(); err != nil {
@@ -127,7 +132,7 @@ func (s *Server) Run(ctx context.Context) error {
 		return err
 	}
 	s.listener = ln
-	s.logger.Info("Server listening (Persistent Mode)", "addr", s.addr, "partitions", len(s.stores), "default", s.defaultPartition)
+	s.logger.Info("Server listening (Persistent Mode)", "addr", s.addr, "databases", len(s.stores), "default", s.defaultDB)
 
 	go s.handleSignals(ctx)
 
@@ -170,11 +175,30 @@ func (s *Server) handleSignals(ctx context.Context) {
 	}
 }
 
+func (s *Server) trackConn(dbName string, delta int64) {
+	s.connsMu.Lock()
+	s.dbConns[dbName] += delta
+	s.connsMu.Unlock()
+}
+
+// DatabaseConns returns number of active connections for a specific DB.
+func (s *Server) DatabaseConns(dbName string) int64 {
+	s.connsMu.Lock()
+	defer s.connsMu.Unlock()
+	return s.dbConns[dbName]
+}
+
+// PartitionConns is kept for interface compatibility if needed, aliasing DatabaseConns.
+func (s *Server) PartitionConns(partition string) int64 {
+	return s.DatabaseConns(partition)
+}
+
 type connState struct {
-	partitionName string
-	partition     *store.Store
-	tx            *stonedb.Transaction
-	role          string
+	dbName   string
+	db       *store.Store
+	tx       *stonedb.Transaction
+	role     string
+	clientID string
 }
 
 func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
@@ -187,10 +211,10 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 
 	// Identify Role from Certificate
 	role := RoleClient // Default
+	clientID := conn.RemoteAddr().String()
+
 	if tlsConn, ok := conn.(*tls.Conn); ok {
 		// Handshake already happened in Accept but we might need to ensure it's complete to get certs.
-		// Since we use RequireAndVerifyClientCert, the handshake completes on Accept for the listener side usually,
-		// or lazily. Accessing ConnectionState should trigger it if needed or return empty if not done.
 		if err := tlsConn.Handshake(); err == nil {
 			state := tlsConn.ConnectionState()
 			if len(state.PeerCertificates) > 0 {
@@ -202,16 +226,27 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 						role = strings.TrimPrefix(org, "TurnstoneDB ")
 					}
 				}
+				// Use CommonName as Unique Replica/Client ID
+				if cert.Subject.CommonName != "" {
+					clientID = cert.Subject.CommonName
+				}
 			}
 		}
 	}
 
 	state := &connState{
-		partitionName: s.defaultPartition,
-		partition:     s.stores[s.defaultPartition],
-		tx:            nil,
-		role:          role,
+		dbName:   s.defaultDB,
+		db:       s.stores[s.defaultDB],
+		tx:       nil,
+		role:     role,
+		clientID: clientID,
 	}
+
+	// Track connection for default DB
+	s.trackConn(state.dbName, 1)
+	defer func() {
+		s.trackConn(state.dbName, -1)
+	}()
 
 	// Ensure active transaction is cleaned up if connection drops
 	defer func() {
@@ -279,13 +314,11 @@ func (s *Server) dispatchCommand(conn net.Conn, r io.Reader, opCode uint8, paylo
 		s.handleSet(conn, payload, st)
 	case protocol.OpCodeDel:
 		s.handleDel(conn, payload, st)
-	case protocol.OpCodeStat:
-		s.handleStat(conn, st)
 	case protocol.OpCodeReplicaOf:
 		s.handleReplicaOf(conn, payload, st)
 	case protocol.OpCodeReplHello:
-		// Hand off control to specialized handler
-		s.HandleReplicaConnection(conn, r, payload)
+		// Hand off control to specialized handler, passing RBAC role and Stable ClientID
+		s.HandleReplicaConnection(conn, r, payload, st.role, st.clientID)
 		return true // Connection takeover
 	default:
 		_ = s.writeBinaryResponse(conn, protocol.ResStatusErr, []byte("Unknown OpCode"))
@@ -340,18 +373,22 @@ func (s *Server) writeBinaryResponse(w io.Writer, status byte, body []byte) erro
 
 func (s *Server) handleSelect(w io.Writer, payload []byte, st *connState) {
 	name := string(payload)
-	if partition, ok := s.stores[name]; ok {
-		st.partitionName = name
-		st.partition = partition
+	if db, ok := s.stores[name]; ok {
+		// Update connection counts
+		s.trackConn(st.dbName, -1)
+		st.dbName = name
+		st.db = db
+		s.trackConn(st.dbName, 1)
+
 		_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
 	} else {
-		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Partition not found"))
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Database not found"))
 	}
 }
 
 func (s *Server) handleBegin(w io.Writer, st *connState) {
-	if st.partition == nil {
-		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Partition selected"))
+	if st.db == nil {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Database selected"))
 		return
 	}
 	if st.tx != nil {
@@ -359,7 +396,7 @@ func (s *Server) handleBegin(w io.Writer, st *connState) {
 		return
 	}
 	// Start a read-write transaction
-	st.tx = st.partition.NewTransaction(true)
+	st.tx = st.db.NewTransaction(true)
 	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
 }
 
@@ -392,8 +429,8 @@ func (s *Server) handleAbort(w io.Writer, st *connState) {
 }
 
 func (s *Server) handleGet(w io.Writer, payload []byte, st *connState) {
-	if st.partition == nil {
-		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Partition selected"))
+	if st.db == nil {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Database selected"))
 		return
 	}
 	if st.tx == nil {
@@ -418,12 +455,12 @@ func (s *Server) handleGet(w io.Writer, payload []byte, st *connState) {
 }
 
 func (s *Server) handleSet(w io.Writer, payload []byte, st *connState) {
-	if st.partition == nil {
-		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Partition selected"))
+	if st.db == nil {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Database selected"))
 		return
 	}
-	if st.partitionName == "0" {
-		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Partition 0 is read-only"))
+	if st.dbName == "0" {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Database 0 is read-only"))
 		return
 	}
 	if st.tx == nil {
@@ -458,12 +495,12 @@ func (s *Server) handleSet(w io.Writer, payload []byte, st *connState) {
 }
 
 func (s *Server) handleDel(w io.Writer, payload []byte, st *connState) {
-	if st.partition == nil {
-		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Partition selected"))
+	if st.db == nil {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Database selected"))
 		return
 	}
-	if st.partitionName == "0" {
-		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Partition 0 is read-only"))
+	if st.dbName == "0" {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Database 0 is read-only"))
 		return
 	}
 	if st.tx == nil {
@@ -484,22 +521,12 @@ func (s *Server) handleDel(w io.Writer, payload []byte, st *connState) {
 	}
 }
 
-func (s *Server) handleStat(w io.Writer, st *connState) {
-	if st.partition == nil {
-		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Partition selected"))
-		return
-	}
-	stats := st.partition.Stats()
-	msg := fmt.Sprintf("[%s] Keys:%d ActiveTxs:%d Uptime:%s", st.partitionName, stats.KeyCount, stats.ActiveTxs, stats.Uptime)
-	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, []byte(msg))
-}
-
 func (s *Server) handleReplicaOf(w io.Writer, payload []byte, st *connState) {
 	if s.replManager == nil {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Replication disabled on server"))
 		return
 	}
-	// Decode: [AddrLen][Addr][RemotePartitionName]
+	// Decode: [AddrLen][Addr][RemoteDBName]
 	if len(payload) < 4 {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Invalid payload"))
 		return
@@ -510,14 +537,14 @@ func (s *Server) handleReplicaOf(w io.Writer, payload []byte, st *connState) {
 		return
 	}
 	addr := string(payload[4 : 4+addrLen])
-	remotePart := string(payload[4+addrLen:])
+	remoteDB := string(payload[4+addrLen:])
 
 	if addr == "" && addrLen == 0 {
 		// Stop replication
-		s.replManager.StopReplication(st.partitionName)
+		s.replManager.StopReplication(st.dbName)
 	} else {
 		// Start replication
-		s.replManager.AddReplica(st.partitionName, addr, remotePart)
+		s.replManager.AddReplica(st.dbName, addr, remoteDB)
 	}
 	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
 }

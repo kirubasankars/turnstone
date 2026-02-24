@@ -60,6 +60,7 @@ type DB struct {
 	// Config
 	minGarbageThreshold int64
 	checksumInterval    time.Duration
+	walRetentionTime    time.Duration
 }
 
 // Open initializes the DB.
@@ -73,6 +74,10 @@ func Open(dir string, opts Options) (*DB, error) {
 	}
 	if opts.CompactionMinGarbage == 0 {
 		opts.CompactionMinGarbage = 1024 * 1024
+	}
+	// Default WAL Retention to 2 hours if not set
+	if opts.WALRetentionTime == 0 {
+		opts.WALRetentionTime = 2 * time.Hour
 	}
 
 	// 1. Storage Components
@@ -97,6 +102,7 @@ func Open(dir string, opts Options) (*DB, error) {
 		commitCh:            make(chan commitRequest, 500),
 		minGarbageThreshold: opts.CompactionMinGarbage,
 		checksumInterval:    opts.ChecksumInterval,
+		walRetentionTime:    opts.WALRetentionTime,
 	}
 
 	// 2. Recovery (VLog -> WAL -> Index)
@@ -218,6 +224,36 @@ func (db *DB) KeyCount() (int64, error) {
 	return count, nil
 }
 
+// StorageStats returns the number and size of WAL and VLog files.
+func (db *DB) StorageStats() (walCount int, walSize int64, vlogCount int, vlogSize int64) {
+	// Scan WAL dir
+	walDir := filepath.Join(db.dir, "wal")
+	if walEntries, err := os.ReadDir(walDir); err == nil {
+		for _, e := range walEntries {
+			if !e.IsDir() && strings.HasSuffix(e.Name(), ".wal") {
+				walCount++
+				if info, err := e.Info(); err == nil {
+					walSize += info.Size()
+				}
+			}
+		}
+	}
+
+	// Scan VLog dir
+	vlogDir := filepath.Join(db.dir, "vlog")
+	if vlogEntries, err := os.ReadDir(vlogDir); err == nil {
+		for _, e := range vlogEntries {
+			if !e.IsDir() && strings.HasSuffix(e.Name(), ".vlog") {
+				vlogCount++
+				if info, err := e.Info(); err == nil {
+					vlogSize += info.Size()
+				}
+			}
+		}
+	}
+	return
+}
+
 func (db *DB) LastOpID() uint64 {
 	return atomic.LoadUint64(&db.operationID)
 }
@@ -271,6 +307,13 @@ func (db *DB) SetCompactionMinGarbage(minGarbage int64) {
 	db.minGarbageThreshold = minGarbage
 }
 
+// SetWALRetentionTime updates the WAL retention duration dynamically.
+func (db *DB) SetWALRetentionTime(d time.Duration) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	db.walRetentionTime = d
+}
+
 // Background Task: Auto Checkpoint
 func (db *DB) runAutoCheckpoint() {
 	defer db.wg.Done()
@@ -292,8 +335,20 @@ func (db *DB) runAutoCheckpoint() {
 						fmt.Printf("Auto-checkpoint failed: %v\n", err)
 					}
 				} else {
-					// NOTE: WAL Purge Disabled to support extended CDC retention.
-					// Previously: _ = db.PurgeWAL(atomic.LoadUint64(&db.lastCkptOpID))
+					// WAL Management:
+					// Purge logs older than retention time AND fully checkpointed.
+					// We get the current safe checkpoint ID which is lastCkptOpID
+					checkpointID := atomic.LoadUint64(&db.lastCkptOpID)
+
+					db.mu.RLock()
+					retention := db.walRetentionTime
+					db.mu.RUnlock()
+
+					if retention > 0 {
+						if err := db.writeAheadLog.PurgeExpired(retention, checkpointID); err != nil {
+							fmt.Printf("WAL purge failed: %v\n", err)
+						}
+					}
 				}
 			}
 		}

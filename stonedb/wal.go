@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // WriteAheadLog handles append-only log files for crash recovery.
@@ -358,8 +359,9 @@ func (wal *WriteAheadLog) Scan(startLoc WALLocation, fn func([]ValueLogEntry) er
 	return nil
 }
 
-// PurgeOlderThan deletes WAL files where all operations are strictly less than minOpID.
-func (wal *WriteAheadLog) PurgeOlderThan(minOpID uint64) error {
+// PurgeExpired deletes WAL files that are older than `retention` AND are fully checkpointed (`safeOpID`).
+// A file is safe to delete if the *next* file in the sequence starts at an OpID <= safeOpID.
+func (wal *WriteAheadLog) PurgeExpired(retention time.Duration, safeOpID uint64) error {
 	wal.mu.Lock()
 	defer wal.mu.Unlock()
 
@@ -379,11 +381,25 @@ func (wal *WriteAheadLog) PurgeOlderThan(minOpID uint64) error {
 		return nil // Never delete the last active file
 	}
 
+	now := time.Now()
+
 	// Iterate up to the second to last file
 	for i := 0; i < len(matches)-1; i++ {
 		currentPath := matches[i]
 		nextPath := matches[i+1]
 
+		// 1. Check Time Expiry
+		info, err := os.Stat(currentPath)
+		if err != nil {
+			return err
+		}
+		if now.Sub(info.ModTime()) < retention {
+			// If this file isn't old enough, subsequent files won't be either (usually).
+			// We stop here to be safe and avoid out-of-order deletion.
+			break
+		}
+
+		// 2. Check Checkpoint Safety
 		// To check if currentPath is fully obsolete, we check the START of nextPath.
 		nextStartOpID, err := wal.readFirstOpID(nextPath)
 		if err != nil {
@@ -391,8 +407,53 @@ func (wal *WriteAheadLog) PurgeOlderThan(minOpID uint64) error {
 			break
 		}
 
+		// If next file starts at or before the safe checkpoint ID, it means the current file
+		// is fully contained within the checkpointed history and can be deleted.
+		if nextStartOpID <= safeOpID {
+			fmt.Printf("Purging expired WAL file %s (ModTime: %v, NextStart: %d <= Checkpoint: %d)\n",
+				filepath.Base(currentPath), info.ModTime().Round(time.Second), nextStartOpID, safeOpID)
+			if err := os.Remove(currentPath); err != nil {
+				return err
+			}
+		} else {
+			// Hit a file that contains data not yet checkpointed/safe. Stop.
+			break
+		}
+	}
+	return nil
+}
+
+// PurgeOlderThan deletes WAL files where all operations are strictly less than minOpID.
+// NOTE: This is kept for backward compatibility/testing but PurgeExpired is preferred for production.
+func (wal *WriteAheadLog) PurgeOlderThan(minOpID uint64) error {
+	wal.mu.Lock()
+	defer wal.mu.Unlock()
+
+	matches, err := filepath.Glob(filepath.Join(wal.dir, "*.wal"))
+	if err != nil {
+		return err
+	}
+
+	sort.Slice(matches, func(i, j int) bool {
+		ni := parseWALName(filepath.Base(matches[i]))
+		nj := parseWALName(filepath.Base(matches[j]))
+		return ni < nj
+	})
+
+	if len(matches) <= 1 {
+		return nil
+	}
+
+	for i := 0; i < len(matches)-1; i++ {
+		currentPath := matches[i]
+		nextPath := matches[i+1]
+
+		nextStartOpID, err := wal.readFirstOpID(nextPath)
+		if err != nil {
+			break
+		}
+
 		if nextStartOpID <= minOpID {
-			fmt.Printf("Purging WAL file %s (Next starts at %d <= %d)\n", filepath.Base(currentPath), nextStartOpID, minOpID)
 			if err := os.Remove(currentPath); err != nil {
 				return err
 			}
@@ -539,6 +600,8 @@ func (wal *WriteAheadLog) replayFile(f *os.File, path string, vl *ValueLog, minT
 }
 
 // stream iterates over a WAL file reader, yielding valid payloads.
+// It tracks `validOffset`, which only increments after a complete, verified frame (Header + Payload + Checksum) is read.
+// If an error occurs in the middle of a frame (short read, checksum mismatch), validOffset points to the start of that frame.
 func (wal *WriteAheadLog) stream(r io.Reader, onPayload func(offset int64, payload []byte) error) (int64, error) {
 	validOffset := int64(0)
 	for {

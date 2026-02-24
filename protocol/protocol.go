@@ -51,6 +51,7 @@ const (
 	OpCodeAbort     uint8 = 0x12
 	OpCodeStat      uint8 = 0x20
 	OpCodeReplicaOf uint8 = 0x32
+	OpCodeSlotDel   uint8 = 0x33
 	OpCodeReplHello uint8 = 0x50
 	OpCodeReplBatch uint8 = 0x51
 	OpCodeReplAck   uint8 = 0x52
@@ -59,6 +60,7 @@ const (
 	// Journal Specific Ops
 	OpJournalSet    uint8 = 1
 	OpJournalDelete uint8 = 2
+	OpJournalCommit uint8 = 3 // New: Marks the end of a transaction
 )
 
 // Response Status Codes
@@ -77,17 +79,16 @@ const (
 
 // Errors
 var (
-	ErrKeyNotFound             = errors.New("key does not exist")
-	ErrCrcMismatch             = errors.New("crc checksum mismatch")
-	ErrClosed                  = errors.New("store closed")
-	ErrCommandTooLarge         = errors.New("command line too large")
-	ErrConflict                = errors.New("transaction conflict")
-	ErrBusy                    = errors.New("server busy")
-	ErrTransactionTimeout      = errors.New("transaction timeout")
-	ErrReadOnly                = errors.New("server is read-only")
-	ErrMemoryLimitExceeded     = errors.New("memory limit exceeded")
-	ErrPartitionNotFound       = errors.New("partition not found")
-	ErrSystemPartitionReadOnly = errors.New("system partition is read-only")
+	ErrKeyNotFound         = errors.New("key does not exist")
+	ErrCrcMismatch         = errors.New("crc checksum mismatch")
+	ErrClosed              = errors.New("store closed")
+	ErrCommandTooLarge     = errors.New("command line too large")
+	ErrConflict            = errors.New("transaction conflict")
+	ErrBusy                = errors.New("server busy")
+	ErrTransactionTimeout  = errors.New("transaction timeout")
+	ErrReadOnly            = errors.New("server is read-only")
+	ErrMemoryLimitExceeded = errors.New("memory limit exceeded")
+	ErrDatabaseNotFound    = errors.New("database not found") // Renamed from ErrPartitionNotFound
 )
 
 var Crc32Table = crc32.MakeTable(crc32.Castagnoli)
