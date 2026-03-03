@@ -778,3 +778,196 @@ func TestInternal_PrepareBatch_IntraBatchConflict(t *testing.T) {
 		t.Errorf("TxC expected ErrWriteConflict (Intra-batch Read-Write), got %v", errC)
 	}
 }
+
+// TestRecovery_LastVLogCorruption_PartialWrite ensures data consistency when
+// the last ValueLog file ends with a partial (incomplete) entry.
+// The recovery process should truncate the partial entry and assume it wasn't committed.
+// However, if the WAL had it, the WAL replay will bring it back (if commit succeeded there).
+// In this test, we simulate that VLog corruption happened *after* DB closed (e.g. disk rot),
+// but we assume WAL is fine.
+func TestRecovery_LastVLogCorruption_PartialWrite(t *testing.T) {
+	dir := t.TempDir()
+	opts := Options{
+		MaxWALSize:         1024 * 1024,
+		TruncateCorruptWAL: true,
+	}
+
+	// 1. Write data
+	db, err := Open(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 10; i++ {
+		tx := db.NewTransaction(true)
+		tx.Put([]byte(fmt.Sprintf("k%d", i)), []byte("val"))
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db.Close()
+
+	// 2. Sabotage the last VLog file (Partial truncate)
+	vlogDir := filepath.Join(dir, "vlog")
+	matches, _ := filepath.Glob(filepath.Join(vlogDir, "*.vlog"))
+	if len(matches) == 0 {
+		t.Fatal("No vlog files found")
+	}
+
+	// db.Close() triggers a checkpoint which might create a new empty log file.
+	// We want to corrupt the last file that actually contains data.
+	var targetVLog string
+	var targetSize int64
+	var targetIndex int = -1
+
+	// Iterate backwards to find the last non-empty file
+	for i := len(matches) - 1; i >= 0; i-- {
+		info, err := os.Stat(matches[i])
+		if err != nil {
+			continue
+		}
+		if info.Size() > 5 { // Ensure it's large enough to truncate
+			targetVLog = matches[i]
+			targetSize = info.Size()
+			targetIndex = i
+			break
+		}
+	}
+
+	if targetVLog == "" {
+		t.Fatal("No suitable non-empty vlog files found to corrupt")
+	}
+
+	// Delete any newer (empty) VLog files created by the clean shutdown rotation.
+	// This ensures Recover() treats targetVLog as the last file, allowing truncation recovery.
+	for i := targetIndex + 1; i < len(matches); i++ {
+		if err := os.Remove(matches[i]); err != nil {
+			t.Logf("Failed to remove empty vlog %s: %v", matches[i], err)
+		}
+	}
+
+	// Truncate by 5 bytes to break the last entry
+	if err := os.Truncate(targetVLog, targetSize-5); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Reopen
+	db2, err := Open(dir, opts)
+	if err != nil {
+		t.Fatalf("Open failed during recovery: %v", err)
+	}
+	defer db2.Close()
+
+	// 4. Verify Data (Should be fully recovered from WAL)
+	for i := 0; i < 10; i++ {
+		tx := db2.NewTransaction(false)
+		val, err := tx.Get([]byte(fmt.Sprintf("k%d", i)))
+		if err != nil {
+			t.Errorf("Key k%d missing after recovery: %v", i, err)
+		} else if string(val) != "val" {
+			t.Errorf("Key k%d mismatch: %s", i, val)
+		}
+		tx.Discard()
+	}
+}
+
+// TestRecovery_LastVLogCorruption_GarbageAppend ensures that appending garbage
+// to the last ValueLog file does not prevent the DB from opening and serving existing data.
+func TestRecovery_LastVLogCorruption_GarbageAppend(t *testing.T) {
+	dir := t.TempDir()
+	opts := Options{MaxWALSize: 1024 * 1024}
+
+	// 1. Write data
+	db, err := Open(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx := db.NewTransaction(true)
+	tx.Put([]byte("key"), []byte("val"))
+	tx.Commit()
+	db.Close()
+
+	// 2. Append garbage to VLog
+	vlogDir := filepath.Join(dir, "vlog")
+	matches, _ := filepath.Glob(filepath.Join(vlogDir, "*.vlog"))
+	lastVLog := matches[len(matches)-1]
+
+	f, err := os.OpenFile(lastVLog, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Write([]byte("GARBAGE"))
+	f.Close()
+
+	// 3. Reopen
+	db2, err := Open(dir, opts)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer db2.Close()
+
+	// 4. Verify Key exists
+	tx2 := db2.NewTransaction(false)
+	val, err := tx2.Get([]byte("key"))
+	if err != nil || string(val) != "val" {
+		t.Errorf("Data lost or corrupt")
+	}
+}
+
+func TestRecovery_VLogCorruption_Middle_Strict(t *testing.T) {
+	dir := t.TempDir()
+	opts := Options{MaxWALSize: 1024 * 1024}
+
+	// 1. Create DB and generate 3 VLog files
+	db, err := Open(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// File 0
+	tx := db.NewTransaction(true)
+	tx.Put([]byte("k0"), []byte("val0"))
+	tx.Commit()
+	db.Checkpoint() // Rotate 0 -> 1
+
+	// File 1 (Middle)
+	tx = db.NewTransaction(true)
+	tx.Put([]byte("k1"), []byte("val1"))
+	tx.Commit()
+	db.Checkpoint() // Rotate 1 -> 2
+
+	// File 2 (Last)
+	tx = db.NewTransaction(true)
+	tx.Put([]byte("k2"), []byte("val2"))
+	tx.Commit()
+
+	db.Close()
+
+	// 2. Corrupt File 1
+	vlogDir := filepath.Join(dir, "vlog")
+	matches, _ := filepath.Glob(filepath.Join(vlogDir, "*.vlog"))
+	if len(matches) < 3 {
+		t.Fatalf("Expected at least 3 VLog files, got %d", len(matches))
+	}
+	middleVLog := matches[1]
+
+	f, err := os.OpenFile(middleVLog, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Overwrite a byte in the header or payload to cause checksum failure
+	// Header size is 29. Payload follows.
+	// Let's overwrite byte 30.
+	if _, err := f.WriteAt([]byte{0xFF}, 30); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	// 3. Reopen - Expect Failure
+	// VLog recovery scans all files to find maxTx/maxOp.
+	// It checks checksums. If a middle file is corrupt, it cannot simply truncate it because it would lose committed data that might be referenced by the index (or future replay).
+	// Currently `Recover` in `vlog.go` returns error if `!isLastFile`.
+	if _, err := Open(dir, opts); err == nil {
+		t.Fatal("Expected Open to fail due to corruption in middle VLog file")
+	}
+}

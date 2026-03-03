@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -625,5 +626,171 @@ func TestVerifyChecksums_Closed(t *testing.T) {
 	// for ... { if isClosed() return nil }
 	if err != nil {
 		t.Logf("VerifyChecksums returned: %v", err)
+	}
+}
+
+func TestDB_RunAutoCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	opts := Options{
+		AutoCheckpointInterval: 50 * time.Millisecond,
+	}
+	db, err := Open(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// 1. Initial state
+	// lastCkptOpID might be 0 or small
+
+	// 2. Write data to advance OpID
+	tx := db.NewTransaction(true)
+	tx.Put([]byte("key"), []byte("val"))
+	tx.Commit()
+
+	currentOp := atomic.LoadUint64(&db.operationID)
+
+	// 3. Wait for ticker (allow some buffer > 50ms)
+	time.Sleep(150 * time.Millisecond)
+
+	// 4. Check if checkpoint happened
+	// If checkpoint ran, it should have updated lastCkptOpID to at least the currentOp
+	// (or higher if other background tasks ran, though unlikely in this test).
+	lastCkpt := atomic.LoadUint64(&db.lastCkptOpID)
+	if lastCkpt < currentOp {
+		t.Errorf("AutoCheckpoint did not update lastCkptOpID. Current: %d, LastCkpt: %d", currentOp, lastCkpt)
+	}
+}
+
+// TestApplyBatch_CalculateStaleBytes verifies that applying a batch correctly detects
+// existing keys and counts them as garbage (stale bytes).
+// This exercises the `calculateStaleBytesSimple` logic.
+func TestApplyBatch_CalculateStaleBytes(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// 1. Write an initial value for "key1"
+	// This will be stored in the active VLog file (likely ID 0).
+	tx := db.NewTransaction(true)
+	initialKey := []byte("key1")
+	initialVal := []byte("old_value")
+	tx.Put(initialKey, initialVal)
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Verify initial garbage stats (should be 0)
+	db.mu.RLock()
+	// Check all files, though we expect mostly file 0
+	var totalGarbage int64
+	for _, g := range db.deletedBytesByFile {
+		totalGarbage += g
+	}
+	db.mu.RUnlock()
+	if totalGarbage != 0 {
+		t.Fatalf("Expected 0 garbage initially, got %d", totalGarbage)
+	}
+
+	// 3. Apply a batch that overwrites "key1"
+	// This should trigger the logic to find "old_value" in the index and mark it stale.
+	newVal := []byte("new_value")
+	batch := []ValueLogEntry{
+		{
+			Key:           initialKey,
+			Value:         newVal,
+			TransactionID: 100,
+			OperationID:   200,
+		},
+	}
+
+	if err := db.ApplyBatch(batch); err != nil {
+		t.Fatalf("ApplyBatch failed: %v", err)
+	}
+
+	// 4. Verify garbage stats increased
+	// The stale size should correspond to the entry written in step 1.
+	// Size = Header (29) + KeyLen (4) + ValLen (9) = 42 bytes.
+	expectedStaleSize := int64(ValueLogHeaderSize + len(initialKey) + len(initialVal))
+
+	db.mu.RLock()
+	fid := db.valueLog.currentFid // Assuming no rotation happened, it's the same file
+	garbage := db.deletedBytesByFile[fid]
+	db.mu.RUnlock()
+
+	if garbage != expectedStaleSize {
+		t.Errorf("Expected garbage size %d, got %d", expectedStaleSize, garbage)
+	}
+}
+
+// TestDB_RunAutoCompaction verifies that the background compaction task runs
+// at the configured interval and compacts eligible files.
+func TestDB_RunAutoCompaction(t *testing.T) {
+	dir := t.TempDir()
+	opts := Options{
+		CompactionInterval:   50 * time.Millisecond,
+		CompactionMinGarbage: 1, // Trigger compaction on any garbage
+		MaxWALSize:           1024 * 1024,
+	}
+	db, err := Open(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// 1. Create Garbage in File 0
+	// Write initial data
+	for i := 0; i < 50; i++ {
+		tx := db.NewTransaction(true)
+		tx.Put([]byte(fmt.Sprintf("key-%d", i)), []byte("val"))
+		tx.Commit()
+	}
+	// Checkpoint to rotate to File 1, sealing File 0
+	db.Checkpoint()
+
+	// Overwrite data to make File 0 garbage
+	for i := 0; i < 50; i++ {
+		tx := db.NewTransaction(true)
+		tx.Put([]byte(fmt.Sprintf("key-%d", i)), []byte("val-new"))
+		tx.Commit()
+	}
+	// Checkpoint again to seal File 1
+	db.Checkpoint()
+
+	// Verify File 0 has garbage
+	db.mu.RLock()
+	// Note: We need to know which file ID was File 0. Typically starts at 0.
+	// But let's check any file with garbage.
+	var initialGarbageFiles int
+	for _, g := range db.deletedBytesByFile {
+		if g > 0 {
+			initialGarbageFiles++
+		}
+	}
+	db.mu.RUnlock()
+
+	if initialGarbageFiles == 0 {
+		t.Fatal("Setup failed: no garbage generated")
+	}
+
+	// 2. Wait for auto-compaction ticker
+	time.Sleep(150 * time.Millisecond)
+
+	// 3. Verify that garbage stats have been cleared (indicating compaction ran)
+	// Compaction removes the entry from deletedBytesByFile map.
+	db.mu.RLock()
+	var remainingGarbageFiles int
+	for _, g := range db.deletedBytesByFile {
+		if g > 0 {
+			remainingGarbageFiles++
+		}
+	}
+	db.mu.RUnlock()
+
+	if remainingGarbageFiles >= initialGarbageFiles {
+		t.Errorf("Auto-compaction failed to reduce garbage files. Before: %d, After: %d", initialGarbageFiles, remainingGarbageFiles)
 	}
 }
