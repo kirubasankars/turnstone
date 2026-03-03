@@ -63,9 +63,17 @@ type Options struct {
 	// If 0, a default of 1MB is used.
 	CompactionMinGarbage int64
 
+	// CompactionInterval is the interval at which the background compaction task runs.
+	// If 0, defaults to 2 minutes.
+	CompactionInterval time.Duration
+
 	// ChecksumInterval is the interval at which the background verifies ValueLog integrity.
 	// If 0, background checksumming is disabled.
 	ChecksumInterval time.Duration
+
+	// AutoCheckpointInterval defines the frequency of the background checkpoint task.
+	// If 0, defaults to 60 seconds.
+	AutoCheckpointInterval time.Duration
 
 	// WALRetentionTime determines how long WAL files are kept.
 	// Files older than this duration AND fully checkpointed will be purged.
