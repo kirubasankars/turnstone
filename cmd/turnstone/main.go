@@ -56,16 +56,17 @@ func main() {
 
 func runInit(home string) error {
 	defaultCfg := config.Config{
-		Port:               ":6379",
-		Debug:              true,
-		MaxConns:           1000,
-		NumberOfPartitions: 16,
-		TLSCertFile:        "certs/server.crt",
-		TLSKeyFile:         "certs/server.key",
-		TLSCAFile:          "certs/ca.crt",
-		TLSClientCertFile:  "certs/client.crt",
-		TLSClientKeyFile:   "certs/client.key",
-		MetricsAddr:        ":9090",
+		Port:              ":6379",
+		Debug:             true,
+		MaxConns:          1000,
+		NumberOfDatabases: 16,
+		TLSCertFile:       "certs/server.crt",
+		TLSKeyFile:        "certs/server.key",
+		TLSCAFile:         "certs/ca.crt",
+		TLSClientCertFile: "certs/client.crt",
+		TLSClientKeyFile:  "certs/client.key",
+		MetricsAddr:       ":9090",
+		WALRetention:      "2h", // Default
 	}
 	configPath := filepath.Join(home, "turnstone.json")
 	if err := config.GenerateConfigArtifacts(home, defaultCfg, configPath); err != nil {
@@ -74,7 +75,7 @@ func runInit(home string) error {
 
 	cdcCfg := struct {
 		Host           string `json:"host"`
-		Partition      string `json:"partition"`
+		Database       string `json:"database"`
 		OutputDir      string `json:"output_dir"`
 		StateFile      string `json:"state_file"`
 		MaxFileSize    int    `json:"max_file_size_mb"`
@@ -87,7 +88,7 @@ func runInit(home string) error {
 		TLSCAFile      string `json:"tls_ca_file"`
 	}{
 		Host:           "localhost:6379",
-		Partition:      "1",
+		Database:       "1",
 		OutputDir:      "cdc_logs",
 		StateFile:      "cdc.state",
 		MaxFileSize:    100,
@@ -131,6 +132,16 @@ func runServer(logger *slog.Logger) {
 		logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	}
 
+	// Parse WAL Retention
+	walRetention := 2 * time.Hour
+	if cfg.WALRetention != "" {
+		if d, err := time.ParseDuration(cfg.WALRetention); err == nil {
+			walRetention = d
+		} else {
+			logger.Warn("Invalid wal_retention, using default 2h", "err", err)
+		}
+	}
+
 	certFile := config.ResolvePath(*homeDir, cfg.TLSCertFile)
 	keyFile := config.ResolvePath(*homeDir, cfg.TLSKeyFile)
 	caFile := config.ResolvePath(*homeDir, cfg.TLSCAFile)
@@ -139,15 +150,17 @@ func runServer(logger *slog.Logger) {
 
 	stores := make(map[string]*store.Store)
 
-	for i := 0; i <= cfg.NumberOfPartitions; i++ {
+	for i := 0; i <= cfg.NumberOfDatabases; i++ {
 		name := strconv.Itoa(i)
 		path := filepath.Join(*homeDir, "data", name)
 		isSystem := (i == 0)
-		st, err := store.NewStore(path, logger.With("partition", name), true, 0, isSystem)
+		st, err := store.NewStore(path, logger.With("db", name), true, 0, isSystem)
 		if err != nil {
-			logger.Error("Failed to initialize store", "partition", name, "err", err)
+			logger.Error("Failed to initialize store", "db", name, "err", err)
 			os.Exit(1)
 		}
+		// Set retention on the underlying DB
+		st.DB.SetWALRetentionTime(walRetention)
 		stores[name] = st
 	}
 
@@ -213,12 +226,12 @@ type CDCState struct {
 func runCDC(logger *slog.Logger) {
 	cfg := struct {
 		Host           string `json:"host"`
-		Partition      string `json:"partition"`
+		Database       string `json:"database"`
 		OutputDir      string `json:"output_dir"`
 		StateFile      string `json:"state_file"`
 		MaxFileSize    int    `json:"max_file_size_mb"`
 		RotateInterval string `json:"rotate_interval"`
-		FlushInterval  string `json:"flush_interval"` // New
+		FlushInterval  string `json:"flush_interval"` // New: Idle timeout
 		ValueFormat    string `json:"value_format"`
 		MetricsAddr    string `json:"metrics_addr"`
 		TLSCertFile    string `json:"tls_cert_file"`
@@ -226,7 +239,7 @@ func runCDC(logger *slog.Logger) {
 		TLSCAFile      string `json:"tls_ca_file"`
 	}{
 		Host:           "localhost:6379",
-		Partition:      "1",
+		Database:       "1",
 		OutputDir:      "cdc_logs",
 		StateFile:      "cdc.state",
 		MaxFileSize:    100,
@@ -338,7 +351,7 @@ func runCDC(logger *slog.Logger) {
 			}
 		}
 
-		filename := fmt.Sprintf("cdc-%s-%d-%d.jsonl.part", cfg.Partition, time.Now().UnixNano(), seq)
+		filename := fmt.Sprintf("cdc-%s-%d-%d.jsonl.part", cfg.Database, time.Now().UnixNano(), seq)
 		path := filepath.Join(outputDir, filename)
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 		if err != nil {
@@ -357,51 +370,80 @@ func runCDC(logger *slog.Logger) {
 		os.Exit(1)
 	}
 
+	// Double-signal handling for forced exit
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	ctx, cancel := context.WithCancel(context.Background())
+	// No defer cancel() here, we call it manually
+
+	go func() {
+		// First signal: Graceful
+		sig := <-sigCh
+		logger.Info("Received signal, shutting down...", "signal", sig)
+		cancel()
+
+		// Second signal: Forced
+		sig = <-sigCh
+		logger.Info("Received second signal, forcing exit", "signal", sig)
+		os.Exit(1)
+	}()
+
 	// Ticker for Time-based and Idle-based rotation
 	go func() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
-		for range ticker.C {
-			fileMutex.Lock()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				fileMutex.Lock()
 
-			// Critical Sync
-			if currentFile != nil {
-				currentFile.Sync()
-			}
-
-			currentSeq := lastSeenSeq
-
-			// Criteria 1: Absolute File Age (Max age)
-			needsAgeRotation := time.Since(lastRotationTime) > rotateDuration
-
-			// Criteria 2: Idle Time (Flush if silence)
-			needsIdleRotation := time.Since(lastWriteTime) > flushDuration
-
-			hasBytes := currentBytes > 0
-			fileMutex.Unlock()
-
-			// Only rotate if there is data to finalize
-			if hasBytes && (needsAgeRotation || needsIdleRotation) {
-				reason := "age"
-				if needsIdleRotation {
-					reason = "idle"
+				// Critical Sync
+				if currentFile != nil {
+					currentFile.Sync()
 				}
 
-				// Log the reason if debug
-				if needsIdleRotation {
-					logger.Info("Triggering idle flush", "idle_ms", time.Since(lastWriteTime).Milliseconds())
-				}
+				currentSeq := lastSeenSeq
 
-				if err := rotateFile(currentSeq); err != nil {
-					logger.Error("Rotation failed", "reason", reason, "err", err)
+				// Criteria 1: Absolute File Age (Max age)
+				needsAgeRotation := time.Since(lastRotationTime) > rotateDuration
+
+				// Criteria 2: Idle Time (Flush if silence)
+				needsIdleRotation := time.Since(lastWriteTime) > flushDuration
+
+				hasBytes := currentBytes > 0
+				fileMutex.Unlock()
+
+				// Only rotate if there is data to finalize
+				if hasBytes && (needsAgeRotation || needsIdleRotation) {
+					reason := "age"
+					if needsIdleRotation {
+						reason = "idle"
+					}
+
+					// Log the reason if debug
+					if needsIdleRotation {
+						logger.Info("Triggering idle flush", "idle_ms", time.Since(lastWriteTime).Milliseconds())
+					}
+
+					if err := rotateFile(currentSeq); err != nil {
+						logger.Error("Rotation failed", "reason", reason, "err", err)
+					}
 				}
 			}
 		}
 	}()
 
-	logger.Info("Starting subscription loop", "partition", cfg.Partition, "format", cfg.ValueFormat)
+	logger.Info("Starting subscription loop", "database", cfg.Database, "format", cfg.ValueFormat)
 
+	// Main Loop
+Loop:
 	for {
+		if ctx.Err() != nil {
+			break Loop
+		}
+
 		var cli *client.Client
 		var err error
 
@@ -417,13 +459,28 @@ func runCDC(logger *slog.Logger) {
 
 		if err != nil {
 			logger.Error("Connection failed, retrying in 5s", "err", err)
-			time.Sleep(5 * time.Second)
-			continue
+			select {
+			case <-ctx.Done():
+				break Loop
+			case <-time.After(5 * time.Second):
+				continue Loop
+			}
 		}
 
 		logger.Info("Connected, subscribing...", "seq", lastSeenSeq)
 
-		err = cli.Subscribe(cfg.Partition, lastSeenSeq, func(c client.Change) error {
+		// Create a separate context for the subscription to handle graceful shutdown
+		// while the client is blocked on Read.
+		doneCh := make(chan struct{})
+		go func() {
+			select {
+			case <-ctx.Done():
+				cli.Close()
+			case <-doneCh:
+			}
+		}()
+
+		err = cli.Subscribe(cfg.Database, lastSeenSeq, func(c client.Change) error {
 			var val any
 			if !c.IsDelete {
 				switch cfg.ValueFormat {
@@ -480,13 +537,36 @@ func runCDC(logger *slog.Logger) {
 			return nil
 		})
 
-		cli.Close()
+		close(doneCh) // Stop the watcher
+
+		if ctx.Err() != nil {
+			break Loop
+		}
+
 		if err != nil {
+			// Fatal error check: if the server says we are OUT_OF_SYNC, we must stop.
+			if strings.Contains(err.Error(), "OUT_OF_SYNC") {
+				logger.Error("Fatal replication error: Client is out of sync with server WAL retention.", "err", err)
+				logger.Error("Manual intervention required: Delete the state file to reset, or check server logs.")
+				os.Exit(1)
+			}
+
 			logger.Error("Subscription dropped, retrying in 3s", "err", err)
 		} else {
 			logger.Warn("Subscription closed unexpectedly, retrying in 3s")
 		}
-		time.Sleep(3 * time.Second)
+
+		select {
+		case <-ctx.Done():
+			break Loop
+		case <-time.After(3 * time.Second):
+		}
+	}
+
+	logger.Info("CDC shutting down, finalizing state...")
+	// Final rotation to ensure data is safe and state is updated
+	if err := rotateFile(lastSeenSeq); err != nil {
+		logger.Error("Final rotation failed", "err", err)
 	}
 }
 

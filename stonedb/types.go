@@ -66,6 +66,11 @@ type Options struct {
 	// ChecksumInterval is the interval at which the background verifies ValueLog integrity.
 	// If 0, background checksumming is disabled.
 	ChecksumInterval time.Duration
+
+	// WALRetentionTime determines how long WAL files are kept.
+	// Files older than this duration AND fully checkpointed will be purged.
+	// If 0, defaults to 2 hours.
+	WALRetentionTime time.Duration
 }
 
 // WALLocation points to a specific batch in the WAL files

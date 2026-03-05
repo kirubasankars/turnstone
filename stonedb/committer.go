@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"os"
 	"sync/atomic"
 )
 
@@ -119,20 +120,80 @@ func (db *DB) prepareBatch(requests []commitRequest) (*commitBatch, error) {
 
 // persistBatch writes the prepared data to the Write-Ahead Log and Value Log.
 func (db *DB) persistBatch(batch *commitBatch) error {
+	// Calculate expected WAL bytes for potential rollback.
+	// Each payload in walPayloads is wrapped in a frame with WALHeaderSize (8 bytes).
+	var walBytesWritten int64
+	for _, p := range batch.walPayloads {
+		walBytesWritten += int64(WALHeaderSize + len(p))
+	}
+
 	// 1. WAL Write (Grouped)
+	// If this returns nil, the transaction is physically durable on disk (fsync'd).
 	if err := db.writeAheadLog.AppendBatches(batch.walPayloads); err != nil {
 		return fmt.Errorf("wal write failed: %w", err)
 	}
 
 	// 2. VLog Write (Grouped)
+	// Write the actual values to the Value Log.
 	fileID, offset, err := db.valueLog.AppendEntries(batch.combinedVLog)
 	if err != nil {
-		return fmt.Errorf("vlog write failed: %w", err)
+		// Attempt to rollback the WAL write to maintain consistency.
+		// If the VLog write fails, we must ensure the WAL entry is removed, otherwise
+		// a restart would replay the transaction, causing a "Phantom Write" (data appearing
+		// after client was told it failed).
+		if rbErr := db.rollbackWAL(walBytesWritten); rbErr != nil {
+			// Rollback failed (likely due to file rotation or I/O error).
+			// We cannot guarantee consistency, so we must crash to force recovery from a known state.
+			fmt.Fprintf(os.Stderr, "CRITICAL: Consistency violation in persistBatch. WAL written, VLog failed, Rollback failed: %v. Orig Err: %v\n", rbErr, err)
+			os.Exit(1)
+		}
+
+		// Rollback succeeded. The system state is clean (as if WAL write never happened).
+		return fmt.Errorf("vlog write failed (wal rolled back): %w", err)
 	}
 
 	// Capture VLog location for Index Update
 	batch.fileID = fileID
 	batch.baseOffset = offset
+
+	return nil
+}
+
+// rollbackWAL attempts to truncate the active WAL file by the specified number of bytes.
+// This is used to undo a successful WAL write if the subsequent VLog write fails.
+func (db *DB) rollbackWAL(bytesToRemove int64) error {
+	wal := db.writeAheadLog
+	wal.mu.Lock()
+	defer wal.mu.Unlock()
+
+	currentSize := int64(wal.writeOffset)
+
+	// Check if a rotation occurred during the write we are trying to undo.
+	// If writeOffset is smaller than bytesToRemove, it means the file was rotated (or just started).
+	// In this case, part of the batch is in a previous file, making simple truncation unsafe/complex.
+	if currentSize < bytesToRemove {
+		return fmt.Errorf("cannot rollback across file boundary (offset %d < remove %d)", currentSize, bytesToRemove)
+	}
+
+	newOffset := currentSize - bytesToRemove
+
+	// 1. Truncate the file to remove the batch
+	if err := wal.currentFile.Truncate(newOffset); err != nil {
+		return fmt.Errorf("truncate failed: %w", err)
+	}
+
+	// 2. Reset the file pointer
+	if _, err := wal.currentFile.Seek(newOffset, 0); err != nil {
+		return fmt.Errorf("seek failed: %w", err)
+	}
+
+	// 3. Update internal offset state
+	wal.writeOffset = uint32(newOffset)
+
+	// 4. Sync to ensure the truncation is durable
+	if err := wal.currentFile.Sync(); err != nil {
+		return fmt.Errorf("sync failed: %w", err)
+	}
 
 	return nil
 }
