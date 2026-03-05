@@ -29,6 +29,9 @@ const (
 	OpCodeSet       = 0x03 // Store a value. Payload: [KeyLen(4)|Key|Value].
 	OpCodeDel       = 0x04 // Delete a value. Payload: Key bytes.
 	OpCodeSelect    = 0x05 // Select the active database. Payload: Database Name bytes.
+	OpCodeMGet      = 0x06 // Multi-Get. Payload: [NumKeys(4)][KLen(4)|Key]...
+	OpCodeMSet      = 0x07 // Multi-Set. Payload: [NumPairs(4)][KLen(4)|Key|VLen(4)|Val]...
+	OpCodeMDel      = 0x08 // Multi-Del. Payload: [NumKeys(4)][KLen(4)|Key]...
 	OpCodeBegin     = 0x10 // Start a new transaction context.
 	OpCodeCommit    = 0x11 // Commit the current transaction.
 	OpCodeAbort     = 0x12 // Rollback the current transaction.
@@ -128,6 +131,10 @@ func mapStatusToError(status byte, body []byte) error {
 type Config struct {
 	// Address is the host:port of the TurnstoneDB server (e.g., "localhost:6379").
 	Address string
+
+	// ClientID is the unique identifier for this client (used for replication/CDC).
+	// If empty, it defaults to "client-unknown".
+	ClientID string
 
 	// ConnectTimeout limits how long the client waits to establish the TCP connection.
 	// Default: 5 seconds.
@@ -351,6 +358,64 @@ func (c *Client) Get(key string) ([]byte, error) {
 	return c.roundTrip(OpCodeGet, []byte(key))
 }
 
+// MGet retrieves values for multiple keys.
+// Requires an active transaction.
+// Returns a slice of byte slices matching the order of input keys.
+// If a key does not exist, the corresponding slice is nil.
+func (c *Client) MGet(keys ...string) ([][]byte, error) {
+	if len(keys) == 0 {
+		return nil, nil
+	}
+	buf := new(bytes.Buffer)
+	binary.Write(buf, binary.BigEndian, uint32(len(keys)))
+	for _, k := range keys {
+		if !isASCII(k) {
+			return nil, ErrInvalidKey
+		}
+		binary.Write(buf, binary.BigEndian, uint32(len(k)))
+		buf.WriteString(k)
+	}
+
+	payload, err := c.roundTrip(OpCodeMGet, buf.Bytes())
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse Response: [NumValues(4)] [ [Len(4)][Val] ... ]
+	if len(payload) < 4 {
+		return nil, errors.New("invalid mget response")
+	}
+	count := binary.BigEndian.Uint32(payload[0:4])
+	if int(count) != len(keys) {
+		return nil, fmt.Errorf("mget count mismatch: expected %d, got %d", len(keys), count)
+	}
+
+	results := make([][]byte, count)
+	offset := 4
+	for i := 0; i < int(count); i++ {
+		if offset+4 > len(payload) {
+			return nil, errors.New("malformed mget response")
+		}
+		valLen := binary.BigEndian.Uint32(payload[offset : offset+4])
+		offset += 4
+
+		// Sentinel for NIL (0xFFFFFFFF)
+		if valLen == 0xFFFFFFFF {
+			results[i] = nil
+			continue
+		}
+
+		if offset+int(valLen) > len(payload) {
+			return nil, errors.New("malformed mget response value")
+		}
+		results[i] = make([]byte, valLen)
+		copy(results[i], payload[offset:offset+int(valLen)])
+		offset += int(valLen)
+	}
+
+	return results, nil
+}
+
 // Set creates or updates a key-value pair.
 // Requires an active transaction.
 func (c *Client) Set(key string, value []byte) error {
@@ -369,6 +434,29 @@ func (c *Client) Set(key string, value []byte) error {
 	return err
 }
 
+// MSet creates or updates multiple key-value pairs.
+// Requires an active transaction.
+func (c *Client) MSet(entries map[string][]byte) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	buf := new(bytes.Buffer)
+	binary.Write(buf, binary.BigEndian, uint32(len(entries)))
+
+	for k, v := range entries {
+		if !isASCII(k) {
+			return ErrInvalidKey
+		}
+		binary.Write(buf, binary.BigEndian, uint32(len(k)))
+		buf.WriteString(k)
+		binary.Write(buf, binary.BigEndian, uint32(len(v)))
+		buf.Write(v)
+	}
+
+	_, err := c.roundTrip(OpCodeMSet, buf.Bytes())
+	return err
+}
+
 // Del removes a key.
 // Requires an active transaction.
 func (c *Client) Del(key string) error {
@@ -377,6 +465,35 @@ func (c *Client) Del(key string) error {
 	}
 	_, err := c.roundTrip(OpCodeDel, []byte(key))
 	return err
+}
+
+// MDel removes multiple keys.
+// Requires an active transaction.
+// Returns the number of keys actually deleted (that existed).
+func (c *Client) MDel(keys ...string) (int, error) {
+	if len(keys) == 0 {
+		return 0, nil
+	}
+	buf := new(bytes.Buffer)
+	binary.Write(buf, binary.BigEndian, uint32(len(keys)))
+	for _, k := range keys {
+		if !isASCII(k) {
+			return 0, ErrInvalidKey
+		}
+		binary.Write(buf, binary.BigEndian, uint32(len(k)))
+		buf.WriteString(k)
+	}
+
+	payload, err := c.roundTrip(OpCodeMDel, buf.Bytes())
+	if err != nil {
+		return 0, err
+	}
+
+	if len(payload) < 4 {
+		return 0, errors.New("invalid mdel response")
+	}
+	count := binary.BigEndian.Uint32(payload[0:4])
+	return int(count), nil
 }
 
 func isASCII(s string) bool {
@@ -434,10 +551,19 @@ func (c *Client) Subscribe(dbName string, startSeq uint64, handler func(Change) 
 		return ErrConnection
 	}
 
+	clientID := c.config.ClientID
+	if clientID == "" {
+		clientID = "client-unknown"
+	}
+
 	// 1. Send Hello Handshake
-	// Format: [Ver:4][NumDBs:4] ... [NameLen:4][Name][LogID:8]
+	// Format: [Ver:4][IDLen:4][ID][NumDBs:4] ... [NameLen:4][Name][LogID:8]
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.BigEndian, uint32(1)) // Version
+
+	binary.Write(buf, binary.BigEndian, uint32(len(clientID))) // ID Len
+	buf.WriteString(clientID)                                  // ID Bytes
+
 	binary.Write(buf, binary.BigEndian, uint32(1)) // Count (1 DB)
 
 	binary.Write(buf, binary.BigEndian, uint32(len(dbName)))

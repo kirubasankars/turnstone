@@ -4,6 +4,7 @@ build:
 	go build -o bin/turnstone-cli   cmd/turnstone-cli/main.go
 	go build -o bin/turnstone-bench cmd/turnstone-bench/main.go
 	go build -o bin/turnstone-load  cmd/turnstone-load/main.go
+	go build -o bin/turnstone-load2  cmd/turnstone-load2/main.go
 	cd cmd/turnstone-duck && go mod tidy && go build -o ../../bin/turnstone-duck
 
 clean:

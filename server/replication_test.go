@@ -62,7 +62,7 @@ func startServerNode(t *testing.T, baseDir, name string, sharedTLS *tls.Config) 
 	stores := make(map[string]*store.Store)
 	for _, dbName := range []string{"0", "1", "2", "3"} {
 		partPath := filepath.Join(nodeDir, "data", dbName)
-		st, err := store.NewStore(partPath, logger, true, 0, true)
+		st, err := store.NewStore(partPath, logger, true, 0, true, "time")
 		if err != nil {
 			t.Fatalf("Failed to init store %s: %v", dbName, err)
 		}
@@ -78,9 +78,10 @@ func startServerNode(t *testing.T, baseDir, name string, sharedTLS *tls.Config) 
 	pool.AppendCertsFromPEM(caCert)
 	replTLS := &tls.Config{Certificates: []tls.Certificate{serverCert}, RootCAs: pool, InsecureSkipVerify: true}
 
-	rm := replication.NewReplicationManager(stores, replTLS, logger)
+	rm := replication.NewReplicationManager(name, stores, replTLS, logger)
 
 	srv, err := NewServer(
+		name, // Use node name as Server ID
 		":0", stores, logger, 10,
 		filepath.Join(certsDir, "server.crt"),
 		filepath.Join(certsDir, "server.key"),
@@ -442,10 +443,16 @@ func TestReplication_SlowConsumer_Dropped(t *testing.T) {
 	defer conn.Close()
 
 	// 4. Send Hello Handshake to subscribe to "1" Database (Valid Database)
+	// Format: [Ver:4][IDLen:4][ID][NumDBs:4] ... [NameLen:4][Name][LogID:8]
 	dbName := "1"
+	clientID := "slow-reader"
 
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.BigEndian, uint32(1)) // Version
+
+	binary.Write(buf, binary.BigEndian, uint32(len(clientID)))
+	buf.WriteString(clientID)
+
 	binary.Write(buf, binary.BigEndian, uint32(1)) // NumDatabases
 
 	binary.Write(buf, binary.BigEndian, uint32(len(dbName)))
