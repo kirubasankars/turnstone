@@ -4,6 +4,8 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -94,7 +96,7 @@ func TestProcessCommitBatch_MixedValidity(t *testing.T) {
 }
 
 // TestProcessCommitBatch_IndexFailure simulates a failure during the index update phase (Stage 3).
-// This is a critical scenario where data is persisted but not indexed.
+// This is a critical scenario where data is persisted but not indexed. we tried hard to rollback
 func TestProcessCommitBatch_IndexFailure(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(dir, Options{})
@@ -103,34 +105,67 @@ func TestProcessCommitBatch_IndexFailure(t *testing.T) {
 	}
 	defer db.Close()
 
-	// Inject failure
-	forcedErr := errors.New("simulated index failure")
-	testingApplyBatchIndexErr = forcedErr
-	defer func() { testingApplyBatchIndexErr = nil }()
-
+	// 1. Establish baseline: Write k1 successfully
 	tx := db.NewTransaction(true)
-	tx.Put([]byte("k"), []byte("v"))
+	tx.Put([]byte("k1"), []byte("v1"))
 
 	reqs := []commitRequest{
+		{tx: tx, resp: make(chan error, 1)},
+	}
+	db.processCommitBatch(reqs)
+
+	// Ensure baseline success
+	if err := <-reqs[0].resp; err != nil {
+		t.Fatalf("Baseline write failed: %v", err)
+	}
+	checkKey(t, db, "k1", "v1")
+
+	// 2. Inject Index Failure
+	// Define a distinct error so we can verify wrapping works
+	simulatedErr := errors.New("simulated index failure")
+	testingApplyBatchIndexErr = simulatedErr
+	defer func() { testingApplyBatchIndexErr = nil }()
+
+	// 3. Attempt a write that will fail at the Index stage
+	tx = db.NewTransaction(true)
+	tx.Put([]byte("k"), []byte("v"))
+
+	reqs = []commitRequest{
 		{tx: tx, resp: make(chan error, 1)},
 	}
 
 	db.processCommitBatch(reqs)
 
-	// Verify error response
-	if err := <-reqs[0].resp; err != forcedErr {
-		t.Errorf("Expected error %v, got %v", forcedErr, err)
+	// 4. Verify the Error Response
+	err = <-reqs[0].resp
+	if err == nil {
+		t.Fatal("Expected error, got nil")
 	}
 
-	// Verify that despite the error reported to the user, the data *was* written to disk (Stage 2 succeeded).
-	// Since the index update failed, a subsequent read *might* fail to find it in the current running instance
-	// (depending on how applyBatchIndex failed exactly, here it fails early).
-	// However, a restart should recover it because WAL/VLog are persistent.
+	// Check that we got the wrapper message indicating rollback happened
+	if !strings.Contains(err.Error(), "safe rollback performed") {
+		t.Errorf("Expected rollback message, got: %v", err)
+	}
 
-	// 1. Check in-memory (should be missing because index update was skipped)
+	// Check that it wraps the underlying cause
+	if !errors.Is(err, simulatedErr) {
+		t.Errorf("Expected error to wrap '%v', got '%v'", simulatedErr, err)
+	}
+
+	// 5. Verify Rollback (In-Memory)
+	// The key should NOT be visible because index update failed
 	checkKeyMissing(t, db, "k")
 
-	// 2. Restart DB to prove persistence (Recovery rebuilds index from VLog)
+	// Delete VLog and Index. This forces a full rebuild from the WAL.
+	// If the WAL wasn't truncated correctly during the rollback,
+	// the replay will resurrect the phantom key "k".
+	if err := os.RemoveAll(filepath.Join(dir, "vlog")); err != nil {
+		t.Fatal(err)
+	}
+
+	// 6. Verify Rollback (Persistence)
+	// Close and Reopen to ensure WAL/VLog were actually truncated.
+	// If rollback failed, "k" would reappear here (Phantom Write).
 	db.Close()
 	db2, err := Open(dir, Options{})
 	if err != nil {
@@ -138,7 +173,15 @@ func TestProcessCommitBatch_IndexFailure(t *testing.T) {
 	}
 	defer db2.Close()
 
-	checkKey(t, db2, "k", "v")
+	// "k" should be gone forever
+	checkKeyMissing(t, db2, "k")
+
+	// "k1" should still be there
+	checkKey(t, db2, "k1", "v1")
+
+	if db.transactionID != db2.transactionID {
+		t.Fatal("transactionID should be advanced")
+	}
 }
 
 // TestProcessCommitBatch_AllFail verifies the behavior when prepareBatch rejects
@@ -153,20 +196,20 @@ func TestProcessCommitBatch_AllFail(t *testing.T) {
 
 	// Setup conflict
 	txInit := db.NewTransaction(true)
-	txInit.Put([]byte("exists"), []byte("v1"))
-	txInit.Commit() // TxID becomes 1
+	_ = txInit.Put([]byte("exists"), []byte("v1"))
+	_ = txInit.Commit() // TxID becomes 1
 
 	// Tx1: Conflict
 	tx1 := db.NewTransaction(true)
 	tx1.readTxID = 0
 	tx1.readSet["exists"] = struct{}{}
-	tx1.Put([]byte("new1"), []byte("val1"))
+	_ = tx1.Put([]byte("new1"), []byte("val1"))
 
 	// Tx2: Conflict
 	tx2 := db.NewTransaction(true)
 	tx2.readTxID = 0
 	tx2.readSet["exists"] = struct{}{}
-	tx2.Put([]byte("new2"), []byte("val2"))
+	_ = tx2.Put([]byte("new2"), []byte("val2"))
 
 	reqs := []commitRequest{
 		{tx: tx1, resp: make(chan error, 1)},

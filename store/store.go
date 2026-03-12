@@ -51,7 +51,7 @@ type Store struct {
 	walStrategy string
 }
 
-func NewStore(dir string, logger *slog.Logger, walSync bool, minReplicas int, isSystem bool, walStrategy string) (*Store, error) {
+func NewStore(dir string, logger *slog.Logger, minReplicas int, isSystem bool, walStrategy string) (*Store, error) {
 	s := &Store{
 		logger:      logger,
 		startTime:   time.Now(),

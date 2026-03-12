@@ -167,9 +167,8 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 	// Ensure connection closes when context is cancelled or function returns
 	go func() {
 		<-ctx.Done()
-		conn.Close()
+		_ = conn.Close()
 	}()
-	defer conn.Close()
 
 	rm.logger.Info("Connected to Leader for replication", "addr", addr, "count", len(dbs))
 
@@ -182,21 +181,21 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 	// Build Hello Payload
 	// Format: [Ver:4][IDLen:4][ID][NumDBs:4] ... [NameLen:4][Name][LogID:8]
 	buf := new(bytes.Buffer)
-	binary.Write(buf, binary.BigEndian, uint32(1)) // Version
+	_ = binary.Write(buf, binary.BigEndian, uint32(1)) // Version
 
 	// Write Server ID
-	binary.Write(buf, binary.BigEndian, uint32(len(rm.serverID)))
+	_ = binary.Write(buf, binary.BigEndian, uint32(len(rm.serverID)))
 	buf.WriteString(rm.serverID)
 
 	// Write DB Count
-	binary.Write(buf, binary.BigEndian, uint32(len(dbs)))
+	_ = binary.Write(buf, binary.BigEndian, uint32(len(dbs)))
 
 	for _, cfg := range dbs {
 		stats := rm.stores[cfg.LocalDB].Stats()
 		logID := uint64(stats.Offset) // Use Offset as LogID
-		binary.Write(buf, binary.BigEndian, uint32(len(cfg.RemoteDB)))
+		_ = binary.Write(buf, binary.BigEndian, uint32(len(cfg.RemoteDB)))
 		buf.WriteString(cfg.RemoteDB)
-		binary.Write(buf, binary.BigEndian, logID)
+		_ = binary.Write(buf, binary.BigEndian, logID)
 		rm.logger.Debug("Sending Hello for DB", "remote_db", cfg.RemoteDB, "local_db", cfg.LocalDB, "startLogID", logID)
 
 		remoteToLocal[cfg.RemoteDB] = append(remoteToLocal[cfg.RemoteDB], cfg.LocalDB)
@@ -272,9 +271,9 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 						if lastCommittedID > 0 {
 							// Send ACK with REMOTE DB Name, so leader knows which stream to update
 							ackBuf := new(bytes.Buffer)
-							binary.Write(ackBuf, binary.BigEndian, uint32(len(remoteDBName)))
+							_ = binary.Write(ackBuf, binary.BigEndian, uint32(len(remoteDBName)))
 							ackBuf.WriteString(remoteDBName)
-							binary.Write(ackBuf, binary.BigEndian, lastCommittedID)
+							_ = binary.Write(ackBuf, binary.BigEndian, lastCommittedID)
 
 							h := make([]byte, 5)
 							h[0] = protocol.OpCodeReplAck

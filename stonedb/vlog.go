@@ -478,6 +478,25 @@ func (vl *ValueLog) Replay(maxTxID uint64, fn func(ValueLogEntry, EntryMeta) err
 	return nil
 }
 
+func (vl *ValueLog) Truncate(offset uint32) error {
+	vl.mu.Lock()
+	defer vl.mu.Unlock()
+
+	// 1. Truncate the file physically
+	if err := vl.currentFile.Truncate(int64(offset)); err != nil {
+		return err
+	}
+
+	// 2. Reset the file pointer (crucial for next write)
+	if _, err := vl.currentFile.Seek(int64(offset), 0); err != nil {
+		return err
+	}
+
+	// 3. Reset internal offset state
+	vl.writeOffset = offset
+	return nil
+}
+
 func (vl *ValueLog) Close() error {
 	vl.mu.Lock()
 	defer vl.mu.Unlock()

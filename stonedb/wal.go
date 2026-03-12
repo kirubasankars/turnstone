@@ -541,7 +541,8 @@ func (wal *WriteAheadLog) replayFile(f *os.File, path string, vl *ValueLog, minT
 		}
 
 		if txID > minTxID {
-			fmt.Printf("Replaying WAL Batch TxID=%d from %s into ValueLog\n", txID, filepath.Base(path))
+			// TODO: bring logger
+			// fmt.Printf("Replaying WAL Batch TxID=%d from %s into ValueLog\n", txID, filepath.Base(path))
 			if _, _, err := vl.AppendEntries(entries); err != nil {
 				return err
 			}
