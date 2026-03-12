@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
-	"os"
 	"sync/atomic"
 )
 
@@ -56,9 +55,15 @@ func (db *DB) processCommitBatch(requests []commitRequest) {
 		return
 	}
 
+	// Capture VLog state BEFORE writing (for potential rollback)
+	// Note: accessing valueLog.writeOffset requires locking or assumes commitMu protects it
+	// Since commitMu is the only writer, reading it directly is safe here if VLog is internal.
+	vlogPreOffset := db.valueLog.writeOffset
+
 	// Stage 2: Persistence (IO)
 	// Writes to WAL and ValueLog.
-	if err := db.persistBatch(batch); err != nil {
+	walBytesWritten, err := db.persistBatch(batch)
+	if err != nil || walBytesWritten == 0 {
 		batch.failAll(err)
 		return
 	}
@@ -66,12 +71,39 @@ func (db *DB) processCommitBatch(requests []commitRequest) {
 	// Stage 3: Application (Memory/Index)
 	// Updates the LevelDB index and advances global clocks.
 	if err := db.applyBatchIndex(batch); err != nil {
-		batch.failAll(err)
+		// rollback WAL and Vlog
+		db.attemptRollbackAndFail(batch, err, vlogPreOffset, walBytesWritten)
 		return
 	}
 
 	// Success
 	batch.successAll()
+}
+
+// Helper to handle the critical rollback logic
+func (db *DB) attemptRollbackAndFail(batch *commitBatch, originalErr error, vlogOffset uint32, walBytes int64) {
+	// Strategy: Undo actions in reverse order of operations.
+	// Order was: WAL Write -> VLog Write.
+	// Undo Order: VLog Truncate -> WAL Truncate.
+
+	// 1. Rollback VLog
+	if vErr := db.valueLog.Truncate(vlogOffset); vErr != nil {
+		// FATAL: We have persisted data on disk that we cannot remove,
+		// and we cannot update the index. The DB is now inconsistent.
+		panic(fmt.Sprintf("CRITICAL: Index failed (%v) and VLog rollback failed (%v). Crashing to protect consistency.", originalErr, vErr))
+	}
+
+	// 2. Rollback WAL
+	if wErr := db.rollbackWAL(walBytes); wErr != nil {
+		// FATAL: VLog rolled back, but WAL stays. On restart, WAL will replay
+		// data into VLog that we just deleted. Phantom writes will appear.
+		panic(fmt.Sprintf("CRITICAL: Index failed (%v), VLog rolled back, but WAL rollback failed (%v). Crashing.", originalErr, wErr))
+	}
+
+	// 3. Rollback Successful
+	// The system state is now exactly as it was before this batch started.
+	// We can safely return the error to the client.
+	batch.failAll(fmt.Errorf("internal error (safe rollback performed): %w", originalErr))
 }
 
 // prepareBatch validates transactions, detects conflicts (inter-tx and intra-batch),
@@ -134,7 +166,7 @@ func (db *DB) prepareBatch(requests []commitRequest) (*commitBatch, error) {
 }
 
 // persistBatch writes the prepared data to the Write-Ahead Log and Value Log.
-func (db *DB) persistBatch(batch *commitBatch) error {
+func (db *DB) persistBatch(batch *commitBatch) (int64, error) {
 	// Calculate expected WAL bytes for potential rollback.
 	// Each payload in walPayloads is wrapped in a frame with WALHeaderSize (8 bytes).
 	var walBytesWritten int64
@@ -145,7 +177,7 @@ func (db *DB) persistBatch(batch *commitBatch) error {
 	// 1. WAL Write (Grouped)
 	// If this returns nil, the transaction is physically durable on disk (fsync'd).
 	if err := db.writeAheadLog.AppendBatches(batch.walPayloads); err != nil {
-		return fmt.Errorf("wal write failed: %w", err)
+		return 0, fmt.Errorf("wal write failed: %w", err)
 	}
 
 	// HOOK: Point of no return checks.
@@ -165,19 +197,18 @@ func (db *DB) persistBatch(batch *commitBatch) error {
 		if rbErr := db.rollbackWAL(walBytesWritten); rbErr != nil {
 			// Rollback failed (likely due to file rotation or I/O error).
 			// We cannot guarantee consistency, so we must crash to force recovery from a known state.
-			fmt.Fprintf(os.Stderr, "CRITICAL: Consistency violation in persistBatch. WAL written, VLog failed, Rollback failed: %v. Orig Err: %v\n", rbErr, err)
-			os.Exit(1)
+			panic(fmt.Sprintf("CRITICAL: Consistency violation in persistBatch. WAL written, VLog failed, Rollback failed: %v. Orig Err: %v\n", rbErr, err))
 		}
 
 		// Rollback succeeded. The system state is clean (as if WAL write never happened).
-		return fmt.Errorf("vlog write failed (wal rolled back): %w", err)
+		return 0, fmt.Errorf("vlog write failed (wal rolled back): %w", err)
 	}
 
 	// Capture VLog location for Index Update
 	batch.fileID = fileID
 	batch.baseOffset = offset
 
-	return nil
+	return walBytesWritten, nil
 }
 
 // rollbackWAL attempts to truncate the active WAL file by the specified number of bytes.
@@ -263,9 +294,9 @@ func hasIntraBatchConflict(tx *Transaction, batchWrites map[string]uint64) bool 
 
 func serializeTx(tx *Transaction, txID, startOpID uint64) ([]byte, []ValueLogEntry) {
 	var walBuf bytes.Buffer
-	binary.Write(&walBuf, binary.BigEndian, txID)
-	binary.Write(&walBuf, binary.BigEndian, startOpID)
-	binary.Write(&walBuf, binary.BigEndian, uint32(len(tx.pendingOps)))
+	_ = binary.Write(&walBuf, binary.BigEndian, txID)
+	_ = binary.Write(&walBuf, binary.BigEndian, startOpID)
+	_ = binary.Write(&walBuf, binary.BigEndian, uint32(len(tx.pendingOps)))
 
 	var vlogEntries []ValueLogEntry
 	opIdx := uint64(0)
@@ -283,9 +314,9 @@ func serializeTx(tx *Transaction, txID, startOpID uint64) ([]byte, []ValueLogEnt
 		opIdx++
 
 		// WAL serialization
-		binary.Write(&walBuf, binary.BigEndian, uint32(len(key)))
+		_ = binary.Write(&walBuf, binary.BigEndian, uint32(len(key)))
 		walBuf.Write(key)
-		binary.Write(&walBuf, binary.BigEndian, uint32(len(op.Value)))
+		_ = binary.Write(&walBuf, binary.BigEndian, uint32(len(op.Value)))
 		walBuf.Write(op.Value)
 		if op.IsDelete {
 			walBuf.WriteByte(1)
