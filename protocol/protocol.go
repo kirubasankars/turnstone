@@ -91,7 +91,7 @@ var (
 	ErrTransactionTimeout  = errors.New("transaction timeout")
 	ErrReadOnly            = errors.New("server is read-only")
 	ErrMemoryLimitExceeded = errors.New("memory limit exceeded")
-	ErrDatabaseNotFound    = errors.New("database not found") // Renamed from ErrPartitionNotFound
+	ErrDatabaseNotFound    = errors.New("database not found")
 )
 
 var Crc32Table = crc32.MakeTable(crc32.Castagnoli)

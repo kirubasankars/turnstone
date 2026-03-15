@@ -32,6 +32,7 @@ type Config struct {
 	NumberOfDatabases    int    `json:"number_of_databases"`
 	WALRetention         string `json:"wal_retention"`          // Duration string e.g. "2h"
 	WALRetentionStrategy string `json:"wal_retention_strategy"` // "time" or "replication"
+	MaxDiskUsagePercent  int    `json:"max_disk_usage_percent"`
 }
 
 // ResolvePath returns an absolute path relative to the home directory if strictly necessary.
@@ -89,6 +90,10 @@ func GenerateConfigArtifacts(homeDir string, defaultCfg Config, configPath strin
 	defaultCfg.WALRetention = "2h" // Default retention
 	if defaultCfg.WALRetentionStrategy == "" {
 		defaultCfg.WALRetentionStrategy = "time"
+	}
+	// Default to 90% if not set (0 is treated as disabled, so we set explicit default here if needed)
+	if defaultCfg.MaxDiskUsagePercent == 0 {
+		defaultCfg.MaxDiskUsagePercent = 90
 	}
 
 	// Set default ID if not provided
