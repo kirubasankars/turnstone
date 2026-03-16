@@ -30,16 +30,43 @@ type replPacket struct {
 
 // HandleReplicaConnection multiplexes streams from multiple databases onto one connection.
 // It uses the provided role to distinguish between full Replicas (quorum members) and CDC clients (observers).
-func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []byte, role string, replicaID string) {
-	// 1. Parse Hello: [Ver:4][NumDBs:4] ... [NameLen:4][Name][LogID:8]
+func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []byte, role string, certClientID string) {
+	// 1. Parse Hello: [Ver:4][IDLen:4][ID][NumDBs:4] ... [NameLen:4][Name][LogID:8]
 	if len(payload) < 8 {
 		s.logger.Error("HandleReplicaConnection: payload too short for header")
 		return
 	}
 	// ver := binary.BigEndian.Uint32(payload[0:4])
-	count := binary.BigEndian.Uint32(payload[4:8])
+	cursor := 4
 
-	cursor := 8
+	// Parse ID
+	if cursor+4 > len(payload) {
+		s.logger.Error("HandleReplicaConnection: payload truncated reading ID len")
+		return
+	}
+	idLen := int(binary.BigEndian.Uint32(payload[cursor : cursor+4]))
+	cursor += 4
+	if cursor+idLen > len(payload) {
+		s.logger.Error("HandleReplicaConnection: payload truncated reading ID")
+		return
+	}
+	replicaID := string(payload[cursor : cursor+idLen])
+	cursor += idLen
+
+	// ID is required field, no fallback required
+	if replicaID == "" || replicaID == "client-unknown" {
+		s.logger.Error("HandleReplicaConnection: replica connected without explicit ID", "role", role)
+		return
+	}
+
+	// Parse DB Count
+	if cursor+4 > len(payload) {
+		s.logger.Error("HandleReplicaConnection: payload truncated reading count")
+		return
+	}
+	count := binary.BigEndian.Uint32(payload[cursor : cursor+4])
+	cursor += 4
+
 	type subReq struct {
 		name  string
 		logID uint64
@@ -64,7 +91,13 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 		subs = append(subs, subReq{name, logID})
 
 		if st, ok := s.stores[name]; ok {
-			s.logger.Info("Replica subscribed", "replica", replicaID, "db", name, "startLogID", logID, "role", role)
+			s.logger.Info("Replica subscribed",
+				"replica_id", replicaID,
+				"auth_id", certClientID,
+				"db", name,
+				"startLogID", logID,
+				"role", role,
+			)
 			st.RegisterReplica(replicaID, logID, role)
 
 			// Clean up when connection closes.

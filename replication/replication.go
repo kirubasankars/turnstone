@@ -24,6 +24,7 @@ type ReplicaSource struct {
 // ReplicationManager handles shared connections to upstream servers.
 type ReplicationManager struct {
 	mu         sync.Mutex
+	serverID   string
 	peers      map[string][]ReplicaSource // Address -> []ReplicaSource
 	cancelFunc map[string]context.CancelFunc
 	stores     map[string]*store.Store
@@ -31,8 +32,9 @@ type ReplicationManager struct {
 	logger     *slog.Logger
 }
 
-func NewReplicationManager(stores map[string]*store.Store, tlsConf *tls.Config, logger *slog.Logger) *ReplicationManager {
+func NewReplicationManager(serverID string, stores map[string]*store.Store, tlsConf *tls.Config, logger *slog.Logger) *ReplicationManager {
 	return &ReplicationManager{
+		serverID:   serverID,
 		peers:      make(map[string][]ReplicaSource),
 		cancelFunc: make(map[string]context.CancelFunc),
 		stores:     stores,
@@ -100,7 +102,7 @@ func (rm *ReplicationManager) StopReplication(dbName string) {
 				cancel()
 			}
 
-			// If other DBs are still replicating, restart the loop with new list
+			// If other dbs are still replicating, restart the loop with new list
 			if len(newDBs) > 0 {
 				rm.spawnConnection(addr)
 			} else {
@@ -178,8 +180,15 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 	txBuffers := make(map[string][]protocol.LogEntry)
 
 	// Build Hello Payload
+	// Format: [Ver:4][IDLen:4][ID][NumDBs:4] ... [NameLen:4][Name][LogID:8]
 	buf := new(bytes.Buffer)
-	binary.Write(buf, binary.BigEndian, uint32(1))
+	binary.Write(buf, binary.BigEndian, uint32(1)) // Version
+
+	// Write Server ID
+	binary.Write(buf, binary.BigEndian, uint32(len(rm.serverID)))
+	buf.WriteString(rm.serverID)
+
+	// Write DB Count
 	binary.Write(buf, binary.BigEndian, uint32(len(dbs)))
 
 	for _, cfg := range dbs {

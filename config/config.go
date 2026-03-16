@@ -19,17 +19,19 @@ import (
 // Config represents the server configuration.
 // Simplified for in-memory mode.
 type Config struct {
-	Port              string `json:"port"`
-	Debug             bool   `json:"debug"`
-	MaxConns          int    `json:"max_conns"`
-	TLSCertFile       string `json:"tls_cert_file"`
-	TLSKeyFile        string `json:"tls_key_file"`
-	TLSCAFile         string `json:"tls_ca_file"`
-	TLSClientCertFile string `json:"tls_client_cert_file"`
-	TLSClientKeyFile  string `json:"tls_client_key_file"`
-	MetricsAddr       string `json:"metrics_addr"`
-	NumberOfDatabases int    `json:"number_of_databases"`
-	WALRetention      string `json:"wal_retention"` // Duration string e.g. "2h"
+	ID                   string `json:"id"` // Unique identifier for this instance
+	Port                 string `json:"port"`
+	Debug                bool   `json:"debug"`
+	MaxConns             int    `json:"max_conns"`
+	TLSCertFile          string `json:"tls_cert_file"`
+	TLSKeyFile           string `json:"tls_key_file"`
+	TLSCAFile            string `json:"tls_ca_file"`
+	TLSClientCertFile    string `json:"tls_client_cert_file"`
+	TLSClientKeyFile     string `json:"tls_client_key_file"`
+	MetricsAddr          string `json:"metrics_addr"`
+	NumberOfDatabases    int    `json:"number_of_databases"`
+	WALRetention         string `json:"wal_retention"`          // Duration string e.g. "2h"
+	WALRetentionStrategy string `json:"wal_retention_strategy"` // "time" or "replication"
 }
 
 // ResolvePath returns an absolute path relative to the home directory if strictly necessary.
@@ -85,6 +87,18 @@ func GenerateConfigArtifacts(homeDir string, defaultCfg Config, configPath strin
 	defaultCfg.TLSClientCertFile = "certs/server.crt"
 	defaultCfg.TLSClientKeyFile = "certs/server.key"
 	defaultCfg.WALRetention = "2h" // Default retention
+	if defaultCfg.WALRetentionStrategy == "" {
+		defaultCfg.WALRetentionStrategy = "time"
+	}
+
+	// Set default ID if not provided
+	if defaultCfg.ID == "" {
+		hostname, _ := os.Hostname()
+		if hostname == "" {
+			hostname = "server"
+		}
+		defaultCfg.ID = fmt.Sprintf("%s-%d", hostname, time.Now().Unix())
+	}
 
 	data, err := json.MarshalIndent(defaultCfg, "", "  ")
 	if err != nil {
