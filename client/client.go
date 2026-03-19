@@ -24,22 +24,24 @@ const ProtoHeaderSize = 5
 // OpCodes define the available commands in the TurnstoneDB wire protocol.
 // These must match the server-side definitions in constants.go.
 const (
-	OpCodePing      = 0x01 // Health check. Expects "PONG".
-	OpCodeGet       = 0x02 // Retrieve a value. Payload: Key bytes.
-	OpCodeSet       = 0x03 // Store a value. Payload: [KeyLen(4)|Key|Value].
-	OpCodeDel       = 0x04 // Delete a value. Payload: Key bytes.
-	OpCodeSelect    = 0x05 // Select the active database. Payload: Database Name bytes.
-	OpCodeMGet      = 0x06 // Multi-Get. Payload: [NumKeys(4)][KLen(4)|Key]...
-	OpCodeMSet      = 0x07 // Multi-Set. Payload: [NumPairs(4)][KLen(4)|Key|VLen(4)|Val]...
-	OpCodeMDel      = 0x08 // Multi-Del. Payload: [NumKeys(4)][KLen(4)|Key]...
-	OpCodeBegin     = 0x10 // Start a new transaction context.
-	OpCodeCommit    = 0x11 // Commit the current transaction.
-	OpCodeAbort     = 0x12 // Rollback the current transaction.
-	OpCodeReplicaOf = 0x32 // Set replication source. Payload: [AddrLen][Addr][RemoteDB].
-	OpCodeReplHello = 0x50 // Replication Handshake (Internal/Client CDC).
-	OpCodeReplBatch = 0x51 // Replication Batch (Internal/Client CDC).
-	OpCodeReplAck   = 0x52 // Replication Ack (Internal/Client CDC).
-	OpCodeQuit      = 0xFF // Gracefully close the connection.
+	OpCodePing             = 0x01 // Health check. Expects "PONG".
+	OpCodeGet              = 0x02 // Retrieve a value. Payload: Key bytes.
+	OpCodeSet              = 0x03 // Store a value. Payload: [KeyLen(4)|Key|Value].
+	OpCodeDel              = 0x04 // Delete a value. Payload: Key bytes.
+	OpCodeSelect           = 0x05 // Select the active database. Payload: Database Name bytes.
+	OpCodeMGet             = 0x06 // Multi-Get. Payload: [NumKeys(4)][KLen(4)|Key]...
+	OpCodeMSet             = 0x07 // Multi-Set. Payload: [NumPairs(4)][KLen(4)|Key|VLen(4)|Val]...
+	OpCodeMDel             = 0x08 // Multi-Del. Payload: [NumKeys(4)][KLen(4)|Key]...
+	OpCodeBegin            = 0x10 // Start a new transaction context.
+	OpCodeCommit           = 0x11 // Commit the current transaction.
+	OpCodeAbort            = 0x12 // Rollback the current transaction.
+	OpCodeReplicaOf        = 0x32 // Set replication source. Payload: [AddrLen][Addr][RemoteDB].
+	OpCodeReplHello        = 0x50 // Replication Handshake (Internal/Client CDC).
+	OpCodeReplBatch        = 0x51 // Replication Batch (Internal/Client CDC).
+	OpCodeReplAck          = 0x52 // Replication Ack (Internal/Client CDC).
+	OpCodeReplSnapshot     = 0x53 // Snapshot Batch (Full Sync).
+	OpCodeReplSnapshotDone = 0x54 // Snapshot Complete Signal.
+	OpCodeQuit             = 0xFF // Gracefully close the connection.
 )
 
 const (
@@ -532,7 +534,7 @@ func (c *Client) Abort() error {
 
 // Change represents a single data modification event from the CDC stream.
 type Change struct {
-	LogSeq   uint64 // The global operation sequence number
+	LogSeq   uint64 // The global operation sequence number (0 for snapshot entries)
 	TxID     uint64 // The transaction ID this change belongs to
 	Key      []byte
 	Value    []byte // nil if IsDelete is true
@@ -650,6 +652,12 @@ func (c *Client) Subscribe(dbName string, startSeq uint64, handler func(Change) 
 				val := data[dCursor : dCursor+vLen]
 				dCursor += vLen
 
+				// Skip Commit Markers in the event stream as they are just signals
+				if opType == 3 { // OpJournalCommit from Protocol
+					if logSeq > maxLogSeq { maxLogSeq = logSeq }
+					continue
+				}
+
 				change := Change{
 					LogSeq:   logSeq,
 					TxID:     txID,
@@ -685,6 +693,51 @@ func (c *Client) Subscribe(dbName string, startSeq uint64, handler func(Change) 
 				return err
 			}
 
+		} else if opCode == OpCodeReplSnapshot {
+			// Parse Snapshot Batch: [DBNameLen][DBName][Count][Data...]
+			// Data format: [KLen][Key][VLen][Val] ...
+			cursor := 0
+			nLen := int(binary.BigEndian.Uint32(payload[cursor : cursor+4]))
+			cursor += 4 + nLen
+			count := binary.BigEndian.Uint32(payload[cursor : cursor+4])
+			cursor += 4
+			data := payload[cursor:]
+			dCursor := 0
+
+			for i := 0; i < int(count); i++ {
+				kLen := int(binary.BigEndian.Uint32(data[dCursor : dCursor+4]))
+				dCursor += 4
+				key := data[dCursor : dCursor+kLen]
+				dCursor += kLen
+				vLen := int(binary.BigEndian.Uint32(data[dCursor : dCursor+4]))
+				dCursor += 4
+				val := data[dCursor : dCursor+vLen]
+				dCursor += vLen
+
+				// Snapshot events have LogSeq 0
+				change := Change{
+					LogSeq:   0,
+					TxID:     0,
+					Key:      key,
+					Value:    val,
+					IsDelete: false, // Snapshots only contain live data
+				}
+				if err := handler(change); err != nil {
+					return err
+				}
+			}
+
+		} else if opCode == OpCodeReplSnapshotDone {
+			// Snapshot Done Signal: [DBNameLen][DBName][0][ResumeSeq(8)]
+			cursor := 0
+			nLen := int(binary.BigEndian.Uint32(payload[cursor : cursor+4]))
+			cursor += 4 + nLen + 4 // Skip Name + Count(0)
+			
+			if cursor + 8 <= len(payload) {
+				resumeSeq := binary.BigEndian.Uint64(payload[cursor:])
+				c.logger.Info("Snapshot sync complete", "resume_seq", resumeSeq)
+			}
+			
 		} else {
 			// Ignore other opcodes or handle error/quit
 			if opCode == ResStatusErr {
