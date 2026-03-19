@@ -40,6 +40,7 @@ type TurnstoneCollector struct {
 	dbWALBytes    *prometheus.Desc
 	dbVLogFiles   *prometheus.Desc
 	dbVLogBytes   *prometheus.Desc
+	dbKeyCount    *prometheus.Desc
 }
 
 func NewTurnstoneCollector(stores map[string]*store.Store, stats ServerStatsProvider) *TurnstoneCollector {
@@ -62,6 +63,7 @@ func NewTurnstoneCollector(stores map[string]*store.Store, stats ServerStatsProv
 		dbWALBytes:    newDescWithLabels("db", "wal_bytes", "Total size of WAL in bytes", []string{"db"}),
 		dbVLogFiles:   newDescWithLabels("db", "vlog_files", "Number of VLog files", []string{"db"}),
 		dbVLogBytes:   newDescWithLabels("db", "vlog_bytes", "Total size of VLog in bytes", []string{"db"}),
+		dbKeyCount:    newDescWithLabels("db", "key_count", "Approximate number of live keys in database", []string{"db"}),
 	}
 }
 
@@ -86,6 +88,7 @@ func (c *TurnstoneCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.dbWALBytes
 	ch <- c.dbVLogFiles
 	ch <- c.dbVLogBytes
+	ch <- c.dbKeyCount
 }
 
 func (c *TurnstoneCollector) Collect(ch chan<- prometheus.Metric) {
@@ -112,6 +115,7 @@ func (c *TurnstoneCollector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(c.dbWALBytes, prometheus.GaugeValue, float64(stats.WALSize), name)
 		ch <- prometheus.MustNewConstMetric(c.dbVLogFiles, prometheus.GaugeValue, float64(stats.VLogFiles), name)
 		ch <- prometheus.MustNewConstMetric(c.dbVLogBytes, prometheus.GaugeValue, float64(stats.VLogSize), name)
+		ch <- prometheus.MustNewConstMetric(c.dbKeyCount, prometheus.GaugeValue, float64(stats.KeyCount), name)
 	}
 }
 
