@@ -25,6 +25,7 @@ import (
 // setupSharedCertEnv creates a temporary directory with a shared CA and certificates.
 // This mirrors setupTestEnv but returns just the dir and config for manual node spawning.
 func setupSharedCertEnv(t *testing.T) (string, *tls.Config) {
+	t.Helper()
 	dir, err := os.MkdirTemp("", "turnstone-repl-test-*")
 	if err != nil {
 		t.Fatal(err)
@@ -48,6 +49,7 @@ func setupSharedCertEnv(t *testing.T) (string, *tls.Config) {
 
 // startServerNode starts a single TurnstoneDB server instance within the shared environment.
 func startServerNode(t *testing.T, baseDir, name string, sharedTLS *tls.Config) (*Server, string, context.CancelFunc) {
+	t.Helper()
 	// Create a logger that writes to the shared log file
 	logPath := filepath.Join(baseDir, "turnstone.log")
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
@@ -103,6 +105,7 @@ func startServerNode(t *testing.T, baseDir, name string, sharedTLS *tls.Config) 
 // connectReplClient is a local helper similar to connectClient in server_test.go
 // but adapted for the replication tests context.
 func connectReplClient(t *testing.T, addr string, tlsConfig *tls.Config) *replTestClient {
+	t.Helper()
 	conn, err := tls.Dial("tcp", addr, tlsConfig)
 	if err != nil {
 		t.Fatalf("Failed to dial server: %v", err)
@@ -120,6 +123,7 @@ func (c *replTestClient) Close() {
 }
 
 func (c *replTestClient) Send(opCode byte, payload []byte) {
+	c.t.Helper()
 	header := make([]byte, 5)
 	header[0] = opCode
 	binary.BigEndian.PutUint32(header[1:], uint32(len(payload)))
@@ -134,6 +138,7 @@ func (c *replTestClient) Send(opCode byte, payload []byte) {
 }
 
 func (c *replTestClient) Read() (byte, []byte) {
+	c.t.Helper()
 	header := make([]byte, 5)
 	if _, err := io.ReadFull(c.conn, header); err != nil {
 		c.t.Fatalf("Read response header failed: %v", err)
@@ -150,6 +155,7 @@ func (c *replTestClient) Read() (byte, []byte) {
 }
 
 func (c *replTestClient) AssertStatus(opCode byte, payload []byte, expectedStatus byte) []byte {
+	c.t.Helper()
 	c.Send(opCode, payload)
 	status, body := c.Read()
 	if status != expectedStatus {
@@ -160,11 +166,13 @@ func (c *replTestClient) AssertStatus(opCode byte, payload []byte, expectedStatu
 
 // selectDatabase switches the client's active database.
 func selectDatabase(t *testing.T, c *replTestClient, dbName string) {
+	t.Helper()
 	c.AssertStatus(protocol.OpCodeSelect, []byte(dbName), protocol.ResStatusOK)
 }
 
 // configureReplication sends the REPLICAOF command.
 func configureReplication(t *testing.T, c *replTestClient, targetAddr, targetDB string) {
+	t.Helper()
 	addrBytes := []byte(targetAddr)
 	dbBytes := []byte(targetDB)
 	payload := make([]byte, 4+len(addrBytes)+len(dbBytes))
@@ -177,6 +185,7 @@ func configureReplication(t *testing.T, c *replTestClient, targetAddr, targetDB 
 
 // writeKeyVal performs a Set operation within a transaction.
 func writeKeyVal(t *testing.T, c *replTestClient, k, v string) {
+	t.Helper()
 	key := []byte(k)
 	val := []byte(v)
 	payload := make([]byte, 4+len(key)+len(val))
@@ -191,6 +200,7 @@ func writeKeyVal(t *testing.T, c *replTestClient, k, v string) {
 
 // readKey performs a Get operation within a transaction.
 func readKey(t *testing.T, c *replTestClient, k string) []byte {
+	t.Helper()
 	c.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
 	c.Send(protocol.OpCodeGet, []byte(k))
 	status, body := c.Read()
@@ -203,6 +213,7 @@ func readKey(t *testing.T, c *replTestClient, k string) []byte {
 
 // waitForConditionOrTimeout is a helper to poll for a condition until timeout.
 func waitForConditionOrTimeout(t *testing.T, timeout time.Duration, check func() bool, errMsg string) {
+	t.Helper()
 	start := time.Now()
 	for time.Since(start) < timeout {
 		if check() {
