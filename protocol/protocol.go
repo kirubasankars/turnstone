@@ -9,29 +9,29 @@ import (
 // --- Constants ---
 
 const (
-	DefaultPort      = ":6379"
-	DefaultReadTimeout = 5 * time.Second
+	DefaultPort         = ":6379"
+	DefaultReadTimeout  = 5 * time.Second
 	DefaultWriteTimeout = 5 * time.Second
-	IdleTimeout      = 3 * 60 * time.Second
-	ShutdownTimeout  = 10 * time.Second
-	MaxTxDuration    = 5 * time.Second
-	MaxTxOps         = 10000
-	DefaultDataDir   = "data"
-	MaxKeySize       = 1 * 1024
-	MaxValueSize     = 4 * 1024
-	MaxCommandSize   = 64 * 1024
-	MaxSyncBytes     = 16 * 1024 * 1024
-	MaxIndexBytes    = 512 * 1024 * 1024
-	HeaderSize       = 16 // Meta(4) + LogSeq(8) + CRC(4)
+	IdleTimeout         = 3 * 60 * time.Second
+	ShutdownTimeout     = 10 * time.Second
+	MaxTxDuration       = 5 * time.Second
+	MaxTxOps            = 10000
+	DefaultDataDir      = "data"
+	MaxKeySize          = 1 * 1024
+	MaxValueSize        = 4 * 1024
+	MaxCommandSize      = 64 * 1024
+	MaxSyncBytes        = 16 * 1024 * 1024
+	MaxIndexBytes       = 512 * 1024 * 1024
+	HeaderSize          = 16 // Meta(4) + LogSeq(8) + CRC(4)
 
 	BatchDelay = 500 * time.Microsecond
 
-	MaxBatchSize        = 4000
-	MaxBatchBytes       = 64 * 1024
-	ProtoHeaderSize     = 5
-	CheckpointInterval = 512 * 1024 * 1024
-	SlowOpThreshold    = 500 * time.Millisecond
-	MaxWALSize          = 200 * 1024 * 1024 // 200MB Limit
+	MaxBatchSize         = 4000
+	MaxBatchBytes        = 64 * 1024
+	ProtoHeaderSize      = 5
+	CheckpointInterval   = 512 * 1024 * 1024
+	SlowOpThreshold      = 500 * time.Millisecond
+	MaxWALSize           = 200 * 1024 * 1024 // 200MB Limit
 )
 
 // Variables (Mutable for testing)
@@ -63,6 +63,12 @@ const (
 	OpCodeReplSnapshot     uint8 = 0x53 // Bulk data payload (Full Sync)
 	OpCodeReplSnapshotDone uint8 = 0x54 // Transition signal to WAL streaming
 	
+	// --- SAFE POINT PROPAGATION ---
+	// Payload: [LogSeq(8)]
+	// Sent by Leader to Followers indicating the oldest log sequence 
+	// required by the cluster (min of all replica slots).
+	OpCodeReplSafePoint    uint8 = 0x55 
+
 	OpCodeQuit      uint8 = 0xFF
 
 	// Journal Specific Ops
@@ -73,16 +79,16 @@ const (
 
 // Response Status Codes
 const (
-	ResStatusOK              = 0x00
-	ResStatusErr             = 0x01
-	ResStatusNotFound        = 0x02
-	ResStatusTxRequired      = 0x03
-	ResStatusTxTimeout       = 0x04
-	ResStatusTxConflict      = 0x05
-	ResTxInProgress          = 0x06
-	ResStatusServerBusy      = 0x07
+	ResStatusOK             = 0x00
+	ResStatusErr            = 0x01
+	ResStatusNotFound       = 0x02
+	ResStatusTxRequired     = 0x03
+	ResStatusTxTimeout      = 0x04
+	ResStatusTxConflict     = 0x05
+	ResTxInProgress         = 0x06
+	ResStatusServerBusy     = 0x07
 	ResStatusEntityTooLarge = 0x08
-	ResStatusMemoryLimit     = 0x09
+	ResStatusMemoryLimit    = 0x09
 )
 
 // Errors

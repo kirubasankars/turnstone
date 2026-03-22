@@ -47,6 +47,7 @@ const (
 const (
 	OpJournalSet    = 1
 	OpJournalDelete = 2
+    OpJournalCommit = 3
 )
 
 // Response Codes indicate the status of a request.
@@ -653,7 +654,7 @@ func (c *Client) Subscribe(dbName string, startSeq uint64, handler func(Change) 
 				dCursor += vLen
 
 				// Skip Commit Markers in the event stream as they are just signals
-				if opType == 3 { // OpJournalCommit from Protocol
+				if opType == OpJournalCommit { // OpJournalCommit from Protocol
 					if logSeq > maxLogSeq { maxLogSeq = logSeq }
 					continue
 				}
