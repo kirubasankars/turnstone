@@ -378,7 +378,7 @@ func TestDB_ApplyBatch(t *testing.T) {
 // TestVLog_AppendEntries verifies low-level VLog appending and reading.
 func TestVLog_AppendEntries(t *testing.T) {
 	dir := t.TempDir()
-	vl, err := OpenValueLog(dir)
+	vl, err := OpenValueLog(dir, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -418,7 +418,7 @@ func TestVLog_AppendEntries(t *testing.T) {
 func TestWAL_AppendBatch_Direct(t *testing.T) {
 	dir := t.TempDir()
 	// Use OpenWriteAheadLog to get the default timeline 1
-	wal, err := OpenWriteAheadLog(dir, 1024*1024, 1)
+	wal, err := OpenWriteAheadLog(dir, 1024*1024, 1, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

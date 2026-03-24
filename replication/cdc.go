@@ -35,11 +35,11 @@ type CDCConfig struct {
 
 // Event defines the JSON structure for CDC events.
 type Event struct {
-	Seq      uint64      `json:"seq"`           // Global Log Sequence
-	Tx       uint64      `json:"tx"`            // Transaction ID
-	Key      string      `json:"key"`           // Key
+	Seq      uint64      `json:"seq"`            // Global Log Sequence
+	Tx       uint64      `json:"tx"`             // Transaction ID
+	Key      string      `json:"key"`            // Key
 	Val      interface{} `json:"val,omitempty"` // Value
-	IsDelete bool        `json:"del"`           // True if deletion
+	IsDelete bool        `json:"del"`            // True if deletion
 }
 
 // Global metric for monitoring within the replication package
@@ -48,20 +48,25 @@ var currentSeq atomic.Uint64
 // StartCDC initiates the Change Data Capture process.
 // It handles state resumption, signal handling, and automatic retries.
 func StartCDC(cfg CDCConfig) {
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
+	}
+
 	// 1. Resume State
 	lastSeq := uint64(0)
 	if content, err := os.ReadFile(cfg.StateFile); err == nil {
 		if val, err := strconv.ParseUint(string(content), 10, 64); err == nil {
 			lastSeq = val
 			currentSeq.Store(lastSeq)
-			fmt.Fprintf(os.Stderr, "Resuming from LogID %d (found in %s)\n", lastSeq, cfg.StateFile)
+			logger.Info("Resuming CDC state", "last_seq", lastSeq, "state_file", cfg.StateFile)
 		}
 	} else {
-		fmt.Fprintf(os.Stderr, "Starting from LogID 0 (no state file %s)\n", cfg.StateFile)
+		logger.Info("Starting CDC from scratch (seq 0)", "reason", "no_state_file")
 	}
 
 	// 2. Start Metrics Server
-	go startMetricsServer(cfg.MetricsAddr)
+	go startMetricsServer(cfg.MetricsAddr, logger)
 
 	// 3. Setup Signal Handling
 	ctx, cancel := context.WithCancel(context.Background())
@@ -71,12 +76,12 @@ func StartCDC(cfg CDCConfig) {
 	go func() {
 		// First signal: Graceful shutdown
 		sig := <-sigCh
-		fmt.Fprintf(os.Stderr, "\nReceived signal %s. Stopping... (Press Ctrl+C again to force quit)\n", sig)
+		logger.Info("Received signal, shutting down...", "signal", sig)
 		cancel()
 
 		// Second signal: Hard exit
 		<-sigCh
-		fmt.Fprintln(os.Stderr, "\nForcing exit...")
+		logger.Warn("Received second signal, forcing exit...")
 		os.Exit(1)
 	}()
 
@@ -108,15 +113,16 @@ func StartCDC(cfg CDCConfig) {
 		if err != nil {
 			// FATAL ERROR CHECK
 			if strings.Contains(err.Error(), "OUT_OF_SYNC") {
-				fmt.Fprintf(os.Stderr, "\n!!! FATAL REPLICATION ERROR !!!\n")
-				fmt.Fprintf(os.Stderr, "Message: %v\n", err)
-				fmt.Fprintf(os.Stderr, "Cause:    The server has purged the logs required to resume from ID %d.\n", lastSeq)
-				fmt.Fprintf(os.Stderr, "Action:   Delete the state file '%s' to resync from the server's current head.\n", cfg.StateFile)
+				logger.Error("FATAL REPLICATION ERROR: Server logs purged", 
+					"required_seq", lastSeq,
+					"action", fmt.Sprintf("Delete %s to resync from head", cfg.StateFile),
+					"err", err,
+				)
 				os.Exit(1)
 			}
-			fmt.Fprintf(os.Stderr, "CDC Disconnected: %v. Retrying in %v...\n", err, backoff)
+			logger.Error("CDC disconnected", "err", err, "retry_in", backoff)
 		} else {
-			fmt.Fprintf(os.Stderr, "Connection closed. Retrying in %v...\n", backoff)
+			logger.Info("CDC connection closed cleanly", "retry_in", backoff)
 		}
 
 		select {
@@ -152,6 +158,8 @@ func runCDCStream(ctx context.Context, cfg CDCConfig, startID uint64, encoder *j
 	certPath := resolve(cfg.CertFile, "certs/client.crt")
 	keyPath := resolve(cfg.KeyFile, "certs/client.key")
 
+	cfg.Logger.Info("Connecting to server", "host", cfg.Host)
+
 	if _, statErr := os.Stat(caPath); statErr == nil {
 		cl, err = client.NewMTLSClientHelper(cfg.Host, caPath, certPath, keyPath, cfg.Logger)
 	} else {
@@ -171,7 +179,6 @@ func runCDCStream(ctx context.Context, cfg CDCConfig, startID uint64, encoder *j
 	}()
 
 	// State persistence optimization
-	// We track the latest offset seen in this session locally, and only flush to disk periodically.
 	var latestPersistedSeq uint64 = startID
 	var latestSeenSeq uint64 = startID
 	lastFlushTime := time.Now()
@@ -226,7 +233,7 @@ func runCDCStream(ctx context.Context, cfg CDCConfig, startID uint64, encoder *j
 	})
 }
 
-func startMetricsServer(addr string) {
+func startMetricsServer(addr string, logger *slog.Logger) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -241,6 +248,6 @@ func startMetricsServer(addr string) {
 
 	server := &http.Server{Addr: addr, Handler: mux}
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		fmt.Fprintf(os.Stderr, "Metrics server failed: %v\n", err)
+		logger.Error("Metrics server failed", "addr", addr, "err", err)
 	}
 }

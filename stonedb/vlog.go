@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -16,19 +17,24 @@ import (
 
 // ValueLog manages storage of values on disk in append-only files.
 type ValueLog struct {
-	dir          string
-	currentFile  *os.File
-	currentFid   uint32
-	writeOffset  uint32
-	fileCache    map[uint32]*os.File
-	lruOrder     []uint32 // Ordered list of fileIDs for eviction (newest at end)
-	maxOpenFiles int
-	mu           sync.RWMutex // Note: Lock() is used for LRU updates
+	dir            string
+	currentFile    *os.File
+	currentFid     uint32
+	writeOffset    uint32
+	fileCache      map[uint32]*os.File
+	lruOrder       []uint32 // Ordered list of fileIDs for eviction (newest at end)
+	maxOpenFiles   int
+	mu             sync.RWMutex // Note: Lock() is used for LRU updates
+	logger         *slog.Logger
 }
 
-func OpenValueLog(dir string) (*ValueLog, error) {
+func OpenValueLog(dir string, logger *slog.Logger) (*ValueLog, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
+	}
+
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 
 	matches, err := filepath.Glob(filepath.Join(dir, "*.vlog"))
@@ -67,6 +73,7 @@ func OpenValueLog(dir string) (*ValueLog, error) {
 		fileCache:    make(map[uint32]*os.File),
 		lruOrder:     make([]uint32, 0),
 		maxOpenFiles: DefaultValueLogMaxOpenFiles,
+		logger:       logger,
 	}, nil
 }
 
@@ -107,7 +114,7 @@ func (vl *ValueLog) Recover() (uint64, uint64, error) {
 		if err != nil {
 			if err == ErrChecksum || err == io.ErrUnexpectedEOF {
 				if isLastFile {
-					fmt.Printf("ValueLog corruption detected in last file %s. Truncating to %d\n", path, validOffset)
+					vl.logger.Warn("ValueLog corruption detected in last file. Truncating.", "file", path, "offset", validOffset)
 					if err := os.Truncate(path, validOffset); err != nil {
 						return 0, 0, err
 					}
@@ -233,6 +240,7 @@ func (vl *ValueLog) DeleteFile(fileID uint32) error {
 	}
 
 	path := filepath.Join(vl.dir, fmt.Sprintf("%04d.vlog", fileID))
+	vl.logger.Info("Deleting VLog file", "file_id", fileID)
 	return os.Remove(path)
 }
 

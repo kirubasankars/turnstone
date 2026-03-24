@@ -215,7 +215,7 @@ func TestWAL_ReadFirstOpID_Failures(t *testing.T) {
 	binary.Write(buf, binary.BigEndian, uint32(0))                  // Checksum
 	os.WriteFile(filepath.Join(walDir, "wal_1_0004.wal"), buf.Bytes(), 0o644)
 
-	wal, _ := OpenWriteAheadLog(walDir, 1024, 1)
+	wal, _ := OpenWriteAheadLog(walDir, 1024, 1, nil)
 
 	// Verify errors directly via readFirstOpID
 	if _, err := wal.readFirstOpID(filepath.Join(walDir, "wal_1_0001.wal")); err == nil {
@@ -233,7 +233,7 @@ func TestWAL_TimelineFork(t *testing.T) {
 	dir := t.TempDir()
 
 	// 1. Start on Timeline 1
-	wal, err := OpenWriteAheadLog(dir, 1024*1024, 1)
+	wal, err := OpenWriteAheadLog(dir, 1024*1024, 1, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -272,7 +272,7 @@ func TestWAL_TimelineFork(t *testing.T) {
 
 func TestWAL_Promotion_Persistence(t *testing.T) {
 	dir := t.TempDir()
-	wal, err := OpenWriteAheadLog(dir, 1024*1024, 1)
+	wal, err := OpenWriteAheadLog(dir, 1024*1024, 1, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -295,7 +295,7 @@ func TestWAL_Promotion_Persistence(t *testing.T) {
 
 	// 4. Reopen and Replay
 	// We request timeline 5 (current state)
-	wal2, err := OpenWriteAheadLog(dir, 1024*1024, 5)
+	wal2, err := OpenWriteAheadLog(dir, 1024*1024, 5, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -330,7 +330,7 @@ func TestWAL_Promotion_Persistence(t *testing.T) {
 
 func TestWAL_Promotion_Validation(t *testing.T) {
 	dir := t.TempDir()
-	wal, _ := OpenWriteAheadLog(dir, 1024, 10)
+	wal, _ := OpenWriteAheadLog(dir, 1024, 10, nil)
 	defer wal.Close()
 
 	// Try promoting to older

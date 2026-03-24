@@ -41,6 +41,8 @@ func (tx *Transaction) checkConflicts() error {
 				// Conflict Condition:
 				// The latest committed version in the DB is NEWER than our transaction's snapshot.
 				if version > tx.readTxID {
+					// Debug log conflict details
+					tx.db.logger.Debug("Conflict detected", "key", key, "read_ts", tx.readTxID, "db_ts", version)
 					return ErrWriteConflict
 				}
 			}
