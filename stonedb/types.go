@@ -45,6 +45,7 @@ var (
 	ErrCorruptData    = errors.New("data corruption detected")
 	ErrTruncated      = errors.New("wal truncated due to corruption")
 	ErrLogUnavailable = errors.New("wal log unavailable for requested operation id")
+	ErrDiskFull       = errors.New("disk usage exceeds threshold")
 )
 
 // Options allows configuring the store behavior on Open
@@ -79,6 +80,10 @@ type Options struct {
 	// Files older than this duration AND fully checkpointed will be purged.
 	// If 0, defaults to 2 hours.
 	WALRetentionTime time.Duration
+
+	// MaxDiskUsagePercent (0-100). If disk usage exceeds this, write transactions fail.
+	// If 0, disabled.
+	MaxDiskUsagePercent int
 }
 
 // WALLocation points to a specific batch in the WAL files

@@ -63,6 +63,8 @@ type DB struct {
 	autoCheckpointInterval time.Duration
 	compactionInterval     time.Duration
 	walRetentionTime       time.Duration
+	maxDiskUsagePercent    int   // Configured threshold
+	isDiskFull             int32 // Atomic boolean (1=Full, 0=OK)
 }
 
 // Open initializes the DB.
@@ -115,6 +117,7 @@ func Open(dir string, opts Options) (*DB, error) {
 		autoCheckpointInterval: opts.AutoCheckpointInterval,
 		compactionInterval:     opts.CompactionInterval,
 		walRetentionTime:       opts.WALRetentionTime,
+		maxDiskUsagePercent:    opts.MaxDiskUsagePercent,
 	}
 
 	// 2. Recovery (VLog -> WAL -> Index)
@@ -186,6 +189,9 @@ func (db *DB) startBackgroundTasks() {
 	if db.checksumInterval > 0 {
 		waitCount++
 	}
+	if db.maxDiskUsagePercent > 0 {
+		waitCount++
+	}
 	db.wg.Add(waitCount)
 
 	go db.runAutoCheckpoint()
@@ -194,6 +200,9 @@ func (db *DB) startBackgroundTasks() {
 
 	if db.checksumInterval > 0 {
 		go db.runBackgroundChecksum()
+	}
+	if db.maxDiskUsagePercent > 0 {
+		go db.runDiskMonitor()
 	}
 }
 
@@ -720,6 +729,44 @@ func (db *DB) calculateStaleBytesSimple(entries []ValueLogEntry, staleBytes map[
 					staleBytes[meta.FileID] += size
 				}
 			}
+		}
+	}
+}
+
+// runDiskMonitor checks disk usage periodically
+func (db *DB) runDiskMonitor() {
+	defer db.wg.Done()
+	// Check every 10 seconds
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	// Initial check
+	db.checkDisk()
+
+	for {
+		select {
+		case <-db.closeCh:
+			return
+		case <-ticker.C:
+			db.checkDisk()
+		}
+	}
+}
+
+func (db *DB) checkDisk() {
+	usage, err := getDiskUsage(db.dir)
+	if err != nil {
+		fmt.Printf("Error checking disk usage: %v\n", err)
+		return
+	}
+
+	if int(usage) > db.maxDiskUsagePercent {
+		if atomic.CompareAndSwapInt32(&db.isDiskFull, 0, 1) {
+			fmt.Printf("WARNING: Disk usage %.2f%% exceeds limit %d%%. Stopping writes.\n", usage, db.maxDiskUsagePercent)
+		}
+	} else {
+		if atomic.CompareAndSwapInt32(&db.isDiskFull, 1, 0) {
+			fmt.Printf("INFO: Disk usage %.2f%% within limit. Resuming writes.\n", usage)
 		}
 	}
 }
