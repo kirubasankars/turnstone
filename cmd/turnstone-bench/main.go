@@ -120,26 +120,45 @@ func runWorkload(phase string, tlsConfig *tls.Config, payload []byte, readPct fl
 	var notFoundOps int64
 	var totalDuration int64
 
-	// Adjust calculations for batch size
-	opsPerClient := *totalOps / *concurrency
-	txsPerClient := opsPerClient / *batchSize
-	if txsPerClient == 0 {
-		txsPerClient = 1
-	}
-
-	// batchesOfPipeline is how many times we fill the pipeline depth
-	batchesOfPipeline := txsPerClient / *pipelineDepth
-	if batchesOfPipeline == 0 {
-		batchesOfPipeline = 1
-	}
+	// Distribute operations
+	baseOps := *totalOps / *concurrency
+	remainder := *totalOps % *concurrency
 
 	startTotal := time.Now()
 
 	for i := 0; i < *concurrency; i++ {
 		wg.Add(1)
-		go func(clientID int) {
+		
+		// Calculate ops for this specific client
+		opsForThisClient := baseOps
+		if i < remainder {
+			opsForThisClient++
+		}
+
+		go func(clientID int, numOps int) {
 			defer wg.Done()
 
+			if numOps == 0 {
+				return
+			}
+
+			// Adjust calculations for batch size based on this client's quota
+			txsPerClient := numOps / *batchSize
+			if txsPerClient == 0 && numOps > 0 {
+				txsPerClient = 1 // Ensure at least one TX if ops < batchSize (though awkward)
+			}
+
+			// batchesOfPipeline is how many times we fill the pipeline depth
+			batchesOfPipeline := txsPerClient / *pipelineDepth
+			if batchesOfPipeline == 0 && txsPerClient > 0 {
+				batchesOfPipeline = 1
+			}
+
+			// Re-calculate actual total ops this client will perform based on batch alignment
+			// (If 10 ops, batch 3 => 3 txs => 9 ops. 1 op lost to floor division unless handled. 
+			// For benchmarking, slightly under-shooting due to batch alignment is acceptable 
+			// if batch > 1, but we try to match numOps).
+			
 			// Local random source
 			seed, _ := rand.Int(rand.Reader, big.NewInt(1<<62))
 			r := mrand.New(mrand.NewSource(seed.Int64()))
@@ -147,7 +166,7 @@ func runWorkload(phase string, tlsConfig *tls.Config, payload []byte, readPct fl
 			conn, err := tls.Dial("tcp", *addr, tlsConfig)
 			if err != nil {
 				log.Printf("[Client %d] Dial failed: %v", clientID, err)
-				atomic.AddInt64(&failedOps, int64(opsPerClient))
+				atomic.AddInt64(&failedOps, int64(numOps))
 				return
 			}
 			defer conn.Close()
@@ -160,7 +179,7 @@ func runWorkload(phase string, tlsConfig *tls.Config, payload []byte, readPct fl
 			selBuf = append(selBuf, dbName...)
 			if _, err := conn.Write(selBuf); err != nil {
 				log.Printf("[Client %d] Select write failed: %v", clientID, err)
-				atomic.AddInt64(&failedOps, int64(opsPerClient))
+				atomic.AddInt64(&failedOps, int64(numOps))
 				return
 			}
 
@@ -168,12 +187,12 @@ func runWorkload(phase string, tlsConfig *tls.Config, payload []byte, readPct fl
 			selHead := make([]byte, 5)
 			if _, err := io.ReadFull(reader, selHead); err != nil {
 				log.Printf("[Client %d] Select read failed: %v", clientID, err)
-				atomic.AddInt64(&failedOps, int64(opsPerClient))
+				atomic.AddInt64(&failedOps, int64(numOps))
 				return
 			}
 			if selHead[0] != client.ResStatusOK {
 				log.Printf("[Client %d] Select failed status: 0x%x", clientID, selHead[0])
-				atomic.AddInt64(&failedOps, int64(opsPerClient))
+				atomic.AddInt64(&failedOps, int64(numOps))
 				return
 			}
 			if sLen := binary.BigEndian.Uint32(selHead[1:]); sLen > 0 {
@@ -183,12 +202,12 @@ func runWorkload(phase string, tlsConfig *tls.Config, payload []byte, readPct fl
 			}
 			// -------------------------
 
-			// Buffer sizing: Depth * (Begin(20) + Commit(20) + BatchSize * OpSize)
 			estOpSize := 20 + *valueSize + *keySize
 			writeBuf := make([]byte, 0, *pipelineDepth*(40+(*batchSize*estOpSize)))
 			headerBuf := make([]byte, 5)
 
 			txCount := 0
+			
 			for b := 0; b < batchesOfPipeline; b++ {
 				writeBuf = writeBuf[:0]
 				startBatch := time.Now()
@@ -213,7 +232,7 @@ func runWorkload(phase string, tlsConfig *tls.Config, payload []byte, readPct fl
 						// Key selection
 						keyIndex := (txCount * *batchSize) + k
 						if phase == "MIXED" {
-							keyIndex = r.Intn(opsPerClient)
+							keyIndex = r.Intn(numOps)
 						}
 						key := generateKey(clientID, keyIndex)
 
@@ -244,7 +263,6 @@ func runWorkload(phase string, tlsConfig *tls.Config, payload []byte, readPct fl
 				}
 
 				// 3. Read Responses
-				// Expect: Depth * (1 Begin + BatchSize Ops + 1 Commit)
 				expectedResps := *pipelineDepth * (2 + *batchSize)
 				batchFailed := false
 
@@ -281,7 +299,7 @@ func runWorkload(phase string, tlsConfig *tls.Config, payload []byte, readPct fl
 					atomic.AddInt64(&totalDuration, latency)
 				}
 			}
-		}(i)
+		}(i, opsForThisClient)
 	}
 
 	wg.Wait()
@@ -301,8 +319,6 @@ func printStats(phase string, elapsed time.Duration, success, failed, notFound i
 	avgLatency := float64(0)
 
 	// Note: Latency calculation here is "Latency per Network Round Trip" (Pipeline Batch)
-	// It is roughly (Network RTT / (Depth * BatchSize)) if we amortize,
-	// but strictly speaking, it's the time the client waited for the whole batch.
 	if success > 0 {
 		avgLatency = (float64(totalLatencyNs) / float64(success)) / 1e6
 	}

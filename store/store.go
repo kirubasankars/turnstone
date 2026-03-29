@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -36,6 +37,10 @@ type ReplicaSlot struct {
 	Role      string    `json:"role"`
 	LastSeen  time.Time `json:"last_seen"`
 	Connected bool      `json:"connected"`
+
+	// quitCh is used to signal the network handler to drop the connection.
+	// It is not serialized to JSON.
+	quitCh chan struct{} `json:"-"`
 }
 
 // Store wraps stonedb.DB to provide a compatibility layer, stats, and replication logic.
@@ -45,6 +50,10 @@ type Store struct {
 	startTime   time.Time
 	isSystem    bool
 	minReplicas int
+
+	// Persistence Context
+	dir    string
+	dbOpts stonedb.Options
 
 	// Replication State
 	mu          sync.Mutex
@@ -62,29 +71,6 @@ type Store struct {
 }
 
 func NewStore(dir string, logger *slog.Logger, minReplicas int, isSystem bool, walStrategy string, maxDiskUsage int) (*Store, error) {
-	s := &Store{
-		logger:        logger,
-		startTime:     time.Now(),
-		isSystem:      isSystem,
-		minReplicas:   minReplicas,
-		replicas:      make(map[string]*ReplicaSlot),
-		slotsFile:     filepath.Join(dir, "replication.slots"),
-		walStrategy:   walStrategy,
-		leaderSafeSeq: math.MaxUint64, // Default to "Safe to delete everything" until leader says otherwise
-	}
-	s.cond = sync.NewCond(&s.mu)
-
-	// Load existing persistence state (if any)
-	s.loadSlots()
-
-	// Start persistence loop
-	go s.runPersistence()
-
-	// Start WAL retention manager if strategy is replication
-	if s.walStrategy == "replication" {
-		go s.runRetentionManager()
-	}
-
 	// Default values
 	maxWALSize := 10 * 1024 * 1024
 
@@ -101,6 +87,7 @@ func NewStore(dir string, logger *slog.Logger, minReplicas int, isSystem bool, w
 		// Enable truncation to recover from partial writes/corruption automatically
 		TruncateCorruptWAL:  true,
 		MaxDiskUsagePercent: maxDiskUsage,
+		Logger:              logger, // Ensure logger is passed down
 	}
 
 	// If strategy is "replication", disable time-based purge in DB by setting retention to 0.
@@ -112,6 +99,31 @@ func NewStore(dir string, logger *slog.Logger, minReplicas int, isSystem bool, w
 		opts.WALRetentionTime = 2 * time.Hour
 	}
 
+	s := &Store{
+		logger:        logger,
+		startTime:     time.Now(),
+		isSystem:      isSystem,
+		minReplicas:   minReplicas,
+		replicas:      make(map[string]*ReplicaSlot),
+		slotsFile:     filepath.Join(dir, "replication.slots"),
+		walStrategy:   walStrategy,
+		leaderSafeSeq: math.MaxUint64, // Default to "Safe to delete everything" until leader says otherwise
+		dir:           dir,
+		dbOpts:        opts,
+	}
+	s.cond = sync.NewCond(&s.mu)
+
+	// Load existing persistence state (if any)
+	s.loadSlots()
+
+	// Start persistence loop
+	go s.runPersistence()
+
+	// Start WAL retention manager if strategy is replication
+	if s.walStrategy == "replication" {
+		go s.runRetentionManager()
+	}
+
 	db, err := stonedb.Open(dir, opts)
 	if err != nil {
 		return nil, err
@@ -119,6 +131,50 @@ func NewStore(dir string, logger *slog.Logger, minReplicas int, isSystem bool, w
 	s.DB = db
 
 	return s, nil
+}
+
+// Reset wipes the database and restarts it. This is used when a full snapshot
+// is received from the leader, requiring a clean slate.
+func (s *Store) Reset() error {
+	s.logger.Warn("Resetting database state (Snapshot detected)")
+
+	// 1. Disconnect any downstream consumers to prevent them from reading invalid state
+	s.RemoveAllReplicas()
+
+	// 2. Close the existing DB instance
+	if err := s.DB.Close(); err != nil {
+		return fmt.Errorf("close failed during reset: %w", err)
+	}
+
+	// 3. Wipe Data Files
+	// We preserve the directory but remove all contents
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return fmt.Errorf("read dir failed: %w", err)
+	}
+
+	for _, e := range entries {
+		// Delete everything including replication slots, logs, and index
+		path := filepath.Join(s.dir, e.Name())
+		if err := os.RemoveAll(path); err != nil {
+			s.logger.Error("Failed to delete file during reset", "path", path, "err", err)
+			return err
+		}
+	}
+
+	// 4. Re-Open Database
+	newDB, err := stonedb.Open(s.dir, s.dbOpts)
+	if err != nil {
+		return fmt.Errorf("reopen failed during reset: %w", err)
+	}
+
+	// 5. Swap Pointer
+	// Note: There is a brief window where s.DB was closed/invalid.
+	// Background tasks on s.Store might have errored during this time, which is expected.
+	s.DB = newDB
+
+	s.logger.Info("Database reset complete")
+	return nil
 }
 
 // SetLeaderSafeSeq updates the retention barrier received from the upstream leader.
@@ -139,8 +195,6 @@ func (s *Store) GetMinSlotLogSeq() uint64 {
 		if slot.LogSeq < minSeq {
 			minSeq = slot.LogSeq
 		}
-		// Debug logging for slot state (verbose, so check level if possible, or keep minimal)
-		// Removed per "keep clean" instruction, relying on EnforceRetentionPolicy debug logs.
 	}
 
 	if !hasSlots {
@@ -167,34 +221,24 @@ func (s *Store) EnforceRetentionPolicy() {
 	minReplicaSeq := s.GetMinSlotLogSeq()
 
 	// 2. Constraint from Upstream (Our Leader)
-	// If we are a leader, this is MaxUint64 (ignored).
-	// If we are a follower, this is the SafePoint sent by the Leader.
 	leaderSafeSeq := atomic.LoadUint64(&s.leaderSafeSeq)
 
 	// 3. Constraint from Local Disk (Checkpoint)
 	lastCkpt := s.DB.GetLastCheckpointOpID()
 
-	// Logic:
-	// We can only delete logs that are safe according to ALL constraints.
-	// SafeID = Min(LocalCheckpoint, DownstreamReplicas, UpstreamLeader)
-
 	safeID := lastCkpt
 	constraintSource := "checkpoint"
 
-	// If a downstream replica needs log X, we must keep it.
 	if minReplicaSeq < safeID {
 		safeID = minReplicaSeq
 		constraintSource = "replica_lag"
 	}
 
-	// If the upstream leader says "Someone in the cluster needs log Y", we must keep it.
-	// This enables us to serve that straggler if we are promoted.
 	if leaderSafeSeq < safeID {
 		safeID = leaderSafeSeq
 		constraintSource = "leader_constraint"
 	}
 
-	// Only log DEBUG unless we are blocked significantly or purging
 	s.logger.Debug("Retention check",
 		"safe_seq", safeID,
 		"constraint", constraintSource,
@@ -206,32 +250,23 @@ func (s *Store) EnforceRetentionPolicy() {
 	if safeID > 0 && safeID != math.MaxUint64 {
 		// Trigger purge
 		if err := s.DB.PurgeWAL(safeID); err != nil {
-			s.logger.Error("Replication-based WAL purge failed", "err", err)
-		} else {
-			// Only log if something was potentially deleted (PurgeWAL doesn't return count, 
-			// but we can assume if safeID advanced significantly since last log it might interest op)
-			// For now, keep it clean and rely on DB logs or Metrics.
+			// Ignore closed errors if we are resetting
+			if !strings.Contains(err.Error(), "closed") {
+				s.logger.Error("Replication-based WAL purge failed", "err", err)
+			}
 		}
 	} else if minReplicaSeq == math.MaxUint64 && leaderSafeSeq == math.MaxUint64 {
-		// No replicas registered AND no upstream leader constraints.
-		// This implies we can purge everything up to checkpoint (standalone mode or leaf with no followers).
-		// This prevents infinite WAL growth if user sets strategy=replication but adds no replicas.
-		
-		// Rate limit this log to avoid spamming every 30s if system is idle
-		// (Logic for rate limiting omitted for simplicity, downgrading to Debug)
 		s.logger.Debug("No replication constraints, purging up to checkpoint", "ckpt", lastCkpt)
-		
 		if err := s.DB.PurgeWAL(lastCkpt); err != nil {
-			s.logger.Error("Fallback WAL purge failed", "err", err)
+			if !strings.Contains(err.Error(), "closed") {
+				s.logger.Error("Fallback WAL purge failed", "err", err)
+			}
 		}
 	}
 }
 
 // ApplyBatch applies a batch of protocol entries.
-// If minReplicas > 0, it blocks until quorum is reached.
-// Used for writes on the Leader.
 func (s *Store) ApplyBatch(entries []protocol.LogEntry) error {
-	// Leader writes uses stonedb internal ID generation via Transaction
 	tx := s.DB.NewTransaction(true)
 	for _, e := range entries {
 		var err error
@@ -250,7 +285,6 @@ func (s *Store) ApplyBatch(entries []protocol.LogEntry) error {
 		return err
 	}
 
-	// Wait for Quorum if configured
 	if s.minReplicas > 0 {
 		s.waitForQuorum(s.DB.LastOpID())
 	}
@@ -259,13 +293,11 @@ func (s *Store) ApplyBatch(entries []protocol.LogEntry) error {
 }
 
 // ReplicateBatch applies a batch from a leader (no quorum wait).
-// Used by Followers.
 func (s *Store) ReplicateBatch(entries []protocol.LogEntry) error {
 	return s.ReplicateBatches([][]protocol.LogEntry{entries})
 }
 
 // ReplicateBatches applies multiple batches from a leader using group commit.
-// Used by Followers.
 func (s *Store) ReplicateBatches(batches [][]protocol.LogEntry) error {
 	var vlogBatches [][]stonedb.ValueLogEntry
 
@@ -276,7 +308,7 @@ func (s *Store) ReplicateBatches(batches [][]protocol.LogEntry) error {
 				Key:           e.Key,
 				Value:         e.Value,
 				OperationID:   e.LogSeq,
-				TransactionID: e.LogSeq, // Mapping LogSeq to TxID for replication
+				TransactionID: e.LogSeq,
 			}
 
 			if e.OpCode == protocol.OpJournalDelete {
@@ -305,7 +337,6 @@ func (s *Store) Get(key string) ([]byte, error) {
 // Close closes the underlying StoneDB instance.
 func (s *Store) Close() error {
 	s.logger.Info("Closing store")
-	// Save slots one last time
 	s.mu.Lock()
 	if s.dirty {
 		s.saveSlotsLocked()
@@ -319,7 +350,6 @@ func (s *Store) Stats() StoreStats {
 	wf, ws, vf, vs := s.DB.StorageStats()
 	keyCount, _ := s.DB.KeyCount()
 
-	// Calculate Least Replica Lag
 	head := s.DB.LastOpID()
 	minLag := uint64(0)
 	first := true
@@ -337,7 +367,6 @@ func (s *Store) Stats() StoreStats {
 	}
 	s.mu.Unlock()
 
-	// If no replicas, lag is 0
 	if first {
 		minLag = 0
 	}
@@ -356,33 +385,38 @@ func (s *Store) Stats() StoreStats {
 	}
 }
 
-// RegisterReplica adds a replica slot to the tracking map (for stats only).
+// GetReplicaSignalChannel returns the kill-switch channel for a specific replica ID.
+func (s *Store) GetReplicaSignalChannel(id string) <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if slot, ok := s.replicas[id]; ok {
+		return slot.quitCh
+	}
+	return nil
+}
+
+// RegisterReplica adds or resets a replica slot in the tracking map.
 func (s *Store) RegisterReplica(id string, logSeq uint64, role string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if slot, ok := s.replicas[id]; ok {
-		// Only log info if connection status changed or seq jumped significantly (optional noise reduction)
-		if !slot.Connected {
-			s.logger.Info("Replica reconnected", "id", id, "seq", logSeq, "role", role)
-		} else {
-			s.logger.Debug("Replica state update", "id", id, "seq", logSeq)
-		}
-		
-		slot.Connected = true
-		if logSeq > slot.LogSeq {
-			slot.LogSeq = logSeq
-		}
-		slot.Role = role
-		slot.LastSeen = time.Now()
+	if old, ok := s.replicas[id]; ok {
+		s.logger.Info("Replica re-registered (slot reset for this db)",
+			"id", id,
+			"old_seq", old.LogSeq,
+			"new_seq", logSeq,
+			"role", role,
+		)
 	} else {
 		s.logger.Info("New replica registered", "id", id, "seq", logSeq, "role", role)
-		s.replicas[id] = &ReplicaSlot{
-			LogSeq:    logSeq,
-			Role:      role,
-			LastSeen:  time.Now(),
-			Connected: true,
-		}
+	}
+
+	s.replicas[id] = &ReplicaSlot{
+		LogSeq:    logSeq,
+		Role:      role,
+		LastSeen:  time.Now(),
+		Connected: true,
+		quitCh:    make(chan struct{}),
 	}
 	s.dirty = true
 }
@@ -404,25 +438,60 @@ func (s *Store) UnregisterReplica(id string) {
 func (s *Store) DeleteReplica(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.replicas[id]; !ok {
+	slot, ok := s.replicas[id]
+	if !ok {
 		return protocol.ErrKeyNotFound
 	}
+
+	if slot.quitCh != nil {
+		select {
+		case <-slot.quitCh:
+		default:
+			close(slot.quitCh)
+		}
+	}
+
 	delete(s.replicas, id)
 	s.dirty = true
 	s.logger.Info("Replica slot deleted", "id", id)
 	return nil
 }
 
-// UpdateReplicaLogSeq updates the acked sequence for a replica and wakes up waiters.
+// RemoveAllReplicas drops all connected replicas and CDC clients.
+func (s *Store) RemoveAllReplicas() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(s.replicas) == 0 {
+		return
+	}
+
+	s.logger.Info("Disconnecting and removing all replicas (role change/reset)", "count", len(s.replicas))
+
+	for _, slot := range s.replicas {
+		if slot.quitCh != nil {
+			select {
+			case <-slot.quitCh:
+			default:
+				close(slot.quitCh)
+			}
+		}
+	}
+
+	s.replicas = make(map[string]*ReplicaSlot)
+	s.dirty = true
+	s.cond.Broadcast()
+}
+
+// UpdateReplicaLogSeq updates the acked sequence for a replica.
 func (s *Store) UpdateReplicaLogSeq(id string, logSeq uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if slot, ok := s.replicas[id]; ok {
-		// Only update if seq advances
 		if logSeq > slot.LogSeq {
 			slot.LogSeq = logSeq
 			s.dirty = true
-			s.cond.Broadcast() // Wake up quorum waiters
+			s.cond.Broadcast()
 		}
 		slot.LastSeen = time.Now()
 	}
@@ -439,7 +508,6 @@ func (s *Store) waitForQuorum(logSeq uint64) {
 	for {
 		acks := 0
 		for _, slot := range s.replicas {
-			// Only count servers towards quorum, not CDC clients
 			if slot.Role == "server" && slot.LogSeq >= logSeq {
 				acks++
 			}
@@ -449,7 +517,6 @@ func (s *Store) waitForQuorum(logSeq uint64) {
 			return
 		}
 
-		// Log warning if waiting too long (> 5s)
 		if !warned && time.Since(startWait) > 5*time.Second {
 			s.logger.Warn("Slow quorum commit", "target_seq", logSeq, "current_acks", acks, "needed", s.minReplicas)
 			warned = true
@@ -499,30 +566,25 @@ func (s *Store) saveSlotsLocked() error {
 	}
 	tmp := s.slotsFile + ".tmp"
 
-	// 1. Create/Truncate Temp File
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return fmt.Errorf("create tmp: %w", err)
 	}
 
-	// 2. Write Data
 	if _, err := f.Write(data); err != nil {
 		f.Close()
 		return fmt.Errorf("write: %w", err)
 	}
 
-	// 3. Fsync to ensure durability on disk
 	if err := f.Sync(); err != nil {
 		f.Close()
 		return fmt.Errorf("sync: %w", err)
 	}
 
-	// 4. Close
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("close: %w", err)
 	}
 
-	// 5. Atomic Rename
 	if err := os.Rename(tmp, s.slotsFile); err != nil {
 		return fmt.Errorf("rename: %w", err)
 	}

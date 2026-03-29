@@ -42,6 +42,22 @@ func NewReplicationManager(serverID string, stores map[string]*store.Store, tlsC
 	}
 }
 
+// IsReplicating checks if the specific database is currently configured to replicate
+// from an upstream source. Used to prevent cascading replication.
+func (rm *ReplicationManager) IsReplicating(dbName string) bool {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+
+	for _, dbs := range rm.peers {
+		for _, db := range dbs {
+			if db.LocalDB == dbName {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (rm *ReplicationManager) Start() {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
@@ -110,7 +126,7 @@ func (rm *ReplicationManager) spawnConnection(addr string) {
 func (rm *ReplicationManager) maintainConnection(ctx context.Context, addr string) {
 	// Create a logger with context for this peer connection
 	peerLogger := rm.logger.With("peer_addr", addr)
-	
+
 	for {
 		if ctx.Err() != nil {
 			return
@@ -159,6 +175,7 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 
 	remoteToLocal := make(map[string][]string)
 	txBuffers := make(map[string][]protocol.LogEntry)
+	snapshotStarted := make(map[string]bool)
 
 	// Handshake
 	// Format: [Ver:4][IDLen:4][ID][NumDBs:4] ... [NameLen:4][Name][LogID:8]
@@ -174,9 +191,9 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 		binary.Write(buf, binary.BigEndian, uint32(len(cfg.RemoteDB)))
 		buf.WriteString(cfg.RemoteDB)
 		binary.Write(buf, binary.BigEndian, logID)
-		
+
 		logger.Debug("Sending Hello for DB", "remote_db", cfg.RemoteDB, "local_db", cfg.LocalDB, "start_log_id", logID)
-		
+
 		remoteToLocal[cfg.RemoteDB] = append(remoteToLocal[cfg.RemoteDB], cfg.LocalDB)
 		txBuffers[cfg.LocalDB] = make([]protocol.LogEntry, 0)
 	}
@@ -252,6 +269,20 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 			data := payload[cursor:]
 
 			if localDBNames, ok := remoteToLocal[remoteDBName]; ok {
+				// Detect start of a new snapshot sequence and RESET local state
+				if !snapshotStarted[remoteDBName] {
+					logger.Info("Snapshot detected, resetting local databases", "remote_db", remoteDBName)
+					for _, localDBName := range localDBNames {
+						if st, ok := rm.stores[localDBName]; ok {
+							if err := st.Reset(); err != nil {
+								logger.Error("Failed to reset database", "db", localDBName, "err", err)
+								return err
+							}
+						}
+					}
+					snapshotStarted[remoteDBName] = true
+				}
+
 				for _, localDBName := range localDBNames {
 					if st, ok := rm.stores[localDBName]; ok {
 						logger.Info("Applying snapshot batch", "db", localDBName, "count", count, "bytes", len(data))
@@ -293,6 +324,8 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 				resumeSeq := binary.BigEndian.Uint64(payload[cursor:])
 				logger.Info("Snapshot finished, switching to WAL streaming", "remote_db", remoteDBName, "resume_seq", resumeSeq)
 			}
+			// Mark snapshot as complete for this DB so future snapshots trigger reset again
+			snapshotStarted[remoteDBName] = false
 			continue
 		}
 
@@ -329,7 +362,7 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 							h := make([]byte, 5)
 							h[0] = protocol.OpCodeReplAck
 							binary.BigEndian.PutUint32(h[1:], uint32(ackBuf.Len()))
-							
+
 							// No Deadline for ACK to prevent self-disconnection on slow networks
 							if _, err := conn.Write(h); err != nil {
 								return err
@@ -383,9 +416,9 @@ func processReplicationPacket(store *store.Store, buffer []protocol.LogEntry, co
 				// We have a complete transaction in buffer
 				pendingBatches = append(pendingBatches, buffer)
 				lastCommittedID = lid
-				
+
 				// Reset buffer for next transaction (CRITICAL: ensure new slice allocation)
-				buffer = nil 
+				buffer = nil
 			} else {
 				// Empty commit (rare but valid)
 				lastCommittedID = lid
