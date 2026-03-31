@@ -164,10 +164,12 @@ type Config struct {
 // Client is a thread-safe, synchronous Key-Value store client.
 // It manages a single persistent TCP connection. Use a pool of Clients for high concurrency.
 type Client struct {
-	conn   net.Conn
-	mu     sync.Mutex
-	config Config
-	logger *slog.Logger
+	conn     net.Conn
+	mu       sync.Mutex
+	config   Config
+	logger   *slog.Logger
+	pool     *Pool
+	poisoned bool
 }
 
 // NewClient creates a new client and attempts to connect immediately.
@@ -247,15 +249,150 @@ func (c *Client) connect() error {
 }
 
 // Close gracefully terminates the TCP connection.
+// If the client was obtained from a Pool, it returns the connection to the pool (if healthy).
 // It is safe to call Close multiple times.
 func (c *Client) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	// If belonging to a pool, try to return it
+	if c.pool != nil {
+		if c.poisoned {
+			c.pool.reportClosed() // Decrement count
+			if c.conn != nil {
+				c.logger.Info("Closing poisoned connection", "addr", c.config.Address)
+				return c.conn.Close()
+			}
+			return nil
+		}
+		// Return to pool
+		select {
+		case c.pool.idle <- c:
+			// successfully returned
+			return nil
+		default:
+			// Pool is full (shouldn't happen if logic is correct, but safe fallback)
+			c.pool.reportClosed()
+			if c.conn != nil {
+				return c.conn.Close()
+			}
+			return nil
+		}
+	}
+
 	if c.conn != nil {
 		c.logger.Info("Closing connection", "addr", c.config.Address)
 		return c.conn.Close()
 	}
 	return nil
+}
+
+// markPoisoned marks the client as unusable, forcing it to be closed instead of returned to the pool.
+func (c *Client) markPoisoned() {
+	c.poisoned = true
+}
+
+// --- Connection Pool ---
+
+// Pool manages a set of reusable Client connections.
+type Pool struct {
+	config Config
+	idle   chan *Client
+	maxCap int
+
+	mu         sync.Mutex
+	currentCap int
+	closed     bool
+}
+
+// NewClientPool creates a connection pool with a maximum capacity.
+func NewClientPool(cfg Config, maxConns int) (*Pool, error) {
+	if maxConns <= 0 {
+		return nil, errors.New("maxConns must be > 0")
+	}
+	// Wrap logger
+	if cfg.Logger == nil {
+		cfg.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+
+	return &Pool{
+		config: cfg,
+		idle:   make(chan *Client, maxConns),
+		maxCap: maxConns,
+	}, nil
+}
+
+// Get retrieves a Client from the pool.
+// If an idle connection is available, it is returned.
+// If not, and the pool is not full, a new connection is created.
+// If the pool is full, this method blocks until a connection is returned.
+func (p *Pool) Get() (*Client, error) {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil, errors.New("pool is closed")
+	}
+
+	// 1. Try to get idle
+	select {
+	case c := <-p.idle:
+		p.mu.Unlock()
+		return c, nil
+	default:
+		// No idle connections
+	}
+
+	// 2. Check capacity
+	if p.currentCap < p.maxCap {
+		p.currentCap++
+		p.mu.Unlock()
+
+		// Create new client
+		c, err := NewClient(p.config)
+		if err != nil {
+			p.reportClosed() // Revert count
+			return nil, err
+		}
+		c.pool = p
+		return c, nil
+	}
+
+	p.mu.Unlock()
+
+	// 3. Wait for idle
+	select {
+	case c, ok := <-p.idle:
+		if !ok {
+			return nil, errors.New("pool is closed")
+		}
+		return c, nil
+		// TODO: Add timeout support for Get? For now block forever as per standard chan semantics
+	}
+}
+
+// reportClosed decrements the active connection count.
+func (p *Pool) reportClosed() {
+	p.mu.Lock()
+	p.currentCap--
+	p.mu.Unlock()
+}
+
+// Close closes the pool and all idle connections.
+func (p *Pool) Close() {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return
+	}
+	p.closed = true
+	close(p.idle) // interrupt wait in Get()
+	p.mu.Unlock()
+
+	for c := range p.idle {
+		if c.conn != nil {
+			c.conn.Close()
+		}
+	}
 }
 
 // roundTrip handles the low-level request/response cycle.
@@ -266,6 +403,7 @@ func (c *Client) roundTrip(op byte, payload []byte) ([]byte, error) {
 	defer c.mu.Unlock()
 
 	if c.conn == nil {
+		c.markPoisoned()
 		return nil, ErrConnection
 	}
 
@@ -283,6 +421,7 @@ func (c *Client) roundTrip(op byte, payload []byte) ([]byte, error) {
 	binary.BigEndian.PutUint32(reqHeader[1:], uint32(len(payload)))
 
 	if _, err := c.conn.Write(reqHeader); err != nil {
+		c.markPoisoned()
 		c.conn.Close()
 		c.conn = nil
 		return nil, fmt.Errorf("%w: write header failed: %v", ErrConnection, err)
@@ -291,6 +430,7 @@ func (c *Client) roundTrip(op byte, payload []byte) ([]byte, error) {
 	// 2. Write Body (if any)
 	if len(payload) > 0 {
 		if _, err := c.conn.Write(payload); err != nil {
+			c.markPoisoned()
 			c.conn.Close()
 			c.conn = nil
 			return nil, fmt.Errorf("%w: write payload failed: %v", ErrConnection, err)
@@ -300,6 +440,7 @@ func (c *Client) roundTrip(op byte, payload []byte) ([]byte, error) {
 	// 3. Read Response Header: [ Status(1) | Length(4) ]
 	respHeader := make([]byte, ProtoHeaderSize)
 	if _, err := io.ReadFull(c.conn, respHeader); err != nil {
+		c.markPoisoned()
 		c.conn.Close()
 		c.conn = nil
 		return nil, fmt.Errorf("%w: read header failed: %v", ErrConnection, err)
@@ -313,6 +454,7 @@ func (c *Client) roundTrip(op byte, payload []byte) ([]byte, error) {
 	if length > 0 {
 		body = make([]byte, length)
 		if _, err := io.ReadFull(c.conn, body); err != nil {
+			c.markPoisoned()
 			c.conn.Close()
 			c.conn = nil
 			return nil, fmt.Errorf("%w: read body failed: %v", ErrConnection, err)

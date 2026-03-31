@@ -129,6 +129,14 @@ func (s *Server) ReloadTLS() error {
 	return nil
 }
 
+// Addr returns the listener's network address.
+func (s *Server) Addr() net.Addr {
+	if s.listener != nil {
+		return s.listener.Addr()
+	}
+	return nil
+}
+
 func (s *Server) Run(ctx context.Context) error {
 	ln, err := tls.Listen("tcp", s.addr, s.tlsConfig)
 	if err != nil {
@@ -465,19 +473,27 @@ func (s *Server) handleCommit(w io.Writer, st *connState) {
 	st.tx = nil
 
 	if err != nil {
-		if err == stonedb.ErrDiskFull {
+		switch err {
+		case stonedb.ErrDiskFull:
 			st.logger.Error("Commit failed: Disk Full")
 			_ = s.writeBinaryResponse(w, protocol.ResStatusServerBusy, []byte("ERR disk is full"))
-		} else if err == stonedb.ErrWriteConflict {
+		case stonedb.ErrWriteConflict:
 			// Conflicts are normal operations, log as Debug or Info
 			st.logger.Debug("Commit failed: Conflict")
 			_ = s.writeBinaryResponse(w, protocol.ResStatusTxConflict, []byte(err.Error()))
-		} else {
+		default:
 			st.logger.Error("Commit failed: Internal Error", "err", err)
 			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte(err.Error()))
 		}
 		return
 	}
+	// Wait for Quorum if required
+	if st.db.MinReplicas() > 0 {
+		// Wait for the latest OpID (which includes the tx we just committed)
+		lastOpID := st.db.LastOpID()
+		st.db.WaitForQuorum(lastOpID)
+	}
+
 	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
 }
 
@@ -526,7 +542,7 @@ func (s *Server) handleSet(w io.Writer, payload []byte, st *connState) {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Database selected"))
 		return
 	}
-	if st.dbName == "0" {
+	if st.db.IsSystem() {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Database 0 is read-only"))
 		return
 	}
@@ -573,7 +589,7 @@ func (s *Server) handleDel(w io.Writer, payload []byte, st *connState) {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Database selected"))
 		return
 	}
-	if st.dbName == "0" {
+	if st.db.IsSystem() {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Database 0 is read-only"))
 		return
 	}
@@ -616,23 +632,33 @@ func (s *Server) handleMGet(w io.Writer, payload []byte, st *connState) {
 	}
 
 	numKeys := binary.BigEndian.Uint32(payload[0:4])
-	offset := 4
+	offset := uint64(4)
 	respBuf := new(bytes.Buffer)
 	binary.Write(respBuf, binary.BigEndian, numKeys)
 
+	// Use explicit bounds check to prevent DoS via huge numKeys
+	// (though MaxCommandSize limits this effectively)
+	if uint64(len(payload)) < offset {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Malformed mget payload"))
+		return
+	}
+
 	for i := 0; i < int(numKeys); i++ {
-		if offset+4 > len(payload) {
+		if offset+4 > uint64(len(payload)) {
 			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Malformed mget payload"))
 			return
 		}
-		kLen := int(binary.BigEndian.Uint32(payload[offset : offset+4]))
+		kLen := binary.BigEndian.Uint32(payload[offset : offset+4])
 		offset += 4
-		if offset+kLen > len(payload) {
+
+		// Overflow safety check
+		if offset+uint64(kLen) > uint64(len(payload)) {
 			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Malformed mget payload key"))
 			return
 		}
-		key := payload[offset : offset+kLen]
-		offset += kLen
+
+		key := payload[offset : offset+uint64(kLen)]
+		offset += uint64(kLen)
 
 		keyStr := string(key)
 		if len(keyStr) > 0 && keyStr[0] == '_' {
@@ -666,7 +692,7 @@ func (s *Server) handleMSet(w io.Writer, payload []byte, st *connState) {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Database selected"))
 		return
 	}
-	if st.dbName == "0" {
+	if st.db.IsSystem() {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Database 0 is read-only"))
 		return
 	}
@@ -680,34 +706,34 @@ func (s *Server) handleMSet(w io.Writer, payload []byte, st *connState) {
 	}
 
 	numPairs := binary.BigEndian.Uint32(payload[0:4])
-	offset := 4
+	offset := uint64(4)
 
 	for i := 0; i < int(numPairs); i++ {
-		if offset+4 > len(payload) {
+		if offset+4 > uint64(len(payload)) {
 			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Malformed mset payload"))
 			return
 		}
-		kLen := int(binary.BigEndian.Uint32(payload[offset : offset+4]))
+		kLen := binary.BigEndian.Uint32(payload[offset : offset+4])
 		offset += 4
-		if offset+kLen > len(payload) {
+		if offset+uint64(kLen) > uint64(len(payload)) {
 			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Malformed mset key"))
 			return
 		}
-		key := payload[offset : offset+kLen]
-		offset += kLen
+		key := payload[offset : offset+uint64(kLen)]
+		offset += uint64(kLen)
 
-		if offset+4 > len(payload) {
+		if offset+4 > uint64(len(payload)) {
 			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Malformed mset val len"))
 			return
 		}
-		vLen := int(binary.BigEndian.Uint32(payload[offset : offset+4]))
+		vLen := binary.BigEndian.Uint32(payload[offset : offset+4])
 		offset += 4
-		if offset+vLen > len(payload) {
+		if offset+uint64(vLen) > uint64(len(payload)) {
 			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Malformed mset value"))
 			return
 		}
-		val := payload[offset : offset+vLen]
-		offset += vLen
+		val := payload[offset : offset+uint64(vLen)]
+		offset += uint64(vLen)
 
 		keyStr := string(key)
 		if len(keyStr) > 0 && keyStr[0] == '_' {
@@ -735,7 +761,7 @@ func (s *Server) handleMDel(w io.Writer, payload []byte, st *connState) {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Database selected"))
 		return
 	}
-	if st.dbName == "0" {
+	if st.db.IsSystem() {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Database 0 is read-only"))
 		return
 	}
@@ -749,22 +775,22 @@ func (s *Server) handleMDel(w io.Writer, payload []byte, st *connState) {
 	}
 
 	numKeys := binary.BigEndian.Uint32(payload[0:4])
-	offset := 4
+	offset := uint64(4)
 	deletedCount := uint32(0)
 
 	for i := 0; i < int(numKeys); i++ {
-		if offset+4 > len(payload) {
+		if offset+4 > uint64(len(payload)) {
 			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Malformed mdel payload"))
 			return
 		}
-		kLen := int(binary.BigEndian.Uint32(payload[offset : offset+4]))
+		kLen := binary.BigEndian.Uint32(payload[offset : offset+4])
 		offset += 4
-		if offset+kLen > len(payload) {
+		if offset+uint64(kLen) > uint64(len(payload)) {
 			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Malformed mdel key"))
 			return
 		}
-		key := payload[offset : offset+kLen]
-		offset += kLen
+		key := payload[offset : offset+uint64(kLen)]
+		offset += uint64(kLen)
 
 		keyStr := string(key)
 		if len(keyStr) > 0 && keyStr[0] == '_' {

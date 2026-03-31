@@ -66,6 +66,8 @@ func TestStore_Recover_Basic(t *testing.T) {
 }
 
 func TestStore_Recover_CRC_Corruption(t *testing.T) {
+	os.Setenv("TS_TEST_WAL_TRUNCATE", "true")
+	defer os.Unsetenv("TS_TEST_WAL_TRUNCATE")
 	dir := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
@@ -151,6 +153,8 @@ func TestStore_Recover_CRC_Corruption(t *testing.T) {
 }
 
 func TestStore_Recover_PartialWrite(t *testing.T) {
+	os.Setenv("TS_TEST_WAL_TRUNCATE", "true")
+	defer os.Unsetenv("TS_TEST_WAL_TRUNCATE")
 	dir := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
