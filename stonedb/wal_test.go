@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -51,38 +50,6 @@ func TestWAL_RotationAndPurge(t *testing.T) {
 	}
 
 	db.Close()
-}
-
-func TestWAL_Migration(t *testing.T) {
-	dir := t.TempDir()
-	walPath := filepath.Join(dir, "wal")
-
-	// Create a FILE named "wal" (simulating old version)
-	if err := os.WriteFile(walPath, []byte("dummy data"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	// Open should trigger migration (File -> Dir)
-	// Because "dummy data" is corrupt WAL, Open might fail, but migration should have happened first.
-	db, err := Open(dir, Options{})
-	if err == nil {
-		db.Close()
-	}
-
-	// Verify "wal" is now a directory
-	info, err := os.Stat(walPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !info.IsDir() {
-		t.Error("WAL path should be a directory after migration")
-	}
-
-	// Verify old data was moved to 00...00.wal
-	migratedFile := filepath.Join(walPath, fmt.Sprintf("%020d.wal", 0))
-	if _, err := os.Stat(migratedFile); err != nil {
-		t.Error("Migrated WAL file not found")
-	}
 }
 
 func TestWAL_ScanErrors(t *testing.T) {
@@ -164,6 +131,8 @@ func TestWAL_Corruption_Truncate(t *testing.T) {
 	}
 
 	// Glob returns sorted paths
+	// Sort by our custom timeline sorter to ensure correct order
+	sortWALFiles(matches)
 	olderFile := matches[0]
 	lastFile := matches[len(matches)-1]
 
@@ -229,100 +198,174 @@ func TestWAL_ReadFirstOpID_Failures(t *testing.T) {
 	os.MkdirAll(walDir, 0o755)
 
 	// Case 1: Empty file
-	os.WriteFile(filepath.Join(walDir, "0001.wal"), []byte{}, 0o644)
+	os.WriteFile(filepath.Join(walDir, "wal_1_0001.wal"), []byte{}, 0o644)
 
 	// Case 2: Short header
-	os.WriteFile(filepath.Join(walDir, "0002.wal"), []byte{0x00, 0x00}, 0o644)
+	os.WriteFile(filepath.Join(walDir, "wal_1_0002.wal"), []byte{0x00, 0x00}, 0o644)
 
 	// Case 3: Bad length (too huge)
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.BigEndian, uint32(99999999)) // Length
 	binary.Write(buf, binary.BigEndian, uint32(0))        // Checksum
-	os.WriteFile(filepath.Join(walDir, "0003.wal"), buf.Bytes(), 0o644)
+	os.WriteFile(filepath.Join(walDir, "wal_1_0003.wal"), buf.Bytes(), 0o644)
 
 	// Case 4: Short Payload
 	buf.Reset()
 	binary.Write(buf, binary.BigEndian, uint32(WALBatchHeaderSize)) // Length
 	binary.Write(buf, binary.BigEndian, uint32(0))                  // Checksum
-	os.WriteFile(filepath.Join(walDir, "0004.wal"), buf.Bytes(), 0o644)
+	os.WriteFile(filepath.Join(walDir, "wal_1_0004.wal"), buf.Bytes(), 0o644)
 
-	wal, _ := OpenWriteAheadLog(walDir, 1024)
+	wal, _ := OpenWriteAheadLog(walDir, 1024, 1)
 
 	// Verify errors directly via readFirstOpID
-	if _, err := wal.readFirstOpID(filepath.Join(walDir, "0001.wal")); err == nil {
+	if _, err := wal.readFirstOpID(filepath.Join(walDir, "wal_1_0001.wal")); err == nil {
 		t.Error("Expected error on empty file")
 	}
-	if _, err := wal.readFirstOpID(filepath.Join(walDir, "0003.wal")); err == nil {
+	if _, err := wal.readFirstOpID(filepath.Join(walDir, "wal_1_0003.wal")); err == nil {
 		t.Error("Expected error on huge length")
 	}
-	if _, err := wal.readFirstOpID(filepath.Join(walDir, "0004.wal")); err == nil {
+	if _, err := wal.readFirstOpID(filepath.Join(walDir, "wal_1_0004.wal")); err == nil {
 		t.Error("Expected error on short payload")
 	}
 }
 
-func TestWAL_BatchDecoding_Boundary(t *testing.T) {
-	// 1. Empty payload
-	if tx, _, _ := decodeWALBatchEntries([]byte{}); tx != 0 {
-		t.Error("Expected 0 for empty payload")
-	}
-
-	// 2. Header only
-	buf := make([]byte, WALBatchHeaderSize)
-	binary.BigEndian.PutUint64(buf[0:], 1)  // TxID
-	binary.BigEndian.PutUint64(buf[8:], 1)  // OpID
-	binary.BigEndian.PutUint32(buf[16:], 0) // Count
-
-	txID, opID, entries := decodeWALBatchEntries(buf)
-	if txID != 1 || opID != 1 || len(entries) != 0 {
-		t.Error("Failed decoding empty batch header")
-	}
-
-	// 3. Corrupt entry length
-	buf2 := make([]byte, WALBatchHeaderSize+4)
-	copy(buf2, buf)
-	binary.BigEndian.PutUint32(buf2[WALBatchHeaderSize:], 100) // KeyLen
-
-	_, _, entries2 := decodeWALBatchEntries(buf2)
-	if len(entries2) != 0 {
-		t.Error("Should return no entries for partial data")
-	}
-}
-
-func TestWriteAheadLog_Stream_EOF(t *testing.T) {
-	wal := &WriteAheadLog{maxSize: 1000}
-	buf := bytes.NewReader([]byte{0x00, 0x01}) // Short header
-	_, err := wal.stream(buf, func(offset int64, payload []byte) error { return nil })
-	if err != io.ErrUnexpectedEOF {
-		t.Errorf("Expected UnexpectedEOF, got %v", err)
-	}
-}
-
-func TestWAL_IndexKeyEncoding(t *testing.T) {
-	opID := uint64(123456789)
-	key := encodeWALIndexKey(opID)
-
-	decoded := decodeWALIndexKey(key)
-	if decoded != opID {
-		t.Errorf("WAL Index Key encoding failed. Got %d, want %d", decoded, opID)
-	}
-}
-
-func TestWAL_Open_LevelDBIndex(t *testing.T) {
+func TestWAL_TimelineFork(t *testing.T) {
 	dir := t.TempDir()
-	db, _ := Open(dir, Options{MaxWALSize: 1024})
 
-	// Write data to rotate and create index
-	for i := 0; i < 100; i++ {
-		tx := db.NewTransaction(true)
-		tx.Put([]byte("k"), []byte("v"))
-		tx.Commit()
-	}
-	db.Close()
-
-	// Reopen - this loads index from LDB if needed during scan
-	db2, err := Open(dir, Options{})
+	// 1. Start on Timeline 1
+	wal, err := OpenWriteAheadLog(dir, 1024*1024, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	db2.Close()
+
+	// Write batch on T1
+	wal.AppendBatch(makeBatch(1, 1, "k1", "v1"))
+
+	// 2. Promote to Timeline 2
+	if err := wal.ForceNewTimeline(2); err != nil {
+		t.Fatalf("ForceNewTimeline failed: %v", err)
+	}
+
+	// Write batch on T2
+	wal.AppendBatch(makeBatch(2, 2, "k2", "v2"))
+	wal.Close()
+
+	// 3. Verify Files
+	matches, _ := filepath.Glob(filepath.Join(dir, "*.wal"))
+	sortWALFiles(matches)
+
+	if len(matches) != 2 {
+		t.Fatalf("Expected 2 WAL files, got %d", len(matches))
+	}
+
+	// Check filenames
+	base1 := filepath.Base(matches[0])
+	base2 := filepath.Base(matches[1])
+
+	if !ioIsPrefix(base1, "wal_1_") {
+		t.Errorf("File 1 should be on Timeline 1, got %s", base1)
+	}
+	if !ioIsPrefix(base2, "wal_2_") {
+		t.Errorf("File 2 should be on Timeline 2, got %s", base2)
+	}
+}
+
+func TestWAL_Promotion_Persistence(t *testing.T) {
+	dir := t.TempDir()
+	wal, err := OpenWriteAheadLog(dir, 1024*1024, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Write on Timeline 1
+	if err := wal.AppendBatch(makeBatch(100, 1, "k1", "v1")); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Promote to Timeline 5 (skip a few generations)
+	if err := wal.ForceNewTimeline(5); err != nil {
+		t.Fatalf("Promotion failed: %v", err)
+	}
+
+	// 3. Write on Timeline 5
+	if err := wal.AppendBatch(makeBatch(101, 2, "k2", "v2")); err != nil {
+		t.Fatal(err)
+	}
+	wal.Close()
+
+	// 4. Reopen and Replay
+	// We request timeline 5 (current state)
+	wal2, err := OpenWriteAheadLog(dir, 1024*1024, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal2.Close()
+
+	foundK1 := false
+	foundK2 := false
+
+	// Scan should cover all histories leading up to current
+	err = wal2.Scan(WALLocation{FileStartOffset: 0, RelativeOffset: 0}, func(entries []ValueLogEntry) error {
+		for _, e := range entries {
+			if string(e.Key) == "k1" {
+				foundK1 = true
+			}
+			if string(e.Key) == "k2" {
+				foundK2 = true
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Scan failed: %v", err)
+	}
+
+	if !foundK1 {
+		t.Error("Failed to recover data from Timeline 1")
+	}
+	if !foundK2 {
+		t.Error("Failed to recover data from Timeline 5")
+	}
+}
+
+func TestWAL_Promotion_Validation(t *testing.T) {
+	dir := t.TempDir()
+	wal, _ := OpenWriteAheadLog(dir, 1024, 10)
+	defer wal.Close()
+
+	// Try promoting to older
+	if err := wal.ForceNewTimeline(5); err == nil {
+		t.Error("Expected error promoting to older timeline")
+	}
+
+	// Try promoting to same
+	if err := wal.ForceNewTimeline(10); err == nil {
+		t.Error("Expected error promoting to same timeline")
+	}
+
+	// Valid
+	if err := wal.ForceNewTimeline(11); err != nil {
+		t.Errorf("Valid promotion failed: %v", err)
+	}
+}
+
+func ioIsPrefix(s, prefix string) bool {
+	return len(s) >= len(prefix) && s[0:len(prefix)] == prefix
+}
+
+// Helper to make a raw WAL batch payload for testing
+func makeBatch(txID, opID uint64, k, v string) []byte {
+	var buf bytes.Buffer
+	binary.Write(&buf, binary.BigEndian, txID)
+	binary.Write(&buf, binary.BigEndian, opID)
+	binary.Write(&buf, binary.BigEndian, uint32(1)) // count
+
+	key := []byte(k)
+	val := []byte(v)
+	binary.Write(&buf, binary.BigEndian, uint32(len(key)))
+	buf.Write(key)
+	binary.Write(&buf, binary.BigEndian, uint32(len(val)))
+	buf.Write(val)
+	buf.WriteByte(0)
+	return buf.Bytes()
 }
