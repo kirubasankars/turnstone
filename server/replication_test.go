@@ -62,7 +62,7 @@ func startServerNode(t *testing.T, baseDir, name string, sharedTLS *tls.Config) 
 	stores := make(map[string]*store.Store)
 	for _, dbName := range []string{"0", "1", "2", "3"} {
 		partPath := filepath.Join(nodeDir, "data", dbName)
-		st, err := store.NewStore(partPath, logger, 0, dbName == "0", "time", 90)
+		st, err := store.NewStore(partPath, logger, 0, dbName == "0", "time", 90, 0)
 		if err != nil {
 			t.Fatalf("Failed to init store %s: %v", dbName, err)
 		}
@@ -822,7 +822,7 @@ func startServerNodeWithReplicas(t *testing.T, baseDir, name string, sharedTLS *
 	for _, dbName := range []string{"0", "1", "2", "3"} {
 		partPath := filepath.Join(nodeDir, "data", dbName)
 		// Use minReplicas here
-		st, err := store.NewStore(partPath, logger, minReplicas, dbName == "0", "time", 90)
+		st, err := store.NewStore(partPath, logger, minReplicas, dbName == "0", "time", 90, 0)
 		if err != nil {
 			t.Fatalf("Failed to init store %s: %v", dbName, err)
 		}
