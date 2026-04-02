@@ -22,7 +22,7 @@ func TestStore_Recover_Basic(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	// 1. Initialize Store and write data (isSystem=false)
-	s1, err := NewStore(dir, logger, 0, false, "time", 90)
+	s1, err := NewStore(dir, logger, 0, false, "time", 90, 0)
 	if err != nil {
 		t.Fatalf("Failed to create initial store: %v", err)
 	}
@@ -45,7 +45,7 @@ func TestStore_Recover_Basic(t *testing.T) {
 	}
 
 	// 2. Re-open Store (isSystem=false)
-	s2, err := NewStore(dir, logger, 0, false, "time", 90)
+	s2, err := NewStore(dir, logger, 0, false, "time", 90, 0)
 	if err != nil {
 		t.Fatalf("Failed to create recovered store: %v", err)
 	}
@@ -72,7 +72,7 @@ func TestStore_Recover_CRC_Corruption(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	// 1. Create Store and write two entries (isSystem=false)
-	s1, err := NewStore(dir, logger, 0, false, "time", 90)
+	s1, err := NewStore(dir, logger, 0, false, "time", 90, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +130,7 @@ func TestStore_Recover_CRC_Corruption(t *testing.T) {
 	}
 
 	// 3. Re-open Store (Should trigger truncate) (isSystem=false)
-	s2, err := NewStore(dir, logger, 0, false, "time", 90)
+	s2, err := NewStore(dir, logger, 0, false, "time", 90, 0)
 	if err != nil {
 		t.Fatalf("Failed to recover store: %v", err)
 	}
@@ -159,7 +159,7 @@ func TestStore_Recover_PartialWrite(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	// 1. Create Store and write data (isSystem=false)
-	s1, err := NewStore(dir, logger, 0, false, "time", 90)
+	s1, err := NewStore(dir, logger, 0, false, "time", 90, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +185,7 @@ func TestStore_Recover_PartialWrite(t *testing.T) {
 	f.Close()
 
 	// 3. Re-open (isSystem=false)
-	s2, err := NewStore(dir, logger, 0, false, "time", 90)
+	s2, err := NewStore(dir, logger, 0, false, "time", 90, 0)
 	if err != nil {
 		t.Fatalf("Recovery failed on partial write: %v", err)
 	}
@@ -203,7 +203,7 @@ func TestStore_Replication_Quorum(t *testing.T) {
 
 	// 1. Create Store with MinReplicas = 1 (isSystem=false)
 	// This ensures that any write operation must wait for at least 1 replica to acknowledge.
-	s, err := NewStore(dir, logger, 1, false, "time", 90)
+	s, err := NewStore(dir, logger, 1, false, "time", 90, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -248,7 +248,7 @@ func TestStore_Replication_ApplyBatch(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	// Replica store (MinReplicas=0) (isSystem=false)
-	s, err := NewStore(dir, logger, 0, false, "time", 90)
+	s, err := NewStore(dir, logger, 0, false, "time", 90, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -287,7 +287,7 @@ func TestStoreStats_ConflictsAndStorage(t *testing.T) {
 	defer os.RemoveAll(dir)
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
-	s, err := NewStore(dir, logger, 0, false, "time", 90)
+	s, err := NewStore(dir, logger, 0, false, "time", 90, 0)
 	if err != nil {
 		t.Fatalf("NewStore failed: %v", err)
 	}
@@ -353,7 +353,7 @@ func TestStore_ReplicaLag(t *testing.T) {
 	defer os.RemoveAll(dir)
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
-	s, err := NewStore(dir, logger, 0, false, "time", 90)
+	s, err := NewStore(dir, logger, 0, false, "time", 90, 0)
 	if err != nil {
 		t.Fatalf("NewStore failed: %v", err)
 	}
@@ -382,5 +382,40 @@ func TestStore_ReplicaLag(t *testing.T) {
 	expectedLag := newHead - head
 	if stats.ReplicaLag != expectedLag {
 		t.Errorf("expected lag %d, got %d", expectedLag, stats.ReplicaLag)
+	}
+}
+
+
+// TestStore_BlockCacheConfiguration verifies that the store initializes correctly
+// with a custom block cache size.
+func TestStore_BlockCacheConfiguration(t *testing.T) {
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	// 1. Initialize with explicit block cache size (e.g., 16MB)
+	// Passing a specific size to ensure the option is accepted down the stack.
+	blockCacheSize := 16 * 1024 * 1024
+	s, err := NewStore(dir, logger, 0, false, "time", 90, blockCacheSize)
+	if err != nil {
+		t.Fatalf("Failed to create store with block cache: %v", err)
+	}
+	defer s.Close()
+
+	// 2. Perform operations to ensure stability
+	entry := protocol.LogEntry{
+		OpCode: protocol.OpJournalSet,
+		Key:    []byte("cache_test"),
+		Value:  []byte("value"),
+	}
+	if err := s.ApplyBatch([]protocol.LogEntry{entry}); err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+
+	val, err := s.Get("cache_test")
+	if err != nil {
+		t.Fatalf("Read failed: %v", err)
+	}
+	if string(val) != "value" {
+		t.Errorf("Unexpected value: %s", val)
 	}
 }

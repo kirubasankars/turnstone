@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -62,8 +63,9 @@ func runInit(home string) error {
 		TLSClientCertFile:    "certs/client.crt",
 		TLSClientKeyFile:     "certs/client.key",
 		MetricsAddr:          ":9090",
-		WALRetention:         "2h",            // Default duration if strategy is time
+		WALRetention:         "2h",          // Default duration if strategy is time
 		WALRetentionStrategy: "replication", // Default strategy
+		BlockCacheSize:       "64MB",        // Default block cache
 	}
 	configPath := filepath.Join(home, "turnstone.json")
 	if err := config.GenerateConfigArtifacts(home, defaultCfg, configPath); err != nil {
@@ -86,6 +88,35 @@ func runInit(home string) error {
 	fmt.Printf("Sample CDC configuration written to %s\n", cdcConfigPath)
 
 	return nil
+}
+
+func parseBytes(s string) (int, error) {
+	s = strings.TrimSpace(strings.ToUpper(s))
+	if s == "" {
+		return 0, nil
+	}
+	var mult int64 = 1
+	suffix := ""
+	if strings.HasSuffix(s, "GB") {
+		mult = 1024 * 1024 * 1024
+		suffix = "GB"
+	} else if strings.HasSuffix(s, "MB") {
+		mult = 1024 * 1024
+		suffix = "MB"
+	} else if strings.HasSuffix(s, "KB") {
+		mult = 1024
+		suffix = "KB"
+	} else if strings.HasSuffix(s, "B") {
+		mult = 1
+		suffix = "B"
+	}
+
+	numStr := strings.TrimSuffix(s, suffix)
+	val, err := strconv.ParseInt(strings.TrimSpace(numStr), 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return int(val * mult), nil
 }
 
 func runServer(logger *slog.Logger) {
@@ -115,6 +146,16 @@ func runServer(logger *slog.Logger) {
 		}
 	}
 
+	// Parse Block Cache
+	blockCacheSize := 64 * 1024 * 1024 // Default 64MB
+	if cfg.BlockCacheSize != "" {
+		if s, err := parseBytes(cfg.BlockCacheSize); err == nil {
+			blockCacheSize = s
+		} else {
+			logger.Warn("Invalid block_cache_size, using default 64MB", "val", cfg.BlockCacheSize, "err", err)
+		}
+	}
+
 	// Set default strategy if missing
 	if cfg.WALRetentionStrategy == "" {
 		cfg.WALRetentionStrategy = "replication"
@@ -134,7 +175,7 @@ func runServer(logger *slog.Logger) {
 		name := strconv.Itoa(i)
 		path := filepath.Join(*homeDir, "data", name)
 		isSystem := (i == 0)
-		st, err := store.NewStore(path, logger.With("db", name), 0, isSystem, cfg.WALRetentionStrategy, cfg.MaxDiskUsagePercent)
+		st, err := store.NewStore(path, logger.With("db", name), 0, isSystem, cfg.WALRetentionStrategy, cfg.MaxDiskUsagePercent, blockCacheSize)
 		if err != nil {
 			logger.Error("Failed to initialize store", "db", name, "err", err)
 			os.Exit(1)

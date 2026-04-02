@@ -19,20 +19,21 @@ import (
 // Config represents the server configuration.
 // Simplified for in-memory mode.
 type Config struct {
-	ID                   string `json:"id"` // Unique identifier for this instance
-	Port                 string `json:"port"`
-	Debug                bool   `json:"debug"`
-	MaxConns             int    `json:"max_conns"`
-	TLSCertFile          string `json:"tls_cert_file"`
-	TLSKeyFile           string `json:"tls_key_file"`
-	TLSCAFile            string `json:"tls_ca_file"`
-	TLSClientCertFile    string `json:"tls_client_cert_file"`
-	TLSClientKeyFile     string `json:"tls_client_key_file"`
-	MetricsAddr          string `json:"metrics_addr"`
-	NumberOfDatabases    int    `json:"number_of_databases"`
-	WALRetention         string `json:"wal_retention"`          // Duration string e.g. "2h"
-	WALRetentionStrategy string `json:"wal_retention_strategy"` // "time" or "replication"
-	MaxDiskUsagePercent  int    `json:"max_disk_usage_percent"`
+	ID                     string `json:"id"` // Unique identifier for this instance
+	Port                   string `json:"port"`
+	Debug                  bool   `json:"debug"`
+	MaxConns               int    `json:"max_conns"`
+	TLSCertFile            string `json:"tls_cert_file"`
+	TLSKeyFile             string `json:"tls_key_file"`
+	TLSCAFile              string `json:"tls_ca_file"`
+	TLSClientCertFile      string `json:"tls_client_cert_file"`
+	TLSClientKeyFile       string `json:"tls_client_key_file"`
+	MetricsAddr            string `json:"metrics_addr"`
+	NumberOfDatabases      int    `json:"number_of_databases"`
+	WALRetention           string `json:"wal_retention"`          // Duration string e.g. "2h"
+	WALRetentionStrategy   string `json:"wal_retention_strategy"` // "time" or "replication"
+	MaxDiskUsagePercent    int    `json:"max_disk_usage_percent"`
+	BlockCacheSize         string `json:"block_cache_size"` // Size string e.g. "64MB"
 }
 
 // ResolvePath returns an absolute path relative to the home directory if strictly necessary.
@@ -94,6 +95,10 @@ func GenerateConfigArtifacts(homeDir string, defaultCfg Config, configPath strin
 	// Default to 90% if not set (0 is treated as disabled, so we set explicit default here if needed)
 	if defaultCfg.MaxDiskUsagePercent == 0 {
 		defaultCfg.MaxDiskUsagePercent = 90
+	}
+	// Default Block Cache
+	if defaultCfg.BlockCacheSize == "" {
+		defaultCfg.BlockCacheSize = "64MB"
 	}
 
 	// Set default ID if not provided

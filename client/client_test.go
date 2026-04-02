@@ -51,7 +51,7 @@ func setupTestEnv(t *testing.T) (string, *server.Server, func()) {
 		dbName := strconv.Itoa(i)
 		// Database 0 is system (read-only for clients), 1-3 are user dbs
 		isSystem := (i == 0)
-		s, err := store.NewStore(filepath.Join(dir, "data", dbName), logger, 0, isSystem, "time", 90)
+		s, err := store.NewStore(filepath.Join(dir, "data", dbName), logger, 0, isSystem, "time", 90, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
