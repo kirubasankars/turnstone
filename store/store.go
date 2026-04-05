@@ -31,6 +31,13 @@ type StoreStats struct {
 	KeyCount   int64 // Number of live keys in the database
 }
 
+const (
+	StateUndefined    = "UNDEFINED"
+	StatePrimary      = "PRIMARY"
+	StateReplica      = "REPLICA"
+	StateSteppingDown = "STEPPING_DOWN"
+)
+
 // ReplicaSlot tracks the state of a connected replication consumer.
 type ReplicaSlot struct {
 	LogSeq    uint64    `json:"log_seq"`
@@ -46,9 +53,9 @@ type ReplicaSlot struct {
 // Store wraps stonedb.DB to provide a compatibility layer, stats, and replication logic.
 type Store struct {
 	*stonedb.DB
-	logger    *slog.Logger
-	startTime time.Time
-	isSystem  bool
+	logger        *slog.Logger
+	startTime     time.Time
+	isSystem      bool
 	minReplicas int
 
 	// Persistence Context
@@ -62,7 +69,12 @@ type Store struct {
 	cond          *sync.Cond
 	slotsFile     string
 	dirty         bool
-	walStrategy   string
+	walStrategy string
+	state       string // Current Database State (UNDEFINED, PRIMARY, REPLICA)
+
+	// Coordination for StepDown
+	safePointCh chan struct{} // Signal to force broadcast of SafePoint
+	timelineCh  chan struct{} // Signal to force broadcast of TimelineID
 
 	// Leader-Propagated Safety Barrier
 	// If we are a follower, the leader tells us what the global minimum sequence is.
@@ -118,6 +130,9 @@ func NewStore(dir string, logger *slog.Logger, minReplicas int, isSystem bool, w
 		leaderSafeSeq: math.MaxUint64, // Default to "Safe to delete everything" until leader says otherwise
 		dir:           dir,
 		dbOpts:        opts,
+		state:         StateUndefined,
+		safePointCh:   make(chan struct{}),
+		timelineCh:    make(chan struct{}),
 	}
 	s.cond = sync.NewCond(&s.mu)
 
@@ -182,6 +197,9 @@ func (s *Store) Reset() error {
 
 	// 6. Swap Pointer
 	s.DB = newDB
+
+	// Reset leader constraint on reset (we are starting fresh)
+	s.SetLeaderSafeSeq(math.MaxUint64)
 
 	s.logger.Info("Database reset complete")
 	return nil
@@ -306,7 +324,7 @@ func (s *Store) ApplyBatch(entries []protocol.LogEntry) error {
 		return err
 	}
 
-	if s.minReplicas > 0 {
+	if s.MinReplicas() > 0 {
 		s.WaitForQuorum(s.DB.LastOpID())
 	}
 
@@ -363,7 +381,8 @@ func (s *Store) Get(key string) ([]byte, error) {
 
 // Close closes the underlying StoneDB instance.
 func (s *Store) Close() error {
-	s.logger.Info("Closing store")
+	// CHANGED: Reduced from INFO to DEBUG
+	s.logger.Debug("Closing store")
 	s.mu.Lock()
 	if s.dirty {
 		s.saveSlotsLocked()
@@ -466,6 +485,8 @@ func (s *Store) RegisterReplica(id string, logSeq uint64, role string) {
 		quitCh:    make(chan struct{}),
 	}
 	s.dirty = true
+	// Notify waiters that a new replica joined (might satisfy quorum)
+	s.cond.Broadcast()
 }
 
 // UnregisterReplica marks the replica as disconnected but keeps the slot.
@@ -546,7 +567,18 @@ func (s *Store) UpdateReplicaLogSeq(id string, logSeq uint64) {
 
 // MinReplicas returns the configured minimum number of replicas required for quorum.
 func (s *Store) MinReplicas() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.minReplicas
+}
+
+// SetMinReplicas updates the minimum number of replicas required for quorum.
+func (s *Store) SetMinReplicas(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.minReplicas = n
+	// Broadcast to wake up any blocked WaitForQuorum calls
+	s.cond.Broadcast()
 }
 
 // WaitForQuorum blocks until enough replicas with Role="server" have acknowledged the given logSeq.
@@ -589,7 +621,8 @@ func (s *Store) loadSlots() {
 	if err := json.Unmarshal(data, &s.replicas); err != nil {
 		s.logger.Error("Failed to parse replication slots file", "err", err)
 	} else {
-		s.logger.Info("Loaded replication slots", "count", len(s.replicas))
+		// CHANGED: Reduced from INFO to DEBUG
+		s.logger.Debug("Loaded replication slots", "count", len(s.replicas))
 	}
 }
 
@@ -641,4 +674,126 @@ func (s *Store) saveSlotsLocked() error {
 		return fmt.Errorf("rename: %w", err)
 	}
 	return nil
+}
+
+// SetState updates the database state.
+func (s *Store) SetState(state string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.state = state
+	s.dirty = true
+	// Trigger waiters (e.g. WaitForPrimary?)
+	s.cond.Broadcast()
+}
+
+// Promote promotes the database to a new timeline and sets state to Primary.
+func (s *Store) Promote() error {
+	if err := s.DB.Promote(); err != nil {
+		return err
+	}
+	// Reset leader constraint as we are now the leader
+	s.SetLeaderSafeSeq(math.MaxUint64)
+
+	s.TriggerTimelineUpdate()
+	s.SetState(StatePrimary)
+	// Also trigger safe point to ensure new timeline starts clean for watchers
+	s.TriggerSafePoint()
+	return nil
+}
+
+// GetState returns the current database state.
+func (s *Store) GetState() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.state
+}
+
+// HealthyReplicaCount returns the number of connected replicas with 'server' role.
+func (s *Store) HealthyReplicaCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	count := 0
+	for _, slot := range s.replicas {
+		if slot.Connected && slot.Role == "server" {
+			count++
+		}
+	}
+	return count
+}
+
+// GetReplicaSignalChannel returns a channel that forces a SafePoint broadcast
+func (s *Store) SafePointSignal() <-chan struct{} {
+	return s.safePointCh
+}
+
+func (s *Store) TimelineSignal() <-chan struct{} {
+	return s.timelineCh
+}
+
+// TriggerSafePoint signals replication streams to send a SafePoint immediately
+func (s *Store) TriggerSafePoint() {
+	select {
+	case s.safePointCh <- struct{}{}:
+	default:
+	}
+}
+
+// TriggerTimelineUpdate signals replication streams to send a TimelineID immediately
+func (s *Store) TriggerTimelineUpdate() {
+	select {
+	case s.timelineCh <- struct{}{}:
+	default:
+	}
+}
+
+// WaitForActiveTransactions blocks until active transaction count is 0 or timeout
+func (s *Store) WaitForActiveTransactions(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		if s.DB.ActiveTransactionCount() == 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timeout waiting for active transactions")
+		}
+		<-ticker.C
+	}
+}
+
+// WaitForReplication blocks until all connected replicas have acked the current LastOpID.
+func (s *Store) WaitForReplication(timeout time.Duration) error {
+	lastOpID := s.DB.LastOpID()
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		min := s.GetMinSlotLogSeq()
+		// Infinite min seq (MaxUint64) means no replicas, which implies "synced" (nothing to sync to)
+		if min == math.MaxUint64 {
+			return nil // No replicas to wait for
+		}
+
+		if min >= lastOpID {
+			return nil
+		}
+
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timeout waiting for replication sync")
+		}
+		<-ticker.C
+	}
+}
+
+// ResetReplicas clears all replica slots
+func (s *Store) ResetReplicas() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.replicas = make(map[string]*ReplicaSlot)
+	if err := s.saveSlotsLocked(); err != nil {
+		s.logger.Error("Failed to save slots after reset", "err", err)
+	}
 }

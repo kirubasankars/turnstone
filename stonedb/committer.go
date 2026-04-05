@@ -84,7 +84,7 @@ func (db *DB) processCommitBatch(requests []commitRequest) {
 		return
 	}
 
-	// Log slow commits (over 100ms)
+	// WARN: Slow operations
 	duration := time.Since(start)
 	if duration > 100*time.Millisecond {
 		db.logger.Warn("Slow group commit", "count", len(requests), "duration", duration)
@@ -116,6 +116,7 @@ func (db *DB) attemptRollbackAndFail(batch *commitBatch, originalErr error, vlog
 		return
 	}
 
+	// INFO: Successful recovery
 	db.logger.Info("Safe rollback performed after index failure")
 	batch.failAll(fmt.Errorf("internal error (safe rollback performed): %w", originalErr))
 }

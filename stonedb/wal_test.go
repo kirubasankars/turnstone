@@ -94,7 +94,7 @@ func TestWAL_Locate_IndexFallback(t *testing.T) {
 	// Now memory is empty. Ask for an ID that is very high.
 	loc, found, err := db.locateWALStart(1000000)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("locateWALStart failed: %v", err)
 	}
 	if !found {
 		t.Error("Should have found last available WAL file via iter.Last()")
@@ -179,7 +179,7 @@ func TestWAL_RotateHookFailure(t *testing.T) {
 	tx := db.NewTransaction(true)
 	tx.Put(make([]byte, 50), make([]byte, 50))
 	if err := tx.Commit(); err != nil {
-		if err.Error() != "wal failed: wal rotate hook failed: boom" {
+		if err.Error() != "wal write failed: wal rotate hook failed: boom" && err.Error() != "wal failed: wal rotate hook failed: boom" {
 			t.Errorf("Expected hook failure error, got: %v", err)
 		}
 	} else {

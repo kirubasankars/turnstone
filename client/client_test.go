@@ -55,6 +55,12 @@ func setupTestEnv(t *testing.T) (string, *server.Server, func()) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		// Promote user databases so they are writable
+		if !isSystem {
+			if err := s.Promote(); err != nil {
+				t.Fatalf("Failed to promote db %s: %v", dbName, err)
+			}
+		}
 		stores[dbName] = s
 	}
 

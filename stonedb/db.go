@@ -155,6 +155,9 @@ func Open(dir string, opts Options) (*DB, error) {
 		logger:                 logger,
 	}
 
+	// CHANGED: Reduced from INFO to DEBUG to prevent log spam on startup
+	logger.Debug("Opening Database", "wal_max_size", opts.MaxWALSize, "wal_retention", opts.WALRetentionTime)
+
 	if err := db.recoverValueLog(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("recover vlog: %w", err)
@@ -244,7 +247,46 @@ func (db *DB) Promote() error {
 		return fmt.Errorf("failed to switch WAL timeline: %w", err)
 	}
 
+	// Keep INFO: Timeline Event is critical
 	db.logger.Info("Promoted to new timeline", "old_timeline", currentTL, "new_timeline", newTL, "at_op", lastOp)
+	return nil
+}
+
+func (db *DB) SetTimeline(newTL uint64) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	currentTL := db.timelineMeta.CurrentTimeline
+	if newTL == currentTL {
+		return nil
+	}
+	if newTL < currentTL {
+		return fmt.Errorf("cannot rewind timeline from %d to %d", currentTL, newTL)
+	}
+
+	// Record history transition
+	lastOp := atomic.LoadUint64(&db.operationID)
+	historyEntry := TimelineHistoryItem{
+		TLI:     currentTL,
+		StartOp: 0,
+		EndOp:   lastOp,
+	}
+	if len(db.timelineMeta.History) > 0 {
+		historyEntry.StartOp = db.timelineMeta.History[len(db.timelineMeta.History)-1].EndOp
+	}
+	db.timelineMeta.History = append(db.timelineMeta.History, historyEntry)
+	db.timelineMeta.CurrentTimeline = newTL
+
+	if err := db.saveTimelineMeta(); err != nil {
+		return fmt.Errorf("failed to save timeline meta: %w", err)
+	}
+
+	if err := db.writeAheadLog.ForceNewTimeline(newTL); err != nil {
+		return fmt.Errorf("failed to switch WAL timeline: %w", err)
+	}
+
+	// Keep INFO: Timeline Event is critical
+	db.logger.Info("Switched to leader timeline", "old_timeline", currentTL, "new_timeline", newTL, "at_op", lastOp)
 	return nil
 }
 
@@ -288,7 +330,8 @@ func (db *DB) openLevelDB(dir string) error {
 		if err := db.RebuildIndexFromVLog(); err != nil {
 			return fmt.Errorf("rebuild index: %w", err)
 		}
-		db.logger.Info("Index rebuild complete", "duration", time.Since(start))
+		// CHANGED: Reduced from INFO to DEBUG
+		db.logger.Debug("Index rebuild complete", "duration", time.Since(start))
 	}
 	return nil
 }
@@ -385,6 +428,12 @@ func (db *DB) GetLastCheckpointOpID() uint64 {
 
 func (db *DB) GetConflicts() uint64 {
 	return atomic.LoadUint64(&db.metricsConflicts)
+}
+
+func (db *DB) CurrentTimeline() uint64 {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return db.timelineMeta.CurrentTimeline
 }
 
 func (db *DB) ActiveTransactionCount() int {
@@ -506,7 +555,8 @@ func (db *DB) runBackgroundChecksum() {
 		case <-ticker.C:
 			if err := db.VerifyChecksums(); err != nil {
 				if !strings.Contains(err.Error(), "closed") {
-					db.logger.Error("Background checksum verification failed", "err", err)
+					// WARN: Integrity check failed
+					db.logger.Warn("Background checksum verification failed", "err", err)
 				}
 			}
 		}
@@ -547,16 +597,9 @@ func isClosed(ch <-chan struct{}) bool {
 func (db *DB) NewTransaction(update bool) *Transaction {
 	// Check for corruption first
 	if atomic.LoadInt32(&db.isCorrupt) == 1 {
-		// Return a transaction that will fail immediately/safely?
-		// Better probably to have Transaction struct handle it or just return a dummy
-		// that errors on any operation. But Transaction struct doesn't have error state on creation.
-		// So we return a transaction but note that subsequent ops might fail if we checked there.
-		// Actually, let's just let it be created, but any Commit() will fail because we check canCommit?
-		// Or better, we can't return nil here as it might panic caller.
-		// We'll let it proceed but Commit will check isCorrupt?
-		// However, the best place is to prevent Commit.
+		// Just return struct, commit will fail
 	}
-	
+
 	readTxID := atomic.LoadUint64(&db.transactionID)
 	tx := &Transaction{
 		db:         db,
@@ -736,7 +779,8 @@ func (db *DB) Close() error {
 	if !atomic.CompareAndSwapInt32(&db.closed, 0, 1) {
 		return nil
 	}
-	db.logger.Info("Closing database instance", "dir", db.dir)
+	// CHANGED: Reduced from INFO to DEBUG
+	db.logger.Debug("Closing database instance", "dir", db.dir)
 	close(db.closeCh)
 	db.wg.Wait()
 
@@ -779,7 +823,7 @@ func (db *DB) Checkpoint() error {
 	if db.ldb == nil {
 		return nil
 	}
-	
+
 	// FIX: Clean up ALL existing garbage stats first to prevent resurrection of deleted files
 	// This ensures we only persist what is currently in memory
 	iter := db.ldb.NewIterator(util.BytesPrefix(sysStaleBytesPrefix), nil)
@@ -809,7 +853,7 @@ func (db *DB) Checkpoint() error {
 	atomic.StoreUint64(&db.lastCkptOpID, atomic.LoadUint64(&db.operationID))
 	// Always sync sequences during checkpoint to be safe
 	db.persistSequences()
-	
+
 	if batch.Len() == 0 {
 		return nil
 	}
@@ -934,10 +978,12 @@ func (db *DB) checkDisk() {
 
 	if int(usage) > db.maxDiskUsagePercent {
 		if atomic.CompareAndSwapInt32(&db.isDiskFull, 0, 1) {
+			// WARN: Resource exhaustion
 			db.logger.Warn("Disk usage exceeds limit, stopping writes", "usage_percent", usage, "limit_percent", db.maxDiskUsagePercent)
 		}
 	} else {
 		if atomic.CompareAndSwapInt32(&db.isDiskFull, 1, 0) {
+			// INFO: Recovery
 			db.logger.Info("Disk usage returned to normal, resuming writes", "usage_percent", usage)
 		}
 	}
@@ -950,7 +996,8 @@ func (db *DB) loadKeyCount() error {
 		return nil
 	}
 	if err == leveldb.ErrNotFound {
-		db.logger.Info("Key count not found, scanning index for initial count", "action", "full_scan")
+		// CHANGED: Reduced from INFO to DEBUG
+		db.logger.Debug("Key count not found, scanning index for initial count", "action", "full_scan")
 		count, err := db.scanKeyCount()
 		if err != nil {
 			return err

@@ -9,7 +9,7 @@ import (
 // --- Constants ---
 
 const (
-	DefaultPort         = ":6379"
+	DefaultPort        = ":6379"
 	DefaultReadTimeout  = 5 * time.Second
 	DefaultWriteTimeout = 5 * time.Second
 	IdleTimeout         = 3 * 60 * time.Second
@@ -26,12 +26,12 @@ const (
 
 	BatchDelay = 500 * time.Microsecond
 
-	MaxBatchSize         = 4000
-	MaxBatchBytes        = 64 * 1024
-	ProtoHeaderSize      = 5
-	CheckpointInterval   = 512 * 1024 * 1024
-	SlowOpThreshold      = 500 * time.Millisecond
-	MaxWALSize           = 200 * 1024 * 1024 // 200MB Limit
+	MaxBatchSize       = 4000
+	MaxBatchBytes      = 64 * 1024
+	ProtoHeaderSize    = 5
+	CheckpointInterval = 512 * 1024 * 1024
+	SlowOpThreshold    = 500 * time.Millisecond
+	MaxWALSize         = 200 * 1024 * 1024 // 200MB Limit
 )
 
 // Variables (Mutable for testing)
@@ -55,26 +55,36 @@ const (
 	OpCodeStat      uint8 = 0x20
 	OpCodeReplicaOf uint8 = 0x32
 	OpCodeSlotDel   uint8 = 0x33
+	OpCodePromote   uint8 = 0x34
+	OpCodeStepDown  uint8 = 0x35
+	OpCodeCheckpoint uint8 = 0x36 // Force WAL Flush/VLog Rotation
+
 	OpCodeReplHello uint8 = 0x50
 	OpCodeReplBatch uint8 = 0x51
 	OpCodeReplAck   uint8 = 0x52
-	
+
 	// --- SNAPSHOT OPCODES ---
 	OpCodeReplSnapshot     uint8 = 0x53 // Bulk data payload (Full Sync)
 	OpCodeReplSnapshotDone uint8 = 0x54 // Transition signal to WAL streaming
-	
+
 	// --- SAFE POINT PROPAGATION ---
 	// Payload: [LogSeq(8)]
-	// Sent by Leader to Followers indicating the oldest log sequence 
+	// Sent by Leader to Followers indicating the oldest log sequence
 	// required by the cluster (min of all replica slots).
-	OpCodeReplSafePoint    uint8 = 0x55 
+	OpCodeReplSafePoint uint8 = 0x55
 
-	OpCodeQuit      uint8 = 0xFF
+	// --- TIMELINE PROPAGATION ---
+	// Payload: [TimelineID(8)]
+	// Sent by Leader to Followers to indicate the current timeline.
+	// Sent initially after handshake and upon any timeline fork (Promotion).
+	OpCodeReplTimeline uint8 = 0x56
+
+	OpCodeQuit uint8 = 0xFF
 
 	// Journal Specific Ops
 	OpJournalSet    uint8 = 1
 	OpJournalDelete uint8 = 2
-	OpJournalCommit uint8 = 3 
+	OpJournalCommit uint8 = 3
 )
 
 // Response Status Codes

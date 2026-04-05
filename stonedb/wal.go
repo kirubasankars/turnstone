@@ -84,6 +84,7 @@ func OpenWriteAheadLog(dir string, maxSize uint32, requestedTL uint64, logger *s
 		activePath = filepath.Join(dir, fmt.Sprintf("wal_%d_%020d.wal", currentTL, 0))
 	}
 
+	// DEBUG: Low level file op
 	logger.Debug("Opening WAL", "active_file", activePath, "timeline", currentTL)
 
 	f, err := os.OpenFile(activePath, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
@@ -195,14 +196,26 @@ func (wal *WriteAheadLog) AppendBatches(payloads [][]byte) error {
 	wal.mu.Lock()
 	defer wal.mu.Unlock()
 
+	// Capture state to attempt rollback on failure if possible
+	startFile := wal.currentFile
+	startOffset := wal.writeOffset
+	rotated := false
+
 	for _, payload := range payloads {
 		if wal.writeOffset > wal.maxSize {
 			if err := wal.rotate(); err != nil {
 				return err
 			}
+			rotated = true
 		}
 
 		if err := wal.writeFrame(payload); err != nil {
+			// If we haven't rotated, we can safely truncate back to the start of this batch group.
+			// This prevents "Phantom Data" where WAL has entries but client was told failure.
+			if !rotated && wal.currentFile == startFile {
+				wal.truncateSilent(int64(startOffset))
+				wal.writeOffset = startOffset
+			}
 			return err
 		}
 	}
@@ -211,13 +224,7 @@ func (wal *WriteAheadLog) AppendBatches(payloads [][]byte) error {
 }
 
 func (wal *WriteAheadLog) writeFrame(payload []byte) error {
-	if len(payload) >= 16 {
-		startOpID := binary.BigEndian.Uint64(payload[8:])
-		wal.batchIndex[startOpID] = WALLocation{
-			FileStartOffset: wal.currentStartOffset,
-			RelativeOffset:  wal.writeOffset,
-		}
-	}
+	startOffset := wal.writeOffset
 
 	var header [8]byte
 	length := uint32(len(payload))
@@ -226,19 +233,38 @@ func (wal *WriteAheadLog) writeFrame(payload []byte) error {
 	binary.BigEndian.PutUint32(header[0:], length)
 	binary.BigEndian.PutUint32(header[4:], checksum)
 
+	// Critical Section: Write I/O
+	// If any write fails, we must truncate back to startOffset to prevent corrupt/partial frames.
 	n1, err := wal.currentFile.Write(header[:])
 	if err != nil {
-		wal.currentFile.Seek(int64(wal.writeOffset), 0)
+		wal.truncateSilent(int64(startOffset))
 		return err
 	}
 	n2, err := wal.currentFile.Write(payload)
 	if err != nil {
-		wal.currentFile.Seek(int64(wal.writeOffset), 0)
+		wal.truncateSilent(int64(startOffset))
 		return err
 	}
 
+	// Only update offsets and index on success
 	wal.writeOffset += uint32(n1 + n2)
+
+	if len(payload) >= 16 {
+		startOpID := binary.BigEndian.Uint64(payload[8:])
+		wal.batchIndex[startOpID] = WALLocation{
+			FileStartOffset: wal.currentStartOffset,
+			RelativeOffset:  startOffset,
+		}
+	}
+
 	return nil
+}
+
+// truncateSilent attempts to revert the file to a specific size.
+// Errors are ignored as this is best-effort cleanup during an error path.
+func (wal *WriteAheadLog) truncateSilent(offset int64) {
+	_ = wal.currentFile.Truncate(offset)
+	_, _ = wal.currentFile.Seek(offset, 0)
 }
 
 func (wal *WriteAheadLog) rotate() error {
@@ -259,6 +285,7 @@ func (wal *WriteAheadLog) rotate() error {
 	wal.currentStartOffset += uint64(wal.writeOffset)
 	path := filepath.Join(wal.dir, fmt.Sprintf("wal_%d_%020d.wal", wal.timelineID, wal.currentStartOffset))
 
+	// INFO: File Lifecycle event
 	wal.logger.Info("Rotating WAL", "new_file", filepath.Base(path))
 
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
@@ -298,6 +325,7 @@ func (wal *WriteAheadLog) ForceNewTimeline(newTimelineID uint64) error {
 	wal.writeOffset = 0
 
 	path := filepath.Join(wal.dir, fmt.Sprintf("wal_%d_%020d.wal", wal.timelineID, wal.currentStartOffset))
+	// INFO: Timeline Event
 	wal.logger.Info("Forcing new timeline", "timeline", wal.timelineID, "file", filepath.Base(path))
 
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
@@ -340,6 +368,7 @@ func (wal *WriteAheadLog) ReplaySinceTx(vl *ValueLog, minTxID uint64, truncateCo
 		}
 	}
 
+	// Ensure the current file handle is positioned at the end after replay updates/truncations
 	wal.currentFile.Seek(0, 2)
 	return nil
 }
@@ -450,6 +479,7 @@ func (wal *WriteAheadLog) PurgeExpired(retention time.Duration, safeOpID uint64)
 		}
 
 		if nextStartOpID <= safeOpID {
+			// INFO: Garbage Collection
 			wal.logger.Info("Purging expired WAL file", "file", filepath.Base(currentPath))
 			if err := os.Remove(currentPath); err != nil {
 				return err
@@ -486,6 +516,7 @@ func (wal *WriteAheadLog) PurgeOlderThan(minOpID uint64) error {
 		}
 
 		if nextStartOpID <= minOpID {
+			// INFO: Garbage Collection
 			wal.logger.Info("Purging WAL file (older than constraint)", "file", filepath.Base(currentPath), "constraint", minOpID)
 			if err := os.Remove(currentPath); err != nil {
 				return err
@@ -576,13 +607,15 @@ func (wal *WriteAheadLog) replayFile(f *os.File, path string, vl *ValueLog, minT
 		needsTruncate := false
 		if err == io.ErrUnexpectedEOF || err == ErrChecksum || err == ErrCorruptData {
 			if truncateCorrupt && isLastFile {
-				wal.logger.Warn("WAL corruption detected in LAST file", "file", filepath.Base(path), "offset", validOffset, "err", err)
+				// WARN: Corruption handled
+				wal.logger.Warn("WAL corruption detected in LAST file (truncating)", "file", filepath.Base(path), "offset", validOffset, "err", err)
 				needsTruncate = true
 			} else {
 				msg := "WAL corruption"
 				if !isLastFile {
 					msg = "WAL corruption in middle file (truncation forbidden)"
 				}
+				// ERROR: Fatal corruption
 				wal.logger.Error(msg, "file", filepath.Base(path), "offset", validOffset, "err", err)
 				return fmt.Errorf("%s in %s at offset %d: %w", msg, path, validOffset, err)
 			}
