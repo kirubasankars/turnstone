@@ -58,6 +58,13 @@ func TestMemoryLeak_ReplicationConsumer(t *testing.T) {
 	cmd.Write(addrBytes)
 	cmd.WriteString("1") // Remote DB Name
 
+	// StepDown first because setupTestEnv promotes to Primary
+	admin.Send(protocol.OpCodeStepDown, nil)
+	statusSD, _ := admin.Read()
+	if statusSD != protocol.ResStatusOK {
+		t.Fatalf("Failed to step down: %x", statusSD)
+	}
+
 	admin.Send(protocol.OpCodeReplicaOf, cmd.Bytes())
 	status, _ := admin.Read()
 	if status != protocol.ResStatusOK {
