@@ -19,21 +19,21 @@ import (
 // Config represents the server configuration.
 // Simplified for in-memory mode.
 type Config struct {
-	ID                     string `json:"id"` // Unique identifier for this instance
-	Port                   string `json:"port"`
-	Debug                  bool   `json:"debug"`
-	MaxConns               int    `json:"max_conns"`
-	TLSCertFile            string `json:"tls_cert_file"`
-	TLSKeyFile             string `json:"tls_key_file"`
-	TLSCAFile              string `json:"tls_ca_file"`
-	TLSClientCertFile      string `json:"tls_client_cert_file"`
-	TLSClientKeyFile       string `json:"tls_client_key_file"`
-	MetricsAddr            string `json:"metrics_addr"`
-	NumberOfDatabases      int    `json:"number_of_databases"`
-	WALRetention           string `json:"wal_retention"`          // Duration string e.g. "2h"
-	WALRetentionStrategy   string `json:"wal_retention_strategy"` // "time" or "replication"
-	MaxDiskUsagePercent    int    `json:"max_disk_usage_percent"`
-	BlockCacheSize         string `json:"block_cache_size"` // Size string e.g. "64MB"
+	ID                   string `json:"id"` // Unique identifier for this instance
+	Port                 string `json:"port"`
+	Debug                bool   `json:"debug"`
+	MaxConns             int    `json:"max_conns"`
+	TLSCertFile          string `json:"tls_cert_file"`
+	TLSKeyFile           string `json:"tls_key_file"`
+	TLSCAFile            string `json:"tls_ca_file"`
+	TLSClientCertFile    string `json:"tls_client_cert_file"`
+	TLSClientKeyFile     string `json:"tls_client_key_file"`
+	MetricsAddr          string `json:"metrics_addr"`
+	NumberOfDatabases    int    `json:"number_of_databases"`
+	WALRetention         string `json:"wal_retention"`          // Duration string e.g. "2h"
+	WALRetentionStrategy string `json:"wal_retention_strategy"` // "time" or "replication"
+	MaxDiskUsagePercent  int    `json:"max_disk_usage_percent"`
+	BlockCacheSize       string `json:"block_cache_size"` // Size string e.g. "64MB"
 }
 
 // ResolvePath returns an absolute path relative to the home directory if strictly necessary.
@@ -56,7 +56,8 @@ func ValidateSecurityConfig(cfg Config) error {
 }
 
 // GenerateConfigArtifacts creates a sample directory structure and certificates.
-func GenerateConfigArtifacts(homeDir string, defaultCfg Config, configPath string) error {
+// Changed extraHosts to variadic to maintain backward compatibility with existing tests.
+func GenerateConfigArtifacts(homeDir string, defaultCfg Config, configPath string, extraHosts ...string) error {
 	if err := os.MkdirAll(homeDir, 0o755); err != nil {
 		return fmt.Errorf("error creating home directory: %w", err)
 	}
@@ -79,7 +80,7 @@ func GenerateConfigArtifacts(homeDir string, defaultCfg Config, configPath strin
 	}
 
 	certsDir := filepath.Dir(ResolvePath(homeDir, defaultCfg.TLSCertFile))
-	if err := generateCerts(certsDir); err != nil {
+	if err := generateCerts(certsDir, extraHosts); err != nil {
 		return fmt.Errorf("error generating certs: %w", err)
 	}
 	fmt.Printf("Certificates generated in: %s\n", certsDir)
@@ -121,7 +122,7 @@ func GenerateConfigArtifacts(homeDir string, defaultCfg Config, configPath strin
 	return nil
 }
 
-func generateCerts(outDir string) error {
+func generateCerts(outDir string, extraHosts []string) error {
 	writePEM := func(filename, typeStr string, bytes []byte) error {
 		path := filepath.Join(outDir, filename)
 		f, err := os.Create(path)
@@ -167,9 +168,19 @@ func generateCerts(outDir string) error {
 			NotAfter:     time.Now().Add(365 * 24 * time.Hour),
 			KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 			ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
-			DNSNames:     hosts,
+			DNSNames:     []string{},
 			IPAddresses:  []net.IP{net.ParseIP("127.0.0.1"), net.IPv6loopback},
 		}
+
+		// Correctly categorize hosts into IPs or DNS Names
+		for _, h := range hosts {
+			if ip := net.ParseIP(h); ip != nil {
+				tmpl.IPAddresses = append(tmpl.IPAddresses, ip)
+			} else {
+				tmpl.DNSNames = append(tmpl.DNSNames, h)
+			}
+		}
+
 		b, err := x509.CreateCertificate(rand.Reader, &tmpl, &caTemplate, &priv.PublicKey, caPriv)
 		if err != nil {
 			return err
@@ -180,7 +191,11 @@ func generateCerts(outDir string) error {
 		return writePEM(role+".key", "RSA PRIVATE KEY", x509.MarshalPKCS1PrivateKey(priv))
 	}
 
-	if err := genLeaf("server", 2, []string{"localhost"}); err != nil {
+	// Always include localhost + any extra hosts provided via CLI
+	serverHosts := []string{"localhost"}
+	serverHosts = append(serverHosts, extraHosts...)
+
+	if err := genLeaf("server", 2, serverHosts); err != nil {
 		return err
 	}
 	if err := genLeaf("client", 3, nil); err != nil {

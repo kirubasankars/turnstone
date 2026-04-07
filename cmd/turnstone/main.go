@@ -6,7 +6,6 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"flag"
-	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -24,24 +23,21 @@ import (
 )
 
 var (
-	initFlag = flag.Bool("init", false, "Generate configuration and certificates, then exit")
-	mode     = flag.String("mode", "server", "Operation mode: 'server' or 'cdc'")
-	homeDir  = flag.String("home", "tsdata", "Home directory for data and certs")
+	mode    = flag.String("mode", "server", "Operation mode: 'server' or 'cdc'")
+	homeDir = flag.String("home", "tsdata", "Home directory for data and certs")
 )
 
 func main() {
 	flag.Parse()
 
-	if *initFlag {
-		if err := runInit(*homeDir); err != nil {
-			fmt.Fprintf(os.Stderr, "Initialization failed: %v\n", err)
-			os.Exit(1)
-		}
-		return
-	}
-
 	logLevel := slog.LevelInfo
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel}))
+
+	// Verify home directory exists before starting
+	if _, err := os.Stat(*homeDir); os.IsNotExist(err) {
+		logger.Error("Home directory does not exist. Run 'turnstone-genconfig -home <path>' first.", "path", *homeDir)
+		os.Exit(1)
+	}
 
 	if *mode == "cdc" {
 		replication.StartFileConsumer(*homeDir, logger)
@@ -49,45 +45,6 @@ func main() {
 	}
 
 	runServer(logger)
-}
-
-func runInit(home string) error {
-	defaultCfg := config.Config{
-		Port:                 ":6379",
-		Debug:                false,
-		MaxConns:             1000,
-		NumberOfDatabases:    4,
-		TLSCertFile:          "certs/server.crt",
-		TLSKeyFile:           "certs/server.key",
-		TLSCAFile:            "certs/ca.crt",
-		TLSClientCertFile:    "certs/client.crt",
-		TLSClientKeyFile:     "certs/client.key",
-		MetricsAddr:          ":9090",
-		WALRetention:         "2h",          // Default duration if strategy is time
-		WALRetentionStrategy: "replication", // Default strategy
-		BlockCacheSize:       "64MB",        // Default block cache
-	}
-	configPath := filepath.Join(home, "turnstone.json")
-	if err := config.GenerateConfigArtifacts(home, defaultCfg, configPath); err != nil {
-		return fmt.Errorf("failed to generate artifacts: %w", err)
-	}
-
-	// Use the exported struct from replication package to ensure consistency.
-	// This defaults to using certs/cdc.crt and certs/cdc.key.
-	cdcCfg := replication.DefaultFileConsumerConfig()
-
-	cdcBytes, err := json.MarshalIndent(cdcCfg, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal CDC config: %w", err)
-	}
-
-	cdcConfigPath := filepath.Join(home, "turnstone.cdc.json")
-	if err := os.WriteFile(cdcConfigPath, cdcBytes, 0o644); err != nil {
-		return fmt.Errorf("failed to write CDC config: %w", err)
-	}
-	fmt.Printf("Sample CDC configuration written to %s\n", cdcConfigPath)
-
-	return nil
 }
 
 func parseBytes(s string) (int, error) {
