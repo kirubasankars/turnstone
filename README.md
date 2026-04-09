@@ -25,14 +25,6 @@ TurnstoneDB separates the storage of keys and values to optimize for modern SSDs
 2. **Value Log (VLog)**: Stores the actual values on disk in append-only files. Garbage collection is performed only when a file exceeds a configurable staleness threshold.
 3. **Write-Ahead Log (WAL)**: Ensures durability. Supports retention strategies based on time or replication acknowledgment.
 
-**The Write Path:**
-
-1. A Transaction buffers writes in memory.
-2. On `Commit`, the request enters the **Group Commit** channel.
-3. The Committer aggregates multiple requests into a single Batch.
-4. **Persist Stage**: Batch is appended to WAL (fsync) and VLog.
-5. **Apply Stage**: In-memory Index is updated.
-
 ---
 
 ## 📦 Installation & Getting Started
@@ -49,33 +41,33 @@ git clone https://github.com/yourusername/turnstone.git
 cd turnstone
 
 # Build server and tools
-go build -o bin/turnstone ./cmd/turnstone
-go build -o bin/turnstone-cli ./cmd/turnstone-cli
-go build -o bin/turnstone-bench ./cmd/turnstone-bench
-go build -o bin/turnstone-load ./cmd/turnstone-load
-go build -o bin/turnstone-duck ./cmd/turnstone-duck
+make build
+# OR manually:
+# go build -o bin/turnstone ./cmd/turnstone
+# go build -o bin/turnstone-cli ./cmd/turnstone-cli
+# go build -o bin/turnstone-generate-config ./cmd/turnstone-generate-config
 
 ```
 
 ### 2. Initialize Configuration & Certificates
 
-TurnstoneDB requires mTLS certificates. The `--init` flag generates a complete environment with a CA, server/client/admin certs, and default config files.
+TurnstoneDB requires mTLS certificates. Use the generator tool to create a complete environment with a CA, server/client/admin certs, and default config files.
 
 ```bash
 # Create a data directory and generate artifacts
-./bin/turnstone --init --home tsdata
+# -ip allows adding SANs (Subject Alternative Names) for remote access
+./bin/turnstone-generate-config -home tsdata -ip 192.168.1.10,myserver.local
 
 # Output:
 # Certificates generated in: tsdata/certs
 # Sample configuration written to tsdata/turnstone.json
-# Sample CDC configuration written to tsdata/turnstone.cdc.json
 
 ```
 
 ### 3. Start the Server
 
 ```bash
-./bin/turnstone --home tsdata
+./bin/turnstone -home tsdata
 
 ```
 
@@ -88,33 +80,37 @@ TurnstoneDB requires mTLS certificates. The `--init` flag generates a complete e
 
 ### Using the CLI (`turnstone-cli`)
 
-The CLI automatically detects certificates in the `--home` directory.
+The CLI automatically detects certificates in the `--home` directory. You must use the `-admin` flag to perform cluster management operations.
 
 ```bash
 # Connect to the server
-./bin/turnstone-cli --home tsdata
+./bin/turnstone-cli -home tsdata
 
 ```
 
 #### Basic Commands
 
+**Note:** All data operations (`get`, `set`, `del`) must be performed inside a transaction block (`begin` ... `commit`).
+
 ```bash
 > select 1
 OK
 
+# Start a Transaction
+> begin
+OK
+
+# Perform Operations
 > set mykey "Hello Turnstone"
 OK
 
 > get mykey
 OK: Hello Turnstone
 
-# Atomic Transaction
-> begin
+> del oldkey
 OK
-> set tx_key_1 "Value A"
-OK
-> set tx_key_2 "Value B"
-OK
+
+# Commit Changes
 > commit
 OK
 
@@ -122,9 +118,12 @@ OK
 
 #### Batch Operations (MGET / MSET)
 
-TurnstoneDB supports pipelined batch operations for high throughput.
+Batch operations also require an active transaction.
 
 ```bash
+> begin
+OK
+
 # Batch Set (MSET) - Atomic write of multiple keys
 > mset user:1 "Alice" user:2 "Bob" user:3 "Charlie"
 OK
@@ -136,88 +135,116 @@ OK
 3) Charlie
 4) (nil)
 
-# Batch Delete (MDEL)
-> mdel user:1 user:2
-(integer) 2
-
-```
-
-### Benchmarking
-
-Stress test the server using the built-in benchmark tool, which supports pipeline depth and batching.
-
-```bash
-# Run a mixed workload (50% Read / 50% Write) with 50 concurrent clients
-# Pipeline depth 5 (5 transactions in flight), Batch size 10 (10 ops per tx)
-./bin/turnstone-bench --home tsdata -c 50 -n 100000 -ratio 0.5 -depth 5 -batch 10
+> commit
+OK
 
 ```
 
 ---
 
-## 📡 Replication & CDC
+## 🕹️ Cluster Management & Failover
 
-### Setting up Replication
+TurnstoneDB supports manual failover handling via a specific lifecycle state machine: `UNDEFINED` -> `REPLICA` -> `PRIMARY`. These commands generally require Admin privileges.
 
-TurnstoneDB supports database-level replication.
+### 1. Following a Leader (`replicaof`)
 
-1. **Start Node A (Leader)** on port 6379.
-2. **Start Node B (Replica)** on port 6380 (configure separate `home` dir).
-3. **Connect to Node B** using the CLI and issue:
+To make the current node follow another node, use `replicaof`. This puts the database into **REPLICA** state.
 
 ```bash
-# Replicate Database 1 from Leader at localhost:6379
+# Replicate Database 1 from a Leader at 10.0.0.5:6379
 > select 1
-> replicaof localhost:6379 1
-Replication started from localhost:6379/1
+> replicaof 10.0.0.5:6379 1
+Replication started from 10.0.0.5:6379/1
 
 ```
 
-* **Snapshotting**: If Node B is too far behind (WAL purged on Leader), it will automatically request a full Snapshot stream before switching to WAL streaming.
-* **Safety**: The Leader propagates a "Safe Point" to followers, ensuring they don't purge WAL entries required by other stragglers.
+### 2. Graceful Step Down (`stepdown`)
+
+Before performing maintenance on a Primary, or to prepare for failover, issue `stepdown`. This command:
+
+1. Blocks new write transactions.
+2. Waits for active transactions to drain.
+3. Ensures connected replicas are synced.
+4. Transitions the database to **UNDEFINED** state (ReadOnly, no replication).
+
+```bash
+> select 1
+> stepdown
+OK
+# All clients are now disconnected from DB 1.
+
+```
+
+### 3. Promoting a Node (`promote`)
+
+To turn a node (either a Replica or an Undefined node) into a Primary, use `promote`. This bumps the **Timeline ID** (forking history safely) and enables write access.
+
+```bash
+> select 1
+# Promote to Primary. Optional arg: min_replicas for synchronous replication.
+> promote
+OK
+
+# OR: Promote with Synchronous Replication (Require 2 acks for every commit)
+> promote 2
+OK
+
+```
+
+### 4. Manual Failover Example
+
+**Scenario:** Moving leadership from Node A to Node B.
+
+1. **On Node A (Old Leader):**
+```bash
+> select 1
+> stepdown
+
+```
+
+
+2. **On Node B (New Leader):**
+```bash
+> select 1
+> promote
+
+```
+
+
+3. **On Node A (Old Leader):**
+```bash
+# Reconfigure A to follow B
+> select 1
+> replicaof <Node_B_IP>:6379 1
+
+```
+
+
+
+---
+
+## 📡 CDC & Data Integration
 
 ### Running a Change Data Capture (CDC) Consumer
 
 You can run a dedicated process to tail the transaction logs and output JSON for ETL pipelines.
 
-#### 1. Configure the Consumer
-
-Edit `tsdata/turnstone.cdc.json` to define the target database and output format:
-
-```json
-{
-  "id": "cdc-worker-01",
-  "host": "localhost:6379",
-  "database": "1",
-  "output_dir": "cdc_logs",
-  "rotate_interval": "1m",
-  "value_format": "json" 
-}
-
-```
-
-#### 2. Start the CDC Process
-
+1. **Configure:** Edit `tsdata/turnstone.cdc.json` to define the target database and output format.
+2. **Run:**
 ```bash
-./bin/turnstone --mode cdc --home tsdata
+./bin/turnstone -mode cdc -home tsdata
 
 ```
 
-#### 3. Consume the Data
 
-The CDC worker writes rotation-safe JSONL files to the `output_dir`. Example output:
-
+3. **Output:** The CDC worker writes rotation-safe JSONL files to the `output_dir`.
 ```json
-// cdc-1-1709320000.jsonl.part
-{"seq": 101, "tx": 50, "key": "device:452", "val": {"lat": 34.05, "lon": -118.25}, "ts": 1709320000}
-{"seq": 102, "tx": 50, "key": "device:452:status", "val": "active", "ts": 1709320000}
+{"seq": 101, "tx": 50, "key": "device:452", "val": {"lat": 34.05}, "ts": 1709320000}
 {"seq": 103, "tx": 51, "key": "session:99", "del": true, "ts": 1709320005}
 
 ```
 
-* **`seq`**: Monotonically increasing Log Sequence Number (LSN).
-* **`tx`**: Transaction ID. Events with the same `tx` were committed atomically.
-* **`del`**: Boolean flag indicating a delete operation (tombstone).
+
 
 ### Analytics with DuckDB
 
@@ -238,24 +265,14 @@ Use `turnstone-duck` to watch CDC logs, deduplicate them (handling the "same key
 | `id` | `hostname` | Unique Node ID. |
 | `port` | `:6379` | TCP listening address. |
 | `max_conns` | `1000` | Maximum concurrent client connections. |
-| `number_of_databases` | `16` | Number of logical databases. |
+| `number_of_databases` | `4` | Number of logical databases. |
 | `wal_retention` | `2h` | Duration to keep WAL files. |
 | `wal_retention_strategy` | `time` | Strategy for WAL purge: `time` or `replication` (wait for replicas). |
 | `max_disk_usage_percent` | `90` | Reject writes if disk usage exceeds this %. |
+| `block_cache_size` | `64MB` | Size of the LevelDB block cache (e.g. "128MB", "1GB"). |
 | `metrics_addr` | `:9090` | Address for Prometheus metrics. |
 | `tls_cert_file` | `certs/server.crt` | Server Certificate. |
 | `tls_client_cert_file` | `certs/server.crt` | Cert used when acting as a Replication Client. |
-
----
-
-## 🏗️ Project Structure
-
-* `cmd/`: Entry points (`turnstone`, `cli`, `bench`, `duck`, `load`).
-* `stonedb/`: **Core Storage Engine**. Contains WAL, VLog, Group Committer, and Compaction logic.
-* `server/`: TCP Server, Connection Multiplexing, and Protocol handling.
-* `replication/`: Replication Manager and CDC logic.
-* `protocol/`: Binary wire protocol definitions.
-* `metrics/`: Prometheus collectors.
 
 ---
 
