@@ -13,6 +13,6 @@ clean:
 	rm -rf ./bin
 
 test:
-	go test -v ./...
+	go test -v ./... | tee test.log
 
 
