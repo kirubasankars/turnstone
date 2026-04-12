@@ -33,10 +33,10 @@ func TestRunInit(t *testing.T) {
 		"certs/cdc.crt",
 		"certs/cdc.key",
 		"certs/ca.crt",
-		// Data Databases (0=System, 16=Last User Database in default config)
+		// Data Databases (0=System, 4=Last User Database in default config)
 		"data/0",
 		"data/1",
-		"data/16",
+		"data/4",
 	}
 
 	for _, artifact := range expectedArtifacts {
@@ -71,7 +71,7 @@ func TestGeneratedConfigsValidity(t *testing.T) {
 		if cfg.Port != ":6379" {
 			t.Errorf("Unexpected default port: %s", cfg.Port)
 		}
-		if cfg.NumberOfDatabases != 16 {
+		if cfg.NumberOfDatabases != 4 {
 			t.Errorf("Unexpected default databases: %d", cfg.NumberOfDatabases)
 		}
 	})
@@ -83,11 +83,10 @@ func TestGeneratedConfigsValidity(t *testing.T) {
 			t.Fatalf("Read CDC config failed: %v", err)
 		}
 
-		// Structure matches the anonymous struct in main.go runCDC
+		// Structure matches the exported struct in replication package
 		var jsonCfg struct {
-			Host      string `json:"host"`
-			Partition string `json:"partition"`
-			// StartSeq was removed
+			Host        string `json:"host"`
+			Database    string `json:"database"`
 			StateFile   string `json:"state_file"`
 			MetricsAddr string `json:"metrics_addr"`
 			TLSCertFile string `json:"tls_cert_file"`

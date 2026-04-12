@@ -6,6 +6,7 @@ build:
 	go build -o bin/turnstone-load  cmd/turnstone-load/main.go
 	go build -o bin/turnstone-load2  cmd/turnstone-load2/main.go
 	cd cmd/turnstone-duck && go mod tidy && go build -o ../../bin/turnstone-duck
+	cd cmd/turnstone-clickhouse && go mod tidy && go build -o ../../bin/turnstone-clickhouse
 
 clean:
 	rm -rf ./bin
