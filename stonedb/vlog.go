@@ -17,15 +17,15 @@ import (
 
 // ValueLog manages storage of values on disk in append-only files.
 type ValueLog struct {
-	dir            string
-	currentFile    *os.File
-	currentFid     uint32
-	writeOffset    uint32
-	fileCache      map[uint32]*os.File
-	lruOrder       []uint32 // Ordered list of fileIDs for eviction (newest at end)
-	maxOpenFiles   int
-	mu             sync.RWMutex // Note: Lock() is used for LRU updates
-	logger         *slog.Logger
+	dir          string
+	currentFile  *os.File
+	currentFid   uint32
+	writeOffset  uint32
+	fileCache    map[uint32]*os.File
+	lruOrder     []uint32 // Ordered list of fileIDs for eviction (newest at end)
+	maxOpenFiles int
+	mu           sync.RWMutex // Note: Lock() is used for LRU updates
+	logger       *slog.Logger
 }
 
 func OpenValueLog(dir string, logger *slog.Logger) (*ValueLog, error) {
@@ -325,27 +325,30 @@ func (vl *ValueLog) AppendEntries(entries []ValueLogEntry) (uint32, uint32, erro
 	var buf bytes.Buffer
 
 	for _, e := range entries {
-		payloadBuf := new(bytes.Buffer)
-
-		binary.Write(payloadBuf, binary.BigEndian, uint32(len(e.Key)))
-		binary.Write(payloadBuf, binary.BigEndian, uint32(len(e.Value)))
-		binary.Write(payloadBuf, binary.BigEndian, e.TransactionID)
-		binary.Write(payloadBuf, binary.BigEndian, e.OperationID)
-
+		// Prepare Header (KeyLen + ValLen + TxID + OpID + Type) = 25 bytes
+		var header [25]byte
+		binary.BigEndian.PutUint32(header[0:], uint32(len(e.Key)))
+		binary.BigEndian.PutUint32(header[4:], uint32(len(e.Value)))
+		binary.BigEndian.PutUint64(header[8:], e.TransactionID)
+		binary.BigEndian.PutUint64(header[16:], e.OperationID)
 		if e.IsDelete {
-			payloadBuf.WriteByte(1)
+			header[24] = 1
 		} else {
-			payloadBuf.WriteByte(0)
+			header[24] = 0 // Explicitly set 0 for clarity
 		}
 
-		payloadBuf.Write(e.Key)
-		payloadBuf.Write(e.Value)
+		// Calculate CRC without intermediate allocation
+		crc := crc32.New(Crc32Table)
+		crc.Write(header[:])
+		crc.Write(e.Key)
+		crc.Write(e.Value)
+		sum := crc.Sum32()
 
-		payload := payloadBuf.Bytes()
-		crc := crc32.Checksum(payload, Crc32Table)
-
-		binary.Write(&buf, binary.BigEndian, crc)
-		buf.Write(payload)
+		// Write [CRC][Header][Key][Value] to main buffer
+		binary.Write(&buf, binary.BigEndian, sum)
+		buf.Write(header[:])
+		buf.Write(e.Key)
+		buf.Write(e.Value)
 	}
 
 	n, err := vl.currentFile.Write(buf.Bytes())

@@ -62,7 +62,7 @@ func startServerNode(t *testing.T, baseDir, name string, sharedTLS *tls.Config) 
 	stores := make(map[string]*store.Store)
 	for _, dbName := range []string{"0", "1", "2", "3"} {
 		partPath := filepath.Join(nodeDir, "data", dbName)
-		st, err := store.NewStore(partPath, logger, 0, true, "time", 90)
+		st, err := store.NewStore(partPath, logger, 0, dbName == "0", "time", 90)
 		if err != nil {
 			t.Fatalf("Failed to init store %s: %v", dbName, err)
 		}
@@ -125,7 +125,7 @@ func stopReplication(t *testing.T, c *testClient, targetDB string) {
 	payload := make([]byte, 4+0+len(dbBytes))
 	binary.BigEndian.PutUint32(payload[0:4], 0)
 	copy(payload[4:], dbBytes)
-	
+
 	c.AssertStatus(protocol.OpCodeReplicaOf, payload, protocol.ResStatusOK)
 }
 
@@ -281,7 +281,7 @@ func TestReplication_FanOut(t *testing.T) {
 	}, "Fan-out replication failed")
 }
 
-func TestReplication_Cascading(t *testing.T) {
+func TestReplication_Cascading_Rejected(t *testing.T) {
 	baseDir, clientTLS := setupSharedCertEnv(t)
 	adminTLS := getRoleTLS(t, baseDir, "admin")
 
@@ -302,10 +302,6 @@ func TestReplication_Cascading(t *testing.T) {
 	defer clientA.Close()
 	selectDatabase(t, clientA, "1")
 
-	clientB := connectClient(t, addrB, clientTLS)
-	defer clientB.Close()
-	selectDatabase(t, clientB, "1")
-
 	clientC := connectClient(t, addrC, clientTLS)
 	defer clientC.Close()
 	selectDatabase(t, clientC, "1")
@@ -323,16 +319,21 @@ func TestReplication_Cascading(t *testing.T) {
 	configureReplication(t, adminB, addrA, "1")
 
 	// Configure C -> B (Database 1)
+	// This should successfully send the config command, but the ACTUAL connection from C to B
+	// will be rejected by B during handshake.
 	configureReplication(t, adminC, addrB, "1")
 
 	// Write to A (Database 1)
 	writeKeyVal(t, clientA, "cascadeKey", "cascadeVal")
 
-	// Verify C gets it (transitively via B)
-	waitForConditionOrTimeout(t, 10*time.Second, func() bool {
-		val := readKey(t, clientC, "cascadeKey")
-		return string(val) == "cascadeVal"
-	}, "Cascading replication failed: Node C did not receive data from Node A via Node B")
+	// Verify C does NOT get it (transitively via B)
+	// We wait a bit to give it a chance to fail if it were going to work.
+	time.Sleep(2 * time.Second)
+
+	val := readKey(t, clientC, "cascadeKey")
+	if val != nil {
+		t.Fatalf("Cascading replication should be rejected, but Node C received data: %s", val)
+	}
 }
 
 func TestReplication_SameServer_Loopback(t *testing.T) {
@@ -611,13 +612,13 @@ func TestCDC_PurgedWAL_TriggersSnapshot(t *testing.T) {
 		t.Fatalf("Expected OpCodeReplSnapshotDone (0x54), got 0x%x", respHead[0])
 	}
 	ln = binary.BigEndian.Uint32(respHead[1:])
-	
+
 	// Payload contains [DBNameLen(4)][DBName][Count(4)][Data(16)]
 	// DBName="1" (1 byte) -> Total wrapper = 9 bytes. Total payload = 25 bytes.
 	if ln < 9+16 {
 		t.Fatalf("Expected at least 25 byte payload for SnapshotDone (wrapper+data), got %d", ln)
 	}
-	
+
 	payload := make([]byte, ln)
 	if _, err := io.ReadFull(cdcConn, payload); err != nil {
 		t.Fatalf("Read Done payload failed: %v", err)
@@ -743,7 +744,7 @@ func TestReplication_KeyCount_Match(t *testing.T) {
 
 	// 3. Verify Key Count on Replica matches Primary
 	// We check specific metrics "turnstone_db_key_count"
-	
+
 	// Wait for Primary to definitely have the count updated in metrics (it might be cached/background)
 	waitForMetric(t, primarySrv, "turnstone_db_key_count", func(val float64) bool {
 		return int(val) == numKeys
@@ -821,7 +822,7 @@ func startServerNodeWithReplicas(t *testing.T, baseDir, name string, sharedTLS *
 	for _, dbName := range []string{"0", "1", "2", "3"} {
 		partPath := filepath.Join(nodeDir, "data", dbName)
 		// Use minReplicas here
-		st, err := store.NewStore(partPath, logger, minReplicas, true, "time", 90)
+		st, err := store.NewStore(partPath, logger, minReplicas, dbName == "0", "time", 90)
 		if err != nil {
 			t.Fatalf("Failed to init store %s: %v", dbName, err)
 		}
@@ -889,7 +890,7 @@ func TestReplication_KeyCount_SyncAndAsync(t *testing.T) {
 	// 4. Configure Replication
 	// Connect Sync Replica -> Primary
 	configureReplication(t, adminReplicaSync, primaryAddr, "1")
-	
+
 	// Connect Async Replica -> Primary
 	configureReplication(t, adminReplicaAsync, primaryAddr, "1")
 
@@ -967,7 +968,7 @@ func TestReplication_Retention_LeaderProtectsSlowFollower(t *testing.T) {
 	selectDatabase(t, adminReplica2, "1")
 	stopReplication(t, adminReplica2, "1")
 	adminReplica2.Close()
-	
+
 	cancelReplica()
 
 	// 6. Write MORE data to Leader (Another 100 entries -> ~5 more WAL files)
@@ -991,7 +992,7 @@ func TestReplication_Retention_LeaderProtectsSlowFollower(t *testing.T) {
 	// If it failed, older files would be deleted because Leader checkpointed.
 	walDir := filepath.Join(baseDir, "leader_ret", "data", "1", "wal")
 	files, _ := filepath.Glob(filepath.Join(walDir, "*.wal"))
-	
+
 	// With 1KB limit and 200 writes, we expect roughly 10 files.
 	if len(files) < 5 {
 		t.Errorf("Leader deleted WAL files too aggressively! Found %d files", len(files))
@@ -1081,7 +1082,7 @@ func TestReplication_Retention_FollowerRespectsLeaderSafePoint(t *testing.T) {
 	selectDatabase(t, adminF2ForStop, "1")
 	stopReplication(t, adminF2ForStop, "1")
 	adminF2ForStop.Close()
-	
+
 	cancelFollower2()
 
 	// 6. Write Batch 2 (100..200) -> F1 syncs, F2 is dead
@@ -1116,7 +1117,7 @@ func TestReplication_Retention_FollowerRespectsLeaderSafePoint(t *testing.T) {
 	// It should NOT delete files containing OpID 100.
 	f1WalDir := filepath.Join(baseDir, "follower1", "data", "1", "wal")
 	files, _ := filepath.Glob(filepath.Join(f1WalDir, "*.wal"))
-	
+
 	// 200 writes @ 1KB limit = ~10 files.
 	// If it deleted everything older than checkpoint (200), we'd have 1-2 files.
 	// If it respected SafePoint(100), we should have ~5 files.
