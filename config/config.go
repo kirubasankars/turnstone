@@ -17,23 +17,21 @@ import (
 )
 
 // Config represents the server configuration.
-// Simplified for in-memory mode.
 type Config struct {
-	ID                   string `json:"id"` // Unique identifier for this instance
-	Port                 string `json:"port"`
-	Debug                bool   `json:"debug"`
-	MaxConns             int    `json:"max_conns"`
-	TLSCertFile          string `json:"tls_cert_file"`
-	TLSKeyFile           string `json:"tls_key_file"`
-	TLSCAFile            string `json:"tls_ca_file"`
-	TLSClientCertFile    string `json:"tls_client_cert_file"`
-	TLSClientKeyFile     string `json:"tls_client_key_file"`
-	MetricsAddr          string `json:"metrics_addr"`
-	NumberOfDatabases    int    `json:"number_of_databases"`
-	WALRetention         string `json:"wal_retention"`          // Duration string e.g. "2h"
-	WALRetentionStrategy string `json:"wal_retention_strategy"` // "time" or "replication"
-	MaxDiskUsagePercent  int    `json:"max_disk_usage_percent"`
-	BlockCacheSize       string `json:"block_cache_size"` // Size string e.g. "64MB"
+	ID                     string `json:"id"` // Unique identifier for this instance
+	Port                   string `json:"port"`
+	Debug                  bool   `json:"debug"`
+	MaxConns               int    `json:"max_conns"`
+	TLSCertFile            string `json:"tls_cert_file"`
+	TLSKeyFile             string `json:"tls_key_file"`
+	TLSCAFile              string `json:"tls_ca_file"`
+	TLSClientCertFile      string `json:"tls_client_cert_file"`
+	TLSClientKeyFile       string `json:"tls_client_key_file"`
+	MetricsAddr            string `json:"metrics_addr"`
+	NumberOfDatabases      int    `json:"number_of_databases"`
+	WALRetentionStrategy   string `json:"wal_retention_strategy"` // "replication" or "checkpoint"
+	MaxDiskUsagePercent    int    `json:"max_disk_usage_percent"`
+	BlockCacheSize         string `json:"block_cache_size"` // Size string e.g. "64MB"
 }
 
 // ResolvePath returns an absolute path relative to the home directory if strictly necessary.
@@ -56,7 +54,6 @@ func ValidateSecurityConfig(cfg Config) error {
 }
 
 // GenerateConfigArtifacts creates a sample directory structure and certificates.
-// Changed extraHosts to variadic to maintain backward compatibility with existing tests.
 func GenerateConfigArtifacts(homeDir string, defaultCfg Config, configPath string, extraHosts ...string) error {
 	if err := os.MkdirAll(homeDir, 0o755); err != nil {
 		return fmt.Errorf("error creating home directory: %w", err)
@@ -69,7 +66,7 @@ func GenerateConfigArtifacts(homeDir string, defaultCfg Config, configPath strin
 	}
 
 	// Create data directories for databases.
-	// Database 0 is reserved for internal purposes.
+	// DB 0 is a normal database now.
 	// If NumberOfDatabases is N, we create databases 0, 1, ..., N.
 	for i := 0; i <= defaultCfg.NumberOfDatabases; i++ {
 		dbID := strconv.Itoa(i)
@@ -86,12 +83,11 @@ func GenerateConfigArtifacts(homeDir string, defaultCfg Config, configPath strin
 	fmt.Printf("Certificates generated in: %s\n", certsDir)
 
 	// Update default config to use server cert for replication client (needs high privs)
-	// instead of the restricted 'client' cert.
 	defaultCfg.TLSClientCertFile = "certs/server.crt"
 	defaultCfg.TLSClientKeyFile = "certs/server.key"
-	defaultCfg.WALRetention = "2h" // Default retention
+	
 	if defaultCfg.WALRetentionStrategy == "" {
-		defaultCfg.WALRetentionStrategy = "time"
+		defaultCfg.WALRetentionStrategy = "replication"
 	}
 	// Default to 90% if not set (0 is treated as disabled, so we set explicit default here if needed)
 	if defaultCfg.MaxDiskUsagePercent == 0 {

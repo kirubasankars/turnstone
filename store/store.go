@@ -55,7 +55,6 @@ type Store struct {
 	*stonedb.DB
 	logger      *slog.Logger
 	startTime   time.Time
-	isSystem    bool
 	minReplicas int
 
 	// Persistence Context
@@ -63,12 +62,12 @@ type Store struct {
 	dbOpts stonedb.Options
 
 	// Replication State
-	mu          sync.Mutex
-	dbMu        sync.RWMutex            // Protects s.DB pointer and state
-	replicas    map[string]*ReplicaSlot // ReplicaID -> Slot State
-	cond        *sync.Cond
-	slotsFile   string
-	dirty       bool
+	mu       sync.Mutex
+	dbMu     sync.RWMutex            // Protects s.DB pointer and state
+	replicas map[string]*ReplicaSlot // ReplicaID -> Slot State
+	cond     *sync.Cond
+	slotsFile string
+	dirty     bool
 	walStrategy string
 	state       string // Current Database State (UNDEFINED, PRIMARY, REPLICA)
 
@@ -83,7 +82,7 @@ type Store struct {
 	leaderSafeSeq uint64
 }
 
-func NewStore(dir string, logger *slog.Logger, minReplicas int, isSystem bool, walStrategy string, maxDiskUsage int, blockCacheSize int) (*Store, error) {
+func NewStore(dir string, logger *slog.Logger, minReplicas int, walStrategy string, maxDiskUsage int, blockCacheSize int) (*Store, error) {
 	// Default values
 	maxWALSize := 10 * 1024 * 1024
 
@@ -94,8 +93,6 @@ func NewStore(dir string, logger *slog.Logger, minReplicas int, isSystem bool, w
 		}
 	}
 
-	// Enable truncation to recover from partial writes/corruption automatically
-	// UPDATE: User requirement is to NOT auto-truncate. Operator must decide (e.g. by manual tool or config override).
 	truncateWAL := false
 	if os.Getenv("TS_TEST_WAL_TRUNCATE") == "true" {
 		truncateWAL = true
@@ -110,19 +107,9 @@ func NewStore(dir string, logger *slog.Logger, minReplicas int, isSystem bool, w
 		Logger:               logger, // Ensure logger is passed down
 	}
 
-	// If strategy is "replication", disable time-based purge in DB by setting retention to 0.
-	// Store will manage purging manually.
-	if walStrategy == "replication" {
-		opts.WALRetentionTime = 0
-	} else {
-		// Default time-based
-		opts.WALRetentionTime = 2 * time.Hour
-	}
-
 	s := &Store{
 		logger:        logger,
 		startTime:     time.Now(),
-		isSystem:      isSystem,
 		minReplicas:   minReplicas,
 		replicas:      make(map[string]*ReplicaSlot),
 		slotsFile:     filepath.Join(dir, "replication.slots"),
@@ -203,11 +190,6 @@ func (s *Store) Reset() error {
 
 	s.logger.Info("Database reset complete")
 	return nil
-}
-
-// IsSystem returns true if this database is a system database (read-only for clients).
-func (s *Store) IsSystem() bool {
-	return s.isSystem
 }
 
 // SetLeaderSafeSeq updates the retention barrier received from the upstream leader.

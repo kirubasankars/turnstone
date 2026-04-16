@@ -78,11 +78,6 @@ type Options struct {
 	// If 0, defaults to 60 seconds.
 	AutoCheckpointInterval time.Duration
 
-	// WALRetentionTime determines how long WAL files are kept.
-	// Files older than this duration AND fully checkpointed will be purged.
-	// If 0, defaults to 2 hours.
-	WALRetentionTime time.Duration
-
 	// MaxDiskUsagePercent (0-100). If disk usage exceeds this, write transactions fail.
 	// If 0, disabled.
 	MaxDiskUsagePercent int
