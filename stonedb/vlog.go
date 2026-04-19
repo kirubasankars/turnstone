@@ -24,17 +24,27 @@ type ValueLog struct {
 	fileCache    map[uint32]*os.File
 	lruOrder     []uint32 // Ordered list of fileIDs for eviction (newest at end)
 	maxOpenFiles int
+	maxSize      uint32
 	mu           sync.RWMutex // Note: Lock() is used for LRU updates
 	logger       *slog.Logger
 }
 
-func OpenValueLog(dir string, logger *slog.Logger) (*ValueLog, error) {
+func OpenValueLog(dir string, maxSize uint32, logger *slog.Logger) (*ValueLog, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
 
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+
+	// PATCH 1: Enforce Hard Cap to prevent 32-bit overflow
+	// We limit to 2GB to be safe with signed 32-bit integers often used in offsets/syscalls.
+	// If the offset exceeds MaxUint32, the index (which uses uint32 for offset) will wrap around
+	// and point to incorrect data, causing silent corruption.
+	const HardMaxFileSize = 2 * 1024 * 1024 * 1024
+	if maxSize > HardMaxFileSize {
+		return nil, fmt.Errorf("MaxVLogSize %d exceeds hard limit of %d (2GB) to prevent integer overflow", maxSize, HardMaxFileSize)
 	}
 
 	matches, err := filepath.Glob(filepath.Join(dir, "*.vlog"))
@@ -73,6 +83,7 @@ func OpenValueLog(dir string, logger *slog.Logger) (*ValueLog, error) {
 		fileCache:    make(map[uint32]*os.File),
 		lruOrder:     make([]uint32, 0),
 		maxOpenFiles: DefaultValueLogMaxOpenFiles,
+		maxSize:      maxSize,
 		logger:       logger,
 	}, nil
 }
@@ -320,6 +331,27 @@ func (vl *ValueLog) stream(r io.Reader, onEntry func(offset int64, e ValueLogEnt
 func (vl *ValueLog) AppendEntries(entries []ValueLogEntry) (uint32, uint32, error) {
 	vl.mu.Lock()
 	defer vl.mu.Unlock()
+
+	// Rotation Trigger: Max Size Check
+	// If the file is already over the limit, rotate BEFORE writing the new batch.
+	// This ensures the new batch goes entirely into the new file.
+	if vl.writeOffset > vl.maxSize {
+		// Replicating rotate logic inline to avoid deadlock recursion
+		if err := vl.currentFile.Sync(); err != nil {
+			return 0, 0, err
+		}
+		if err := vl.currentFile.Close(); err != nil {
+			return 0, 0, err
+		}
+		vl.currentFid++
+		path := filepath.Join(vl.dir, fmt.Sprintf("%04d.vlog", vl.currentFid))
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
+		if err != nil {
+			return 0, 0, err
+		}
+		vl.currentFile = f
+		vl.writeOffset = 0
+	}
 
 	startOffset := vl.writeOffset
 	var buf bytes.Buffer

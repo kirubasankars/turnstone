@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"log/slog"
 	"math"
@@ -18,9 +19,8 @@ import (
 )
 
 var (
-	MaxReplicationBatchSize  = 1 * 1024 * 1024            // 1MB
-	MaxTransactionBufferSize = uint64(64 * 1024 * 1024)   // 64MB
-	ErrBatchFull             = errors.New("replication batch full")
+	MaxReplicationBatchSize = 1 * 1024 * 1024 // 1MB
+	ErrBatchFull            = errors.New("replication batch full")
 )
 
 type replPacket struct {
@@ -240,33 +240,40 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 			st.logger.Warn("Dropping replica connection due to error", "err", err)
 			return
 		case p := <-outCh:
-			// Frame: [OpCode][TotalLen] [DBNameLen][DBName][Count/Reserved][Data...]
-			totalLen := 4 + len(p.dbName) + 4 + len(p.data)
+			// Frame: [OpCode][TotalLen] [CRC32(4)][DBNameLen][DBName][Count/Reserved][Data...]
+			// We calculate CRC on the payload body.
+			// Body = [DBNameLen][DBName][Count/Reserved][Data...]
+
+			bodyBuf := new(bytes.Buffer)
+			binary.Write(bodyBuf, binary.BigEndian, uint32(len(p.dbName)))
+			bodyBuf.WriteString(p.dbName)
+			binary.Write(bodyBuf, binary.BigEndian, p.count)
+			bodyBuf.Write(p.data)
+
+			rawBody := bodyBuf.Bytes()
+			crc := crc32.Checksum(rawBody, protocol.Crc32Table)
+
+			// Packet structure: [CRC(4)][RawBody]
+			finalPayloadLen := 4 + len(rawBody)
+
 			header := make([]byte, 5)
 			header[0] = p.opCode
-			binary.BigEndian.PutUint32(header[1:], uint32(totalLen))
+			binary.BigEndian.PutUint32(header[1:], uint32(finalPayloadLen))
 
 			// Write strictly without Deadlines to allow slow consumers
 			if _, err := conn.Write(header); err != nil {
 				return
 			}
 
-			nameH := make([]byte, 4)
-			binary.BigEndian.PutUint32(nameH, uint32(len(p.dbName)))
-			if _, err := conn.Write(nameH); err != nil {
-				return
-			}
-			if _, err := conn.Write([]byte(p.dbName)); err != nil {
-				return
-			}
-
-			cntH := make([]byte, 4)
-			binary.BigEndian.PutUint32(cntH, p.count)
-			if _, err := conn.Write(cntH); err != nil {
+			// Write CRC
+			crcBuf := make([]byte, 4)
+			binary.BigEndian.PutUint32(crcBuf, crc)
+			if _, err := conn.Write(crcBuf); err != nil {
 				return
 			}
 
-			if _, err := conn.Write(p.data); err != nil {
+			// Write Body
+			if _, err := conn.Write(rawBody); err != nil {
 				return
 			}
 		}
@@ -277,7 +284,6 @@ func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh c
 	currentLogID := minLogID
 
 	// 0. Send Initial Timeline
-	// This ensures the replica is aware of the leader's timeline immediately upon joining.
 	currentTL := st.DB.CurrentTimeline()
 	tlBuf := make([]byte, 8)
 	binary.BigEndian.PutUint64(tlBuf, currentTL)
@@ -288,82 +294,99 @@ func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh c
 		data:   tlBuf,
 		count:  0,
 	}:
-		// DEBUG: Timeline details
 		logger.Debug("Sent initial timeline to replica", "db", name, "timeline", currentTL)
 	case <-done:
 		return nil
 	}
 
-	// 1. Snapshot Check
-	err := st.ScanWAL(currentLogID+1, func([]stonedb.ValueLogEntry) error { return nil })
+	// Retry loop for WAL Streaming vs Snapshot Fallback (Patch 2)
+	for {
+		// 1. Snapshot Check / WAL Availability
+		// If WAL is unavailable, we MUST snapshot.
+		// If WAL is available, we proceed to stream it.
+		// We use a check + loop structure to handle race conditions where WAL disappears.
 
-	if err == stonedb.ErrLogUnavailable && currentLogID < st.LastOpID() {
-		// INFO: Snapshot required
-		logger.Info("Replica lag exceeds WAL retention. Starting Full Snapshot.", "db", name, "req_seq", currentLogID, "head", st.LastOpID())
+		// Check WAL Availability first
+		err := st.ScanWAL(currentLogID+1, func([]stonedb.ValueLogEntry) error { return nil })
 
-		snapTxID, snapOpID, snapErr := st.StreamSnapshot(func(batch []stonedb.SnapshotEntry) error {
-			var buf bytes.Buffer
-			for _, e := range batch {
-				binary.Write(&buf, binary.BigEndian, uint32(len(e.Key)))
-				buf.Write(e.Key)
-				binary.Write(&buf, binary.BigEndian, uint32(len(e.Value)))
-				buf.Write(e.Value)
+		if err == stonedb.ErrLogUnavailable && currentLogID < st.LastOpID() {
+			// INFO: Snapshot required
+			logger.Info("Replica lag exceeds WAL retention. Starting Full Snapshot.", "db", name, "req_seq", currentLogID, "head", st.LastOpID())
+
+			snapTxID, snapOpID, snapErr := st.StreamSnapshot(func(batch []stonedb.SnapshotEntry) error {
+				var buf bytes.Buffer
+				for _, e := range batch {
+					binary.Write(&buf, binary.BigEndian, uint32(len(e.Key)))
+					buf.Write(e.Key)
+					binary.Write(&buf, binary.BigEndian, uint32(len(e.Value)))
+					buf.Write(e.Value)
+				}
+				select {
+				case outCh <- replPacket{
+					dbName: name,
+					opCode: protocol.OpCodeReplSnapshot,
+					data:   buf.Bytes(),
+					count:  uint32(len(batch)),
+				}:
+				case <-done:
+					return io.EOF
+				}
+				return nil
+			})
+
+			if snapErr != nil {
+				return fmt.Errorf("snapshot failed: %w", snapErr)
 			}
+
+			doneBuf := make([]byte, 16)
+			binary.BigEndian.PutUint64(doneBuf[0:], snapTxID)
+			binary.BigEndian.PutUint64(doneBuf[8:], snapOpID)
+
 			select {
 			case outCh <- replPacket{
 				dbName: name,
-				opCode: protocol.OpCodeReplSnapshot,
-				data:   buf.Bytes(),
-				count:  uint32(len(batch)),
+				opCode: protocol.OpCodeReplSnapshotDone,
+				data:   doneBuf,
+				count:  0,
 			}:
 			case <-done:
-				return io.EOF
+				return nil
 			}
-			return nil
-		})
+			// INFO: Snapshot done
+			logger.Info("Snapshot complete. Resuming WAL stream.", "db", name, "resume_seq", snapOpID)
+			currentLogID = snapOpID
 
-		if snapErr != nil {
-			return fmt.Errorf("snapshot failed: %w", snapErr)
+			// Resend Timeline after Snapshot
+			currentTL = st.DB.CurrentTimeline()
+			binary.BigEndian.PutUint64(tlBuf, currentTL)
+			select {
+			case outCh <- replPacket{
+				dbName: name,
+				opCode: protocol.OpCodeReplTimeline,
+				data:   tlBuf,
+				count:  0,
+			}:
+			case <-done:
+				return nil
+			}
 		}
 
-		doneBuf := make([]byte, 16)
-		binary.BigEndian.PutUint64(doneBuf[0:], snapTxID)
-		binary.BigEndian.PutUint64(doneBuf[8:], snapOpID)
-
-		select {
-		case outCh <- replPacket{
-			dbName: name,
-			opCode: protocol.OpCodeReplSnapshotDone,
-			data:   doneBuf,
-			count:  0,
-		}:
-		case <-done:
-			return nil
+		// 2. WAL Streaming Loop
+		if err := s.runWALStreamLoop(name, st, currentLogID, outCh, done, logger); err != nil {
+			// If error is ErrLogUnavailable, break inner loop and retry outer loop (which will trigger snapshot)
+			// This handles the race condition where WAL was purged between check and stream.
+			if err.Error() == "OUT_OF_SYNC" || errors.Is(err, stonedb.ErrLogUnavailable) {
+				logger.Warn("WAL unavailable during stream, falling back to snapshot", "db", name)
+				continue
+			}
+			return err
 		}
-		// INFO: Snapshot done
-		logger.Info("Snapshot complete. Resuming WAL stream.", "db", name, "resume_seq", snapOpID)
-		currentLogID = snapOpID
-
-		// 1.5. Resend Timeline after Snapshot
-		// If a promotion occurred during the snapshot stream (which can take time),
-		// the non-blocking signal in TriggerTimelineUpdate might have been missed.
-		// We send the current timeline again to ensure the replica is consistent before receiving WAL.
-		currentTL = st.DB.CurrentTimeline()
-		binary.BigEndian.PutUint64(tlBuf, currentTL)
-		select {
-		case outCh <- replPacket{
-			dbName: name,
-			opCode: protocol.OpCodeReplTimeline,
-			data:   tlBuf,
-			count:  0,
-		}:
-			logger.Debug("Resending timeline after snapshot", "db", name, "timeline", currentTL)
-		case <-done:
-			return nil
-		}
+		return nil
 	}
+}
 
-	// 2. WAL Streaming & SafePoint Broadcast
+func (s *Server) runWALStreamLoop(name string, st *store.Store, startLogID uint64, outCh chan<- replPacket, done <-chan struct{}, logger *slog.Logger) error {
+	currentLogID := startLogID
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -376,7 +399,6 @@ func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh c
 			return nil
 
 		case <-st.TimelineSignal():
-			// DEBUG: Timeline event
 			logger.Debug("Broadcasting new timeline", "db", name)
 			currentTL := st.DB.CurrentTimeline()
 			tlBuf := make([]byte, 8)
@@ -393,18 +415,16 @@ func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh c
 			}
 
 		case <-safePointTicker.C:
-			// Broadcast Safe Point
 			minSeq := st.GetMinSlotLogSeq()
 			if minSeq > 0 {
 				buf := make([]byte, 8)
 				binary.BigEndian.PutUint64(buf, minSeq)
-
 				select {
 				case outCh <- replPacket{
 					dbName: name,
 					opCode: protocol.OpCodeReplSafePoint,
 					data:   buf,
-					count:  0, // Ignored
+					count:  0,
 				}:
 				case <-done:
 					return nil
@@ -412,14 +432,10 @@ func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh c
 			}
 
 		case <-st.SafePointSignal():
-			// DEBUG: Forced safe point
-			logger.Debug("Broadcasting forced safe point", "db", name)
-			// Forced Broadcast of Safe Point
 			minSeq := st.GetMinSlotLogSeq()
 			if minSeq > 0 && minSeq != math.MaxUint64 {
 				buf := make([]byte, 8)
 				binary.BigEndian.PutUint64(buf, minSeq)
-
 				select {
 				case outCh <- replPacket{
 					dbName: name,
@@ -443,7 +459,6 @@ func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh c
 				lastEntry := entries[len(entries)-1]
 
 				for _, e := range entries {
-					// Wire Format: [LogID(8)][TxID(8)][Op(1)][KLen(4)][Key][VLen(4)][Val]
 					if err := binary.Write(&batchBuf, binary.BigEndian, e.OperationID); err != nil {
 						return err
 					}
@@ -475,7 +490,6 @@ func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh c
 					}
 				}
 
-				// Append Commit Marker
 				if err := binary.Write(&batchBuf, binary.BigEndian, lastEntry.OperationID); err != nil {
 					return err
 				}
@@ -483,8 +497,8 @@ func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh c
 					return err
 				}
 				batchBuf.WriteByte(protocol.OpJournalCommit)
-				binary.Write(&batchBuf, binary.BigEndian, uint32(0)) // KeyLen
-				binary.Write(&batchBuf, binary.BigEndian, uint32(0)) // ValLen
+				binary.Write(&batchBuf, binary.BigEndian, uint32(0))
+				binary.Write(&batchBuf, binary.BigEndian, uint32(0))
 				count++
 
 				return nil
@@ -508,7 +522,7 @@ func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh c
 					continue
 				} else if err == stonedb.ErrLogUnavailable {
 					if currentLogID < st.LastOpID() {
-						return fmt.Errorf("OUT_OF_SYNC: requested log %d is purged", currentLogID+1)
+						return errors.New("OUT_OF_SYNC")
 					}
 				} else {
 					logger.Error("WAL Scan error", "db", name, "err", err)
@@ -517,80 +531,4 @@ func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh c
 			}
 		}
 	}
-}
-
-// processReplicationPacket parses raw bytes into LogEntries, buffers them, and applies them.
-// It handles fragmentation by accumulating entries in 'buffer' until a Commit marker is found.
-func processReplicationPacket(store *store.Store, buffer []protocol.LogEntry, currentSize uint64, count uint32, data []byte) ([]protocol.LogEntry, uint64, uint64, error) {
-	cursor := 0
-	var lastCommittedID uint64
-	var pendingBatches [][]protocol.LogEntry
-
-	for i := 0; i < int(count); i++ {
-		// Entry: [LogID(8)][TxID(8)][Op(1)][KLen(4)][Key][VLen(4)][Val]
-		if cursor+17 > len(data) {
-			return buffer, 0, currentSize, fmt.Errorf("malformed batch entry header")
-		}
-		lid := binary.BigEndian.Uint64(data[cursor : cursor+8])
-		op := data[cursor+16]
-		cursor += 17
-
-		kLen := int(binary.BigEndian.Uint32(data[cursor : cursor+4]))
-		cursor += 4
-		if cursor+kLen > len(data) {
-			return buffer, 0, currentSize, fmt.Errorf("malformed batch entry key")
-		}
-		key := data[cursor : cursor+kLen]
-		cursor += kLen
-
-		vLen := int(binary.BigEndian.Uint32(data[cursor : cursor+4]))
-		cursor += 4
-		if cursor+vLen > len(data) {
-			return buffer, 0, currentSize, fmt.Errorf("malformed batch entry val")
-		}
-		val := data[cursor : cursor+vLen]
-		cursor += vLen
-
-		// Handle Commit Marker
-		// Handle Commit Marker
-		if op == protocol.OpJournalCommit {
-			if len(buffer) > 0 {
-				// We have a complete transaction in buffer
-				pendingBatches = append(pendingBatches, buffer)
-				lastCommittedID = lid
-
-				// Reset buffer for next transaction (CRITICAL: ensure new slice allocation)
-				buffer = nil
-				currentSize = 0
-			} else {
-				// Empty commit (rare but valid)
-				lastCommittedID = lid
-			}
-		} else {
-			// Check Size Limit
-			entrySize := uint64(len(key) + len(val) + 20) // overhead estimation
-			if currentSize+entrySize > MaxTransactionBufferSize {
-				return buffer, 0, currentSize, fmt.Errorf("transaction too large: %d > %d", currentSize+entrySize, MaxTransactionBufferSize)
-			}
-			currentSize += entrySize
-
-			// Buffer the op until we see a commit
-			buffer = append(buffer, protocol.LogEntry{
-				LogSeq: lid,
-				OpCode: op,
-				Key:    key,
-				Value:  val,
-			})
-		}
-	}
-
-	// Apply all fully accumulated transactions
-	if len(pendingBatches) > 0 {
-		if err := store.ReplicateBatches(pendingBatches); err != nil {
-			return buffer, lastCommittedID, currentSize, err
-		}
-	}
-
-	// Return remaining buffer (incomplete transaction) and last commit ID
-	return buffer, lastCommittedID, currentSize, nil
 }

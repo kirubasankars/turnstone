@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -76,7 +77,7 @@ func main() {
 	}
 
 	fmt.Println("Connected.")
-	fmt.Println("Commands: select <db>, replicaof <host:port> <remote_db>, promote [min_replicas], stepdown, get <k>, set <k> <v>, del <k>, mget <k>..., mset <k> <v>..., mdel <k>..., begin, commit, abort, checkpoint, clear, quit")
+	fmt.Println("Commands: select <db>, replicaof <host:port> <remote_db>, promote [min_replicas], stepdown, get <k>, set <k> <v>, del <k>, mget <k>..., mset <k> <v>..., mdel <k>..., begin, commit, abort, checkpoint, stat, clear, quit")
 	fmt.Print("> ")
 
 	// 2. Interactive Loop
@@ -206,6 +207,18 @@ func handleCommand(cl *client.Client, cmd string, parts []string) error {
 		err = cl.Checkpoint()
 		if err == nil {
 			fmt.Println("OK")
+		}
+
+	case "stat":
+		result, err = cl.Stat()
+		if err == nil {
+			var obj interface{}
+			if json.Unmarshal(result, &obj) == nil {
+				pretty, _ := json.MarshalIndent(obj, "", "  ")
+				fmt.Println(string(pretty))
+			} else {
+				fmt.Println(string(result))
+			}
 		}
 
 	case "get":

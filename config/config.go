@@ -18,20 +18,20 @@ import (
 
 // Config represents the server configuration.
 type Config struct {
-	ID                     string `json:"id"` // Unique identifier for this instance
-	Port                   string `json:"port"`
-	Debug                  bool   `json:"debug"`
-	MaxConns               int    `json:"max_conns"`
-	TLSCertFile            string `json:"tls_cert_file"`
-	TLSKeyFile             string `json:"tls_key_file"`
-	TLSCAFile              string `json:"tls_ca_file"`
-	TLSClientCertFile      string `json:"tls_client_cert_file"`
-	TLSClientKeyFile       string `json:"tls_client_key_file"`
-	MetricsAddr            string `json:"metrics_addr"`
-	NumberOfDatabases      int    `json:"number_of_databases"`
-	WALRetentionStrategy   string `json:"wal_retention_strategy"` // "replication" or "checkpoint"
-	MaxDiskUsagePercent    int    `json:"max_disk_usage_percent"`
-	BlockCacheSize         string `json:"block_cache_size"` // Size string e.g. "64MB"
+	ID                   string `json:"id"` // Unique identifier for this instance
+	Port                 string `json:"port"`
+	Debug                bool   `json:"debug"`
+	MaxConns             int    `json:"max_conns"`
+	TLSCertFile          string `json:"tls_cert_file"`
+	TLSKeyFile           string `json:"tls_key_file"`
+	TLSCAFile            string `json:"tls_ca_file"`
+	TLSClientCertFile    string `json:"tls_client_cert_file"`
+	TLSClientKeyFile     string `json:"tls_client_key_file"`
+	MetricsAddr          string `json:"metrics_addr"`
+	NumberOfDatabases    int    `json:"number_of_databases"`
+	WALRetentionStrategy string `json:"wal_retention_strategy"` // "replication" or "checkpoint"
+	MaxDiskUsagePercent  int    `json:"max_disk_usage_percent"`
+	BlockCacheSize       string `json:"block_cache_size"` // Size string e.g. "64MB"
 }
 
 // ResolvePath returns an absolute path relative to the home directory if strictly necessary.
@@ -43,14 +43,6 @@ func ResolvePath(homeDir, path string) string {
 		return path
 	}
 	return filepath.Join(homeDir, path)
-}
-
-// ValidateSecurityConfig ensures that critical security parameters are present.
-func ValidateSecurityConfig(cfg Config) error {
-	if cfg.TLSCertFile == "" || cfg.TLSKeyFile == "" || cfg.TLSCAFile == "" {
-		return fmt.Errorf("security critical: 'tls_cert_file', 'tls_key_file', and 'tls_ca_file' must be set")
-	}
-	return nil
 }
 
 // GenerateConfigArtifacts creates a sample directory structure and certificates.
@@ -85,7 +77,7 @@ func GenerateConfigArtifacts(homeDir string, defaultCfg Config, configPath strin
 	// Update default config to use server cert for replication client (needs high privs)
 	defaultCfg.TLSClientCertFile = "certs/server.crt"
 	defaultCfg.TLSClientKeyFile = "certs/server.key"
-	
+
 	if defaultCfg.WALRetentionStrategy == "" {
 		defaultCfg.WALRetentionStrategy = "replication"
 	}

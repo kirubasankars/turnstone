@@ -54,7 +54,7 @@ func (db *DB) RunCompaction() (bool, error) {
 		if staleBatch.Len() > 0 {
 			if err := db.ldb.Write(staleBatch, &opt.WriteOptions{Sync: true}); err != nil {
 				return err
-			}
+						}
 			staleBatch.Reset()
 		}
 		return nil
@@ -277,28 +277,4 @@ func (db *DB) rewriteBatch(entries []ValueLogEntry) error {
 	}
 
 	return nil
-}
-
-func (db *DB) computeStaleBytes(ops map[string]*PendingOp) map[uint32]int64 {
-	staleBytes := make(map[uint32]int64)
-	iter := db.ldb.NewIterator(nil, nil)
-	defer iter.Release()
-
-	for k := range ops {
-		keyBytes := []byte(k)
-		seekKey := encodeIndexKey(keyBytes, math.MaxUint64)
-
-		if iter.Seek(seekKey) {
-			foundKey := iter.Key()
-			uKey, _, err := decodeIndexKey(foundKey)
-			if err == nil && bytes.Equal(uKey, keyBytes) {
-				meta, err := decodeEntryMeta(iter.Value())
-				if err == nil {
-					size := int64(ValueLogHeaderSize) + int64(len(keyBytes)) + int64(meta.ValueLen)
-					staleBytes[meta.FileID] += size
-				}
-			}
-		}
-	}
-	return staleBytes
 }

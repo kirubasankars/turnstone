@@ -9,29 +9,22 @@ import (
 // --- Constants ---
 
 const (
-	DefaultPort        = ":6379"
-	DefaultReadTimeout  = 5 * time.Second
-	DefaultWriteTimeout = 5 * time.Second
-	IdleTimeout         = 3 * 60 * time.Second
-	ShutdownTimeout     = 10 * time.Second
-	MaxTxDuration       = 5 * time.Second
-	MaxTxOps            = 10000
-	DefaultDataDir      = "data"
-	MaxKeySize          = 1 * 1024
-	MaxValueSize        = 4 * 1024
-	MaxCommandSize      = 64 * 1024
-	MaxSyncBytes        = 16 * 1024 * 1024
-	MaxIndexBytes       = 512 * 1024 * 1024
-	HeaderSize          = 16 // Meta(4) + LogSeq(8) + CRC(4)
+	DefaultPort             = ":6379"
+	DefaultReadTimeout      = 5 * time.Second
+	DefaultWriteTimeout     = 5 * time.Second
+	IdleTimeout             = 3 * 60 * time.Second
+	ShutdownTimeout         = 10 * time.Second
+	MaxTxDuration           = 5 * time.Second        // Strict 5s limit
+	MaxTxSize               = 200 * 1024 * 1024      // 200MB Limit
+	MaxValueSize            = 64 * 1024              // 64KB Limit
+	MaxCommandSize          = 66 * 1024              // Val(64k) + Key(1k) + Overhead
+	MaxTransactionBufferSize = 64 * 1024 * 1024      // 64MB Limit for buffering a tx in memory (replication/server)
+	HeaderSize              = 16                     // Meta(4) + LogSeq(8) + CRC(4)
 
-	BatchDelay = 500 * time.Microsecond
-
-	MaxBatchSize       = 4000
-	MaxBatchBytes      = 64 * 1024
-	ProtoHeaderSize    = 5
-	CheckpointInterval = 512 * 1024 * 1024
-	SlowOpThreshold    = 500 * time.Millisecond
-	MaxWALSize         = 200 * 1024 * 1024 // 200MB Limit
+	ProtoHeaderSize      = 5
+	CheckpointInterval   = 512 * 1024 * 1024
+	SlowOpThreshold      = 500 * time.Millisecond
+	DefaultMaxVLogSize   = 200 * 1024 * 1024 // 200MB Limit for VLog files
 )
 
 // Variables (Mutable for testing)
@@ -41,27 +34,27 @@ var (
 
 // OpCodes define the available commands in the TurnstoneDB wire protocol.
 const (
-	OpCodePing      uint8 = 0x01
-	OpCodeGet       uint8 = 0x02
-	OpCodeSet       uint8 = 0x03
-	OpCodeDel       uint8 = 0x04
-	OpCodeSelect    uint8 = 0x05
-	OpCodeMGet      uint8 = 0x06
-	OpCodeMSet      uint8 = 0x07
-	OpCodeMDel      uint8 = 0x08
-	OpCodeBegin     uint8 = 0x10
-	OpCodeCommit    uint8 = 0x11
-	OpCodeAbort     uint8 = 0x12
-	OpCodeStat      uint8 = 0x20
-	OpCodeReplicaOf uint8 = 0x32
-	OpCodeSlotDel   uint8 = 0x33
-	OpCodePromote   uint8 = 0x34
-	OpCodeStepDown  uint8 = 0x35
-	OpCodeCheckpoint uint8 = 0x36 // Force WAL Flush/VLog Rotation
+	OpCodePing             uint8 = 0x01
+	OpCodeGet              uint8 = 0x02
+	OpCodeSet              uint8 = 0x03
+	OpCodeDel              uint8 = 0x04
+	OpCodeSelect           uint8 = 0x05
+	OpCodeMGet             uint8 = 0x06
+	OpCodeMSet             uint8 = 0x07
+	OpCodeMDel             uint8 = 0x08
+	OpCodeBegin            uint8 = 0x10
+	OpCodeCommit           uint8 = 0x11
+	OpCodeAbort            uint8 = 0x12
+	OpCodeStat             uint8 = 0x20
+	OpCodeReplicaOf        uint8 = 0x32
+	OpCodeSlotDel          uint8 = 0x33
+	OpCodePromote          uint8 = 0x34
+	OpCodeStepDown         uint8 = 0x35
+	OpCodeCheckpoint       uint8 = 0x36 // Force WAL Flush/VLog Rotation
 
-	OpCodeReplHello uint8 = 0x50
-	OpCodeReplBatch uint8 = 0x51
-	OpCodeReplAck   uint8 = 0x52
+	OpCodeReplHello        uint8 = 0x50
+	OpCodeReplBatch        uint8 = 0x51
+	OpCodeReplAck          uint8 = 0x52
 
 	// --- SNAPSHOT OPCODES ---
 	OpCodeReplSnapshot     uint8 = 0x53 // Bulk data payload (Full Sync)
@@ -126,10 +119,12 @@ type LogEntry struct {
 	Offset int64 // Virtual Offset in the WAL (internal use for checkpoints)
 }
 
-type Entry struct {
-	Key      string
-	Value    []byte
-	IsDelete bool
-	TxID     uint64
-	LogSeq   uint64
+// IsASCII validates if a string contains only ASCII characters.
+func IsASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] > 127 {
+			return false
+		}
+	}
+	return true
 }

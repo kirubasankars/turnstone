@@ -6,18 +6,21 @@ import (
 	"fmt"
 	"math"
 
+	"turnstone/protocol"
+
 	"github.com/syndtr/goleveldb/leveldb/iterator"
 )
 
 // Transaction represents a running transaction.
 type Transaction struct {
-	db         *DB
-	pendingOps map[string]*PendingOp
-	readSet    map[string]struct{} // Track keys read for conflict detection
-	readTxID   uint64
-	finished   bool
-	update     bool
-	iter       iterator.Iterator // Cached iterator for reads
+	db          *DB
+	pendingOps  map[string]*PendingOp
+	readSet     map[string]struct{} // Track keys read for conflict detection
+	readTxID    uint64
+	finished    bool
+	update      bool
+	iter        iterator.Iterator // Cached iterator for reads
+	currentSize int64             // accumulated size of keys and values + overhead
 }
 
 // Discard cleans up the transaction resources and unregisters it.
@@ -44,7 +47,15 @@ func (tx *Transaction) Put(key, value []byte) error {
 	if len(key) == 0 {
 		return errors.New("empty key")
 	}
+
+	// Calculate size increase: KeyLen(4) + Key + ValLen(4) + Val + Type(1)
+	entrySize := int64(len(key) + len(value) + 9)
+	if tx.currentSize+entrySize > int64(protocol.MaxTxSize) {
+		return fmt.Errorf("transaction size exceeds limit %d", protocol.MaxTxSize)
+	}
+
 	tx.pendingOps[string(key)] = &PendingOp{Value: append([]byte{}, value...), IsDelete: false}
+	tx.currentSize += entrySize
 	return nil
 }
 
@@ -52,7 +63,15 @@ func (tx *Transaction) Delete(key []byte) error {
 	if !tx.update {
 		return errors.New("cannot delete in read-only transaction")
 	}
+
+	// Calculate size increase: KeyLen(4) + Key + ValLen(4) + Val(0) + Type(1)
+	entrySize := int64(len(key) + 9)
+	if tx.currentSize+entrySize > int64(protocol.MaxTxSize) {
+		return fmt.Errorf("transaction size exceeds limit %d", protocol.MaxTxSize)
+	}
+
 	tx.pendingOps[string(key)] = &PendingOp{Value: nil, IsDelete: true}
+	tx.currentSize += entrySize
 	return nil
 }
 

@@ -7,7 +7,6 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,16 +18,17 @@ import (
 
 // StoreStats holds basic metrics.
 type StoreStats struct {
-	ActiveTxs  int
-	Uptime     string
-	Offset     int64 // Represents the WAL/VLog offset or similar metric
-	Conflicts  uint64
-	ReplicaLag uint64 // Least replica lag among all replicas
-	WALFiles   int
-	WALSize    int64
-	VLogFiles  int
-	VLogSize   int64
-	KeyCount   int64 // Number of live keys in the database
+	ActiveTxs    int
+	Uptime       string
+	Offset       int64 // Represents the WAL/VLog offset or similar metric
+	Conflicts    uint64
+	ReplicaLag   uint64 // Least replica lag among all replicas
+	WALFiles     int
+	WALSize      int64
+	VLogFiles    int
+	VLogSize     int64
+	KeyCount     int64 // Number of live keys in the database
+	GarbageBytes int64 // Total stale bytes in VLog
 }
 
 const (
@@ -62,14 +62,15 @@ type Store struct {
 	dbOpts stonedb.Options
 
 	// Replication State
-	mu       sync.Mutex
-	dbMu     sync.RWMutex            // Protects s.DB pointer and state
-	replicas map[string]*ReplicaSlot // ReplicaID -> Slot State
-	cond     *sync.Cond
-	slotsFile string
-	dirty     bool
-	walStrategy string
-	state       string // Current Database State (UNDEFINED, PRIMARY, REPLICA)
+	mu             sync.Mutex
+	dbMu           sync.RWMutex            // Protects s.DB pointer and state
+	replicas       map[string]*ReplicaSlot // ReplicaID -> Slot State
+	cond           *sync.Cond
+	slotsFile      string
+	dirty          bool
+	walStrategy    string
+	state          string // Current Database State (UNDEFINED, PRIMARY, REPLICA)
+	replicaTimeout time.Duration
 
 	// Coordination for StepDown
 	safePointCh chan struct{} // Signal to force broadcast of SafePoint
@@ -83,23 +84,13 @@ type Store struct {
 }
 
 func NewStore(dir string, logger *slog.Logger, minReplicas int, walStrategy string, maxDiskUsage int, blockCacheSize int) (*Store, error) {
-	// Default values
-	maxWALSize := 10 * 1024 * 1024
-
-	// Allow Test Override
-	if v := os.Getenv("TS_TEST_WAL_SIZE"); v != "" {
-		if i, err := strconv.Atoi(v); err == nil && i > 0 {
-			maxWALSize = i
-		}
-	}
-
 	truncateWAL := false
 	if os.Getenv("TS_TEST_WAL_TRUNCATE") == "true" {
 		truncateWAL = true
 	}
 
 	opts := stonedb.Options{
-		MaxWALSize:           uint32(maxWALSize),
+		// MaxWALSize removed - handled by time-based checkpointing
 		CompactionMinGarbage: 4 * 1024 * 1024,
 		TruncateCorruptWAL:   truncateWAL,
 		MaxDiskUsagePercent:  maxDiskUsage,
@@ -108,18 +99,19 @@ func NewStore(dir string, logger *slog.Logger, minReplicas int, walStrategy stri
 	}
 
 	s := &Store{
-		logger:        logger,
-		startTime:     time.Now(),
-		minReplicas:   minReplicas,
-		replicas:      make(map[string]*ReplicaSlot),
-		slotsFile:     filepath.Join(dir, "replication.slots"),
-		walStrategy:   walStrategy,
-		leaderSafeSeq: math.MaxUint64, // Default to "Safe to delete everything" until leader says otherwise
-		dir:           dir,
-		dbOpts:        opts,
-		state:         StateUndefined,
-		safePointCh:   make(chan struct{}),
-		timelineCh:    make(chan struct{}),
+		logger:         logger,
+		startTime:      time.Now(),
+		minReplicas:    minReplicas,
+		replicas:       make(map[string]*ReplicaSlot),
+		slotsFile:      filepath.Join(dir, "replication.slots"),
+		walStrategy:    walStrategy,
+		leaderSafeSeq:  math.MaxUint64, // Default to "Safe to delete everything" until leader says otherwise
+		dir:            dir,
+		dbOpts:         opts,
+		state:          StateUndefined,
+		safePointCh:    make(chan struct{}),
+		timelineCh:     make(chan struct{}),
+		replicaTimeout: 1 * time.Minute, // Default strict timeout for lagging replicas
 	}
 	s.cond = sync.NewCond(&s.mu)
 
@@ -132,6 +124,8 @@ func NewStore(dir string, logger *slog.Logger, minReplicas int, walStrategy stri
 	// Start WAL retention manager if strategy is replication
 	if s.walStrategy == "replication" {
 		go s.runRetentionManager()
+		// SELF-HEALING: Start the zombie replica eviction monitor
+		go s.runReplicaEviction()
 	}
 
 	db, err := stonedb.Open(dir, opts)
@@ -228,6 +222,52 @@ func (s *Store) runRetentionManager() {
 	}
 }
 
+// runReplicaEviction implements SELF-HEALING for stuck replicas.
+func (s *Store) runReplicaEviction() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		s.evictZombieReplicas()
+	}
+}
+
+func (s *Store) evictZombieReplicas() {
+	// Get current head to determine if replicas are actually lagging
+	headSeq := s.DB.LastOpID()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for id, slot := range s.replicas {
+		// A replica is a "Zombie" if:
+		// 1. It is lagging (slot.LogSeq < headSeq) -> It is holding back WAL purging.
+		// 2. It hasn't been seen/acked in > replicaTimeout.
+		// If a replica is caught up (LogSeq == headSeq), we tolerate idleness because it's not blocking WAL.
+
+		if slot.LogSeq < headSeq && time.Since(slot.LastSeen) > s.replicaTimeout {
+			s.logger.Warn("Evicting zombie replica (blocking WAL retention)",
+				"replica_id", id,
+				"lag", headSeq-slot.LogSeq,
+				"last_seen", time.Since(slot.LastSeen),
+			)
+
+			// Signal network handler to close
+			if slot.quitCh != nil {
+				select {
+				case <-slot.quitCh:
+				default:
+					close(slot.quitCh)
+				}
+			}
+
+			// Remove from map immediately to unblock GetMinSlotLogSeq
+			delete(s.replicas, id)
+			s.dirty = true
+		}
+	}
+}
+
 // EnforceRetentionPolicy runs the logic to determine which WAL files can be safely deleted.
 // It considers local checkpoints, downstream replicas, and upstream leader constraints.
 // This is public to allow deterministic testing.
@@ -285,6 +325,16 @@ func (s *Store) EnforceRetentionPolicy() {
 
 // ApplyBatch applies a batch of protocol entries.
 func (s *Store) ApplyBatch(entries []protocol.LogEntry) error {
+	// PATCH 3: Strict Sync Replication (Wait for Replicas BEFORE locking)
+	// If configured for sync replication, verify we have enough healthy replicas connected
+	// to satisfy quorum *before* attempting the commit. This fails fast if the cluster is degraded.
+	if s.minReplicas > 0 {
+		healthy := s.HealthyReplicaCount()
+		if healthy < s.minReplicas {
+			return fmt.Errorf("insufficient replicas for safe write: have %d, need %d", healthy, s.minReplicas)
+		}
+	}
+
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 
@@ -363,7 +413,6 @@ func (s *Store) Get(key string) ([]byte, error) {
 
 // Close closes the underlying StoneDB instance.
 func (s *Store) Close() error {
-	// CHANGED: Reduced from INFO to DEBUG
 	s.logger.Debug("Closing store")
 	s.mu.Lock()
 	if s.dirty {
@@ -398,6 +447,7 @@ func (s *Store) Stats() StoreStats {
 	wf, ws, vf, vs := s.DB.StorageStats()
 	keyCount, _ := s.DB.KeyCount()
 	head := s.DB.LastOpID()
+	garbage := s.DB.TotalGarbageBytes()
 
 	minLag := uint64(0)
 	first := true
@@ -420,16 +470,17 @@ func (s *Store) Stats() StoreStats {
 	}
 
 	return StoreStats{
-		ActiveTxs:  s.DB.ActiveTransactionCount(),
-		Uptime:     time.Since(s.startTime).Round(time.Second).String(),
-		Offset:     int64(head),
-		Conflicts:  s.DB.GetConflicts(),
-		ReplicaLag: minLag,
-		WALFiles:   wf,
-		WALSize:    ws,
-		VLogFiles:  vf,
-		VLogSize:   vs,
-		KeyCount:   keyCount,
+		ActiveTxs:    s.DB.ActiveTransactionCount(),
+		Uptime:       time.Since(s.startTime).Round(time.Second).String(),
+		Offset:       int64(head),
+		Conflicts:    s.DB.GetConflicts(),
+		ReplicaLag:   minLag,
+		WALFiles:     wf,
+		WALSize:      ws,
+		VLogFiles:    vf,
+		VLogSize:     vs,
+		KeyCount:     keyCount,
+		GarbageBytes: garbage,
 	}
 }
 
