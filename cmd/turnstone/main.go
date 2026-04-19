@@ -22,7 +22,7 @@ import (
 )
 
 var (
-	mode    = flag.String("mode", "server", "Operation mode: 'server' or 'cdc'")
+	mode    = flag.String("mode", "server", "Operation mode: 'server', 'cdc', or 'dev'")
 	homeDir = flag.String("home", "tsdata", "Home directory for data and certs")
 )
 
@@ -43,7 +43,7 @@ func main() {
 		return
 	}
 
-	runServer(logger)
+	runServer(logger, *mode == "dev")
 }
 
 func parseBytes(s string) (int, error) {
@@ -75,7 +75,11 @@ func parseBytes(s string) (int, error) {
 	return int(val * mult), nil
 }
 
-func runServer(logger *slog.Logger) {
+func runServer(logger *slog.Logger, devMode bool) {
+	if devMode {
+		logger.Info("Starting in DEV mode: Transaction timeouts disabled, all DBs auto-promoted")
+	}
+
 	configPath := filepath.Join(*homeDir, "turnstone.json")
 	cfgBytes, err := os.ReadFile(configPath)
 	if err != nil {
@@ -128,6 +132,17 @@ func runServer(logger *slog.Logger) {
 			logger.Error("Failed to initialize store", "db", name, "err", err)
 			os.Exit(1)
 		}
+
+		// DEV MODE: Auto-promote databases so they are writable immediately
+		if devMode {
+			st.SetMinReplicas(0)
+			if err := st.Promote(); err != nil {
+				logger.Error("Failed to auto-promote DB in dev mode", "db", name, "err", err)
+			} else {
+				logger.Info("Dev Mode: Auto-promoted DB to PRIMARY", "db", name)
+			}
+		}
+
 		stores[name] = st
 	}
 
@@ -149,6 +164,7 @@ func runServer(logger *slog.Logger) {
 		keyFile,
 		caFile,
 		rm,
+		devMode,
 	)
 	if err != nil {
 		logger.Error("Failed to create server", "err", err)
