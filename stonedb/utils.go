@@ -40,12 +40,12 @@ func decodeIndexKey(data []byte) ([]byte, uint64, error) {
 func (m *EntryMeta) Encode() []byte {
 	buf := make([]byte, MetaSize)
 	binary.BigEndian.PutUint32(buf[0:], m.FileID)
-	binary.BigEndian.PutUint32(buf[4:], m.ValueOffset)
-	binary.BigEndian.PutUint32(buf[8:], m.ValueLen)
-	binary.BigEndian.PutUint64(buf[12:], m.TransactionID)
-	binary.BigEndian.PutUint64(buf[20:], m.OperationID)
+	binary.BigEndian.PutUint64(buf[4:], uint64(m.ValueOffset)) // 8 bytes for offset
+	binary.BigEndian.PutUint32(buf[12:], m.ValueLen)
+	binary.BigEndian.PutUint64(buf[16:], m.TransactionID)
+	binary.BigEndian.PutUint64(buf[24:], m.OperationID)
 	if m.IsTombstone {
-		buf[28] = 1
+		buf[32] = 1
 	}
 	return buf
 }
@@ -56,10 +56,10 @@ func decodeEntryMeta(data []byte) (*EntryMeta, error) {
 	}
 	m := &EntryMeta{}
 	m.FileID = binary.BigEndian.Uint32(data[0:])
-	m.ValueOffset = binary.BigEndian.Uint32(data[4:])
-	m.ValueLen = binary.BigEndian.Uint32(data[8:])
-	m.TransactionID = binary.BigEndian.Uint64(data[12:])
-	m.OperationID = binary.BigEndian.Uint64(data[20:])
-	m.IsTombstone = data[28] == 1
+	m.ValueOffset = int64(binary.BigEndian.Uint64(data[4:])) // 8 bytes for offset
+	m.ValueLen = binary.BigEndian.Uint32(data[12:])
+	m.TransactionID = binary.BigEndian.Uint64(data[16:])
+	m.OperationID = binary.BigEndian.Uint64(data[24:])
+	m.IsTombstone = data[32] == 1
 	return m, nil
 }

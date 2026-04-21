@@ -95,7 +95,7 @@ func Open(dir string, opts Options) (*DB, error) {
 	}
 
 	if opts.MaxVLogSize == 0 {
-		opts.MaxVLogSize = protocol.DefaultMaxVLogSize
+		opts.MaxVLogSize = int64(protocol.DefaultMaxVLogSize)
 	}
 	if opts.CompactionMinGarbage == 0 {
 		opts.CompactionMinGarbage = 1024 * 1024
@@ -160,7 +160,8 @@ func Open(dir string, opts Options) (*DB, error) {
 		return nil, fmt.Errorf("recover vlog: %w", err)
 	}
 
-	if err := db.syncWALToValueLog(opts.TruncateCorruptWAL); err != nil {
+	// FIX: Pass timeline history to ensure we don't replay orphaned writes
+	if err := db.syncWALToValueLog(opts.TruncateCorruptWAL, meta.History); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("sync wal: %w", err)
 	}
@@ -837,9 +838,7 @@ func (db *DB) Checkpoint() error {
 		batch.Put(k, v)
 	}
 
-	// Rotate VLog only if it has reached the size threshold.
-	// This prevents rotating small files during frequent checkpoints,
-	// while ensuring full files become immutable for compaction.
+	// Rotate VLog only if it has reached the size threshold (using new int64 check)
 	if db.valueLog.writeOffset >= db.valueLog.maxSize {
 		if err := db.valueLog.Rotate(); err != nil {
 			return fmt.Errorf("vlog rotate failed: %w", err)
@@ -860,21 +859,21 @@ func (db *DB) Checkpoint() error {
 	return db.ldb.Write(batch, &opt.WriteOptions{Sync: true})
 }
 
-func (db *DB) UpdateIndexForEntries(entries []ValueLogEntry, fileID uint32, baseOffset uint32, staleBytes map[uint32]int64) error {
+func (db *DB) UpdateIndexForEntries(entries []ValueLogEntry, fileID uint32, baseOffset int64, staleBytes map[uint32]int64) error {
 	batch := new(leveldb.Batch)
 	currentOffset := baseOffset
 	for _, e := range entries {
 		recSize := ValueLogHeaderSize + len(e.Key) + len(e.Value)
 		meta := EntryMeta{
 			FileID:        fileID,
-			ValueOffset:   currentOffset,
+			ValueOffset:   currentOffset, // int64
 			ValueLen:      uint32(len(e.Value)),
 			TransactionID: e.TransactionID,
 			OperationID:   e.OperationID,
 			IsTombstone:   e.IsDelete,
 		}
 		batch.Put(encodeIndexKey(e.Key, e.TransactionID), meta.Encode())
-		currentOffset += uint32(recSize)
+		currentOffset += int64(recSize)
 	}
 	if err := db.ldb.Write(batch, &opt.WriteOptions{Sync: false}); err != nil {
 		return err

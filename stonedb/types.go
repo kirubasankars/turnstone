@@ -14,8 +14,9 @@ const (
 	// ValueLog Entry Header: CRC(4) + KeyLen(4) + ValLen(4) + TxID(8) + OpID(8) + Type(1)
 	ValueLogHeaderSize = 29
 
-	// Meta Size: FileID(4) + Offset(4) + Len(4) + TxID(8) + OpID(8) + Type(1)
-	MetaSize = 29
+	// Meta Size: FileID(4) + Offset(8) + Len(4) + TxID(8) + OpID(8) + Type(1)
+	// Updated to 33 bytes to support 64-bit offsets (was 29).
+	MetaSize = 33
 
 	// WAL Header: Length(4) + Checksum(4)
 	WALHeaderSize = 8
@@ -40,14 +41,14 @@ var (
 )
 
 var (
-	ErrTxnFinished      = errors.New("transaction is already finished")
-	ErrWriteConflict    = errors.New("write conflict detected")
-	ErrKeyNotFound      = errors.New("key not found")
-	ErrChecksum         = errors.New("checksum mismatch")
-	ErrCorruptData      = errors.New("data corruption detected")
-	ErrTruncated        = errors.New("wal truncated due to corruption")
-	ErrLogUnavailable   = errors.New("wal log unavailable for requested operation id")
-	ErrDiskFull         = errors.New("disk usage exceeds threshold")
+	ErrTxnFinished         = errors.New("transaction is already finished")
+	ErrWriteConflict       = errors.New("write conflict detected")
+	ErrKeyNotFound         = errors.New("key not found")
+	ErrChecksum            = errors.New("checksum mismatch")
+	ErrCorruptData         = errors.New("data corruption detected")
+	ErrTruncated           = errors.New("wal truncated due to corruption")
+	ErrLogUnavailable      = errors.New("wal log unavailable for requested operation id")
+	ErrDiskFull            = errors.New("disk usage exceeds threshold")
 )
 
 // Options allows configuring the store behavior on Open
@@ -59,7 +60,8 @@ type Options struct {
 
 	// MaxVLogSize is the threshold in bytes at which the ValueLog file is rotated.
 	// If 0, defaults to 200MB.
-	MaxVLogSize uint32
+	// Updated to int64 for 64-bit support.
+	MaxVLogSize int64
 
 	// CompactionMinGarbage is the minimum amount of stale data (in bytes)
 	// required in a file before it becomes a candidate for compaction.
@@ -120,7 +122,7 @@ type ValueLogEntry struct {
 // EntryMeta is the pointer stored in LevelDB (formerly valueMeta)
 type EntryMeta struct {
 	FileID        uint32
-	ValueOffset   uint32
+	ValueOffset   int64 // Updated to int64 (8 bytes) to remove 4GB limit
 	ValueLen      uint32
 	TransactionID uint64
 	OperationID   uint64
