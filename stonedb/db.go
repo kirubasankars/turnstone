@@ -710,7 +710,6 @@ func (db *DB) ApplyBatches(batches [][]ValueLogEntry) error {
 	// 3. Write VLog (One Append for all entries)
 	fileID, baseOffset, err := db.valueLog.AppendEntries(combinedVLog)
 	if err != nil {
-		// Note: Ideally we should rollback WAL here if possible, but this is a critical IO failure.
 		return fmt.Errorf("vlog append batches: %w", err)
 	}
 

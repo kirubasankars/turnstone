@@ -77,8 +77,11 @@ func main() {
 	}
 
 	fmt.Println("Connected.")
-	fmt.Println("Commands: select <db>, replicaof <host:port> <remote_db>, promote [min_replicas], stepdown, get <k>, set <k> <v>, del <k>, mget <k>..., mset <k> <v>..., mdel <k>..., begin, commit, abort, checkpoint, stat, clear, quit")
-	fmt.Print("> ")
+	fmt.Println("Commands: select <db>, replicaof <host:port> <remote_db>, promote [min_replicas], stepdown, flushdb, get <k>, set <k> <v>, del <k>, mget <k>..., mset <k> <v>..., mdel <k>..., begin, commit, abort, checkpoint, stat, clear, quit")
+	
+	// Track current database for the prompt (default server DB is 0)
+	currentDB := "0"
+	fmt.Printf("%s> ", currentDB)
 
 	// 2. Interactive Loop
 	scanner := bufio.NewScanner(os.Stdin)
@@ -86,7 +89,7 @@ func main() {
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
-			fmt.Print("> ")
+			fmt.Printf("%s> ", currentDB)
 			continue
 		}
 
@@ -96,7 +99,7 @@ func main() {
 		// Handle local commands
 		if cmd == "clear" || cmd == "cls" {
 			fmt.Print("\033[H\033[2J")
-			fmt.Print("> ")
+			fmt.Printf("%s> ", currentDB)
 			continue
 		}
 		if cmd == "quit" || cmd == "exit" {
@@ -111,8 +114,11 @@ func main() {
 			if !errors.Is(err, client.ErrNotFound) {
 				hasError = true
 			}
+		} else if cmd == "select" && len(parts) >= 2 {
+			// Update the tracked DB name on successful SELECT
+			currentDB = parts[1]
 		}
-		fmt.Print("> ")
+		fmt.Printf("%s> ", currentDB)
 	}
 
 	if hasError {
@@ -169,9 +175,6 @@ func handleCommand(cl *client.Client, cmd string, parts []string) error {
 			var val int
 			if _, errScan := fmt.Sscanf(parts[1], "%d", &val); errScan == nil {
 				minReplicas = val
-			} else {
-				// If parsing fails, maybe user typed something else. Warn but proceed with 0?
-				// Better to just ignore if it's not an int.
 			}
 		}
 		err = cl.Promote(minReplicas)
@@ -181,6 +184,12 @@ func handleCommand(cl *client.Client, cmd string, parts []string) error {
 
 	case "stepdown":
 		err = cl.StepDown()
+		if err == nil {
+			fmt.Println("OK")
+		}
+
+	case "flushdb":
+		err = cl.FlushDB()
 		if err == nil {
 			fmt.Println("OK")
 		}

@@ -37,11 +37,14 @@ const (
 	OpCodePromote          = 0x34
 	OpCodeStepDown         = 0x35
 	OpCodeCheckpoint       = 0x36
+	OpCodeFlushDB          = 0x37
 	OpCodeReplHello        = 0x50
 	OpCodeReplBatch        = 0x51
 	OpCodeReplAck          = 0x52
 	OpCodeReplSnapshot     = 0x53
 	OpCodeReplSnapshotDone = 0x54
+	OpCodeReplSafePoint    = 0x55
+	OpCodeReplTimeline     = 0x56
 	OpCodeQuit             = 0xFF
 )
 
@@ -396,6 +399,11 @@ func (c *Client) Checkpoint() error {
 	return err
 }
 
+func (c *Client) FlushDB() error {
+	_, err := c.roundTrip(OpCodeFlushDB, nil)
+	return err
+}
+
 func (c *Client) Stat() ([]byte, error) {
 	return c.roundTrip(OpCodeStat, nil)
 }
@@ -584,14 +592,29 @@ func (c *Client) Subscribe(dbName string, startSeq uint64, handler func(Change) 
 
 	respHeader := make([]byte, ProtoHeaderSize)
 	for {
+		if c.config.ReadTimeout > 0 {
+			c.conn.SetReadDeadline(time.Now().Add(c.config.ReadTimeout))
+		}
+
 		if _, err := io.ReadFull(c.conn, respHeader); err != nil {
 			return err
 		}
 		opCode := respHeader[0]
 		length := binary.BigEndian.Uint32(respHeader[1:])
+
+		// SAFETY CHECK: Prevent OOM on huge/corrupted length
+		if length > 512*1024*1024 {
+			return ErrEntityTooLarge
+		}
+
 		payload := make([]byte, length)
 		if _, err := io.ReadFull(c.conn, payload); err != nil {
 			return err
+		}
+
+		// Handle Heartbeats (SafePoint/Timeline) to avoid fallback to error
+		if opCode == OpCodeReplSafePoint || opCode == OpCodeReplTimeline {
+			continue
 		}
 
 		if opCode == OpCodeReplBatch || opCode == OpCodeReplSnapshot || opCode == OpCodeReplSnapshotDone {
@@ -683,19 +706,37 @@ func (c *Client) Subscribe(dbName string, startSeq uint64, handler func(Change) 
 			}
 		} else if opCode == OpCodeReplSnapshot {
 			cursor := 0
+			if cursor+4 > len(payload) {
+				return fmt.Errorf("malformed snapshot: header")
+			}
 			nLen := int(binary.BigEndian.Uint32(payload[cursor : cursor+4]))
 			cursor += 4 + nLen
+			if cursor+4 > len(payload) {
+				return fmt.Errorf("malformed snapshot: count")
+			}
 			count := binary.BigEndian.Uint32(payload[cursor : cursor+4])
 			cursor += 4
 			data := payload[cursor:]
 			dCursor := 0
 			for i := 0; i < int(count); i++ {
+				if dCursor+4 > len(data) {
+					return fmt.Errorf("malformed snapshot entry: klen")
+				}
 				kLen := int(binary.BigEndian.Uint32(data[dCursor : dCursor+4]))
 				dCursor += 4
+				if dCursor+kLen > len(data) {
+					return fmt.Errorf("malformed snapshot entry: key")
+				}
 				key := data[dCursor : dCursor+kLen]
 				dCursor += kLen
+				if dCursor+4 > len(data) {
+					return fmt.Errorf("malformed snapshot entry: vlen")
+				}
 				vLen := int(binary.BigEndian.Uint32(data[dCursor : dCursor+4]))
 				dCursor += 4
+				if dCursor+vLen > len(data) {
+					return fmt.Errorf("malformed snapshot entry: val")
+				}
 				val := data[dCursor : dCursor+vLen]
 				dCursor += vLen
 				change := Change{
@@ -709,6 +750,26 @@ func (c *Client) Subscribe(dbName string, startSeq uint64, handler func(Change) 
 					return err
 				}
 			}
+
+			// PATCH: Send ACK for snapshot chunks to act as Heartbeat
+			// This prevents the server from disconnecting the client as a zombie during long snapshots.
+			// We send LogSeq=0 because we don't have the final seq yet, but it updates LastSeen on server.
+			ackBuf := new(bytes.Buffer)
+			binary.Write(ackBuf, binary.BigEndian, uint32(len(dbName)))
+			ackBuf.WriteString(dbName)
+			binary.Write(ackBuf, binary.BigEndian, uint64(0)) // Seq 0 for keepalive
+
+			ackHeader := make([]byte, ProtoHeaderSize)
+			ackHeader[0] = OpCodeReplAck
+			binary.BigEndian.PutUint32(ackHeader[1:], uint32(ackBuf.Len()))
+
+			if _, err := c.conn.Write(ackHeader); err != nil {
+				return err
+			}
+			if _, err := c.conn.Write(ackBuf.Bytes()); err != nil {
+				return err
+			}
+
 		} else if opCode == OpCodeReplSnapshotDone {
 			cursor := 0
 			nLen := int(binary.BigEndian.Uint32(payload[cursor : cursor+4]))

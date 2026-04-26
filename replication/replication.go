@@ -61,6 +61,22 @@ func (rm *ReplicationManager) IsReplicating(dbName string) bool {
 	return false
 }
 
+// GetReplicationSource returns the upstream address and remote database name for a given local database.
+// Returns empty strings if the database is not replicating.
+func (rm *ReplicationManager) GetReplicationSource(dbName string) (string, string) {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+
+	for addr, sources := range rm.peers {
+		for _, src := range sources {
+			if src.LocalDB == dbName {
+				return addr, src.RemoteDB
+			}
+		}
+	}
+	return "", ""
+}
+
 func (rm *ReplicationManager) Start() {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()

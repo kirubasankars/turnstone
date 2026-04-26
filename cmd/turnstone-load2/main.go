@@ -19,6 +19,7 @@ import (
 
 var (
 	addr        = flag.String("addr", "localhost:6379", "TurnstoneDB server address")
+	db          = flag.String("db", "1", "Database index to use")
 	home        = flag.String("home", ".", "Path to home directory containing certs/")
 	numWorkers  = flag.Int("workers", 50, "Number of concurrent workers")
 	numKeys     = flag.Int("devices", 10000, "Number of unique devices to simulate")
@@ -71,6 +72,7 @@ func main() {
 
 	fmt.Printf("--- Event Pipeline: Sharded R-M-W Generator (Batch Mode) ---\n")
 	fmt.Printf("Server:       %s\n", *addr)
+	fmt.Printf("Database:     %s\n", *db)
 	fmt.Printf("Concurrency:  %d workers\n", *numWorkers)
 	fmt.Printf("Device Pool:  %d devices\n", *numKeys)
 	fmt.Printf("Strategy:     Key Partitioning + MGET/MSET/MDEL\n")
@@ -154,7 +156,9 @@ func runWorker(id int, iterations int, startID, endID int, ca, cert, key, paddin
 	}
 	defer cl.Close()
 
-	if err := cl.Select("1"); err != nil {
+	// Select the database passed via command line
+	if err := cl.Select(*db); err != nil {
+		log.Printf("[Worker %d] Select DB %s failed: %v", id, *db, err)
 		stats.Failures += int64(iterations * 2)
 		return stats
 	}
