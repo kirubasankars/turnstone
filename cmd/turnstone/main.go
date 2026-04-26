@@ -124,7 +124,7 @@ func runServer(logger *slog.Logger, devMode bool) {
 	for i := 0; i <= cfg.NumberOfDatabases; i++ {
 		name := strconv.Itoa(i)
 		path := filepath.Join(*homeDir, "data", name)
-		
+
 		// DB 0 is now treated as a regular database (minReplicas configurable, not implicitly system)
 		// We hardcode minReplicas=0 for initial startup, but it can be promoted later.
 		st, err := store.NewStore(path, logger.With("db", name), 0, cfg.WALRetentionStrategy, cfg.MaxDiskUsagePercent, blockCacheSize)
