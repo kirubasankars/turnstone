@@ -103,6 +103,7 @@ func setupTestEnv(t *testing.T) (string, map[string]*store.Store, *Server, func(
 		filepath.Join(certsDir, "server.key"),
 		filepath.Join(certsDir, "ca.crt"),
 		rm,
+		false,
 	)
 	if err != nil {
 		t.Fatalf("Failed to create server: %v", err)
@@ -578,10 +579,12 @@ func TestMetrics_Conflicts(t *testing.T) {
 	c2.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusOK)
 
 	// C1 Updates. Since C1 read "initial", it expects Version 1.
-	// But C2 moved it to Version 2. This creates a Write Conflict on Commit.
-	c1.AssertStatus(protocol.OpCodeSet, pl2, protocol.ResStatusOK)
+	// But C2 already committed Version 2 and holds no lock anymore, so
+	// eager first-writer-wins detects this as a blind-write conflict
+	// immediately at SET time (not deferred to COMMIT).
+	c1.AssertStatus(protocol.OpCodeSet, pl2, protocol.ResStatusTxConflict)
 
-	// C1 Commit -> Should Fail with Conflict
+	// C1 Commit -> Should still fail with Conflict (tx is now aborted)
 	c1.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusTxConflict)
 
 	// Verify Metric (updated name)
@@ -608,6 +611,7 @@ func TestServer_Backpressure(t *testing.T) {
 		filepath.Join(certsDir, "server.key"),
 		filepath.Join(certsDir, "ca.crt"),
 		nil, // No Replication Manager needed for this test
+		false,
 	)
 	if err != nil {
 		t.Fatalf("Failed to create server: %v", err)
@@ -808,12 +812,17 @@ func TestServer_RoleTransitions(t *testing.T) {
 	// Note: We need a new connection (old admin conn likely closed too)
 	admin = connectClient(t, addr, adminTLS)
 	admin.AssertStatus(protocol.OpCodeSelect, []byte("1"), protocol.ResStatusOK)
-	// REPLICAOF valid only in UNDEFINED
-	// ReplicaOf(addr="dummy", db="origin")
-	replPayload := []byte{0, 0, 0, 5} // addr len 5
-	binary.BigEndian.PutUint32(replPayload[0:4], 5)
-	replPayload = append(replPayload, []byte("dummy")...)
-	replPayload = append(replPayload, []byte("origin")...)
+	// REPLICAOF valid only in UNDEFINED.
+	// AddReplica now performs a synchronous handshake before returning, so
+	// the source must be a live, reachable peer: loop back to this same
+	// server's DB "0" (already PRIMARY from setupTestEnv, no cascading
+	// concerns since it's not itself a replica).
+	remoteDB := []byte("0")
+	addrBytes := []byte(addr)
+	replPayload := make([]byte, 4+len(addrBytes)+len(remoteDB))
+	binary.BigEndian.PutUint32(replPayload[0:4], uint32(len(addrBytes)))
+	copy(replPayload[4:], addrBytes)
+	copy(replPayload[4+len(addrBytes):], remoteDB)
 
 	admin.AssertStatus(protocol.OpCodeReplicaOf, replPayload, protocol.ResStatusOK)
 	admin.Close()

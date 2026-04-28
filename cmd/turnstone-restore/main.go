@@ -143,11 +143,36 @@ func runRestore(ctx context.Context) error {
 
 	// 6. Ingest Loop
 	log.Println("Ingesting data...")
-	var batch []stonedb.ValueLogEntry
+	type restoreEntry struct {
+		Key      []byte
+		Value    []byte
+		IsDelete bool
+	}
+	var batch []restoreEntry
 	count := 0
 	restoreSeq := meta.SnapshotOpID
 	restoreTx := meta.SnapshotTxID
 	batchSize := 0
+
+	applyBatch := func(entries []restoreEntry) error {
+		if len(entries) == 0 {
+			return nil
+		}
+		tx := db.NewTransaction(true)
+		for _, e := range entries {
+			var err error
+			if e.IsDelete {
+				err = tx.Delete(e.Key)
+			} else {
+				err = tx.Put(e.Key, e.Value)
+			}
+			if err != nil {
+				tx.Discard()
+				return err
+			}
+		}
+		return tx.Commit()
+	}
 
 	for {
 		if ctx.Err() != nil {
@@ -184,18 +209,16 @@ func runRestore(ctx context.Context) error {
 		}
 		isDelete := typeBuf[0] == 1
 
-		batch = append(batch, stonedb.ValueLogEntry{
-			Key:           key,
-			Value:         val,
-			TransactionID: restoreTx,
-			OperationID:   restoreSeq,
-			IsDelete:      isDelete,
+		batch = append(batch, restoreEntry{
+			Key:      key,
+			Value:    val,
+			IsDelete: isDelete,
 		})
 		batchSize += kLen + vLen
 		count++
 
 		if batchSize > 4*1024*1024 {
-			if err := db.ApplyBatch(batch); err != nil {
+			if err := applyBatch(batch); err != nil {
 				return fmt.Errorf("batch apply: %w", err)
 			}
 			fmt.Printf("\rRestored items: %d", count)
@@ -205,7 +228,7 @@ func runRestore(ctx context.Context) error {
 	}
 
 	if len(batch) > 0 {
-		if err := db.ApplyBatch(batch); err != nil {
+		if err := applyBatch(batch); err != nil {
 			return fmt.Errorf("final apply: %w", err)
 		}
 	}

@@ -186,16 +186,17 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 	for _, req := range subs {
 		if storePtr, ok := s.stores[req.name]; ok {
 			wg.Add(1)
-			go func(name string, sp *store.Store, startLogID uint64) {
+			physical := st.role != RoleCDC
+			go func(name string, sp *store.Store, startLogID uint64, physical bool) {
 				defer wg.Done()
-				if err := s.streamDB(name, sp, startLogID, outCh, done, st.logger); err != nil {
+				if err := s.streamDB(name, sp, startLogID, outCh, done, st.logger, physical); err != nil {
 					st.logger.Error("Replica stream failed", "db", name, "err", err)
 					select {
 					case errCh <- err:
 					default:
 					}
-				}
-			}(req.name, storePtr, req.logID)
+					}
+				}(req.name, storePtr, req.logID, physical)
 		}
 	}
 
@@ -298,7 +299,7 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 	}
 }
 
-func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh chan<- replPacket, done <-chan struct{}, logger *slog.Logger) error {
+func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh chan<- replPacket, done <-chan struct{}, logger *slog.Logger, physical bool) error {
 	currentLogID := minLogID
 
 	// 0. Send Initial Timeline
@@ -405,7 +406,7 @@ func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh c
 		}
 
 		// 2. WAL Streaming Loop
-		if err := s.runWALStreamLoop(name, st, currentLogID, outCh, done, logger); err != nil {
+		if err := s.runWALStreamLoop(name, st, currentLogID, outCh, done, logger, physical); err != nil {
 			// If error is OUT_OF_SYNC or ErrLogUnavailable, break inner loop and retry outer loop (which will trigger snapshot)
 			// This handles the race condition where WAL was purged between check and stream.
 			if err.Error() == "OUT_OF_SYNC" || errors.Is(err, stonedb.ErrLogUnavailable) {
@@ -418,10 +419,45 @@ func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh c
 	}
 }
 
-func (s *Server) runWALStreamLoop(name string, st *store.Store, startLogID uint64, outCh chan<- replPacket, done <-chan struct{}, logger *slog.Logger) error {
+// journalOpForRecordType maps a stonedb WAL record type to its wire journal
+// opcode (identical numbering, kept distinct so the wire format doesn't leak
+// stonedb's internal type directly).
+func journalOpForRecordType(t stonedb.WALRecordType) uint8 {
+	switch t {
+	case stonedb.WALRecordBegin:
+		return protocol.OpJournalBegin
+	case stonedb.WALRecordSet:
+		return protocol.OpJournalSet
+	case stonedb.WALRecordDelete:
+		return protocol.OpJournalDelete
+	case stonedb.WALRecordCommit:
+		return protocol.OpJournalCommit
+	case stonedb.WALRecordAbort:
+		return protocol.OpJournalAbort
+	}
+	return 0
+}
+
+func writeJournalEntry(buf *bytes.Buffer, opID, xid uint64, op uint8, key, val []byte) {
+	binary.Write(buf, binary.BigEndian, opID)
+	binary.Write(buf, binary.BigEndian, xid)
+	buf.WriteByte(op)
+	binary.Write(buf, binary.BigEndian, uint32(len(key)))
+	buf.Write(key)
+	binary.Write(buf, binary.BigEndian, uint32(len(val)))
+	buf.Write(val)
+}
+
+func (s *Server) runWALStreamLoop(name string, st *store.Store, startLogID uint64, outCh chan<- replPacket, done <-chan struct{}, logger *slog.Logger, physical bool) error {
 	currentLogID := startLogID
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
+
+	// pending buffers SET/DEL records per-xid for the CDC (logical) stream:
+	// only committed changes are ever forwarded to a cdc role, mirroring
+	// today's committed-only JSONL contract even though the leader now logs
+	// eagerly. Unused in physical mode.
+	pending := make(map[uint64][]stonedb.WALRecord)
 
 	safePointTicker := time.NewTicker(1 * time.Second)
 	defer safePointTicker.Stop()
@@ -485,55 +521,40 @@ func (s *Server) runWALStreamLoop(name string, st *store.Store, startLogID uint6
 			var batchBuf bytes.Buffer
 			var count uint32
 
-			err := st.ScanWAL(currentLogID+1, func(entries []stonedb.ValueLogEntry) error {
-				if len(entries) == 0 {
-					return nil
-				}
-				lastEntry := entries[len(entries)-1]
-
-				for _, e := range entries {
-					if err := binary.Write(&batchBuf, binary.BigEndian, e.OperationID); err != nil {
-						return err
+			err := st.ScanWAL(currentLogID+1, func(recs []stonedb.WALRecord) error {
+				for _, r := range recs {
+					if physical {
+						op := journalOpForRecordType(r.Type)
+						writeJournalEntry(&batchBuf, r.OpID, r.XID, op, r.Key, r.Value)
+						count++
+					} else {
+						// Logical/CDC decoding: buffer SET/DEL per-xid, only
+						// emit them (plus a commit marker) once we observe
+						// the COMMIT record; drop everything on ABORT.
+						switch r.Type {
+						case stonedb.WALRecordBegin:
+							// nothing to forward
+						case stonedb.WALRecordSet, stonedb.WALRecordDelete:
+							pending[r.XID] = append(pending[r.XID], r)
+						case stonedb.WALRecordAbort:
+							delete(pending, r.XID)
+						case stonedb.WALRecordCommit:
+							for _, br := range pending[r.XID] {
+								writeJournalEntry(&batchBuf, br.OpID, br.XID, journalOpForRecordType(br.Type), br.Key, br.Value)
+								count++
+							}
+							delete(pending, r.XID)
+							writeJournalEntry(&batchBuf, r.OpID, r.XID, protocol.OpJournalCommit, nil, nil)
+							count++
+						}
 					}
-					if err := binary.Write(&batchBuf, binary.BigEndian, e.TransactionID); err != nil {
-						return err
-					}
 
-					op := protocol.OpJournalSet
-					if e.IsDelete {
-						op = protocol.OpJournalDelete
-					}
-					batchBuf.WriteByte(op)
-
-					if err := binary.Write(&batchBuf, binary.BigEndian, uint32(len(e.Key))); err != nil {
-						return err
-					}
-					batchBuf.Write(e.Key)
-
-					if err := binary.Write(&batchBuf, binary.BigEndian, uint32(len(e.Value))); err != nil {
-						return err
-					}
-					batchBuf.Write(e.Value)
-
-					count++
-					currentLogID = e.OperationID
+					currentLogID = r.OpID
 
 					if batchBuf.Len() > MaxReplicationBatchSize {
 						return ErrBatchFull
 					}
 				}
-
-				if err := binary.Write(&batchBuf, binary.BigEndian, lastEntry.OperationID); err != nil {
-					return err
-				}
-				if err := binary.Write(&batchBuf, binary.BigEndian, lastEntry.TransactionID); err != nil {
-					return err
-				}
-				batchBuf.WriteByte(protocol.OpJournalCommit)
-				binary.Write(&batchBuf, binary.BigEndian, uint32(0))
-				binary.Write(&batchBuf, binary.BigEndian, uint32(0))
-				count++
-
 				return nil
 			})
 

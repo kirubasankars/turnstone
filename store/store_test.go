@@ -96,7 +96,29 @@ func TestStore_Recover_CRC_Corruption(t *testing.T) {
 	if err != nil || len(matches) == 0 {
 		t.Fatalf("No WAL files found in %s", walDir)
 	}
-	walPath := matches[len(matches)-1] // Use last file
+	// Close() rotates the WAL, leaving a fresh empty file after the one that
+	// holds our data. Recovery only tolerates trailing corruption in the
+	// genuinely last WAL file, so remove the empty rotated file(s) and
+	// corrupt the one that actually contains our entries.
+	walPath := ""
+	for i := len(matches) - 1; i >= 0; i-- {
+		info, err := os.Stat(matches[i])
+		if err != nil {
+			continue
+		}
+		if info.Size() == 0 {
+			if err := os.Remove(matches[i]); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
+		if walPath == "" {
+			walPath = matches[i]
+		}
+	}
+	if walPath == "" {
+		t.Fatalf("No non-empty WAL files found in %s", walDir)
+	}
 
 	// Open file, flip the last byte.
 	f, err := os.OpenFile(walPath, os.O_RDWR, 0o644)
@@ -210,14 +232,20 @@ func TestStore_Replication_Quorum(t *testing.T) {
 	}
 	defer s.Close()
 
-	// 2. Perform Write (Should Block)
+	// 2. Register a connected replica that hasn't acked anything yet.
+	// ApplyBatch fails fast (before writing) if there are zero healthy
+	// replicas, so a healthy-but-behind replica is needed to actually
+	// exercise the quorum-wait path below.
+	s.RegisterReplica("replica-1", 0, "server")
+
+	// 3. Perform Write (Should Block)
 	// We run this in a goroutine because ApplyBatch is synchronous and will block until quorum is met.
 	done := make(chan error)
 	go func() {
 		done <- s.ApplyBatch([]protocol.LogEntry{{OpCode: protocol.OpJournalSet, Key: []byte("k"), Value: []byte("v")}})
 	}()
 
-	// 3. Verify it's blocked
+	// 4. Verify it's blocked
 	select {
 	case err := <-done:
 		t.Fatalf("Write returned before quorum was met. Err: %v", err)
@@ -225,12 +253,12 @@ func TestStore_Replication_Quorum(t *testing.T) {
 		// Expected behavior: timeout because write is blocked
 	}
 
-	// 4. Register Replica and Ack
-	// The write above generates a LogSeq.
-	// Since we started fresh, nextLogSeq was 1. The write used LogSeq 1.
-	// We acknowledge 1 to ensure the write is unblocked.
-	s.RegisterReplica("replica-1", 0, "server") // Fixed: Added "server" role
-	s.UpdateReplicaLogSeq("replica-1", 1)
+	// 5. Ack the write.
+	// Under eager logging, a single-entry transaction writes multiple WAL
+	// records (BEGIN, SET, COMMIT), so the quorum target is the COMMIT
+	// record's opID, not a fixed LogSeq of 1. Query the actual opID the
+	// write is waiting on before acking it.
+	s.UpdateReplicaLogSeq("replica-1", s.DB.LastOpID())
 
 	// 5. Verify Unblock
 	// Now that quorum is met, the write should complete successfully.
@@ -261,8 +289,8 @@ func TestStore_Replication_ApplyBatch(t *testing.T) {
 		{LogSeq: 101, OpCode: protocol.OpJournalSet, Key: []byte("k2"), Value: []byte("v2")},
 	}
 
-	if err := s.ReplicateBatch(entries); err != nil {
-		t.Fatalf("ReplicateBatch failed: %v", err)
+	if err := s.ApplyBatch(entries); err != nil {
+		t.Fatalf("ApplyBatch failed: %v", err)
 	}
 
 	// Verify Data is readable

@@ -153,6 +153,90 @@ func sortWALFiles(paths []string) {
 	})
 }
 
+// encodeWALRecord serializes a WALRecord to its on-disk payload:
+// Type(1) + XID(8) + OpID(8) + type-specific body.
+//   - Set:    KeyLen(4) + Key + ValLen(4) + Val
+//   - Delete: KeyLen(4) + Key
+//   - Begin/Commit/Abort: empty body
+func encodeWALRecord(rec WALRecord) []byte {
+	var bodyLen int
+	switch rec.Type {
+	case WALRecordSet:
+		bodyLen = 4 + len(rec.Key) + 4 + len(rec.Value)
+	case WALRecordDelete:
+		bodyLen = 4 + len(rec.Key)
+	}
+	buf := make([]byte, WALRecordHeaderSize+bodyLen)
+	buf[0] = byte(rec.Type)
+	binary.BigEndian.PutUint64(buf[1:], rec.XID)
+	binary.BigEndian.PutUint64(buf[9:], rec.OpID)
+
+	switch rec.Type {
+	case WALRecordSet:
+		off := WALRecordHeaderSize
+		binary.BigEndian.PutUint32(buf[off:], uint32(len(rec.Key)))
+		off += 4
+		copy(buf[off:], rec.Key)
+		off += len(rec.Key)
+		binary.BigEndian.PutUint32(buf[off:], uint32(len(rec.Value)))
+		off += 4
+		copy(buf[off:], rec.Value)
+	case WALRecordDelete:
+		off := WALRecordHeaderSize
+		binary.BigEndian.PutUint32(buf[off:], uint32(len(rec.Key)))
+		off += 4
+		copy(buf[off:], rec.Key)
+	}
+	return buf
+}
+
+// decodeWALRecord parses a single WAL frame payload back into a WALRecord.
+func decodeWALRecord(payload []byte) (WALRecord, error) {
+	if len(payload) < WALRecordHeaderSize {
+		return WALRecord{}, ErrCorruptData
+	}
+	rec := WALRecord{
+		Type: WALRecordType(payload[0]),
+		XID:  binary.BigEndian.Uint64(payload[1:]),
+		OpID: binary.BigEndian.Uint64(payload[9:]),
+	}
+	body := payload[WALRecordHeaderSize:]
+	switch rec.Type {
+	case WALRecordSet:
+		if len(body) < 4 {
+			return WALRecord{}, ErrCorruptData
+		}
+		klen := int(binary.BigEndian.Uint32(body[0:]))
+		off := 4
+		if off+klen+4 > len(body) {
+			return WALRecord{}, ErrCorruptData
+		}
+		rec.Key = append([]byte{}, body[off:off+klen]...)
+		off += klen
+		vlen := int(binary.BigEndian.Uint32(body[off:]))
+		off += 4
+		if off+vlen > len(body) {
+			return WALRecord{}, ErrCorruptData
+		}
+		rec.Value = append([]byte{}, body[off:off+vlen]...)
+	case WALRecordDelete:
+		if len(body) < 4 {
+			return WALRecord{}, ErrCorruptData
+		}
+		klen := int(binary.BigEndian.Uint32(body[0:]))
+		off := 4
+		if off+klen > len(body) {
+			return WALRecord{}, ErrCorruptData
+		}
+		rec.Key = append([]byte{}, body[off:off+klen]...)
+	case WALRecordBegin, WALRecordCommit, WALRecordAbort:
+		// no body
+	default:
+		return WALRecord{}, ErrCorruptData
+	}
+	return rec, nil
+}
+
 func (wal *WriteAheadLog) SetOnRotate(fn func(map[uint64]WALLocation) error) {
 	wal.mu.Lock()
 	defer wal.mu.Unlock()
@@ -199,11 +283,51 @@ func (wal *WriteAheadLog) strictSync() error {
 	return nil
 }
 
-func (wal *WriteAheadLog) AppendBatch(payload []byte) error {
+// AppendRecordsWithOpIDs assigns an opID (via nextOpID) to each builder in order,
+// writes the resulting frame, and optionally fsyncs once for the whole group.
+// opID allocation and the WAL append happen inside the same critical section so
+// physical file order always matches logical opID order.
+func (wal *WriteAheadLog) AppendRecordsWithOpIDs(nextOpID func() uint64, builders []func(opID uint64) []byte, sync bool) ([]uint64, error) {
 	wal.mu.Lock()
 	defer wal.mu.Unlock()
 
-	// Check rotation threshold
+	if len(builders) == 0 {
+		return nil, nil
+	}
+
+	if wal.writeOffset >= wal.maxSize {
+		if err := wal.rotate(); err != nil {
+			return nil, err
+		}
+	}
+
+	startOffset := wal.writeOffset
+	opIDs := make([]uint64, len(builders))
+
+	for i, build := range builders {
+		opID := nextOpID()
+		opIDs[i] = opID
+		payload := build(opID)
+		if err := wal.writeFrame(payload); err != nil {
+			_ = wal.truncateTailLocked(int64(wal.writeOffset - startOffset))
+			return nil, err
+		}
+	}
+
+	if sync {
+		if err := wal.strictSync(); err != nil {
+			return nil, err
+		}
+	}
+	return opIDs, nil
+}
+
+// AppendReplicatedRecord writes a single pre-built record payload (opID already
+// assigned by the leader) verbatim. Used by followers applying a replication stream.
+func (wal *WriteAheadLog) AppendReplicatedRecord(payload []byte, sync bool) error {
+	wal.mu.Lock()
+	defer wal.mu.Unlock()
+
 	if wal.writeOffset >= wal.maxSize {
 		if err := wal.rotate(); err != nil {
 			return err
@@ -213,34 +337,10 @@ func (wal *WriteAheadLog) AppendBatch(payload []byte) error {
 	if err := wal.writeFrame(payload); err != nil {
 		return err
 	}
-
-	return wal.strictSync()
-}
-
-func (wal *WriteAheadLog) AppendBatches(payloads [][]byte) error {
-	wal.mu.Lock()
-	defer wal.mu.Unlock()
-
-	// Check rotation threshold before writing the group
-	if wal.writeOffset >= wal.maxSize {
-		if err := wal.rotate(); err != nil {
-			return err
-		}
+	if sync {
+		return wal.strictSync()
 	}
-
-	// Track start offset for internal rollback if needed within this loop
-	startOffset := wal.writeOffset
-
-	for _, payload := range payloads {
-		if err := wal.writeFrame(payload); err != nil {
-			// If a write fails mid-batch, we attempt to clean up internally first.
-			_ = wal.truncateTailLocked(int64(wal.writeOffset - startOffset))
-			return err
-		}
-	}
-
-	// Sync only once for the whole group
-	return wal.strictSync()
+	return nil
 }
 
 // writeFrame writes a single frame atomically (header + payload).
@@ -265,15 +365,23 @@ func (wal *WriteAheadLog) writeFrame(payload []byte) error {
 	currentFileOffset := wal.writeOffset
 	wal.writeOffset += uint32(n)
 
-	if len(payload) >= 16 {
-		startOpID := binary.BigEndian.Uint64(payload[8:])
-		wal.batchIndex[startOpID] = WALLocation{
+	if opID, ok := peekOpID(payload); ok {
+		wal.batchIndex[opID] = WALLocation{
 			FileStartOffset: wal.currentStartOffset,
 			RelativeOffset:  currentFileOffset,
 		}
 	}
 
 	return nil
+}
+
+// peekOpID extracts the OpID field (bytes [9:17]) from an encoded WAL record
+// payload without doing a full decode.
+func peekOpID(payload []byte) (uint64, bool) {
+	if len(payload) < WALRecordHeaderSize {
+		return 0, false
+	}
+	return binary.BigEndian.Uint64(payload[9:17]), true
 }
 
 // TruncateTail removes the last N bytes from the active WAL file.
@@ -386,9 +494,12 @@ func (wal *WriteAheadLog) ForceNewTimeline(newTimelineID uint64) error {
 	return nil
 }
 
-// ReplaySinceTx replays WAL entries from the given txID.
-// It accepts a timeline history to ensure we don't replay "zombie" writes from abandoned timelines.
-func (wal *WriteAheadLog) ReplaySinceTx(vl *ValueLog, minTxID uint64, history []TimelineHistoryItem, truncateCorrupt bool, onReplay func([]ValueLogEntry), onTruncate func() error) error {
+// ReplaySinceTx replays every WAL record found on disk, in order. Records
+// with OpID > minOpID are redone into the ValueLog (they may not have made it
+// there before a crash); onReplay is invoked for every record regardless, so
+// callers can reconstruct the commit log. It accepts a timeline history to
+// ensure we don't replay "zombie" writes from abandoned timelines.
+func (wal *WriteAheadLog) ReplaySinceTx(vl *ValueLog, minOpID uint64, history []TimelineHistoryItem, truncateCorrupt bool, onReplay func(WALRecord), onTruncate func() error) error {
 	wal.mu.Lock()
 	defer wal.mu.Unlock()
 
@@ -407,7 +518,7 @@ func (wal *WriteAheadLog) ReplaySinceTx(vl *ValueLog, minTxID uint64, history []
 
 		isLastFile := (i == len(matches)-1)
 
-		err = wal.replayFile(f, path, vl, minTxID, history, truncateCorrupt, isLastFile, onReplay, onTruncate)
+		err = wal.replayFile(f, path, vl, minOpID, history, truncateCorrupt, isLastFile, onReplay, onTruncate)
 		f.Close()
 
 		if err != nil {
@@ -424,7 +535,7 @@ func (wal *WriteAheadLog) ReplaySinceTx(vl *ValueLog, minTxID uint64, history []
 	return nil
 }
 
-func (wal *WriteAheadLog) Scan(startLoc WALLocation, fn func([]ValueLogEntry) error) error {
+func (wal *WriteAheadLog) Scan(startLoc WALLocation, fn func([]WALRecord) error) error {
 	wal.mu.Lock()
 	defer wal.mu.Unlock()
 
@@ -574,21 +685,21 @@ func (wal *WriteAheadLog) readFirstOpID(path string) (uint64, error) {
 	}
 
 	length := binary.BigEndian.Uint32(header[0:])
-	// Sanity Check: a batch must be at least as big as its header
-	if length < WALBatchHeaderSize {
-		return 0, fmt.Errorf("invalid batch length: %d", length)
+	// Sanity Check: a record must be at least as big as its header
+	if length < WALRecordHeaderSize {
+		return 0, fmt.Errorf("invalid record length: %d", length)
 	}
 
-	buf := make([]byte, 16)
+	buf := make([]byte, WALRecordHeaderSize)
 	if _, err := io.ReadFull(f, buf); err != nil {
 		return 0, err
 	}
 
-	startOpID := binary.BigEndian.Uint64(buf[8:])
-	return startOpID, nil
+	opID := binary.BigEndian.Uint64(buf[9:])
+	return opID, nil
 }
 
-func (wal *WriteAheadLog) scanFile(f *os.File, startOffset int64, fn func([]ValueLogEntry) error) error {
+func (wal *WriteAheadLog) scanFile(f *os.File, startOffset int64, fn func([]WALRecord) error) error {
 	if startOffset > 0 {
 		stat, err := f.Stat()
 		if err != nil {
@@ -605,16 +716,16 @@ func (wal *WriteAheadLog) scanFile(f *os.File, startOffset int64, fn func([]Valu
 	reader := bufio.NewReader(f)
 
 	_, err := wal.stream(reader, func(offset int64, payload []byte) error {
-		_, _, entries := decodeWALBatchEntries(payload)
-		if len(entries) > 0 {
-			return fn(entries)
+		rec, decErr := decodeWALRecord(payload)
+		if decErr != nil {
+			return decErr
 		}
-		return nil
+		return fn([]WALRecord{rec})
 	})
 	return err
 }
 
-func (wal *WriteAheadLog) replayFile(f *os.File, path string, vl *ValueLog, minTxID uint64, history []TimelineHistoryItem, truncateCorrupt bool, isLastFile bool, onReplay func([]ValueLogEntry), onTruncate func() error) error {
+func (wal *WriteAheadLog) replayFile(f *os.File, path string, vl *ValueLog, minOpID uint64, history []TimelineHistoryItem, truncateCorrupt bool, isLastFile bool, onReplay func(WALRecord), onTruncate func() error) error {
 	reader := bufio.NewReader(f)
 
 	// FIX: Parse timeline from filename to support history pruning
@@ -630,38 +741,70 @@ func (wal *WriteAheadLog) replayFile(f *os.File, path string, vl *ValueLog, minT
 	}
 
 	validOffset, err := wal.stream(reader, func(offset int64, payload []byte) error {
-		txID, startOpID, entries := decodeWALBatchEntries(payload)
+		rec, decErr := decodeWALRecord(payload)
+		if decErr != nil {
+			return decErr
+		}
 
 		if filepath.Base(path) == filepath.Base(wal.currentFile.Name()) {
-			wal.batchIndex[startOpID] = WALLocation{
+			wal.batchIndex[rec.OpID] = WALLocation{
 				FileStartOffset: wal.currentStartOffset,
 				RelativeOffset:  uint32(offset),
 			}
 		}
 
-		// FIX: Check if this batch is orphaned (belongs to a dead branch of history)
-		if startOpID > cutoffOp {
-			wal.logger.Warn("Skipping orphaned WAL batch (exceeds timeline history)",
+		// FIX: Check if this record is orphaned (belongs to a dead branch of history)
+		if rec.OpID > cutoffOp {
+			wal.logger.Warn("Skipping orphaned WAL record (exceeds timeline history)",
 				"file", filepath.Base(path),
 				"file_tl", fileTL,
-				"op_id", startOpID,
+				"op_id", rec.OpID,
 				"cutoff", cutoffOp)
 			return nil
 		}
 
-		if txID > minTxID {
-			if _, _, err := vl.AppendEntries(entries); err != nil {
+		if rec.OpID > minOpID && (rec.Type == WALRecordSet || rec.Type == WALRecordDelete) {
+			entry := ValueLogEntry{Key: rec.Key, Value: rec.Value, TransactionID: rec.XID, OperationID: rec.OpID, IsDelete: rec.Type == WALRecordDelete}
+			if _, _, err := vl.AppendEntries([]ValueLogEntry{entry}); err != nil {
 				return err
 			}
-			if onReplay != nil {
-				onReplay(entries)
-			}
+		}
+		if onReplay != nil {
+			onReplay(rec)
 		}
 		return nil
 	})
 
 	if err != nil {
 		if err == io.ErrUnexpectedEOF || err == ErrChecksum || err == ErrCorruptData {
+			if truncateCorrupt && isLastFile {
+				// A torn/garbage tail on the current (last) WAL file most
+				// likely means we crashed (or a caller injected garbage)
+				// mid-write. Only the last file can safely be truncated:
+				// anything before it is a sealed, previously-fsynced file
+				// that must never be rewritten. Truncate back to the last
+				// known-good frame boundary and let the caller (onTruncate)
+				// discard any index state that can no longer be trusted.
+				wal.logger.Warn("WAL corruption detected at tail of last file. Truncating.",
+					"file", filepath.Base(path),
+					"offset", validOffset,
+					"err", err)
+				if truncErr := os.Truncate(path, validOffset); truncErr != nil {
+					return fmt.Errorf("failed to truncate corrupt WAL tail %s: %w", path, truncErr)
+				}
+				if filepath.Base(path) == filepath.Base(wal.currentFile.Name()) {
+					// Keep in-memory accounting in sync with the file we
+					// just shrank; the fd stays open (O_APPEND resolves the
+					// new EOF on the next write automatically).
+					wal.writeOffset = uint32(validOffset)
+				}
+				if onTruncate != nil {
+					if cbErr := onTruncate(); cbErr != nil {
+						return fmt.Errorf("onTruncate callback failed for %s: %w", path, cbErr)
+					}
+				}
+				return ErrTruncated
+			}
 			// Prioritize Durability: Do not truncate. Treat as fatal corruption.
 			// This forces manual intervention (admin decision) rather than silent data loss.
 			// Exception: Standard EOF is handled by stream return value.
@@ -714,60 +857,6 @@ func (wal *WriteAheadLog) stream(r io.Reader, onPayload func(offset int64, paylo
 
 		validOffset += int64(WALHeaderSize) + int64(length)
 	}
-}
-
-func decodeWALBatchEntries(payload []byte) (uint64, uint64, []ValueLogEntry) {
-	if len(payload) < WALBatchHeaderSize {
-		return 0, 0, nil
-	}
-	txID := binary.BigEndian.Uint64(payload[0:])
-	startOpID := binary.BigEndian.Uint64(payload[8:])
-
-	var entries []ValueLogEntry
-	offset := WALBatchHeaderSize
-	opIdx := uint64(0)
-
-	for offset < len(payload) {
-		if offset+4 > len(payload) {
-			break
-		}
-		keyLen := int(binary.BigEndian.Uint32(payload[offset:]))
-		offset += 4
-
-		if offset+keyLen > len(payload) {
-			break
-		}
-		key := payload[offset : offset+keyLen]
-		offset += keyLen
-
-		if offset+4 > len(payload) {
-			break
-		}
-		valLen := int(binary.BigEndian.Uint32(payload[offset:]))
-		offset += 4
-
-		if offset+valLen > len(payload) {
-			break
-		}
-		val := payload[offset : offset+valLen]
-		offset += valLen
-
-		if offset+1 > len(payload) {
-			break
-		}
-		isDelete := payload[offset] == 1
-		offset += 1
-
-		entries = append(entries, ValueLogEntry{
-			Key:           append([]byte{}, key...),
-			Value:         append([]byte{}, val...),
-			TransactionID: txID,
-			OperationID:   startOpID + opIdx,
-			IsDelete:      isDelete,
-		})
-		opIdx++
-	}
-	return txID, startOpID, entries
 }
 
 func (wal *WriteAheadLog) Close() error {

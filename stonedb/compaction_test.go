@@ -12,7 +12,6 @@ func TestCompaction_BasicGarbageCollection(t *testing.T) {
 	dir := t.TempDir()
 
 	opts := Options{
-		MaxWALSize:           1024 * 1024,
 		CompactionMinGarbage: 1, // Trigger on any garbage for test
 	}
 	db, err := Open(dir, opts)
@@ -158,7 +157,7 @@ func TestCompaction_RewriteWithSkip(t *testing.T) {
 	// This test targets logic where rewriteBatch skips entries
 	// that have been superseded by newer transactions.
 	dir := t.TempDir()
-	opts := Options{MaxWALSize: 1024 * 1024, CompactionMinGarbage: 1}
+	opts := Options{CompactionMinGarbage: 1}
 	db, err := Open(dir, opts)
 	if err != nil {
 		t.Fatal(err)
@@ -260,7 +259,7 @@ func TestValueLog_Iterate_MissingFile(t *testing.T) {
 
 func TestCompaction_CleansUpStaleIndexEntries(t *testing.T) {
 	dir := t.TempDir()
-	opts := Options{MaxWALSize: 1024 * 1024, CompactionMinGarbage: 1}
+	opts := Options{CompactionMinGarbage: 1}
 	db, err := Open(dir, opts)
 	if err != nil {
 		t.Fatal(err)
@@ -319,7 +318,7 @@ func TestCompaction_CleansUpStaleIndexEntries(t *testing.T) {
 
 func TestCompaction_PrunesVersionChains(t *testing.T) {
 	dir := t.TempDir()
-	opts := Options{MaxWALSize: 1024 * 1024, CompactionMinGarbage: 1}
+	opts := Options{CompactionMinGarbage: 1}
 	db, err := Open(dir, opts)
 	if err != nil {
 		t.Fatal(err)
@@ -474,7 +473,6 @@ func TestCompaction_MixedScenario_CrossCheckpoint(t *testing.T) {
 	dir := t.TempDir()
 	opts := Options{
 		CompactionMinGarbage: 1,
-		MaxWALSize:           1024 * 1024,
 	}
 	db, err := Open(dir, opts)
 	if err != nil {

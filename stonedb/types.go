@@ -21,12 +21,55 @@ const (
 	// WAL Header: Length(4) + Checksum(4)
 	WALHeaderSize = 8
 
-	// WAL Batch Header: TxID(8) + StartOpID(8) + Count(4)
-	WALBatchHeaderSize = 20
+	// WAL Record Header: Type(1) + XID(8) + OpID(8)
+	WALRecordHeaderSize = 17
 
 	// Default limit for open ValueLog files
 	DefaultValueLogMaxOpenFiles = 500
 )
+
+// WALRecordType identifies the kind of a single WAL record. Every client
+// operation (BEGIN/SET/DEL/COMMIT/ABORT) is logged as its own typed record,
+// Postgres-style, rather than being buffered and flushed as one batch at commit.
+type WALRecordType uint8
+
+const (
+	WALRecordBegin  WALRecordType = 1
+	WALRecordSet    WALRecordType = 2
+	WALRecordDelete WALRecordType = 3
+	WALRecordCommit WALRecordType = 4
+	WALRecordAbort  WALRecordType = 5
+)
+
+// WALRecord is a single decoded WAL entry.
+type WALRecord struct {
+	Type WALRecordType
+	XID  uint64 // Transaction ID (assigned at BEGIN)
+	OpID uint64 // Monotonic log sequence number, assigned per record
+	Key  []byte
+	Value []byte
+}
+
+// TxStatus is the commit-log (clog) state of a transaction ID.
+type TxStatus uint8
+
+const (
+	TxInProgress TxStatus = 0
+	TxCommitted  TxStatus = 1
+	TxAborted    TxStatus = 2
+)
+
+// Snapshot captures the visibility boundary for a transaction, Postgres-style:
+// a version with a given xmin is visible iff xmin < Xmax and xmin is not in Xip,
+// and the transaction that produced it is marked committed in the clog.
+type Snapshot struct {
+	Xmax uint64          // Versions with xmin >= Xmax are never visible.
+	Xip  map[uint64]bool // Transactions that were in-progress when the snapshot was taken.
+}
+
+func (s Snapshot) contains(xid uint64) bool {
+	return s.Xip[xid]
+}
 
 var (
 	// Crc32Table uses the Castagnoli polynomial which is often hardware-accelerated (CRC32C)
@@ -38,11 +81,13 @@ var (
 	sysOperationIDKey   = []byte("!sys!opseq!")
 	sysKeyCountKey      = []byte("!sys!keycount!") // Persisted Key Count
 	sysWALIndexPrefix   = []byte("!sys!wal!idx!")
+	sysClogPrefix       = []byte("!sys!clog!")
 )
 
 var (
 	ErrTxnFinished         = errors.New("transaction is already finished")
 	ErrWriteConflict       = errors.New("write conflict detected")
+	ErrTxAborted           = errors.New("current transaction is aborted, commands ignored until end of transaction block")
 	ErrKeyNotFound         = errors.New("key not found")
 	ErrChecksum            = errors.New("checksum mismatch")
 	ErrCorruptData         = errors.New("data corruption detected")
@@ -90,6 +135,11 @@ type Options struct {
 
 	// Logger is the structured logger to use. If nil, logging is discarded.
 	Logger *slog.Logger
+
+	// TxTimeout is the maximum age a RW transaction may reach before the
+	// background liveness reaper force-aborts it, independent of client
+	// activity. If 0, defaults to protocol.MaxTxDuration.
+	TxTimeout time.Duration
 }
 
 // WALLocation points to a specific batch in the WAL files

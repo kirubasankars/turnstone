@@ -7,7 +7,7 @@ import (
 
 func TestBasicCRUD(t *testing.T) {
 	dir := t.TempDir()
-	opts := Options{MaxWALSize: 1024 * 1024} // 1MB
+	opts := Options{}
 
 	db, err := Open(dir, opts)
 	if err != nil {
@@ -107,7 +107,7 @@ func TestBasicCRUD(t *testing.T) {
 
 func TestPersistence(t *testing.T) {
 	dir := t.TempDir()
-	opts := Options{MaxWALSize: 1024 * 1024}
+	opts := Options{}
 
 	// 1. Open and Write
 	{
@@ -153,7 +153,7 @@ func TestPersistence(t *testing.T) {
 
 func TestWALScan(t *testing.T) {
 	dir := t.TempDir()
-	opts := Options{MaxWALSize: 1024} // Small WAL size to force rotation
+	opts := Options{}
 
 	db, err := Open(dir, opts)
 	if err != nil {
@@ -161,11 +161,9 @@ func TestWALScan(t *testing.T) {
 	}
 	defer db.Close()
 
-	// Write enough data to force multiple WAL files
-	// ValueLogHeader is ~29 bytes. Payload is Key+Val.
-	// We want to trigger rotation (1024 bytes).
-	// Let's write 50 entries of ~50 bytes each -> 2500 bytes.
-
+	// Each committed write now logs BEGIN+SET+COMMIT records, so opIDs are
+	// no longer 1:1 with the number of Put calls; scan the full WAL first to
+	// learn the actual head opID before picking a scan-from-the-middle point.
 	const count = 50
 	for i := 0; i < count; i++ {
 		tx := db.NewTransaction(true)
@@ -180,14 +178,14 @@ func TestWALScan(t *testing.T) {
 		tx.Discard()
 	}
 
-	// Scan from the middle
-	startOpID := uint64(25)
+	headOpID := db.LastOpID()
+	startOpID := headOpID / 2
 	foundCount := 0
 
-	err = db.ScanWAL(startOpID, func(entries []ValueLogEntry) error {
-		for _, e := range entries {
-			if e.OperationID < startOpID {
-				t.Errorf("Got OpID %d, expected >= %d", e.OperationID, startOpID)
+	err = db.ScanWAL(startOpID, func(recs []WALRecord) error {
+		for _, r := range recs {
+			if r.OpID < startOpID {
+				t.Errorf("Got OpID %d, expected >= %d", r.OpID, startOpID)
 			}
 			foundCount++
 		}
@@ -197,9 +195,7 @@ func TestWALScan(t *testing.T) {
 		t.Fatalf("ScanWAL failed: %v", err)
 	}
 
-	// We wrote 'count' operations. OpIDs start at 1.
-	// Scanning from 25 means we expect 25, 26, ... 50 (Total 26 items).
-	expected := count - int(startOpID) + 1
+	expected := int(headOpID-startOpID) + 1
 	if foundCount != expected {
 		t.Errorf("ScanWAL count mismatch: expected %d, got %d", expected, foundCount)
 	}

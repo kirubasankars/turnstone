@@ -206,8 +206,8 @@ func TestCDC_MessageContent(t *testing.T) {
 			continue // Skip other messages
 		}
 
-		// Parse Batch: [DBNameLen][DBName][Count][Entries...]
-		cursor := 0
+		// Parse Batch: [CRC32(4)][DBNameLen][DBName][Count][Entries...]
+		cursor := 4 // skip CRC32
 		if cursor+4 > len(payload) {
 			continue
 		}
@@ -320,6 +320,13 @@ func TestCDC_PurgedWAL_TriggersSnapshot(t *testing.T) {
 	cAdmin2.Close()
 
 	// 3. Write more data (OpID 2) into File 2
+	// StepDown disconnects all client connections on this db, so c1 is no
+	// longer usable; reconnect rather than relying on timing luck against
+	// the delayed connection-kill.
+	c1.Close()
+	c1 = connectClient(t, addr, clientTLS)
+	defer c1.Close()
+	selectDatabase(t, c1, "1")
 	c1.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
 	c1.AssertStatus(protocol.OpCodeSet, makeSet("k2", "v2"), protocol.ResStatusOK)
 	c1.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusOK)
@@ -336,8 +343,11 @@ func TestCDC_PurgedWAL_TriggersSnapshot(t *testing.T) {
 	cAdmin4.AssertStatus(protocol.OpCodePromote, make([]byte, 4), protocol.ResStatusOK)
 	cAdmin4.Close()
 
-	// 5. Purge logs older than OpID 2. This deletes File 1.
-	if err := st1.DB.PurgeWAL(2); err != nil {
+	// 5. Purge logs older than k2's transaction. Under the eager-logging WAL
+	// format each write is 3 records (BEGIN/SET/COMMIT), so k1's whole
+	// transaction occupies OpIDs 1-3 and k2's BEGIN is OpID 4; purging
+	// "older than 4" is what actually evicts File 1 (k1's file).
+	if err := st1.DB.PurgeWAL(4); err != nil {
 		t.Fatal(err)
 	}
 
@@ -421,10 +431,10 @@ func TestCDC_PurgedWAL_TriggersSnapshot(t *testing.T) {
 	}
 	ln = binary.BigEndian.Uint32(respHead[1:])
 
-	// Payload contains [DBNameLen(4)][DBName][Count(4)][Data(16)]
-	// DBName="1" (1 byte) -> Total wrapper = 9 bytes. Total payload = 25 bytes.
-	if ln < 9+16 {
-		t.Fatalf("Expected at least 25 byte payload for SnapshotDone (wrapper+data), got %d", ln)
+	// Payload contains [CRC32(4)][DBNameLen(4)][DBName][Count(4)][Data(16)]
+	// DBName="1" (1 byte) -> Total wrapper = 4+9 = 13 bytes. Total payload = 29 bytes.
+	if ln < 4+9+16 {
+		t.Fatalf("Expected at least 29 byte payload for SnapshotDone (wrapper+data), got %d", ln)
 	}
 
 	payload := make([]byte, ln)
@@ -433,7 +443,7 @@ func TestCDC_PurgedWAL_TriggersSnapshot(t *testing.T) {
 	}
 
 	// Skip framing
-	cursor := 0
+	cursor := 4 // skip CRC32
 	nLen := int(binary.BigEndian.Uint32(payload[cursor:]))
 	cursor += 4 + nLen + 4 // DBNameLen + DBName + Count
 
@@ -454,6 +464,11 @@ func TestCDC_PurgedWAL_TriggersSnapshot(t *testing.T) {
 	}
 
 	// 10. Write new data to verify live streaming
+	// StepDown (step 4) disconnected c1 again; reconnect before writing.
+	c1.Close()
+	c1 = connectClient(t, addr, clientTLS)
+	defer c1.Close()
+	selectDatabase(t, c1, "1")
 	c1.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
 	c1.AssertStatus(protocol.OpCodeSet, makeSet("k3", "v3"), protocol.ResStatusOK)
 	c1.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusOK)

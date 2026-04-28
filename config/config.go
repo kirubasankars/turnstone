@@ -45,6 +45,14 @@ func ResolvePath(homeDir, path string) string {
 	return filepath.Join(homeDir, path)
 }
 
+// ValidateSecurityConfig ensures that critical security parameters are present.
+func ValidateSecurityConfig(cfg Config) error {
+	if cfg.TLSCertFile == "" || cfg.TLSKeyFile == "" || cfg.TLSCAFile == "" {
+		return fmt.Errorf("security critical: 'tls_cert_file', 'tls_key_file', and 'tls_ca_file' must be set")
+	}
+	return nil
+}
+
 // GenerateConfigArtifacts creates a sample directory structure and certificates.
 func GenerateConfigArtifacts(homeDir string, defaultCfg Config, configPath string, extraHosts ...string) error {
 	if err := os.MkdirAll(homeDir, 0o755); err != nil {

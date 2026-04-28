@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 
 	"github.com/syndtr/goleveldb/leveldb"
+	"github.com/syndtr/goleveldb/leveldb/iterator"
 	"github.com/syndtr/goleveldb/leveldb/opt"
 )
 
@@ -77,23 +78,10 @@ func (db *DB) RunCompaction() (bool, error) {
 	iter := db.ldb.NewIterator(nil, nil)
 	defer iter.Release()
 
+	horizon := db.minActiveSnapshotXmax()
+
 	err := db.valueLog.IterateFile(bestFid, func(e ValueLogEntry, _ EntryMeta) error {
-		// Pre-filter: Check if the entry is the latest version in the index.
-		isAlive := false
-		seekKey := encodeIndexKey(e.Key, math.MaxUint64)
-		if iter.Seek(seekKey) {
-			foundKey := iter.Key()
-			uKey, _, err := decodeIndexKey(foundKey)
-			if err == nil && bytes.Equal(uKey, e.Key) {
-				meta, err := decodeEntryMeta(iter.Value())
-				if err == nil {
-					// STRICT CHECK: The index must point to THIS transaction/operation.
-					if meta.TransactionID == e.TransactionID && meta.OperationID == e.OperationID {
-						isAlive = true
-					}
-				}
-			}
-		}
+		isAlive, isCurrentPointer := db.isEntryAlive(iter, e, horizon)
 
 		if isAlive {
 			validEntries = append(validEntries, e)
@@ -108,8 +96,14 @@ func (db *DB) RunCompaction() (bool, error) {
 					return err
 				}
 			}
-		} else {
-			// It's stale. We need to remove this specific version from the index.
+		} else if isCurrentPointer {
+			// This VLog record is still the index's current pointer for
+			// (key, xid), but it has been resolved as garbage (aborted, or a
+			// committed version fully superseded below the vacuum horizon).
+			// Only remove the index entry in that case -- if it is NOT the
+			// current pointer, a later write within the same transaction has
+			// already superseded it in the index and that entry must be left
+			// untouched.
 			staleBatch.Delete(encodeIndexKey(e.Key, e.TransactionID))
 
 			// Flush if stale batch gets too big
@@ -161,6 +155,77 @@ func (db *DB) RunCompaction() (bool, error) {
 	return true, nil
 }
 
+// isEntryAlive decides whether a ValueLog entry encountered during
+// compaction must be preserved. It returns:
+//   - isAlive: true if the entry must be rewritten forward.
+//   - isCurrentPointer: true if the index for (key, xid) still points at
+//     exactly this (TransactionID, OperationID) pair (used by the caller to
+//     decide whether it is safe to delete the index entry when !isAlive).
+//
+// Rules: in-progress versions are always kept (their fate isn't known yet).
+// Aborted versions are always garbage. A committed version is kept if it is
+// the current visible pointer for its key (no newer committed version
+// exists, or the newer one is itself still in-progress), or if some active
+// snapshot's horizon still needs it (vacuum horizon).
+func (db *DB) isEntryAlive(iter iterator.Iterator, e ValueLogEntry, horizon uint64) (isAlive bool, isCurrentPointer bool) {
+	seekKey := encodeIndexKey(e.Key, math.MaxUint64)
+
+	var newerCommittedXmin uint64
+	haveNewerCommitted := false
+	haveNewerInProgress := false
+
+	for ok := iter.Seek(seekKey); ok && iter.Valid(); ok = iter.Next() {
+		foundKey := iter.Key()
+		uKey, xmin, err := decodeIndexKey(foundKey)
+		if err != nil || !bytes.Equal(uKey, e.Key) {
+			return false, false
+		}
+
+		if xmin == e.TransactionID {
+			meta, err := decodeEntryMeta(iter.Value())
+			if err != nil || meta.OperationID != e.OperationID {
+				return false, false
+			}
+			isCurrentPointer = true
+			switch db.clogStatus(xmin) {
+			case TxAborted:
+				return false, true
+			case TxInProgress:
+				return true, true
+			default: // TxCommitted
+				if haveNewerInProgress {
+					// A newer in-progress writer exists; until it resolves,
+					// this committed version is still what current readers see.
+					return true, true
+				}
+				if !haveNewerCommitted {
+					return true, true // current visible pointer
+				}
+				// The superseding version already existed before the oldest
+				// active snapshot's horizon, so every active snapshot already
+				// sees it; this older version is truly dead. Conversely, if
+				// the superseding version landed at or after the horizon,
+				// the oldest active snapshot predates it and still needs
+				// this older version to remain visible.
+				return newerCommittedXmin >= horizon, true
+			}
+		}
+
+		switch db.clogStatus(xmin) {
+		case TxCommitted:
+			if !haveNewerCommitted {
+				haveNewerCommitted = true
+				newerCommittedXmin = xmin
+			}
+		case TxInProgress:
+			haveNewerInProgress = true
+		case TxAborted:
+			// ignore aborted newer versions when looking for a superseding one
+		}
+	}
+	return false, false
+}
+
 // deleteObsoleteFiles checks if any pending files are safe to delete based on active transactions.
 func (db *DB) deleteObsoleteFiles() {
 	db.activeTxnsMu.Lock()
@@ -210,8 +275,6 @@ func (db *DB) rewriteBatch(entries []ValueLogEntry) error {
 	defer db.commitMu.Unlock()
 
 	batch := new(leveldb.Batch)
-	iter := db.ldb.NewIterator(nil, nil)
-	defer iter.Release()
 
 	currentOffset := baseOffset
 	var newGarbage int64
@@ -220,20 +283,21 @@ func (db *DB) rewriteBatch(entries []ValueLogEntry) error {
 		recSize := ValueLogHeaderSize + len(e.Key) + len(e.Value)
 		isLatest := false
 
-		// Re-verify against current index state under lock.
-		// A user transaction might have updated the key while we were writing to VLog.
-		seekKey := encodeIndexKey(e.Key, math.MaxUint64)
-		if iter.Seek(seekKey) {
-			foundKey := iter.Key()
-			uKey, _, err := decodeIndexKey(foundKey)
-			if err == nil && bytes.Equal(uKey, e.Key) {
-				meta, err := decodeEntryMeta(iter.Value())
-				if err == nil {
-					// It is only safe to update the index if it still points to the exact version we moved.
-					if meta.TransactionID == e.TransactionID && meta.OperationID == e.OperationID {
-						isLatest = true
-					}
-				}
+		// Re-verify against current index state under lock, by exact
+		// (key, xid) lookup -- NOT "is this the newest version for the
+		// key". Vacuum-horizon compaction can legitimately keep an older
+		// committed version alive (still visible to a long-lived snapshot)
+		// even after a newer version has since been written for the same
+		// key; a "still the newest" check would wrongly conclude the older
+		// version's own index entry is now dead and must be deleted here,
+		// erasing the only copy of a version some open snapshot still
+		// needs. The exact entry can only have moved (or been reclaimed)
+		// via this same code path or explicit GC, so checking that it
+		// still points at the (FileID, offset) we're relocating from is
+		// both necessary and sufficient.
+		if raw, err := db.ldb.Get(encodeIndexKey(e.Key, e.TransactionID), nil); err == nil {
+			if meta, err := decodeEntryMeta(raw); err == nil && meta.OperationID == e.OperationID {
+				isLatest = true
 			}
 		}
 

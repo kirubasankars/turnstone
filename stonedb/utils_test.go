@@ -56,7 +56,8 @@ func TestUtils_EncodingErrors(t *testing.T) {
 func TestEntryMeta_Encode(t *testing.T) {
 	m := EntryMeta{IsTombstone: true}
 	buf := m.Encode()
-	if buf[28] != 1 {
+	// Layout: FileID(4) + ValueOffset(8) + ValueLen(4) + TransactionID(8) + OperationID(8) + IsTombstone(1).
+	if buf[32] != 1 {
 		t.Error("Failed to encode tombstone")
 	}
 	m2, _ := decodeEntryMeta(buf)

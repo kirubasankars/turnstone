@@ -5,7 +5,9 @@ import (
 )
 
 // TestIsolation_WriteWriteConflict verifies that two concurrent transactions
-// cannot update the same key. First committer wins.
+// cannot update the same key. Under first-writer-wins (NOWAIT key locks),
+// whichever transaction calls Put first wins the key; the other conflicts
+// immediately at Put time, not at Commit.
 func TestIsolation_WriteWriteConflict(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(dir, Options{})
@@ -31,20 +33,26 @@ func TestIsolation_WriteWriteConflict(t *testing.T) {
 	tx2 := db.NewTransaction(true)
 	val2, _ := tx2.Get(key) // Read v0
 
-	// 4. Tx1 updates
-	tx1.Put(key, append(val1, []byte("-tx1")...))
-
-	// 5. Tx2 updates
-	tx2.Put(key, append(val2, []byte("-tx2")...))
-
-	// 6. Tx2 commits FIRST -> Should succeed
-	if err := tx2.Commit(); err != nil {
-		t.Fatalf("Tx2 failed to commit: %v", err)
+	// 4. Tx1 writes FIRST -> acquires the key lock, so its write succeeds.
+	if err := tx1.Put(key, append(val1, []byte("-tx1")...)); err != nil {
+		t.Fatalf("Tx1 expected Put to succeed (first writer), got: %v", err)
 	}
 
-	// 7. Tx1 commits SECOND -> Should fail (Write Conflict on same key)
-	if err := tx1.Commit(); err != ErrWriteConflict {
-		t.Errorf("Tx1 expected ErrWriteConflict, got: %v", err)
+	// 5. Tx2 writes SECOND -> the key is already locked by Tx1, so Tx2
+	// conflicts immediately at Put time, not later at Commit.
+	if err := tx2.Put(key, append(val2, []byte("-tx2")...)); err != ErrWriteConflict {
+		t.Fatalf("Tx2 expected ErrWriteConflict at Put (second writer), got: %v", err)
+	}
+
+	// 6. Tx1 commits -> should succeed, nobody else holds its lock.
+	if err := tx1.Commit(); err != nil {
+		t.Fatalf("Tx1 failed to commit: %v", err)
+	}
+
+	// 7. Tx2 commits -> already aborted by the failed Put, so Commit must
+	// report the same conflict rather than a spurious OK.
+	if err := tx2.Commit(); err != ErrWriteConflict {
+		t.Errorf("Tx2 expected ErrWriteConflict on Commit, got: %v", err)
 	}
 }
 

@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -60,10 +59,28 @@ type DB struct {
 	// Metrics (Atomic counters)
 	metricsConflicts uint64
 
-	// Transaction State
+	// Transaction State (snapshot horizon tracking; value = snapshot.Xmax)
 	activeTxnsMu   sync.Mutex
 	activeTxns     map[*Transaction]uint64
 	pendingDeletes []pendingFile
+
+	// Postgres-style eager transaction bookkeeping.
+	txMu         sync.Mutex
+	activeXids   map[uint64]*Transaction // in-progress RW xids -> owner (nil = applied via replication)
+	keyLocks     map[string]uint64       // key -> owning xid (first-writer-wins, NOWAIT)
+	txStartTimes map[uint64]time.Time    // xid -> start time, local RW only (liveness reaper)
+	beginOpIDs   map[uint64]uint64       // xid -> opID of its BEGIN record (WAL purge floor)
+	txTimeout    time.Duration           // MaxTxDuration override for the liveness reaper
+
+	// pendingClogRebuild holds clog decisions reconstructed from the WAL during
+	// recovery, before LevelDB is open. Flushed by persistClogRebuild.
+	pendingClogRebuild map[uint64]TxStatus
+
+	// replImpact accumulates per-xid key-count/garbage impact for replicated
+	// (ApplyRecord) writes, mirroring what a local Transaction tracks in
+	// memory between Put/Delete and Commit. Flushed to keyCount/
+	// deletedBytesByFile on a replicated COMMIT, discarded on ABORT.
+	replImpact map[uint64]*replTxImpact
 
 	// Background Tasks
 	closeCh      chan struct{}
@@ -110,6 +127,9 @@ func Open(dir string, opts Options) (*DB, error) {
 	if opts.BlockCacheSize == 0 {
 		opts.BlockCacheSize = 64 * 1024 * 1024
 	}
+	if opts.TxTimeout == 0 {
+		opts.TxTimeout = protocol.MaxTxDuration
+	}
 
 	logger := opts.Logger
 	if logger == nil {
@@ -141,6 +161,12 @@ func Open(dir string, opts Options) (*DB, error) {
 		valueLog:               vl,
 		deletedBytesByFile:     make(map[uint32]int64),
 		activeTxns:             make(map[*Transaction]uint64),
+		activeXids:             make(map[uint64]*Transaction),
+		keyLocks:               make(map[string]uint64),
+		txStartTimes:           make(map[uint64]time.Time),
+		beginOpIDs:             make(map[uint64]uint64),
+		replImpact:             make(map[uint64]*replTxImpact),
+		txTimeout:              opts.TxTimeout,
 		closeCh:                make(chan struct{}),
 		commitCh:               make(chan commitRequest, 500),
 		minGarbageThreshold:    opts.CompactionMinGarbage,
@@ -169,6 +195,13 @@ func Open(dir string, opts Options) (*DB, error) {
 	if err := db.openLevelDB(dir); err != nil {
 		db.Close()
 		return nil, err
+	}
+
+	// The clog can only be persisted once LevelDB is open; apply whatever was
+	// reconstructed from the WAL replay above now.
+	if err := db.persistClogRebuild(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("persist recovered clog: %w", err)
 	}
 
 	db.writeAheadLog.SetOnRotate(db.onWALRotate)
@@ -334,7 +367,7 @@ func (db *DB) openLevelDB(dir string) error {
 
 func (db *DB) startBackgroundTasks() {
 	db.lastCkptOpID = db.operationID
-	waitCount := 3
+	waitCount := 4
 	if db.checksumInterval > 0 {
 		waitCount++
 	}
@@ -346,12 +379,57 @@ func (db *DB) startBackgroundTasks() {
 	go db.runAutoCheckpoint()
 	go db.runAutoCompaction()
 	go db.runGroupCommits()
+	go db.runLivenessReaper()
 
 	if db.checksumInterval > 0 {
 		go db.runBackgroundChecksum()
 	}
 	if db.maxDiskUsagePercent > 0 {
 		go db.runDiskMonitor()
+	}
+}
+
+// runLivenessReaper force-aborts any locally-owned RW transaction that has
+// been open longer than db.txTimeout, independent of client activity. This
+// bounds how long a stalled/forgotten connection can hold first-writer-wins
+// key locks.
+func (db *DB) runLivenessReaper() {
+	defer db.wg.Done()
+	interval := db.txTimeout / 4
+	if interval <= 0 || interval > 5*time.Second {
+		interval = 5 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-db.closeCh:
+			return
+		case <-ticker.C:
+			db.reapExpiredTransactions()
+		}
+	}
+}
+
+func (db *DB) reapExpiredTransactions() {
+	now := time.Now()
+	var expired []*Transaction
+
+	db.txMu.Lock()
+	for xid, start := range db.txStartTimes {
+		if now.Sub(start) > db.txTimeout {
+			if tx, ok := db.activeXids[xid]; ok && tx != nil {
+				expired = append(expired, tx)
+			}
+		}
+	}
+	db.txMu.Unlock()
+
+	for _, tx := range expired {
+		tx.markAborted()
+		db.logger.Warn("Liveness reaper force-aborted stalled transaction", "xid", tx.xid, "timeout", db.txTimeout)
+		db.abortTransaction(tx)
 	}
 }
 
@@ -585,27 +663,86 @@ func isClosed(ch <-chan struct{}) bool {
 	}
 }
 
+// NewTransaction starts a new transaction. Read-write transactions are
+// assigned an xid immediately and log a BEGIN WAL record (Postgres-style);
+// read-only transactions merely capture a snapshot and never touch the WAL.
 func (db *DB) NewTransaction(update bool) *Transaction {
-	// Check for corruption first
-	if atomic.LoadInt32(&db.isCorrupt) == 1 {
-		// Just return struct, commit will fail
+	if !update {
+		db.activeTxnsMu.Lock()
+		db.txMu.Lock()
+		snap := db.buildSnapshotLocked()
+		db.txMu.Unlock()
+		tx := &Transaction{db: db, update: false, snapshot: snap}
+		db.activeTxns[tx] = snap.Xmax
+		db.activeTxnsMu.Unlock()
+		return tx
 	}
 
-	readTxID := atomic.LoadUint64(&db.transactionID)
+	// xid allocation and snapshot construction must be atomic with each
+	// other under txMu: if we incremented db.transactionID before taking
+	// the lock, a concurrent NewTransaction's buildSnapshotLocked (running
+	// between our increment and our own txMu acquisition) could compute an
+	// Xmax that already covers our xid (since Xmax is derived from the same
+	// counter) while our xid is not yet in activeXids/Xip -- making that
+	// other transaction's snapshot treat us as neither future nor
+	// in-progress. A write that later lands on a key we've already
+	// committed would then wrongly look "old enough" to overwrite, silently
+	// dropping our update (a lost update / torn snapshot).
+	db.txMu.Lock()
+	xid := atomic.AddUint64(&db.transactionID, 1)
+	snap := db.buildSnapshotLocked()
 	tx := &Transaction{
-		db:         db,
-		pendingOps: make(map[string]*PendingOp),
-		readSet:    make(map[string]struct{}),
-		readTxID:   readTxID,
-		update:     update,
+		db:              db,
+		update:          true,
+		xid:             xid,
+		snapshot:        snap,
+		keyLocks:        make(map[string]struct{}),
+		dispositionSeen: make(map[string]bool),
+		ownPriorMeta:    make(map[string]*EntryMeta),
+		staleBytes:      make(map[uint32]int64),
+		readSet:         make(map[string]struct{}),
 	}
+	db.activeXids[xid] = tx
+	db.txStartTimes[xid] = time.Now()
+	db.txMu.Unlock()
+
 	db.activeTxnsMu.Lock()
-	db.activeTxns[tx] = readTxID
+	db.activeTxns[tx] = xid
 	db.activeTxnsMu.Unlock()
+
+	opID, err := db.appendRecord(WALRecordBegin, xid, nil, nil)
+	if err != nil {
+		// Best-effort: mark the transaction unusable; Put/Commit will surface the failure.
+		tx.aborted = true
+		tx.beginErr = err
+	} else {
+		tx.beginOpID = opID
+		db.txMu.Lock()
+		db.beginOpIDs[xid] = opID
+		db.txMu.Unlock()
+	}
+
 	return tx
 }
 
-func (db *DB) ScanWAL(startOpID uint64, fn func([]ValueLogEntry) error) error {
+// appendRecord assigns an opID and appends one WAL record atomically: opID
+// allocation and the physical write happen inside the same WAL-locked
+// critical section, so file order always matches opID order.
+func (db *DB) appendRecord(recType WALRecordType, xid uint64, key, value []byte) (uint64, error) {
+	nextOpID := func() uint64 { return atomic.AddUint64(&db.operationID, 1) }
+	build := func(opID uint64) []byte {
+		return encodeWALRecord(WALRecord{Type: recType, XID: xid, OpID: opID, Key: key, Value: value})
+	}
+	opIDs, err := db.writeAheadLog.AppendRecordsWithOpIDs(nextOpID, []func(uint64) []byte{build}, false)
+	if err != nil {
+		return 0, err
+	}
+	return opIDs[0], nil
+}
+
+// ScanWAL streams typed WAL records at or after startOpID, in physical (and
+// therefore logical) order.
+func (db *DB) ScanWAL(startOpID uint64, fn func([]WALRecord) error) error {
 	loc, found, err := db.locateWALStart(startOpID)
 	if err != nil {
 		return err
@@ -613,11 +750,11 @@ func (db *DB) ScanWAL(startOpID uint64, fn func([]ValueLogEntry) error) error {
 	if !found {
 		return ErrLogUnavailable
 	}
-	return db.writeAheadLog.Scan(loc, func(entries []ValueLogEntry) error {
-		var filtered []ValueLogEntry
-		for _, e := range entries {
-			if e.OperationID >= startOpID {
-				filtered = append(filtered, e)
+	return db.writeAheadLog.Scan(loc, func(recs []WALRecord) error {
+		var filtered []WALRecord
+		for _, r := range recs {
+			if r.OpID >= startOpID {
+				filtered = append(filtered, r)
 			}
 		}
 		if len(filtered) > 0 {
@@ -627,112 +764,182 @@ func (db *DB) ScanWAL(startOpID uint64, fn func([]ValueLogEntry) error) error {
 	})
 }
 
+// PurgeWAL deletes WAL files older than minOpID, but never past the oldest
+// still-open BEGIN (local or replicated) so an in-progress transaction's
+// records always remain replayable.
 func (db *DB) PurgeWAL(minOpID uint64) error {
+	db.txMu.Lock()
+	for _, op := range db.beginOpIDs {
+		if op < minOpID {
+			minOpID = op
+		}
+	}
+	db.txMu.Unlock()
 	return db.writeAheadLog.PurgeOlderThan(minOpID)
 }
 
-func (db *DB) ApplyBatch(entries []ValueLogEntry) error {
-	// Check Corruption
+// ApplyRecord applies a single replicated WAL record directly to the engine,
+// mirroring the eager write path used locally: SET/DEL land in VLog+index
+// immediately (uncommitted), and COMMIT/ABORT resolve the clog. opIDs/xids
+// are taken verbatim from the leader, not reassigned.
+func (db *DB) ApplyRecord(rec WALRecord) error {
 	if atomic.LoadInt32(&db.isCorrupt) == 1 {
 		return errors.New("database is corrupt")
 	}
-	// For backward compatibility or single batch application.
-	// Delegates to ApplyBatches for consistency.
-	return db.ApplyBatches([][]ValueLogEntry{entries})
+
+	payload := encodeWALRecord(rec)
+
+	switch rec.Type {
+	case WALRecordBegin:
+		if err := db.writeAheadLog.AppendReplicatedRecord(payload, false); err != nil {
+			return err
+		}
+		db.txMu.Lock()
+		db.activeXids[rec.XID] = nil
+		db.beginOpIDs[rec.XID] = rec.OpID
+		db.txMu.Unlock()
+		db.ForceSetClocks(rec.XID, rec.OpID)
+		return nil
+
+	case WALRecordSet, WALRecordDelete:
+		if err := db.writeAheadLog.AppendReplicatedRecord(payload, false); err != nil {
+			return err
+		}
+		fileID, offset, err := db.valueLog.AppendEntries([]ValueLogEntry{{
+			Key: rec.Key, Value: rec.Value, TransactionID: rec.XID, OperationID: rec.OpID, IsDelete: rec.Type == WALRecordDelete,
+		}})
+		if err != nil {
+			atomic.StoreInt32(&db.isCorrupt, 1)
+			return err
+		}
+		meta := EntryMeta{
+			FileID: fileID, ValueOffset: offset, ValueLen: uint32(len(rec.Value)),
+			TransactionID: rec.XID, OperationID: rec.OpID, IsTombstone: rec.Type == WALRecordDelete,
+		}
+		if err := db.ldb.Put(encodeIndexKey(rec.Key, rec.XID), meta.Encode(), nil); err != nil {
+			atomic.StoreInt32(&db.isCorrupt, 1)
+			return err
+		}
+		db.accountReplicatedWrite(rec)
+		db.ForceSetClocks(rec.XID, rec.OpID)
+		return nil
+
+	case WALRecordCommit:
+		if err := db.writeAheadLog.AppendReplicatedRecord(payload, true); err != nil {
+			return err
+		}
+		if err := db.ldb.Put(encodeClogKey(rec.XID), []byte{byte(TxCommitted)}, nil); err != nil {
+			panic("CRITICAL: replica clog commit persist failed: " + err.Error())
+		}
+		db.txMu.Lock()
+		delete(db.activeXids, rec.XID)
+		delete(db.beginOpIDs, rec.XID)
+		impact := db.replImpact[rec.XID]
+		delete(db.replImpact, rec.XID)
+		db.txMu.Unlock()
+		db.applyReplicatedImpact(impact)
+		db.ForceSetClocks(rec.XID, rec.OpID)
+		return nil
+
+	case WALRecordAbort:
+		if err := db.writeAheadLog.AppendReplicatedRecord(payload, false); err != nil {
+			return err
+		}
+		if err := db.ldb.Put(encodeClogKey(rec.XID), []byte{byte(TxAborted)}, nil); err != nil {
+			db.logger.Error("failed to persist replicated abort clog entry", "xid", rec.XID, "err", err)
+		}
+		db.txMu.Lock()
+		delete(db.activeXids, rec.XID)
+		delete(db.beginOpIDs, rec.XID)
+		delete(db.replImpact, rec.XID)
+		db.txMu.Unlock()
+		db.ForceSetClocks(rec.XID, rec.OpID)
+		return nil
+	}
+
+	return fmt.Errorf("unknown WAL record type: %d", rec.Type)
 }
 
-// ApplyBatches applies multiple transactions (batches of entries) atomically to disk.
-// This enables Group Commit for replication streams.
-func (db *DB) ApplyBatches(batches [][]ValueLogEntry) error {
-	if atomic.LoadInt32(&db.isCorrupt) == 1 {
-		return errors.New("database is corrupt")
+// replTxImpact accumulates the key-count/garbage impact of a single
+// replicated (ApplyRecord) transaction's writes, mirroring the bookkeeping a
+// local *Transaction keeps between Put/Delete and Commit.
+type replTxImpact struct {
+	keyDelta        int64
+	staleBytes      map[uint32]int64
+	dispositionSeen map[string]bool
+}
+
+// accountReplicatedWrite updates the per-xid impact accumulator for a
+// replicated SET/DELETE record, using the same "current DB truth" comparison
+// a local write makes on its first touch of a key. Must be called after the
+// index write for rec has already landed, so latestResolvedMeta's exclusion
+// of rec.XID correctly finds the prior version (if any).
+func (db *DB) accountReplicatedWrite(rec WALRecord) {
+	keyStr := string(rec.Key)
+	isDelete := rec.Type == WALRecordDelete
+
+	db.txMu.Lock()
+	impact, ok := db.replImpact[rec.XID]
+	if !ok {
+		impact = &replTxImpact{staleBytes: make(map[uint32]int64), dispositionSeen: make(map[string]bool)}
+		db.replImpact[rec.XID] = impact
 	}
+	wasLiveIfSeen, seenBefore := impact.dispositionSeen[keyStr]
+	db.txMu.Unlock()
 
-	if len(batches) == 0 {
-		return nil
-	}
+	var wasLive bool
+	var staleFileID uint32
+	var staleSize int64
+	haveStale := false
 
-	db.commitMu.Lock()
-	defer db.commitMu.Unlock()
-
-	var walPayloads [][]byte
-	var combinedVLog []ValueLogEntry
-	var maxTxID uint64
-	var maxOpID uint64
-
-	// 1. Preparation & Serialization
-	for _, entries := range batches {
-		if len(entries) == 0 {
-			continue
+	if seenBefore {
+		// Second+ write to this key within the same replicated xid: compare
+		// against our own prior write in this xid, not the DB-wide index
+		// (a single-writer xid can't race itself).
+		wasLive = wasLiveIfSeen
+	} else {
+		iter := db.ldb.NewIterator(nil, nil)
+		meta, _, found := db.latestResolvedMeta(iter, rec.Key, rec.XID)
+		iter.Release()
+		wasLive = found && meta != nil && !meta.IsTombstone
+		if found && meta != nil {
+			staleFileID = meta.FileID
+			staleSize = int64(ValueLogHeaderSize) + int64(len(rec.Key)) + int64(meta.ValueLen)
+			haveStale = true
 		}
+	}
 
-		first := entries[0]
-		txID := first.TransactionID
-		startOpID := first.OperationID
-
-		var walBuf bytes.Buffer
-		binary.Write(&walBuf, binary.BigEndian, txID)
-		binary.Write(&walBuf, binary.BigEndian, startOpID)
-		binary.Write(&walBuf, binary.BigEndian, uint32(len(entries)))
-
-		for _, e := range entries {
-			binary.Write(&walBuf, binary.BigEndian, uint32(len(e.Key)))
-			walBuf.Write(e.Key)
-			binary.Write(&walBuf, binary.BigEndian, uint32(len(e.Value)))
-			walBuf.Write(e.Value)
-			val := byte(0)
-			if e.IsDelete {
-				val = 1
-			}
-			walBuf.WriteByte(val)
-
-			if e.TransactionID > maxTxID {
-				maxTxID = e.TransactionID
-			}
-			if e.OperationID > maxOpID {
-				maxOpID = e.OperationID
-			}
+	db.txMu.Lock()
+	if haveStale {
+		impact.staleBytes[staleFileID] += staleSize
+	}
+	if isDelete {
+		if wasLive {
+			impact.keyDelta--
 		}
-
-		walPayloads = append(walPayloads, walBuf.Bytes())
-		combinedVLog = append(combinedVLog, entries...)
+	} else if !wasLive {
+		impact.keyDelta++
 	}
+	impact.dispositionSeen[keyStr] = !isDelete
+	db.txMu.Unlock()
+}
 
-	if len(walPayloads) == 0 {
-		return nil
+// applyReplicatedImpact durably applies an accumulated replicated
+// transaction's key-count/garbage impact once its COMMIT record has landed.
+func (db *DB) applyReplicatedImpact(impact *replTxImpact) {
+	if impact == nil {
+		return
 	}
-
-	// 2. Write WAL (One Fsync for all batches)
-	if err := db.writeAheadLog.AppendBatches(walPayloads); err != nil {
-		return fmt.Errorf("wal append batches: %w", err)
+	if impact.keyDelta != 0 {
+		atomic.AddInt64(&db.keyCount, impact.keyDelta)
 	}
-
-	// 3. Write VLog (One Append for all entries)
-	fileID, baseOffset, err := db.valueLog.AppendEntries(combinedVLog)
-	if err != nil {
-		return fmt.Errorf("vlog append batches: %w", err)
+	if len(impact.staleBytes) > 0 {
+		db.mu.Lock()
+		for fid, sz := range impact.staleBytes {
+			db.deletedBytesByFile[fid] += sz
+		}
+		db.mu.Unlock()
 	}
-
-	// 4. Update Index (Consolidated update)
-	staleBytes, keyDelta := db.calculateBatchImpact(combinedVLog)
-
-	if err := db.UpdateIndexForEntries(combinedVLog, fileID, baseOffset, staleBytes); err != nil {
-		return fmt.Errorf("index update: %w", err)
-	}
-
-	// 5. Update Clocks
-	atomic.AddInt64(&db.keyCount, keyDelta)
-
-	currentTx := atomic.LoadUint64(&db.transactionID)
-	if maxTxID > currentTx {
-		atomic.StoreUint64(&db.transactionID, maxTxID)
-	}
-	currentOp := atomic.LoadUint64(&db.operationID)
-	if maxOpID > currentOp {
-		atomic.StoreUint64(&db.operationID, maxOpID)
-	}
-
-	return nil
 }
 
 func (db *DB) locateWALStart(targetOpID uint64) (WALLocation, bool, error) {
@@ -837,11 +1044,11 @@ func (db *DB) Checkpoint() error {
 		batch.Put(k, v)
 	}
 
-	// Rotate VLog only if it has reached the size threshold (using new int64 check)
-	if db.valueLog.writeOffset >= db.valueLog.maxSize {
-		if err := db.valueLog.Rotate(); err != nil {
-			return fmt.Errorf("vlog rotate failed: %w", err)
-		}
+	// Always rotate VLog during checkpoint (Rotate is a no-op if the current
+	// file is empty), so compaction can treat "checkpointed" files as sealed
+	// candidates instead of waiting for MaxVLogSize to be reached.
+	if err := db.valueLog.Rotate(); err != nil {
+		return fmt.Errorf("vlog rotate failed: %w", err)
 	}
 
 	// Always rotate WAL during checkpoint
@@ -856,35 +1063,6 @@ func (db *DB) Checkpoint() error {
 		return nil
 	}
 	return db.ldb.Write(batch, &opt.WriteOptions{Sync: true})
-}
-
-func (db *DB) UpdateIndexForEntries(entries []ValueLogEntry, fileID uint32, baseOffset int64, staleBytes map[uint32]int64) error {
-	batch := new(leveldb.Batch)
-	currentOffset := baseOffset
-	for _, e := range entries {
-		recSize := ValueLogHeaderSize + len(e.Key) + len(e.Value)
-		meta := EntryMeta{
-			FileID:        fileID,
-			ValueOffset:   currentOffset, // int64
-			ValueLen:      uint32(len(e.Value)),
-			TransactionID: e.TransactionID,
-			OperationID:   e.OperationID,
-			IsTombstone:   e.IsDelete,
-		}
-		batch.Put(encodeIndexKey(e.Key, e.TransactionID), meta.Encode())
-		currentOffset += int64(recSize)
-	}
-	if err := db.ldb.Write(batch, &opt.WriteOptions{Sync: false}); err != nil {
-		return err
-	}
-	if len(staleBytes) > 0 {
-		db.mu.Lock()
-		for fid, delta := range staleBytes {
-			db.deletedBytesByFile[fid] += delta
-		}
-		db.mu.Unlock()
-	}
-	return nil
 }
 
 func (db *DB) onWALRotate(index map[uint64]WALLocation) error {
@@ -903,51 +1081,6 @@ func (db *DB) onWALRotate(index map[uint64]WALLocation) error {
 		batch.Put(encodeWALIndexKey(opID), locBytes)
 	}
 	return db.ldb.Write(batch, nil)
-}
-
-func (db *DB) calculateBatchImpact(entries []ValueLogEntry) (map[uint32]int64, int64) {
-	staleBytes := make(map[uint32]int64)
-	keyDelta := int64(0)
-	batchState := make(map[string]bool)
-
-	iter := db.ldb.NewIterator(nil, nil)
-	defer iter.Release()
-
-	for _, e := range entries {
-		key := string(e.Key)
-		exists := false
-
-		if state, seen := batchState[key]; seen {
-			exists = state
-		} else {
-			seekKey := encodeIndexKey(e.Key, math.MaxUint64)
-			if iter.Seek(seekKey) {
-				foundKey := iter.Key()
-				uKey, _, err := decodeIndexKey(foundKey)
-				if err == nil && bytes.Equal(uKey, e.Key) {
-					meta, err := decodeEntryMeta(iter.Value())
-					if err == nil {
-						size := int64(ValueLogHeaderSize) + int64(len(e.Key)) + int64(meta.ValueLen)
-						staleBytes[meta.FileID] += size
-						exists = !meta.IsTombstone
-					}
-				}
-			}
-		}
-
-		if e.IsDelete {
-			if exists {
-				keyDelta--
-			}
-			batchState[key] = false
-		} else {
-			if !exists {
-				keyDelta++
-			}
-			batchState[key] = true
-		}
-	}
-	return staleBytes, keyDelta
 }
 
 func (db *DB) runDiskMonitor() {

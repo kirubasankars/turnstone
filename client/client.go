@@ -48,10 +48,16 @@ const (
 	OpCodeQuit             = 0xFF
 )
 
+// Journal opcodes mirror protocol.OpJournal* / stonedb.WALRecordType. Begin
+// and Abort are only ever sent on a "server" (physical) replication stream;
+// a "cdc" role client (the only user of Subscribe) never receives them since
+// the leader buffers per-xid and only forwards committed Set/Delete/Commit.
 const (
 	OpJournalSet    = 1
 	OpJournalDelete = 2
 	OpJournalCommit = 3
+	OpJournalBegin  = 4
+	OpJournalAbort  = 5
 )
 
 const (

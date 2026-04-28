@@ -258,7 +258,7 @@ func TestRecovery_FullRebuildFromWAL(t *testing.T) {
 
 func TestRecovery_PartialRebuildFromWAL(t *testing.T) {
 	dir := t.TempDir()
-	opts := Options{MaxWALSize: 1024 * 1024} // Ensure WAL is large enough
+	opts := Options{} // Ensure WAL is large enough
 
 	// 1. Create DB and write enough data to span multiple VLog files
 	db, err := Open(dir, opts)
@@ -337,7 +337,7 @@ func TestRecovery_PartialRebuildFromWAL(t *testing.T) {
 
 func TestRecovery_WALTruncation_Atomicity(t *testing.T) {
 	dir := t.TempDir()
-	opts := Options{TruncateCorruptWAL: true, MaxWALSize: 1024 * 1024}
+	opts := Options{TruncateCorruptWAL: true}
 
 	// 1. Setup: Write Tx1 and Tx2
 	db, err := Open(dir, opts)
@@ -365,7 +365,22 @@ func TestRecovery_WALTruncation_Atomicity(t *testing.T) {
 	if len(matches) == 0 {
 		t.Fatal("No WAL files found")
 	}
-	lastWAL := matches[len(matches)-1]
+	sortWALFiles(matches)
+	// db.Close() always checkpoints, which rotates the WAL into a fresh,
+	// empty file. That trailing empty file is just checkpoint noise (no
+	// crash ever touched it); remove it so the file that actually holds
+	// Tx1/Tx2's frames is once again the last (and thus truncatable) file.
+	lastWAL := ""
+	for i := len(matches) - 1; i >= 0; i-- {
+		if info, err := os.Stat(matches[i]); err == nil && info.Size() > 0 {
+			lastWAL = matches[i]
+			break
+		}
+		os.Remove(matches[i])
+	}
+	if lastWAL == "" {
+		t.Fatal("No non-empty WAL file found")
+	}
 
 	info, _ := os.Stat(lastWAL)
 	// Truncate 1 byte off the end. This invalidates the checksum/length of the last frame (Tx2).
@@ -447,7 +462,6 @@ func TestRecovery_WALCorruption_Strict(t *testing.T) {
 func TestRecovery_LastVLogCorruption_PartialWrite(t *testing.T) {
 	dir := t.TempDir()
 	opts := Options{
-		MaxWALSize:         1024 * 1024,
 		TruncateCorruptWAL: true,
 	}
 
@@ -532,7 +546,7 @@ func TestRecovery_LastVLogCorruption_PartialWrite(t *testing.T) {
 
 func TestRecovery_LastVLogCorruption_GarbageAppend(t *testing.T) {
 	dir := t.TempDir()
-	opts := Options{MaxWALSize: 1024 * 1024}
+	opts := Options{}
 
 	// 1. Write data
 	db, err := Open(dir, opts)
@@ -573,7 +587,7 @@ func TestRecovery_LastVLogCorruption_GarbageAppend(t *testing.T) {
 
 func TestRecovery_VLogCorruption_Middle_Strict(t *testing.T) {
 	dir := t.TempDir()
-	opts := Options{MaxWALSize: 1024 * 1024}
+	opts := Options{}
 
 	// 1. Create DB and generate 3 VLog files
 	db, err := Open(dir, opts)

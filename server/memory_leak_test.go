@@ -5,6 +5,8 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"fmt"
+	"net"
 	"testing"
 	"time"
 	"turnstone/protocol"
@@ -43,7 +45,10 @@ func TestMemoryLeak_ReplicationConsumer(t *testing.T) {
 		t.Fatalf("Failed to start fake leader: %v", err)
 	}
 	defer fakeLeader.Close()
-	fakeLeaderAddr := fakeLeader.Addr().String()
+	// fakeLeader.Addr() reports "0.0.0.0:port" (wildcard bind address), which
+	// isn't reliably dialable as a destination; substitute the loopback IP
+	// the dialer should actually connect to.
+	fakeLeaderAddr := fmt.Sprintf("127.0.0.1:%d", fakeLeader.Addr().(*net.TCPAddr).Port)
 
 	// 2. Configure Server to replicate from Fake Leader
 	// We use the Admin client to send `REPLICAOF` command.
@@ -65,13 +70,46 @@ func TestMemoryLeak_ReplicationConsumer(t *testing.T) {
 		t.Fatalf("Failed to step down: %x", statusSD)
 	}
 
+	// StepDown disconnects all connections on this db (including the
+	// current admin session itself); reconnect before issuing further
+	// commands rather than racing the delayed connection-kill.
+	admin.Close()
+	admin = connectClient(t, srv.listener.Addr().String(), getRoleTLS(t, dir, "admin"))
+	defer admin.Close()
+
+	// REPLICAOF first performs a short verification handshake on its own
+	// connection (which it closes) before spawning the persistent streaming
+	// connection. Accept and ack that verification connection in the
+	// background while we wait for the ReplicaOf response.
+	verifyDone := make(chan struct{})
+	go func() {
+		defer close(verifyDone)
+		vconn, err := fakeLeader.Accept()
+		if err != nil {
+			return
+		}
+		defer vconn.Close()
+		buf := make([]byte, 1024)
+		if _, err := vconn.Read(buf); err != nil {
+			return
+		}
+		if buf[0] != protocol.OpCodeReplHello {
+			return
+		}
+		// Ack with OK/empty response so verifyHandshake succeeds.
+		ack := make([]byte, 5)
+		ack[0] = protocol.ResStatusOK
+		_, _ = vconn.Write(ack)
+	}()
+
 	admin.Send(protocol.OpCodeReplicaOf, cmd.Bytes())
 	status, _ := admin.Read()
 	if status != protocol.ResStatusOK {
 		t.Fatalf("Failed to configure replication: %x", status)
 	}
+	<-verifyDone
 
-	// 3. Accept Connection from Server (Consumer)
+	// 3. Accept the persistent streaming connection from the server (Consumer)
 	conn, err := fakeLeader.Accept()
 	if err != nil {
 		t.Fatalf("Fake Leader accept failed: %v", err)
