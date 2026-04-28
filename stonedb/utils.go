@@ -37,6 +37,13 @@ func decodeIndexKey(data []byte) ([]byte, uint64, error) {
 	return key, math.MaxUint64 - invTs, nil
 }
 
+func encodeClogKey(xid uint64) []byte {
+	k := make([]byte, len(sysClogPrefix)+8)
+	copy(k, sysClogPrefix)
+	binary.BigEndian.PutUint64(k[len(sysClogPrefix):], xid)
+	return k
+}
+
 func (m *EntryMeta) Encode() []byte {
 	buf := make([]byte, MetaSize)
 	binary.BigEndian.PutUint32(buf[0:], m.FileID)
