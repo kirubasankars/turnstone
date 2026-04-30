@@ -81,6 +81,27 @@ type Store struct {
 	// We must NOT delete WAL files newer than this, to ensure we can promote to leader
 	// and serve other stragglers.
 	leaderSafeSeq uint64
+
+	// adminMu serializes administrative role-transition commands (REPLICAOF,
+	// PROMOTE, STEPDOWN) for this database. Each of those handlers reads
+	// GetState(), validates it, and only later calls SetState()/Promote()/
+	// AddReplica() -- without a lock spanning that whole sequence, two
+	// concurrent admin connections could both pass a stale state check
+	// (e.g. both see UNDEFINED) and then race into conflicting transitions.
+	adminMu sync.Mutex
+}
+
+// LockAdmin acquires the per-database administrative serialization lock.
+// Callers must pair this with UnlockAdmin (typically via defer) and hold it
+// across the entire read-state -> validate -> mutate-state sequence of a
+// REPLICAOF/PROMOTE/STEPDOWN command.
+func (s *Store) LockAdmin() {
+	s.adminMu.Lock()
+}
+
+// UnlockAdmin releases the per-database administrative serialization lock.
+func (s *Store) UnlockAdmin() {
+	s.adminMu.Unlock()
 }
 
 func NewStore(dir string, logger *slog.Logger, minReplicas int, walStrategy string, maxDiskUsage int, blockCacheSize int) (*Store, error) {
@@ -259,8 +280,11 @@ func (s *Store) runReplicaEviction() {
 }
 
 func (s *Store) evictZombieReplicas() {
-	// Get current head to determine if replicas are actually lagging
-	headSeq := s.DB.LastOpID()
+	// Get current head to determine if replicas are actually lagging.
+	// Goes through the dbMu-guarded wrapper (not s.DB.LastOpID() directly):
+	// s.DB itself can be swapped concurrently by Store.Reset(), which holds
+	// dbMu.Lock() while doing so.
+	headSeq := s.LastOpID()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -351,39 +375,54 @@ func (s *Store) EnforceRetentionPolicy() {
 
 // ApplyBatch applies a batch of protocol entries.
 func (s *Store) ApplyBatch(entries []protocol.LogEntry) error {
+	minReplicas := s.MinReplicas()
+
 	// PATCH 3: Strict Sync Replication (Wait for Replicas BEFORE locking)
 	// If configured for sync replication, verify we have enough healthy replicas connected
 	// to satisfy quorum *before* attempting the commit. This fails fast if the cluster is degraded.
-	if s.minReplicas > 0 {
+	if minReplicas > 0 {
 		healthy := s.HealthyReplicaCount()
-		if healthy < s.minReplicas {
-			return fmt.Errorf("insufficient replicas for safe write: have %d, need %d", healthy, s.minReplicas)
+		if healthy < minReplicas {
+			return fmt.Errorf("insufficient replicas for safe write: have %d, need %d", healthy, minReplicas)
 		}
 	}
 
-	s.dbMu.RLock()
-	defer s.dbMu.RUnlock()
+	var lastOpID uint64
+	err := func() error {
+		s.dbMu.RLock()
+		defer s.dbMu.RUnlock()
 
-	tx := s.DB.NewTransaction(true)
-	for _, e := range entries {
-		var err error
-		if e.OpCode == protocol.OpJournalDelete {
-			err = tx.Delete(e.Key)
-		} else {
-			err = tx.Put(e.Key, e.Value)
+		tx := s.DB.NewTransaction(true)
+		for _, e := range entries {
+			var err error
+			if e.OpCode == protocol.OpJournalDelete {
+				err = tx.Delete(e.Key)
+			} else {
+				err = tx.Put(e.Key, e.Value)
+			}
+			if err != nil {
+				tx.Discard()
+				return err
+			}
 		}
-		if err != nil {
-			tx.Discard()
+
+		if err := tx.Commit(); err != nil {
 			return err
 		}
-	}
-
-	if err := tx.Commit(); err != nil {
+		lastOpID = s.DB.LastOpID()
+		return nil
+	}()
+	if err != nil {
 		return err
 	}
 
-	if s.MinReplicas() > 0 {
-		s.WaitForQuorum(s.DB.LastOpID())
+	if minReplicas > 0 {
+		// Deliberately called after releasing dbMu above: WaitForQuorum can
+		// block for seconds, and holding dbMu.RLock() across it would stall
+		// every other reader/writer (including Store.Reset's dbMu.Lock())
+		// for as long as replicas are catching up -- a single slow write
+		// could otherwise freeze the whole store.
+		return s.WaitForQuorum(lastOpID, 0, nil)
 	}
 
 	return nil
@@ -615,8 +654,28 @@ func (s *Store) SetMinReplicas(n int) {
 	s.cond.Broadcast()
 }
 
-// WaitForQuorum blocks until enough replicas with Role="server" have acknowledged the given logSeq.
-func (s *Store) WaitForQuorum(logSeq uint64) {
+// defaultQuorumTimeout bounds WaitForQuorum when the caller doesn't specify
+// one. An unbounded wait would let a single write hang its caller (and,
+// transitively, any client blocked on that response) forever if replicas
+// never catch up -- e.g. every replica disconnected after the commit but
+// before acking it.
+const defaultQuorumTimeout = 30 * time.Second
+
+// WaitForQuorum blocks until enough currently-connected replicas with
+// Role="server" have acknowledged the given logSeq, or timeout elapses
+// (defaultQuorumTimeout if timeout <= 0), in which case it returns an error
+// instead of hanging. If cancel is non-nil and is closed while waiting,
+// WaitForQuorum returns early with an error -- callers use this to give up
+// promptly if e.g. the client that requested the commit has already
+// disconnected, instead of always holding the wait (and whatever resources
+// the caller holds, such as a connection-semaphore slot) for the full
+// timeout.
+func (s *Store) WaitForQuorum(logSeq uint64, timeout time.Duration, cancel <-chan struct{}) error {
+	if timeout <= 0 {
+		timeout = defaultQuorumTimeout
+	}
+	deadline := time.Now().Add(timeout)
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -626,13 +685,19 @@ func (s *Store) WaitForQuorum(logSeq uint64) {
 	for {
 		acks := 0
 		for _, slot := range s.replicas {
-			if slot.Role == "server" && slot.LogSeq >= logSeq {
+			// Only a slot's *currently connected* replica counts towards
+			// quorum. A disconnected slot's stale high-water LogSeq (e.g.
+			// reloaded verbatim from slots.json on process restart, before
+			// that replica has actually reconnected) must not be able to
+			// satisfy quorum for a replica that isn't actually there right
+			// now to receive/ack future writes.
+			if slot.Connected && slot.Role == "server" && slot.LogSeq >= logSeq {
 				acks++
 			}
 		}
 
 		if acks >= s.minReplicas {
-			return
+			return nil
 		}
 
 		if !warned && time.Since(startWait) > 5*time.Second {
@@ -640,7 +705,36 @@ func (s *Store) WaitForQuorum(logSeq uint64) {
 			warned = true
 		}
 
+		if cancel != nil {
+			select {
+			case <-cancel:
+				return fmt.Errorf("quorum wait cancelled: have %d/%d acks for seq %d", acks, s.minReplicas, logSeq)
+			default:
+			}
+		}
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return fmt.Errorf("timeout waiting for replication quorum: have %d/%d acks for seq %d", acks, s.minReplicas, logSeq)
+		}
+
+		// sync.Cond has no timed-wait primitive; a timer that forces a
+		// periodic wakeup (rebroadcasting into the same Cond) is what
+		// actually enforces the deadline/cancel check, since otherwise
+		// Wait() only returns when a replica ack/registration/
+		// SetMinReplicas calls Broadcast -- which may never happen again
+		// if every replica has gone silent.
+		wake := remaining
+		if wake > time.Second {
+			wake = time.Second
+		}
+		timer := time.AfterFunc(wake, func() {
+			s.mu.Lock()
+			s.cond.Broadcast()
+			s.mu.Unlock()
+		})
 		s.cond.Wait()
+		timer.Stop()
 	}
 }
 
@@ -654,10 +748,18 @@ func (s *Store) loadSlots() {
 	}
 	if err := json.Unmarshal(data, &s.replicas); err != nil {
 		s.logger.Error("Failed to parse replication slots file", "err", err)
-	} else {
-		// CHANGED: Reduced from INFO to DEBUG
-		s.logger.Debug("Loaded replication slots", "count", len(s.replicas))
+		return
 	}
+	// A freshly (re)started process has no live connections yet, no matter
+	// what the persisted snapshot says: whatever TCP connection a slot had
+	// when this file was last saved is long gone. Force every reloaded slot
+	// to Connected=false so it can't falsely satisfy WaitForQuorum's quorum
+	// gate until that replica actually reconnects and re-registers.
+	for _, slot := range s.replicas {
+		slot.Connected = false
+	}
+	// CHANGED: Reduced from INFO to DEBUG
+	s.logger.Debug("Loaded replication slots", "count", len(s.replicas))
 }
 
 func (s *Store) runPersistence() {
@@ -722,7 +824,10 @@ func (s *Store) SetState(state string) {
 
 // Promote promotes the database to a new timeline and sets state to Primary.
 func (s *Store) Promote() error {
-	if err := s.DB.Promote(); err != nil {
+	s.dbMu.RLock()
+	err := s.DB.Promote()
+	s.dbMu.RUnlock()
+	if err != nil {
 		return err
 	}
 	// Reset leader constraint as we are now the leader
@@ -787,7 +892,10 @@ func (s *Store) WaitForActiveTransactions(timeout time.Duration) error {
 	defer ticker.Stop()
 
 	for {
-		if s.DB.ActiveTransactionCount() == 0 {
+		s.dbMu.RLock()
+		count := s.DB.ActiveTransactionCount()
+		s.dbMu.RUnlock()
+		if count == 0 {
 			return nil
 		}
 		if time.Now().After(deadline) {
@@ -797,9 +905,21 @@ func (s *Store) WaitForActiveTransactions(timeout time.Duration) error {
 	}
 }
 
+// AbortAllActiveWriteTransactions force-aborts every in-progress, locally-
+// owned RW transaction. Callers use this when a bounded drain
+// (WaitForActiveTransactions) times out but they still need a hard
+// guarantee that nothing can commit locally after this call returns -- e.g.
+// STEPDOWN, which must not let a straggler transaction commit after the
+// final safe-point has already been broadcast to replicas.
+func (s *Store) AbortAllActiveWriteTransactions() {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	s.DB.AbortAllActiveWriteTransactions()
+}
+
 // WaitForReplication blocks until all connected replicas have acked the current LastOpID.
 func (s *Store) WaitForReplication(timeout time.Duration) error {
-	lastOpID := s.DB.LastOpID()
+	lastOpID := s.LastOpID()
 	deadline := time.Now().Add(timeout)
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()

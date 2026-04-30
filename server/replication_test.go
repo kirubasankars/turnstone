@@ -98,7 +98,7 @@ func startServerNode(t *testing.T, baseDir, name string, sharedTLS *tls.Config) 
 
 	// Wait for listener
 	time.Sleep(50 * time.Millisecond)
-	return srv, srv.listener.Addr().String(), cancel
+	return srv, srv.Addr().String(), cancel
 }
 
 func promoteNode(t *testing.T, baseDir, addr string, databases ...string) {
@@ -764,7 +764,7 @@ func startServerNodeWithReplicas(t *testing.T, baseDir, name string, sharedTLS *
 	go srv.Run(ctx)
 
 	time.Sleep(50 * time.Millisecond)
-	return srv, srv.listener.Addr().String(), cancel
+	return srv, srv.Addr().String(), cancel
 }
 
 func TestReplication_KeyCount_SyncAndAsync(t *testing.T) {

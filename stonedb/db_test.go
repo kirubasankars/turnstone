@@ -609,15 +609,12 @@ func TestLocateWALStart_LevelDBFallback(t *testing.T) {
 
 	// Test case: Locate ID that doesn't exist (future).
 	// Implementation falls back to the last known batch location, which is valid behavior
-	// for scanning (start from the end).
-	_, found, err = db2.locateWALStart(999999)
-	if err != nil {
+	// for scanning (start from the end). Whether it reports found or not is
+	// acceptable either way -- the previous assertion "Should not find future
+	// OpID" was incorrect given the implementation's iter.Last() fallback --
+	// so this case only asserts it doesn't error.
+	if _, _, err = db2.locateWALStart(999999); err != nil {
 		t.Fatal(err)
-	}
-	if !found {
-		// If it's not found, that's acceptable too, but if found, it shouldn't error.
-		// The previous assertion "Should not find future OpID" was incorrect given the implementation's
-		// iter.Last() fallback.
 	}
 }
 

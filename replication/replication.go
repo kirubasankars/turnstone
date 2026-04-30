@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -86,17 +87,57 @@ func (rm *ReplicationManager) Start() {
 	}
 }
 
+// removeDBFromOtherPeersLocked removes any peer entry for dbName that is
+// NOT under keepAddr. A given local database must never replicate from more
+// than one upstream source concurrently: if the caller bypassed the normal
+// REPLICAOF/PROMOTE state-machine guard (or a stale entry was otherwise left
+// behind), this ensures AddReplica itself stays globally deduped by dbName
+// rather than only deduping within the same sourceAddr's entry. Must be
+// called with rm.mu held.
+func (rm *ReplicationManager) removeDBFromOtherPeersLocked(dbName, keepAddr string) {
+	for addr, existingDBs := range rm.peers {
+		if addr == keepAddr {
+			continue
+		}
+		for i, db := range existingDBs {
+			if db.LocalDB != dbName {
+				continue
+			}
+			rm.logger.Warn("Replacing stale/duplicate replication source for db", "db", dbName, "old_source", addr, "new_source", keepAddr)
+			newDBs := make([]ReplicaSource, 0, len(existingDBs)-1)
+			newDBs = append(newDBs, existingDBs[:i]...)
+			newDBs = append(newDBs, existingDBs[i+1:]...)
+			if len(newDBs) > 0 {
+				rm.peers[addr] = newDBs
+			} else {
+				delete(rm.peers, addr)
+				if cancel, exists := rm.cancelFunc[addr]; exists {
+					cancel()
+					delete(rm.cancelFunc, addr)
+				}
+			}
+			break
+		}
+	}
+}
+
 func (rm *ReplicationManager) AddReplica(dbName, sourceAddr, sourceDB string) error {
 	rm.mu.Lock()
 
 	// Check existing
-	dbs, _ := rm.peers[sourceAddr]
+	dbs := rm.peers[sourceAddr]
 	for _, db := range dbs {
 		if db.LocalDB == dbName {
 			rm.mu.Unlock()
 			return nil // Already added
 		}
 	}
+
+	// Defensively dedupe globally by dbName before we even attempt the
+	// handshake, so a stale entry under a different address can't leak
+	// into candidateDBs sent to the (possibly new) upstream.
+	rm.removeDBFromOtherPeersLocked(dbName, sourceAddr)
+	dbs = rm.peers[sourceAddr]
 
 	// Create candidate configuration
 	candidateDBs := make([]ReplicaSource, len(dbs), len(dbs)+1)
@@ -117,12 +158,17 @@ func (rm *ReplicationManager) AddReplica(dbName, sourceAddr, sourceDB string) er
 	defer rm.mu.Unlock()
 
 	// Re-fetch current state in case it changed while we were verifying
-	currentDBs, _ := rm.peers[sourceAddr]
+	currentDBs := rm.peers[sourceAddr]
 	for _, db := range currentDBs {
 		if db.LocalDB == dbName {
 			return nil // Someone else added it
 		}
 	}
+
+	// Re-dedupe: another AddReplica for the same dbName under a different
+	// address may have raced in while we were doing the network handshake.
+	rm.removeDBFromOtherPeersLocked(dbName, sourceAddr)
+	currentDBs = rm.peers[sourceAddr]
 
 	// Append to the *current* authoritative list
 	finalDBs := append(currentDBs, ReplicaSource{LocalDB: dbName, RemoteDB: sourceDB})
@@ -231,10 +277,28 @@ func (rm *ReplicationManager) StopReplication(dbName string) {
 	}
 }
 
+// safeGo runs fn in a new goroutine with panic recovery. A replication
+// connection can be driven by data from a remote peer; if a parsing bug (or
+// a malicious/corrupted peer) ever triggers a panic despite the bounds
+// checks above, this keeps that failure scoped to the single replication
+// goroutine instead of taking down the entire server process, which would
+// otherwise happen since Go does not recover panics across goroutine
+// boundaries.
+func (rm *ReplicationManager) safeGo(name string, fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				rm.logger.Error("replication goroutine panicked", "goroutine", name, "panic", r, "stack", string(debug.Stack()))
+			}
+		}()
+		fn()
+	}()
+}
+
 func (rm *ReplicationManager) spawnConnection(addr string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	rm.cancelFunc[addr] = cancel
-	go rm.maintainConnection(ctx, addr)
+	rm.safeGo("maintainConnection:"+addr, func() { rm.maintainConnection(ctx, addr) })
 }
 
 func (rm *ReplicationManager) maintainConnection(ctx context.Context, addr string) {
@@ -274,6 +338,38 @@ func (rm *ReplicationManager) maintainConnection(ctx context.Context, addr strin
 	}
 }
 
+// readLenPrefixedString reads a [Len:4][Bytes] string from buf at cursor,
+// returning the string, the cursor advanced past it, and whether the read
+// was in-bounds. All wire-format parsing below must use helpers like this
+// (rather than slicing directly) because the data originates from a network
+// peer: a truncated/malformed/malicious packet must never be able to panic
+// this goroutine, since an unrecovered panic here would crash the entire
+// server process, not just this replication connection.
+func readLenPrefixedString(buf []byte, cursor int) (string, int, bool) {
+	if cursor+4 > len(buf) {
+		return "", cursor, false
+	}
+	n := int(binary.BigEndian.Uint32(buf[cursor : cursor+4]))
+	cursor += 4
+	if n < 0 || cursor+n > len(buf) {
+		return "", cursor, false
+	}
+	return string(buf[cursor : cursor+n]), cursor + n, true
+}
+
+// readLenPrefixedBytes is the []byte counterpart of readLenPrefixedString.
+func readLenPrefixedBytes(buf []byte, cursor int) ([]byte, int, bool) {
+	if cursor+4 > len(buf) {
+		return nil, cursor, false
+	}
+	n := int(binary.BigEndian.Uint32(buf[cursor : cursor+4]))
+	cursor += 4
+	if n < 0 || cursor+n > len(buf) {
+		return nil, cursor, false
+	}
+	return buf[cursor : cursor+n], cursor + n, true
+}
+
 // connectAndSync connects to the remote, sends Hello, and checks the response status.
 func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, dbs []ReplicaSource, logger *slog.Logger) error {
 	dialer := net.Dialer{Timeout: 5 * time.Second}
@@ -282,10 +378,10 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 		return err
 	}
 
-	go func() {
+	rm.safeGo("connCloser:"+addr, func() {
 		<-ctx.Done()
 		_ = conn.Close()
-	}()
+	})
 	defer conn.Close()
 
 	logger.Info("Connected to Leader", "db_count", len(dbs))
@@ -428,11 +524,11 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 
 		// --- Handle Full Snapshot ---
 		if opCode == protocol.OpCodeReplSnapshot {
-			cursor := 0
-			nLen := int(binary.BigEndian.Uint32(payload[cursor : cursor+4]))
-			cursor += 4
-			remoteDBName := string(payload[cursor : cursor+nLen])
-			cursor += nLen
+			remoteDBName, cursor, ok := readLenPrefixedString(payload, 0)
+			if !ok || cursor+4 > len(payload) {
+				logger.Warn("Malformed snapshot packet, skipping", "len", len(payload))
+				continue
+			}
 			count := binary.BigEndian.Uint32(payload[cursor : cursor+4])
 			cursor += 4
 			data := payload[cursor:]
@@ -457,21 +553,30 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 						logger.Info("Applying snapshot batch", "db", localDBName, "count", count, "bytes", len(data))
 						dCursor := 0
 						tx := st.DB.NewTransaction(true)
+						malformed := false
 						for i := 0; i < int(count); i++ {
-							kLen := int(binary.BigEndian.Uint32(data[dCursor:]))
-							dCursor += 4
-							key := data[dCursor : dCursor+kLen]
-							dCursor += kLen
-							vLen := int(binary.BigEndian.Uint32(data[dCursor:]))
-							dCursor += 4
-							val := data[dCursor : dCursor+vLen]
-							dCursor += vLen
+							key, next, ok := readLenPrefixedBytes(data, dCursor)
+							if !ok {
+								malformed = true
+								break
+							}
+							dCursor = next
+							val, next, ok := readLenPrefixedBytes(data, dCursor)
+							if !ok {
+								malformed = true
+								break
+							}
+							dCursor = next
 
 							if err := tx.Put(key, val); err != nil {
 								tx.Discard()
 								logger.Error("Failed to apply snapshot entry", "db", localDBName, "err", err)
 								return err
 							}
+						}
+						if malformed {
+							tx.Discard()
+							return fmt.Errorf("malformed snapshot batch for db %s", localDBName)
 						}
 						if err := tx.Commit(); err != nil {
 							logger.Error("Failed to commit snapshot batch", "db", localDBName, "err", err)
@@ -485,11 +590,11 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 
 		// --- Handle Snapshot Done Signal ---
 		if opCode == protocol.OpCodeReplSnapshotDone {
-			cursor := 0
-			nLen := int(binary.BigEndian.Uint32(payload[cursor : cursor+4]))
-			cursor += 4
-			remoteDBName := string(payload[cursor : cursor+nLen])
-			cursor += nLen
+			remoteDBName, cursor, ok := readLenPrefixedString(payload, 0)
+			if !ok {
+				logger.Warn("Malformed snapshot-done packet, skipping", "len", len(payload))
+				continue
+			}
 			cursor += 4 // Skip Count(0)
 
 			if cursor+16 <= len(payload) {
@@ -513,11 +618,11 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 
 		// --- Handle Standard WAL Batch ---
 		if opCode == protocol.OpCodeReplBatch {
-			cursor := 0
-			nLen := int(binary.BigEndian.Uint32(payload[cursor : cursor+4]))
-			cursor += 4
-			remoteDBName := string(payload[cursor : cursor+nLen])
-			cursor += nLen
+			remoteDBName, cursor, ok := readLenPrefixedString(payload, 0)
+			if !ok || cursor+4 > len(payload) {
+				logger.Warn("Malformed batch packet, skipping", "len", len(payload))
+				continue
+			}
 			count := binary.BigEndian.Uint32(payload[cursor : cursor+4])
 			cursor += 4
 			data := payload[cursor:]

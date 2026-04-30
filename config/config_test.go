@@ -122,8 +122,15 @@ func TestGenerateConfigArtifacts(t *testing.T) {
 		info, err := os.Stat(path)
 		if os.IsNotExist(err) {
 			t.Errorf("Certificate artifact missing: %s", f)
+			continue
 		} else if info.Size() == 0 {
 			t.Errorf("Certificate artifact is empty: %s", f)
+		}
+		// Private keys must not be group/world-readable; public certs are fine at 0644.
+		if strings.HasSuffix(f, ".key") {
+			if perm := info.Mode().Perm(); perm != 0o600 {
+				t.Errorf("Private key %s has permissions %o, want 0600", f, perm)
+			}
 		}
 	}
 }
@@ -206,5 +213,31 @@ func TestValidateSecurityConfig(t *testing.T) {
 	}
 	if err := ValidateSecurityConfig(badCfg); err == nil {
 		t.Error("Expected error for missing cert file, got nil")
+	}
+}
+
+// TestValidateConfig checks MaxDiskUsagePercent range validation.
+func TestValidateConfig(t *testing.T) {
+	cases := []struct {
+		name    string
+		pct     int
+		wantErr bool
+	}{
+		{"disabled", 0, false},
+		{"typical", 90, false},
+		{"max", 100, false},
+		{"negative", -5, true},
+		{"over100", 150, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateConfig(Config{MaxDiskUsagePercent: tc.pct})
+			if tc.wantErr && err == nil {
+				t.Errorf("expected error for pct=%d, got nil", tc.pct)
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("expected no error for pct=%d, got %v", tc.pct, err)
+			}
+		})
 	}
 }

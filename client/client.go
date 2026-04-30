@@ -16,6 +16,12 @@ import (
 	"time"
 )
 
+// defaultIOTimeout is used for Config.ReadTimeout/WriteTimeout when the
+// caller leaves them unset (zero). Without a default, a slow or
+// network-partitioned server leaves roundTrip()/Subscribe() blocked in
+// I/O forever with no way for the caller to notice or recover.
+const defaultIOTimeout = 30 * time.Second
+
 // --- Protocol Constants ---
 
 const ProtoHeaderSize = 5
@@ -141,11 +147,18 @@ type Client struct {
 	logger   *slog.Logger
 	pool     *Pool
 	poisoned bool
+	closed   bool
 }
 
 func NewClient(cfg Config) (*Client, error) {
 	if cfg.ConnectTimeout == 0 {
 		cfg.ConnectTimeout = 5 * time.Second
+	}
+	if cfg.ReadTimeout == 0 {
+		cfg.ReadTimeout = defaultIOTimeout
+	}
+	if cfg.WriteTimeout == 0 {
+		cfg.WriteTimeout = defaultIOTimeout
 	}
 	logger := cfg.Logger
 	if logger == nil {
@@ -203,28 +216,21 @@ func (c *Client) connect() error {
 	return nil
 }
 
+// Close either returns c to its pool (if it's healthy and the pool isn't
+// shutting down) or closes its underlying connection directly. It is
+// idempotent: calling Close() more than once on the same *Client is a
+// no-op after the first call, so a double-Close (e.g. a defer plus an
+// explicit early Close()) can't push the same client into the pool's idle
+// set twice.
 func (c *Client) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closed {
+		return nil
+	}
+	c.closed = true
 	if c.pool != nil {
-		if c.poisoned {
-			c.pool.reportClosed()
-			if c.conn != nil {
-				c.logger.Info("Closing poisoned connection", "addr", c.config.Address)
-				return c.conn.Close()
-			}
-			return nil
-		}
-		select {
-		case c.pool.idle <- c:
-			return nil
-		default:
-			c.pool.reportClosed()
-			if c.conn != nil {
-				return c.conn.Close()
-			}
-			return nil
-		}
+		return c.pool.releaseOrClose(c)
 	}
 	if c.conn != nil {
 		c.logger.Info("Closing connection", "addr", c.config.Address)
@@ -284,19 +290,53 @@ func (p *Pool) Get() (*Client, error) {
 		return c, nil
 	}
 	p.mu.Unlock()
-	select {
-	case c, ok := <-p.idle:
-		if !ok {
-			return nil, errors.New("pool is closed")
-		}
-		return c, nil
+	c, ok := <-p.idle
+	if !ok {
+		return nil, errors.New("pool is closed")
 	}
+	return c, nil
 }
 
 func (p *Pool) reportClosed() {
 	p.mu.Lock()
 	p.currentCap--
 	p.mu.Unlock()
+}
+
+// releaseOrClose returns c to the pool's idle set if it's healthy and the
+// pool isn't shutting down; otherwise it closes c's connection directly and
+// decrements currentCap. The idle-channel send happens while holding p.mu,
+// which is what makes this safe against a concurrent Pool.Close(): that
+// function also takes p.mu before setting p.closed and closing the idle
+// channel, so the two can never interleave as "send" then "close on a
+// channel a send is still in flight for". Without this shared lock,
+// Client.Close() sending on p.idle after Pool.Close() has already closed
+// it panics with "send on closed channel".
+func (p *Pool) releaseOrClose(c *Client) error {
+	p.mu.Lock()
+	if p.closed || c.poisoned {
+		p.currentCap--
+		p.mu.Unlock()
+		if c.conn != nil {
+			if c.poisoned {
+				c.logger.Info("Closing poisoned connection", "addr", c.config.Address)
+			}
+			return c.conn.Close()
+		}
+		return nil
+	}
+	select {
+	case p.idle <- c:
+		p.mu.Unlock()
+		return nil
+	default:
+		p.currentCap--
+		p.mu.Unlock()
+		if c.conn != nil {
+			return c.conn.Close()
+		}
+		return nil
+	}
 }
 
 func (p *Pool) Close() {
@@ -389,6 +429,13 @@ func (c *Client) ReplicaOf(sourceAddr, sourceDB string) error {
 }
 
 func (c *Client) Promote(minReplicas int) error {
+	// A negative value wraps around through the uint32 cast below (e.g.
+	// -1 becomes 4294967295), silently requesting a quorum the server can
+	// never satisfy. Reject it here instead of sending nonsense over the
+	// wire.
+	if minReplicas < 0 {
+		return fmt.Errorf("minReplicas must be >= 0, got %d", minReplicas)
+	}
 	payload := make([]byte, 4)
 	binary.BigEndian.PutUint32(payload, uint32(minReplicas))
 	_, err := c.roundTrip(OpCodePromote, payload)
@@ -573,7 +620,12 @@ func (c *Client) Subscribe(dbName string, startSeq uint64, handler func(Change) 
 	}
 	clientID := c.config.ClientID
 	if clientID == "" {
-		clientID = "client-unknown"
+		// The server's own handshake rejects the literal string
+		// "client-unknown" (server/replication.go treats it the same as
+		// an empty ID), so falling back to that exact value here meant
+		// every default-configured Subscribe() caller was guaranteed to
+		// fail its handshake. Generate a unique-enough fallback instead.
+		clientID = fmt.Sprintf("client-%d-%d", os.Getpid(), time.Now().UnixNano())
 	}
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.BigEndian, uint32(1))

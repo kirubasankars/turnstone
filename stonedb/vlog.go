@@ -12,8 +12,84 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 )
+
+// parseVLogFileID extracts the numeric file ID from a VLog file path. Unlike
+// fmt.Sscanf(name, "%04d.vlog", ...), the width modifier in "%04d" caps how
+// many digits Sscanf will consume (4), so it silently fails to parse (and
+// therefore silently skips) any file ID >= 10000 once rotation runs long
+// enough to produce 5+ digit names -- those files would then vanish from
+// maxFid/GetImmutableFileIDs and be excluded from Recover/Replay entirely.
+// strconv.ParseUint has no such width limit.
+func parseVLogFileID(path string) (uint32, error) {
+	base := filepath.Base(path)
+	s := strings.TrimSuffix(base, ".vlog")
+	n, err := strconv.ParseUint(s, 10, 32)
+	if err != nil {
+		return 0, err
+	}
+	return uint32(n), nil
+}
+
+// sortVLogFiles orders VLog file paths numerically by file ID. A plain
+// lexicographic sort.Strings only happens to match numeric order while every
+// file ID has the same digit count (i.e. below 10000, given "%04d.vlog"
+// zero-padding) -- once a 5-digit ID appears, e.g. "10000.vlog" sorts before
+// "9999.vlog" lexicographically, which is backwards.
+func sortVLogFiles(paths []string) {
+	sort.Slice(paths, func(i, j int) bool {
+		idI, _ := parseVLogFileID(paths[i])
+		idJ, _ := parseVLogFileID(paths[j])
+		return idI < idJ
+	})
+}
+
+// cachedVLogFile is a refcounted, evictable read handle on a VLog file.
+// getFileHandle hands these out (incrementing refs) to callers doing a
+// ReadAt; evictOldest/DeleteFile/Close mark pendingClose and only actually
+// close the underlying *os.File once every outstanding reader has released
+// it. Without this, a concurrent ReadAt could still be in flight against an
+// *os.File that eviction/deletion/compaction closed out from under it.
+type cachedVLogFile struct {
+	f            *os.File
+	mu           sync.Mutex
+	refs         int
+	pendingClose bool
+}
+
+func (c *cachedVLogFile) acquire() {
+	c.mu.Lock()
+	c.refs++
+	c.mu.Unlock()
+}
+
+// release drops a reference. If the handle has since been evicted/deleted
+// and this was the last outstanding reference, it is closed here instead of
+// at eviction time.
+func (c *cachedVLogFile) release() {
+	c.mu.Lock()
+	c.refs--
+	shouldClose := c.pendingClose && c.refs <= 0
+	c.mu.Unlock()
+	if shouldClose {
+		c.f.Close()
+	}
+}
+
+// markForClose flags the handle to be closed once its last active reader
+// releases it (immediately, if there are no active readers right now).
+func (c *cachedVLogFile) markForClose() {
+	c.mu.Lock()
+	c.pendingClose = true
+	shouldClose := c.refs <= 0
+	c.mu.Unlock()
+	if shouldClose {
+		c.f.Close()
+	}
+}
 
 // ValueLog manages storage of values on disk in append-only files.
 type ValueLog struct {
@@ -21,7 +97,7 @@ type ValueLog struct {
 	currentFile  *os.File
 	currentFid   uint32
 	writeOffset  int64 // Updated to int64 for 64-bit offsets
-	fileCache    map[uint32]*os.File
+	fileCache    map[uint32]*cachedVLogFile
 	lruOrder     []uint32 // Ordered list of fileIDs for eviction (newest at end)
 	maxOpenFiles int
 	maxSize      int64 // Updated to int64
@@ -50,8 +126,7 @@ func OpenValueLog(dir string, maxSize int64, logger *slog.Logger) (*ValueLog, er
 
 	maxFid := uint32(0)
 	for _, m := range matches {
-		var fid uint32
-		if _, err := fmt.Sscanf(filepath.Base(m), "%04d.vlog", &fid); err == nil {
+		if fid, err := parseVLogFileID(m); err == nil {
 			if fid > maxFid {
 				maxFid = fid
 			}
@@ -76,7 +151,7 @@ func OpenValueLog(dir string, maxSize int64, logger *slog.Logger) (*ValueLog, er
 		currentFile:  f,
 		currentFid:   maxFid,
 		writeOffset:  stat.Size(), // int64
-		fileCache:    make(map[uint32]*os.File),
+		fileCache:    make(map[uint32]*cachedVLogFile),
 		lruOrder:     make([]uint32, 0),
 		maxOpenFiles: DefaultValueLogMaxOpenFiles,
 		maxSize:      maxSize,
@@ -93,7 +168,7 @@ func (vl *ValueLog) Recover() (uint64, uint64, error) {
 	if err != nil {
 		return 0, 0, err
 	}
-	sort.Strings(matches)
+	sortVLogFiles(matches)
 
 	maxTx := uint64(0)
 	maxOp := uint64(0)
@@ -142,6 +217,21 @@ func (vl *ValueLog) Recover() (uint64, uint64, error) {
 		}
 	}
 	return maxTx, maxOp, nil
+}
+
+// CurrentFileID returns the ID of the currently active (writable) VLog file.
+func (vl *ValueLog) CurrentFileID() uint32 {
+	vl.mu.RLock()
+	defer vl.mu.RUnlock()
+	return vl.currentFid
+}
+
+// Sync fsyncs the currently active VLog file, making everything written to
+// it so far durable.
+func (vl *ValueLog) Sync() error {
+	vl.mu.Lock()
+	defer vl.mu.Unlock()
+	return vl.currentFile.Sync()
 }
 
 func (vl *ValueLog) Rotate() error {
@@ -214,8 +304,7 @@ func (vl *ValueLog) GetImmutableFileIDs() ([]uint32, error) {
 
 	var ids []uint32
 	for _, m := range matches {
-		var fid uint32
-		if _, err := fmt.Sscanf(filepath.Base(m), "%04d.vlog", &fid); err == nil {
+		if fid, err := parseVLogFileID(m); err == nil {
 			if fid != vl.currentFid {
 				ids = append(ids, fid)
 			}
@@ -235,9 +324,10 @@ func (vl *ValueLog) DeleteFile(fileID uint32) error {
 		return errors.New("cannot delete active file")
 	}
 
-	// Close cached handle and update LRU
-	if f, ok := vl.fileCache[fileID]; ok {
-		f.Close()
+	// Mark the cached handle for close (deferred until any in-flight
+	// ReadAt using it releases its reference) and update LRU.
+	if c, ok := vl.fileCache[fileID]; ok {
+		c.markForClose()
 		delete(vl.fileCache, fileID)
 		// Remove from LRU list
 		for i, id := range vl.lruOrder {
@@ -381,19 +471,41 @@ func (vl *ValueLog) AppendEntries(entries []ValueLogEntry) (uint32, int64, error
 	}
 
 	n, err := vl.currentFile.Write(buf.Bytes())
+	if n > 0 {
+		// Advance writeOffset by whatever was actually written to the file
+		// *before* checking err: os.File.Write can return n > 0 alongside a
+		// non-nil error on a partial write. If we left writeOffset at its
+		// old value here, the next AppendEntries call would use it as its
+		// startOffset -- but the file's real EOF is now n bytes further
+		// along (this partial write's leftover garbage), so the next
+		// entry's header/data would be recorded in the index at an offset
+		// that doesn't actually point at what was written, corrupting the
+		// next read.
+		vl.writeOffset += int64(n)
+	}
 	if err != nil {
+		// Best-effort: truncate the partial write away so the file and our
+		// tracked offset agree again, instead of leaving a torn record for
+		// the next append (or a future Recover scan) to trip over.
+		if truncErr := vl.currentFile.Truncate(startOffset); truncErr == nil {
+			vl.currentFile.Seek(0, io.SeekEnd)
+			vl.writeOffset = startOffset
+		} else {
+			vl.logger.Error("VLog partial write recovery: truncate failed, writeOffset may be desynced from file", "err", truncErr)
+		}
 		return 0, 0, err
 	}
 
-	vl.writeOffset += int64(n)
 	return vl.currentFid, startOffset, nil
 }
 
 func (vl *ValueLog) ReadValue(fileID uint32, offset int64, valLen uint32) ([]byte, error) {
-	f, err := vl.getFileHandle(fileID)
+	c, err := vl.getFileHandle(fileID)
 	if err != nil {
 		return nil, err
 	}
+	defer c.release()
+	f := c.f
 
 	header := make([]byte, ValueLogHeaderSize)
 	if _, err := f.ReadAt(header, offset); err != nil {
@@ -419,36 +531,38 @@ func (vl *ValueLog) ReadValue(fileID uint32, offset int64, valLen uint32) ([]byt
 	return data[valStart : valStart+valLen], nil
 }
 
-func (vl *ValueLog) getFileHandle(fileID uint32) (*os.File, error) {
+// getFileHandle returns a refcounted read handle for fileID, always through
+// a dedicated read-only *os.File independent of vl.currentFile -- including
+// for the currently-active file. This matters because vl.currentFile is the
+// live writer fd that Rotate()/AppendEntries's size-triggered rotation can
+// close out from under a caller at any time; handing that same fd out for
+// reads would let a concurrent rotation close it mid-ReadAt. Every returned
+// handle must be released via its release() method.
+func (vl *ValueLog) getFileHandle(fileID uint32) (*cachedVLogFile, error) {
 	vl.mu.Lock()
 	defer vl.mu.Unlock()
 
-	// 1. Check Active File
-	if fileID == vl.currentFid {
-		return vl.currentFile, nil
-	}
-
-	// 2. Check Cache
-	if f, ok := vl.fileCache[fileID]; ok {
+	if c, ok := vl.fileCache[fileID]; ok {
 		vl.moveToBack(fileID)
-		return f, nil
+		c.acquire()
+		return c, nil
 	}
 
-	// 3. Evict if needed
 	if len(vl.fileCache) >= vl.maxOpenFiles {
 		vl.evictOldest()
 	}
 
-	// 4. Open File
 	path := filepath.Join(vl.dir, fmt.Sprintf("%04d.vlog", fileID))
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 
-	vl.fileCache[fileID] = f
+	c := &cachedVLogFile{f: f}
+	c.acquire()
+	vl.fileCache[fileID] = c
 	vl.lruOrder = append(vl.lruOrder, fileID)
-	return f, nil
+	return c, nil
 }
 
 func (vl *ValueLog) moveToBack(fileID uint32) {
@@ -472,8 +586,8 @@ func (vl *ValueLog) evictOldest() {
 	oldestID := vl.lruOrder[0]
 	vl.lruOrder = vl.lruOrder[1:]
 
-	if f, ok := vl.fileCache[oldestID]; ok {
-		f.Close()
+	if c, ok := vl.fileCache[oldestID]; ok {
+		c.markForClose()
 		delete(vl.fileCache, oldestID)
 	}
 }
@@ -486,12 +600,11 @@ func (vl *ValueLog) Replay(maxTxID uint64, fn func(ValueLogEntry, EntryMeta) err
 	if err != nil {
 		return err
 	}
-	sort.Strings(matches)
+	sortVLogFiles(matches)
 
 	for _, path := range matches {
-		base := filepath.Base(path)
-		var fileID uint32
-		if _, err := fmt.Sscanf(base, "%04d.vlog", &fileID); err != nil {
+		fileID, err := parseVLogFileID(path)
+		if err != nil {
 			continue
 		}
 
@@ -518,25 +631,6 @@ func (vl *ValueLog) Replay(maxTxID uint64, fn func(ValueLogEntry, EntryMeta) err
 	return nil
 }
 
-func (vl *ValueLog) Truncate(offset int64) error {
-	vl.mu.Lock()
-	defer vl.mu.Unlock()
-
-	// 1. Truncate the file physically
-	if err := vl.currentFile.Truncate(offset); err != nil {
-		return err
-	}
-
-	// 2. Reset the file pointer (crucial for next write)
-	if _, err := vl.currentFile.Seek(offset, 0); err != nil {
-		return err
-	}
-
-	// 3. Reset internal offset state
-	vl.writeOffset = offset
-	return nil
-}
-
 func (vl *ValueLog) Close() error {
 	vl.mu.Lock()
 	defer vl.mu.Unlock()
@@ -544,11 +638,11 @@ func (vl *ValueLog) Close() error {
 	if err := vl.currentFile.Close(); err != nil {
 		return err
 	}
-	for _, f := range vl.fileCache {
-		f.Close()
+	for _, c := range vl.fileCache {
+		c.markForClose()
 	}
 	// Clear cache references
-	vl.fileCache = make(map[uint32]*os.File)
+	vl.fileCache = make(map[uint32]*cachedVLogFile)
 	vl.lruOrder = nil
 	return nil
 }

@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"math"
 	"net"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -17,6 +18,18 @@ import (
 	"turnstone/stonedb"
 	"turnstone/store"
 )
+
+// recoverAndLog is deferred at the top of every replication goroutine. These
+// goroutines parse network input from remote peers and run for the lifetime
+// of a replica connection; an unrecovered panic in any of them would take
+// down the entire server process (all databases, all client connections),
+// not just this one connection, since Go does not recover panics across
+// goroutine boundaries.
+func recoverAndLog(logger *slog.Logger, name string) {
+	if r := recover(); r != nil {
+		logger.Error("replication goroutine panicked", "goroutine", name, "panic", r, "stack", string(debug.Stack()))
+	}
+}
 
 var (
 	MaxReplicationBatchSize = 1 * 1024 * 1024 // 1MB
@@ -28,6 +41,10 @@ const (
 	ReplicaWriteTimeout = 10 * 60 * time.Second
 	// SnapshotRateLimit caps the full-sync bandwidth to prevent disk/network thrashing (32MB/s).
 	SnapshotRateLimit = 32 * 1024 * 1024
+	// MaxReplAckSize bounds the ACK-reader's per-frame allocation. A real
+	// ACK body is [DBNameLen(4)][DBName][LogID(8)]; 64KB is far more than
+	// any legitimate db name could need.
+	MaxReplAckSize = 64 * 1024
 )
 
 type replPacket struct {
@@ -161,6 +178,7 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 		killWg.Add(1)
 		go func(c <-chan struct{}) {
 			defer killWg.Done()
+			defer recoverAndLog(st.logger, "killChannelWatcher")
 			select {
 			case <-c:
 				killOnce.Do(func() { close(mergedKill) })
@@ -189,6 +207,7 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 			physical := st.role != RoleCDC
 			go func(name string, sp *store.Store, startLogID uint64, physical bool) {
 				defer wg.Done()
+				defer recoverAndLog(st.logger, "streamDB:"+name)
 				if err := s.streamDB(name, sp, startLogID, outCh, done, st.logger, physical); err != nil {
 					st.logger.Error("Replica stream failed", "db", name, "err", err)
 					select {
@@ -202,6 +221,7 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 
 	// ACK Reader (KeepAlive & Progress)
 	go func() {
+		defer recoverAndLog(st.logger, "ackReader")
 		h := make([]byte, 5)
 		for {
 			// Allow a generous read deadline for heartbeats, but not infinite
@@ -213,25 +233,45 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 				}
 				return
 			}
-			if h[0] == protocol.OpCodeReplAck {
-				ln := binary.BigEndian.Uint32(h[1:])
-				b := make([]byte, ln)
-				if _, err := io.ReadFull(r, b); err != nil {
-					select {
-					case errCh <- err:
-					default:
-					}
-					return
+
+			ln := binary.BigEndian.Uint32(h[1:])
+			// Cap the allocation: this length is fully peer-controlled, and
+			// a real ACK body ([DBNameLen][DBName][LogID]) never needs more
+			// than a few hundred bytes. Without a cap, a malicious/broken
+			// peer can force an arbitrarily large (up to 4GB) allocation
+			// per frame here.
+			if ln > MaxReplAckSize {
+				select {
+				case errCh <- fmt.Errorf("ack frame too large: %d bytes", ln):
+				default:
 				}
-				// Parse ACK: [DBNameLen][DBName][LogID]
-				if len(b) > 4 {
-					nL := binary.BigEndian.Uint32(b[:4])
-					if len(b) >= 4+int(nL)+8 {
-						dbName := string(b[4 : 4+nL])
-						logID := binary.BigEndian.Uint64(b[4+nL:])
-						if storePtr, ok := s.stores[dbName]; ok {
-							storePtr.UpdateReplicaLogSeq(replicaID, logID)
-						}
+				return
+			}
+			b := make([]byte, ln)
+			if _, err := io.ReadFull(r, b); err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
+				return
+			}
+
+			// Always consume exactly `ln` bytes above regardless of opcode
+			// so framing stays in sync on this connection: previously, a
+			// non-ACK opcode here skipped reading its body entirely,
+			// permanently desyncing every subsequent header read on this
+			// connection.
+			if h[0] != protocol.OpCodeReplAck {
+				continue
+			}
+
+			// Parse ACK: [DBNameLen][DBName][LogID]
+			if len(b) > 4 {
+				nL := binary.BigEndian.Uint32(b[:4])
+				if len(b) >= 4+int(nL)+8 {
+					logID := binary.BigEndian.Uint64(b[4+nL:])
+					if storePtr, ok := s.stores[string(b[4:4+nL])]; ok {
+						storePtr.UpdateReplicaLogSeq(replicaID, logID)
 					}
 				}
 			}

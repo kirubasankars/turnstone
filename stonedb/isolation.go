@@ -1,5 +1,12 @@
 package stonedb
 
+import (
+	"bytes"
+	"math"
+
+	"github.com/syndtr/goleveldb/leveldb/iterator"
+)
+
 // checkReadSetConflicts implements the read half of Snapshot Isolation
 // validation at COMMIT time: if any key we read has since gained a newer
 // committed version that our snapshot could not see, we must abort
@@ -21,11 +28,47 @@ func (tx *Transaction) checkReadSetConflicts() error {
 
 	for k := range tx.readSet {
 		key := []byte(k)
-		_, xmin, found := tx.db.latestResolvedMeta(iter, key, tx.xid)
-		if found && (xmin >= tx.snapshot.Xmax || tx.snapshot.contains(xmin)) {
-			tx.db.logger.Debug("Read-set conflict detected", "key", k, "xmin", xmin, "snapshot_xmax", tx.snapshot.Xmax)
+		if tx.db.hasNewerCommittedVersion(iter, key, tx.xid, tx.snapshot) {
+			tx.db.logger.Debug("Read-set conflict detected", "key", k, "snapshot_xmax", tx.snapshot.Xmax)
 			return ErrWriteConflict
 		}
 	}
 	return nil
+}
+
+// hasNewerCommittedVersion reports whether a *durably committed* version of
+// key exists that snap could not see (xmin >= snap.Xmax, or xmin was still
+// in-progress as of snap). Unlike latestResolvedMeta (used by the write
+// path, where lock exclusivity guarantees any other version found has
+// already fully resolved), this must not treat a still-in-progress writer
+// as a definitive conflict: that writer might never commit, and punishing a
+// committing reader for a write that never lands would be a real deviation
+// from Snapshot Isolation (only a *committed* write can violate it). We skip
+// past in-progress/aborted versions and keep looking at older ones instead.
+func (db *DB) hasNewerCommittedVersion(iter iterator.Iterator, key []byte, excludeXid uint64, snap Snapshot) bool {
+	seekKey := encodeIndexKey(key, math.MaxUint64)
+	if !iter.Seek(seekKey) {
+		return false
+	}
+	for iter.Valid() {
+		foundKey := iter.Key()
+		uKey, xmin, err := decodeIndexKey(foundKey)
+		if err != nil || !bytes.Equal(uKey, key) {
+			return false
+		}
+		if xmin == excludeXid {
+			iter.Next()
+			continue
+		}
+		if db.clogStatus(xmin) != TxCommitted {
+			// Aborted, or still undecided: neither can be a genuine
+			// snapshot-isolation conflict. Keep walking toward older
+			// versions -- if the writer eventually commits, it will be
+			// caught by this same check.
+			iter.Next()
+			continue
+		}
+		return xmin >= snap.Xmax || snap.contains(xmin)
+	}
+	return false
 }

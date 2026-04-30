@@ -12,14 +12,35 @@ import (
 	"github.com/syndtr/goleveldb/leveldb/opt"
 )
 
+// relocateEntry pairs a ValueLog entry being compacted forward with its
+// original physical offset in the source file, so rewriteBatch's
+// re-verification can confirm the index still points at exactly this
+// (file, offset) pair rather than merely a matching OperationID (which a
+// previous, possibly partial, compaction pass could have already relocated
+// elsewhere while leaving the same OperationID behind).
+type relocateEntry struct {
+	entry      ValueLogEntry
+	origOffset int64
+}
+
 // RunCompaction picks the file with the most stale data and compacts it.
 // Returns true if a file was compacted, false if no candidates were found.
 func (db *DB) RunCompaction() (bool, error) {
+	// Guard against concurrent compaction passes (the auto-compaction loop
+	// and a manually-triggered one) picking the same candidate file: both
+	// would relocate the same live entries independently, duplicating them
+	// and leaking the untracked copies as garbage forever, and could each
+	// try to os.Remove the same now-empty file.
+	if !atomic.CompareAndSwapInt32(&db.compacting, 0, 1) {
+		return false, nil
+	}
+	defer atomic.StoreInt32(&db.compacting, 0)
+
 	// 1. Pick Candidate
 	db.mu.RLock()
 	var bestFid uint32
 	var maxGarbage int64
-	activeFid := db.valueLog.currentFid
+	activeFid := db.valueLog.CurrentFileID()
 
 	for fid, garbage := range db.deletedBytesByFile {
 		// Don't compact the active file
@@ -41,7 +62,7 @@ func (db *DB) RunCompaction() (bool, error) {
 	db.logger.Info("Compacting file", "file_id", bestFid, "garbage_bytes", maxGarbage)
 
 	// 2. Rewrite valid entries
-	var validEntries []ValueLogEntry
+	var validEntries []relocateEntry
 	currentBatchSize := 0
 	// Limit batch size to ~2MB or 1000 entries to control memory usage during compaction
 	const maxBatchBytes = 2 * 1024 * 1024
@@ -65,7 +86,7 @@ func (db *DB) RunCompaction() (bool, error) {
 	flushValid := func() error {
 		if len(validEntries) > 0 {
 			// rewriteBatch will handle re-verification and index updates for these
-			if err := db.rewriteBatch(validEntries); err != nil {
+			if err := db.rewriteBatch(validEntries, bestFid); err != nil {
 				return err
 			}
 			validEntries = validEntries[:0]
@@ -80,11 +101,11 @@ func (db *DB) RunCompaction() (bool, error) {
 
 	horizon := db.minActiveSnapshotXmax()
 
-	err := db.valueLog.IterateFile(bestFid, func(e ValueLogEntry, _ EntryMeta) error {
+	err := db.valueLog.IterateFile(bestFid, func(e ValueLogEntry, m EntryMeta) error {
 		isAlive, isCurrentPointer := db.isEntryAlive(iter, e, horizon)
 
 		if isAlive {
-			validEntries = append(validEntries, e)
+			validEntries = append(validEntries, relocateEntry{entry: e, origOffset: m.ValueOffset})
 			currentBatchSize += len(e.Key) + len(e.Value) + ValueLogHeaderSize
 
 			if currentBatchSize >= maxBatchBytes || len(validEntries) >= maxBatchCount {
@@ -263,11 +284,29 @@ func (db *DB) deleteObsoleteFiles() {
 
 // rewriteBatch moves valid entries to the active log and updates the index.
 // It includes a critical re-verification step under lock to prevent race conditions.
-func (db *DB) rewriteBatch(entries []ValueLogEntry) error {
+func (db *DB) rewriteBatch(entries []relocateEntry, origFileID uint32) error {
 	// 1. Write to VLog (Expensive I/O) - NO LOCK
-	fileID, baseOffset, err := db.valueLog.AppendEntries(entries)
+	plain := make([]ValueLogEntry, len(entries))
+	for i, re := range entries {
+		plain[i] = re.entry
+	}
+	fileID, baseOffset, err := db.valueLog.AppendEntries(plain)
 	if err != nil {
 		return err
+	}
+
+	// Fsync the relocated copy before repointing the index at it. Compaction
+	// relocations keep each entry's original, already-below-watermark
+	// OperationID, so recovery's redo logic (which only trusts WAL records
+	// with OpID above the ValueLog's recovered high-water mark) can never
+	// redo them if they go missing -- an unsynced write here is this
+	// relocated copy's only chance at durability. If we crash before this
+	// Sync, the source file (origFileID) is still untouched and still the
+	// index's current pointer, so nothing is lost; the risk is only a crash
+	// *after* the index update below points at bytes that were never
+	// flushed.
+	if err := db.valueLog.Sync(); err != nil {
+		return fmt.Errorf("vlog sync failed during compaction relocation: %w", err)
 	}
 
 	// 2. Update Index (Fast Memory Ops) - LOCK REQUIRED
@@ -279,25 +318,41 @@ func (db *DB) rewriteBatch(entries []ValueLogEntry) error {
 	currentOffset := baseOffset
 	var newGarbage int64
 
-	for _, e := range entries {
+	for _, re := range entries {
+		e := re.entry
 		recSize := ValueLogHeaderSize + len(e.Key) + len(e.Value)
 		isLatest := false
 
 		// Re-verify against current index state under lock, by exact
-		// (key, xid) lookup -- NOT "is this the newest version for the
-		// key". Vacuum-horizon compaction can legitimately keep an older
+		// (key, xid) lookup AND the exact (FileID, offset) we relocated
+		// this entry from -- NOT merely a matching OperationID.
+		// Vacuum-horizon compaction can legitimately keep an older
 		// committed version alive (still visible to a long-lived snapshot)
 		// even after a newer version has since been written for the same
-		// key; a "still the newest" check would wrongly conclude the older
-		// version's own index entry is now dead and must be deleted here,
-		// erasing the only copy of a version some open snapshot still
-		// needs. The exact entry can only have moved (or been reclaimed)
-		// via this same code path or explicit GC, so checking that it
-		// still points at the (FileID, offset) we're relocating from is
-		// both necessary and sufficient.
+		// key, so a "still the newest" check would be wrong. But a bare
+		// OperationID match is not sufficient either: a relocated entry
+		// keeps its original OperationID forever, so it cannot distinguish
+		// "this is still the original, unmoved entry in origFileID" from
+		// "a previous (possibly partial) compaction pass already relocated
+		// this same entry elsewhere, and something else now legitimately
+		// occupies this OperationID's slot by coincidence of an aborted
+		// retry" -- silently leaking the earlier relocated copy as
+		// untracked garbage forever. Checking the source (FileID, offset)
+		// too makes the check exact.
+		alreadyRelocatedElsewhere := false
 		if raw, err := db.ldb.Get(encodeIndexKey(e.Key, e.TransactionID), nil); err == nil {
 			if meta, err := decodeEntryMeta(raw); err == nil && meta.OperationID == e.OperationID {
-				isLatest = true
+				if meta.FileID == origFileID && meta.ValueOffset == re.origOffset {
+					isLatest = true
+				} else {
+					// The index already points somewhere other than
+					// origFileID/re.origOffset for this exact (key, xid),
+					// despite the same OperationID: a previous (possibly
+					// partial/crashed) compaction pass already relocated
+					// this entry there. That copy is the valid one; ours is
+					// a stale duplicate we must not let overwrite it.
+					alreadyRelocatedElsewhere = true
+				}
 			}
 		}
 
@@ -317,8 +372,14 @@ func (db *DB) rewriteBatch(entries []ValueLogEntry) error {
 			// The space we just used in the new VLog file is now garbage.
 			newGarbage += int64(recSize)
 
-			// We still delete the OLD index entry to keep history clean
-			batch.Delete(encodeIndexKey(e.Key, e.TransactionID))
+			if !alreadyRelocatedElsewhere {
+				// Truly gone (aborted, or garbage-collected already):
+				// delete the OLD index entry to keep history clean. A
+				// no-op if it's already absent.
+				batch.Delete(encodeIndexKey(e.Key, e.TransactionID))
+			}
+			// If alreadyRelocatedElsewhere, leave the index untouched: it
+			// already correctly points at the valid earlier relocation.
 		}
 
 		currentOffset += int64(recSize)

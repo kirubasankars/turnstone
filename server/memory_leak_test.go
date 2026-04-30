@@ -24,7 +24,7 @@ func TestMemoryLeak_ReplicationConsumer(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Connect as CDC/Replica
-	cdc := connectClient(t, srv.listener.Addr().String(), getRoleTLS(t, dir, "cdc"))
+	cdc := connectClient(t, srv.Addr().String(), getRoleTLS(t, dir, "cdc"))
 	defer cdc.Close()
 
 	// 1. We act as the Leader. The Server connects TO us.
@@ -52,7 +52,7 @@ func TestMemoryLeak_ReplicationConsumer(t *testing.T) {
 
 	// 2. Configure Server to replicate from Fake Leader
 	// We use the Admin client to send `REPLICAOF` command.
-	admin := connectClient(t, srv.listener.Addr().String(), getRoleTLS(t, dir, "admin"))
+	admin := connectClient(t, srv.Addr().String(), getRoleTLS(t, dir, "admin"))
 	defer admin.Close()
 
 	// REPLICAOF localhost:port 1
@@ -74,7 +74,7 @@ func TestMemoryLeak_ReplicationConsumer(t *testing.T) {
 	// current admin session itself); reconnect before issuing further
 	// commands rather than racing the delayed connection-kill.
 	admin.Close()
-	admin = connectClient(t, srv.listener.Addr().String(), getRoleTLS(t, dir, "admin"))
+	admin = connectClient(t, srv.Addr().String(), getRoleTLS(t, dir, "admin"))
 	defer admin.Close()
 
 	// REPLICAOF first performs a short verification handshake on its own

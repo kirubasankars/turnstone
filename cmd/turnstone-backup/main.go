@@ -347,11 +347,30 @@ func runBackup(ctx context.Context) error {
 						vLenBuf := make([]byte, 4)
 						binary.BigEndian.PutUint32(vLenBuf, uint32(len(e.val)))
 
-						outputWriter.Write(kLenBuf)
-						outputWriter.Write(e.key)
-						outputWriter.Write(vLenBuf)
-						outputWriter.Write(e.val)
-						outputWriter.Write([]byte{storageType})
+						// Every Write() error here must be surfaced: this
+						// pipeline writes straight to disk (via
+						// outputWriter -> [gzip ->] diskWriter -> file),
+						// so a write failure (e.g. disk full/IO error)
+						// mid-backup previously vanished silently, leaving
+						// a truncated backup file that still went on to
+						// report success (and would even pass its own
+						// checksum, since the checksum is computed over
+						// whatever bytes actually made it to disk).
+						if _, err := outputWriter.Write(kLenBuf); err != nil {
+							return fmt.Errorf("write backup entry (klen): %w", err)
+						}
+						if _, err := outputWriter.Write(e.key); err != nil {
+							return fmt.Errorf("write backup entry (key): %w", err)
+						}
+						if _, err := outputWriter.Write(vLenBuf); err != nil {
+							return fmt.Errorf("write backup entry (vlen): %w", err)
+						}
+						if _, err := outputWriter.Write(e.val); err != nil {
+							return fmt.Errorf("write backup entry (val): %w", err)
+						}
+						if _, err := outputWriter.Write([]byte{storageType}); err != nil {
+							return fmt.Errorf("write backup entry (type): %w", err)
+						}
 						count++
 					}
 					delete(pending, txID)
@@ -435,11 +454,21 @@ func writeEntry(r io.Reader, w io.Writer, typeByte byte) error {
 		return err
 	}
 
-	w.Write(makeKLen(kLen))
-	w.Write(key)
-	w.Write(makeVLen(vLen))
-	w.Write(val)
-	w.Write([]byte{typeByte})
+	if _, err := w.Write(makeKLen(kLen)); err != nil {
+		return err
+	}
+	if _, err := w.Write(key); err != nil {
+		return err
+	}
+	if _, err := w.Write(makeVLen(vLen)); err != nil {
+		return err
+	}
+	if _, err := w.Write(val); err != nil {
+		return err
+	}
+	if _, err := w.Write([]byte{typeByte}); err != nil {
+		return err
+	}
 	return nil
 }
 

@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"hash"
 	"io"
 	"log"
 	"os"
@@ -74,7 +73,26 @@ func runRestore(ctx context.Context) error {
 		return fmt.Errorf("invalid meta JSON: %w", err)
 	}
 
-	// 3. Prepare Target
+	// 3. Verify Checksum BEFORE touching the target directory or committing
+	// anything. Previously this tool ingested every batch straight into the
+	// live target DB while streaming the backup file, and only checked the
+	// SHA256 *after* everything had already been committed -- so a
+	// checksum mismatch was reported as a fatal error only after the
+	// "restored" database had already been fully (or partially) written
+	// with corrupt data, directly contradicting --verify's documented
+	// "before restoring" contract. Hashing the raw backup file is cheap
+	// (single sequential read, no decompression/parsing needed since the
+	// checksum covers the on-disk bytes exactly as turnstone-backup wrote
+	// them), so do it as a standalone pass first.
+	if *verify {
+		log.Println("Verifying backup checksum before restoring...")
+		if err := verifyBackupChecksum(bkPath, meta.SHA256); err != nil {
+			return err
+		}
+		log.Println("Checksum OK.")
+	}
+
+	// 4. Prepare Target
 	if _, err := os.Stat(*outDir); err == nil {
 		return fmt.Errorf("target directory %s already exists", *outDir)
 	}
@@ -86,7 +104,7 @@ func runRestore(ctx context.Context) error {
 		return fmt.Errorf("failed to create DB structure: %w", err)
 	}
 
-	// 4. Initialize StoneDB State
+	// 5. Initialize StoneDB State
 	tlMeta := stonedb.TimelineMeta{
 		CurrentTimeline: meta.CurrentTimeline,
 		History:         []stonedb.TimelineHistoryItem{}, // Fresh history
@@ -109,7 +127,7 @@ func runRestore(ctx context.Context) error {
 	}
 	defer db.Close()
 
-	// 5. Setup Read Pipeline
+	// 6. Setup Read Pipeline
 	f, err := os.Open(bkPath)
 	if err != nil {
 		return err
@@ -117,12 +135,6 @@ func runRestore(ctx context.Context) error {
 	defer f.Close()
 
 	var inputReader io.Reader = f
-	var hasher hash.Hash
-
-	if *verify {
-		hasher = sha256.New()
-		inputReader = io.TeeReader(f, hasher)
-	}
 
 	// Check Compression (Peek Magic Bytes)
 	bufReader := bufio.NewReader(inputReader)
@@ -141,7 +153,7 @@ func runRestore(ctx context.Context) error {
 		inputReader = bufReader
 	}
 
-	// 6. Ingest Loop
+	// 7. Ingest Loop
 	log.Println("Ingesting data...")
 	type restoreEntry struct {
 		Key      []byte
@@ -233,16 +245,6 @@ func runRestore(ctx context.Context) error {
 		}
 	}
 
-	// 7. Verify Checksum
-	if *verify {
-		log.Println("\nVerifying checksum...")
-		calculated := hex.EncodeToString(hasher.Sum(nil))
-		if calculated != meta.SHA256 {
-			return fmt.Errorf("CHECKSUM MISMATCH!\nBackup file is corrupt.\nExpected: %s\nGot:      %s", meta.SHA256, calculated)
-		}
-		log.Println("Checksum OK.")
-	}
-
 	// 8. Finalize
 	db.ForceSetClocks(restoreTx, restoreSeq)
 	log.Println("Finalizing checkpoint...")
@@ -251,5 +253,30 @@ func runRestore(ctx context.Context) error {
 	}
 
 	fmt.Printf("\nRestore Complete.\nDatabase at: %s\nLast OpID: %d\n", dbPath, restoreSeq)
+	return nil
+}
+
+// verifyBackupChecksum computes the SHA256 of the raw backup file (exactly
+// as turnstone-backup wrote it to disk, i.e. before any gzip decompression)
+// and compares it against the expected checksum from backup.meta, returning
+// an error on mismatch. This is a standalone read-only pass over the file
+// and never touches the restore target, so it's safe to run before any
+// target-directory/DB state is created.
+func verifyBackupChecksum(path, expectedSHA256 string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open backup file for verification: %w", err)
+	}
+	defer f.Close()
+
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, f); err != nil {
+		return fmt.Errorf("read backup file for verification: %w", err)
+	}
+
+	calculated := hex.EncodeToString(hasher.Sum(nil))
+	if calculated != expectedSHA256 {
+		return fmt.Errorf("CHECKSUM MISMATCH!\nBackup file is corrupt.\nExpected: %s\nGot:      %s", expectedSHA256, calculated)
+	}
 	return nil
 }

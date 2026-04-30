@@ -275,7 +275,7 @@ func TestServer_RBAC(t *testing.T) {
 	go srv.Run(ctx)
 	time.Sleep(100 * time.Millisecond)
 
-	addr := srv.listener.Addr().String()
+	addr := srv.Addr().String()
 
 	// 1. Client Role Tests
 	t.Run("Client", func(t *testing.T) {
@@ -333,8 +333,7 @@ func TestServer_Lifecycle_And_Ping(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 
-	// Accessing srv.listener directly because we are in package server
-	addr := srv.listener.Addr().String()
+	addr := srv.Addr().String()
 
 	client := connectClient(t, addr, getClientTLS(t, dir))
 	defer client.Close()
@@ -354,7 +353,7 @@ func TestServer_DB0_AccessControl(t *testing.T) {
 	go srv.Run(ctx)
 	time.Sleep(100 * time.Millisecond)
 
-	addr := srv.listener.Addr().String()
+	addr := srv.Addr().String()
 
 	// 1. Client attempts to access Database 0 -> Should Succeed now (DB 0 is normal)
 	client := connectClient(t, addr, getClientTLS(t, dir))
@@ -384,7 +383,7 @@ func TestServer_CRUD(t *testing.T) {
 	go srv.Run(ctx)
 	time.Sleep(100 * time.Millisecond)
 
-	client := connectClient(t, srv.listener.Addr().String(), getClientTLS(t, dir))
+	client := connectClient(t, srv.Addr().String(), getClientTLS(t, dir))
 	defer client.Close()
 
 	// 0. Switch to Writable Database "1"
@@ -436,7 +435,7 @@ func TestMetrics_Connections(t *testing.T) {
 	initialActive := m1["turnstone_server_connections_active"]
 
 	// Connect Client
-	client := connectClient(t, srv.listener.Addr().String(), getClientTLS(t, dir))
+	client := connectClient(t, srv.Addr().String(), getClientTLS(t, dir))
 
 	// Check after connect
 	m2 := gatherMetrics(t, srv)
@@ -465,7 +464,7 @@ func TestMetrics_Transactions(t *testing.T) {
 	go srv.Run(ctx)
 	time.Sleep(100 * time.Millisecond)
 
-	client := connectClient(t, srv.listener.Addr().String(), getClientTLS(t, dir))
+	client := connectClient(t, srv.Addr().String(), getClientTLS(t, dir))
 	defer client.Close()
 
 	// Select Database 1
@@ -497,7 +496,7 @@ func TestMetrics_StorageIO(t *testing.T) {
 	go srv.Run(ctx)
 	time.Sleep(100 * time.Millisecond)
 
-	client := connectClient(t, srv.listener.Addr().String(), getClientTLS(t, dir))
+	client := connectClient(t, srv.Addr().String(), getClientTLS(t, dir))
 	defer client.Close()
 
 	// Select Database 1
@@ -540,16 +539,16 @@ func TestMetrics_Conflicts(t *testing.T) {
 	go srv.Run(ctx)
 	time.Sleep(100 * time.Millisecond)
 
-	c1 := connectClient(t, srv.listener.Addr().String(), getClientTLS(t, dir))
+	c1 := connectClient(t, srv.Addr().String(), getClientTLS(t, dir))
 	defer c1.Close()
-	c2 := connectClient(t, srv.listener.Addr().String(), getClientTLS(t, dir))
+	c2 := connectClient(t, srv.Addr().String(), getClientTLS(t, dir))
 	defer c2.Close()
 
 	c1.AssertStatus(protocol.OpCodeSelect, []byte("1"), protocol.ResStatusOK)
 	c2.AssertStatus(protocol.OpCodeSelect, []byte("1"), protocol.ResStatusOK)
 
 	// Initial key setup
-	setupTx := connectClient(t, srv.listener.Addr().String(), getClientTLS(t, dir))
+	setupTx := connectClient(t, srv.Addr().String(), getClientTLS(t, dir))
 	setupTx.AssertStatus(protocol.OpCodeSelect, []byte("1"), protocol.ResStatusOK)
 	setupTx.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
 
@@ -626,7 +625,7 @@ func TestServer_Backpressure(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	tlsConfig := getClientTLS(t, dir)
-	addr := srv.listener.Addr().String()
+	addr := srv.Addr().String()
 
 	// 1. Fill Capacity (1/1)
 	c1 := connectClient(t, addr, tlsConfig)
@@ -690,7 +689,7 @@ func TestServer_Transaction_Abort(t *testing.T) {
 	go srv.Run(ctx)
 	time.Sleep(100 * time.Millisecond)
 
-	client := connectClient(t, srv.listener.Addr().String(), getClientTLS(t, dir))
+	client := connectClient(t, srv.Addr().String(), getClientTLS(t, dir))
 	defer client.Close()
 
 	client.AssertStatus(protocol.OpCodeSelect, []byte("1"), protocol.ResStatusOK)
@@ -723,7 +722,7 @@ func TestServer_Command_Validation(t *testing.T) {
 	go srv.Run(ctx)
 	time.Sleep(100 * time.Millisecond)
 
-	client := connectClient(t, srv.listener.Addr().String(), getClientTLS(t, dir))
+	client := connectClient(t, srv.Addr().String(), getClientTLS(t, dir))
 	defer client.Close()
 
 	client.AssertStatus(protocol.OpCodeSelect, []byte("1"), protocol.ResStatusOK)
@@ -765,7 +764,7 @@ func TestServer_RoleTransitions(t *testing.T) {
 	go srv.Run(ctx)
 	time.Sleep(100 * time.Millisecond)
 
-	addr := srv.listener.Addr().String()
+	addr := srv.Addr().String()
 	clientTLS := getClientTLS(t, dir)
 	adminTLS := getRoleTLS(t, dir, "admin")
 
@@ -855,7 +854,7 @@ func TestPromote_QuorumBehavior(t *testing.T) {
 	go srv.Run(ctx)
 	time.Sleep(100 * time.Millisecond)
 
-	addr := srv.listener.Addr().String()
+	addr := srv.Addr().String()
 	admin := connectClient(t, addr, getRoleTLS(t, dir, "admin"))
 	defer admin.Close()
 	selectDatabase(t, admin, "1")

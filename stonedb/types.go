@@ -94,6 +94,7 @@ var (
 	ErrTruncated           = errors.New("wal truncated due to corruption")
 	ErrLogUnavailable      = errors.New("wal log unavailable for requested operation id")
 	ErrDiskFull            = errors.New("disk usage exceeds threshold")
+	ErrDatabaseClosed      = errors.New("database is closed")
 )
 
 // Options allows configuring the store behavior on Open
