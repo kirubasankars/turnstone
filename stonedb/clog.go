@@ -89,6 +89,20 @@ func (db *DB) abortTransaction(tx *Transaction) {
 	}
 
 	tx.abortOnce.Do(func() {
+		// Claim the sole right to decide this xid's durable outcome. If
+		// this fails, processCommitBatch already claimed it (it is
+		// currently committing, or has already committed, this same tx) --
+		// we must not write a conflicting ABORT record or touch its locks;
+		// the committer is the sole source of truth for this xid now and
+		// will release its locks itself. Without this, the liveness reaper
+		// racing an in-flight Commit() could write both an ABORT and a
+		// COMMIT record for the same xid, and could also iterate
+		// tx.keyLocks concurrently with the owning goroutine's own
+		// unsynchronized mutation of it.
+		if !tx.claimDecision() {
+			return
+		}
+
 		db.txMu.Lock()
 		_, stillActive := db.activeXids[tx.xid]
 		db.txMu.Unlock()
@@ -100,11 +114,20 @@ func (db *DB) abortTransaction(tx *Transaction) {
 		}
 
 		if _, err := db.appendRecord(WALRecordAbort, tx.xid, nil, nil); err != nil {
-			db.logger.Error("failed to append ABORT record", "xid", tx.xid, "err", err)
+			// The WAL is the source of truth for whether this xid is
+			// resolved. If we cannot durably record the ABORT decision but
+			// still proceed to release locks/remove it from activeXids
+			// below, a concurrent transaction could observe clogStatus's
+			// "no entry found -> assume committed" fallback and silently
+			// treat this aborted write as committed history. Crash instead,
+			// mirroring processCommitBatch's symmetric panic on a failed
+			// commit persist -- forcing a clog rebuild from the WAL on
+			// restart rather than serving an inconsistent decision.
+			panic("CRITICAL: ABORT record append failed. Database entering unrecoverable state to avoid laundering an aborted write into committed history: " + err.Error())
 		}
 		if db.ldb != nil {
 			if err := db.ldb.Put(encodeClogKey(tx.xid), []byte{byte(TxAborted)}, nil); err != nil {
-				db.logger.Error("failed to persist aborted clog entry", "xid", tx.xid, "err", err)
+				panic("CRITICAL: aborted clog entry persist failed after WAL abort append: " + err.Error())
 			}
 		}
 

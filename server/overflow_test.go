@@ -22,7 +22,7 @@ func TestMGet_IntegerOverflow_Safety(t *testing.T) {
 	time.Sleep(50 * time.Millisecond) // Wait for listener
 
 	// We use a raw TCP connection to send a crafted malicious payload
-	conn, err := tls.Dial("tcp", srv.listener.Addr().String(), getClientTLS(t, dir))
+	conn, err := tls.Dial("tcp", srv.Addr().String(), getClientTLS(t, dir))
 	if err != nil {
 		t.Fatalf("Failed to connect: %v", err)
 	}
