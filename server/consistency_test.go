@@ -124,7 +124,7 @@ func TestTimeline_Propagation(t *testing.T) {
 	baseDir, clientTLS := setupSharedCertEnv(t)
 	adminTLS := getRoleTLS(t, baseDir, "admin")
 
-	// 1. Start Primary (TL=1)
+	// 1. Start Primary (TL=0, promote to 1)
 	_, primAddr, cancelPrim := startServerNode(t, baseDir, "prim_tl", clientTLS)
 	defer cancelPrim()
 	promoteNode(t, baseDir, primAddr, "1")
@@ -153,11 +153,17 @@ func TestTimeline_Propagation(t *testing.T) {
 	}, "Sync TL1 failed")
 
 	// 4. Promote Primary AGAIN (TL 1 -> 2)
-	// This should bump timeline and broadcast to Replica
+	// Primary must StepDown first to become UNDEFINED.
 	cPrimAdmin := connectClient(t, primAddr, adminTLS)
-	defer cPrimAdmin.Close()
 	selectDatabase(t, cPrimAdmin, "1")
-	cPrimAdmin.AssertStatus(protocol.OpCodePromote, make([]byte, 4), protocol.ResStatusOK)
+	cPrimAdmin.AssertStatus(protocol.OpCodeStepDown, nil, protocol.ResStatusOK)
+	cPrimAdmin.Close()
+
+	// Reconnect as Admin to Promote
+	cPrimAdmin2 := connectClient(t, primAddr, adminTLS)
+	defer cPrimAdmin2.Close()
+	selectDatabase(t, cPrimAdmin2, "1")
+	cPrimAdmin2.AssertStatus(protocol.OpCodePromote, make([]byte, 4), protocol.ResStatusOK)
 
 	// 5. Write on TL 2
 	cPrim2 := connectClient(t, primAddr, clientTLS)
