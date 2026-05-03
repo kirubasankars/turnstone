@@ -78,7 +78,7 @@ func main() {
 
 	fmt.Println("Connected.")
 	fmt.Println("Commands: select <db>, replicaof <host:port> <remote_db>, promote [min_replicas], stepdown, flushdb, get <k>, set <k> <v>, del <k>, mget <k>..., mset <k> <v>..., mdel <k>..., begin, commit, abort, checkpoint, stat, clear, quit")
-	
+
 	// Track current database for the prompt (default server DB is 0)
 	currentDB := "0"
 	fmt.Printf("%s> ", currentDB)
