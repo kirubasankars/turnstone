@@ -128,7 +128,7 @@ func runWorkload(phase string, tlsConfig *tls.Config, payload []byte, readPct fl
 
 	for i := 0; i < *concurrency; i++ {
 		wg.Add(1)
-		
+
 		// Calculate ops for this specific client
 		opsForThisClient := baseOps
 		if i < remainder {
@@ -155,10 +155,10 @@ func runWorkload(phase string, tlsConfig *tls.Config, payload []byte, readPct fl
 			}
 
 			// Re-calculate actual total ops this client will perform based on batch alignment
-			// (If 10 ops, batch 3 => 3 txs => 9 ops. 1 op lost to floor division unless handled. 
-			// For benchmarking, slightly under-shooting due to batch alignment is acceptable 
+			// (If 10 ops, batch 3 => 3 txs => 9 ops. 1 op lost to floor division unless handled.
+			// For benchmarking, slightly under-shooting due to batch alignment is acceptable
 			// if batch > 1, but we try to match numOps).
-			
+
 			// Local random source
 			seed, _ := rand.Int(rand.Reader, big.NewInt(1<<62))
 			r := mrand.New(mrand.NewSource(seed.Int64()))
@@ -207,7 +207,7 @@ func runWorkload(phase string, tlsConfig *tls.Config, payload []byte, readPct fl
 			headerBuf := make([]byte, 5)
 
 			txCount := 0
-			
+
 			for b := 0; b < batchesOfPipeline; b++ {
 				writeBuf = writeBuf[:0]
 				startBatch := time.Now()

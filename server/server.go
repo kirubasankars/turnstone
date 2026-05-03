@@ -37,19 +37,19 @@ const (
 )
 
 type Server struct {
-	stores           map[string]*store.Store
-	defaultDB        string
-	id     string // Unique Server ID
-	addr   string
-	logger *slog.Logger
+	stores    map[string]*store.Store
+	defaultDB string
+	id        string // Unique Server ID
+	addr      string
+	logger    *slog.Logger
 
 	// listener is written once by Run() and read by Addr()/CloseAll(), which
 	// can legitimately be called concurrently with Run() still starting up
 	// (e.g. a caller polling Addr() right after launching Run() in a
 	// goroutine), so it needs its own lock rather than being a bare field.
-	listenerMu sync.Mutex
-	listener   net.Listener
-	maxConns   int
+	listenerMu       sync.Mutex
+	listener         net.Listener
+	maxConns         int
 	sem              chan struct{}
 	wg               sync.WaitGroup
 	totalConns       uint64

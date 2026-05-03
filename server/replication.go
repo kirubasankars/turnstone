@@ -214,8 +214,8 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 					case errCh <- err:
 					default:
 					}
-					}
-				}(req.name, storePtr, req.logID, physical)
+				}
+			}(req.name, storePtr, req.logID, physical)
 		}
 	}
 

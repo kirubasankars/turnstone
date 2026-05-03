@@ -14,17 +14,17 @@ const (
 	DefaultWriteTimeout      = 5 * time.Second
 	IdleTimeout              = 3 * 60 * time.Second
 	ShutdownTimeout          = 10 * time.Second
-	MaxTxDuration            = 30 * time.Second        // Strict 30s limit
-	MaxTxSize                = 200 * 1024 * 1024       // 200MB Limit
-	MaxValueSize             = 4 * 1024 * 1024         // 4MB Limit
-	MaxCommandSize           = 512 * 1024 * 1024       // 512MB Limit (Must fit in uint32)
-	MaxTransactionBufferSize = 64 * 1024 * 1024        // 64MB Limit for buffering a tx in memory (replication/server)
-	HeaderSize               = 16                      // Meta(4) + LogSeq(8) + CRC(4)
+	MaxTxDuration            = 30 * time.Second  // Strict 30s limit
+	MaxTxSize                = 200 * 1024 * 1024 // 200MB Limit
+	MaxValueSize             = 4 * 1024 * 1024   // 4MB Limit
+	MaxCommandSize           = 512 * 1024 * 1024 // 512MB Limit (Must fit in uint32)
+	MaxTransactionBufferSize = 64 * 1024 * 1024  // 64MB Limit for buffering a tx in memory (replication/server)
+	HeaderSize               = 16                // Meta(4) + LogSeq(8) + CRC(4)
 
-	ProtoHeaderSize      = 5
-	CheckpointInterval   = 512 * 1024 * 1024
-	SlowOpThreshold      = 500 * time.Millisecond
-	DefaultMaxVLogSize   = 200 * 1024 * 1024 // 200MB Limit for VLog files
+	ProtoHeaderSize    = 5
+	CheckpointInterval = 512 * 1024 * 1024
+	SlowOpThreshold    = 500 * time.Millisecond
+	DefaultMaxVLogSize = 200 * 1024 * 1024 // 200MB Limit for VLog files
 )
 
 // Variables (Mutable for testing)
@@ -34,28 +34,28 @@ var (
 
 // OpCodes define the available commands in the TurnstoneDB wire protocol.
 const (
-	OpCodePing             uint8 = 0x01
-	OpCodeGet              uint8 = 0x02
-	OpCodeSet              uint8 = 0x03
-	OpCodeDel              uint8 = 0x04
-	OpCodeSelect           uint8 = 0x05
-	OpCodeMGet             uint8 = 0x06
-	OpCodeMSet             uint8 = 0x07
-	OpCodeMDel             uint8 = 0x08
-	OpCodeBegin            uint8 = 0x10
-	OpCodeCommit           uint8 = 0x11
-	OpCodeAbort            uint8 = 0x12
-	OpCodeStat             uint8 = 0x20
-	OpCodeReplicaOf        uint8 = 0x32
-	OpCodeSlotDel          uint8 = 0x33
-	OpCodePromote          uint8 = 0x34
-	OpCodeStepDown         uint8 = 0x35
-	OpCodeCheckpoint       uint8 = 0x36 // Force WAL Flush/VLog Rotation
-	OpCodeFlushDB          uint8 = 0x37 // Wipe Database
+	OpCodePing       uint8 = 0x01
+	OpCodeGet        uint8 = 0x02
+	OpCodeSet        uint8 = 0x03
+	OpCodeDel        uint8 = 0x04
+	OpCodeSelect     uint8 = 0x05
+	OpCodeMGet       uint8 = 0x06
+	OpCodeMSet       uint8 = 0x07
+	OpCodeMDel       uint8 = 0x08
+	OpCodeBegin      uint8 = 0x10
+	OpCodeCommit     uint8 = 0x11
+	OpCodeAbort      uint8 = 0x12
+	OpCodeStat       uint8 = 0x20
+	OpCodeReplicaOf  uint8 = 0x32
+	OpCodeSlotDel    uint8 = 0x33
+	OpCodePromote    uint8 = 0x34
+	OpCodeStepDown   uint8 = 0x35
+	OpCodeCheckpoint uint8 = 0x36 // Force WAL Flush/VLog Rotation
+	OpCodeFlushDB    uint8 = 0x37 // Wipe Database
 
-	OpCodeReplHello        uint8 = 0x50
-	OpCodeReplBatch        uint8 = 0x51
-	OpCodeReplAck          uint8 = 0x52
+	OpCodeReplHello uint8 = 0x50
+	OpCodeReplBatch uint8 = 0x51
+	OpCodeReplAck   uint8 = 0x52
 
 	// --- SNAPSHOT OPCODES ---
 	OpCodeReplSnapshot     uint8 = 0x53 // Bulk data payload (Full Sync)

@@ -280,7 +280,7 @@ func TestCDC_PurgedWAL_TriggersSnapshot(t *testing.T) {
 
 	addr := srv.Addr().String()
 	// Removed redundant promoteNode call as setupTestEnv already sets Primary state
-	
+
 	clientTLS := getClientTLS(t, dir)
 	cdcTLS := getRoleTLS(t, dir, "cdc")
 	adminTLS := getRoleTLS(t, dir, "admin")
@@ -306,7 +306,7 @@ func TestCDC_PurgedWAL_TriggersSnapshot(t *testing.T) {
 
 	// 2. Force WAL Rotation using Promote() (File 1 -> File 2)
 	st1 := stores["1"]
-	
+
 	// FIX: StepDown first before calling Promote via admin client to satisfy UNDEFINED requirement
 	cAdmin := connectClient(t, addr, adminTLS)
 	selectDatabase(t, cAdmin, "1")
