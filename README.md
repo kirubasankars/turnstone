@@ -17,61 +17,6 @@
 
 ---
 
-## 🛠️ Architecture
-
-TurnstoneDB separates the storage of keys and values to optimize for modern SSDs:
-
-1. **LevelDB (Index)**: Stores `Key + (MaxUint64 - TxID) -> <FileID, Offset, Size>`. This encoding allows for efficient MVCC lookups (time-travel queries) and keeps the LSM tree small.
-2. **Value Log (VLog)**: Stores the actual values on disk in append-only files. Garbage collection is performed only when a file exceeds a configurable staleness threshold.
-3. **Write-Ahead Log (WAL)**: Ensures durability. Supports retention strategies based on time or replication acknowledgment. WAL rotation is checkpoint-driven (not size-triggered); checkpoints run on a timer (default 60s) or can be forced via the `checkpoint` admin command.
-
----
-
-## 🔀 Transaction Model: Postgres-style Eager Logging
-
-> ⚠️ **Breaking change.** This is a new on-disk WAL format. Data directories created by older versions of TurnstoneDB cannot be opened by this version and must be rebuilt (e.g. from a backup or by resyncing from a peer). Client wire protocol opcodes (`BEGIN`/`SET`/`DEL`/`COMMIT`/`ABORT`) are unchanged — only the internal WAL framing, status semantics, and replication journal changed.
-
-Earlier versions of TurnstoneDB buffered all writes in memory between `BEGIN` and `COMMIT`, and only touched the WAL/VLog/index once, atomically, at commit time. TurnstoneDB now follows PostgreSQL's write path instead:
-
-```mermaid
-sequenceDiagram
-    participant Client
-    participant Tx
-    participant WAL
-    participant VLog
-    participant Index
-    participant Clog
-    Client->>Tx: BEGIN
-    Tx->>WAL: BEGIN xid,op
-    Client->>Tx: SET k v
-    Tx->>WAL: SET xid,op,k,v
-    Tx->>VLog: append (uncommitted)
-    Tx->>Index: xmin=xid, in_progress
-    Client->>Tx: COMMIT
-    Tx->>WAL: COMMIT xid,op
-    Note over WAL: group fsync
-    Tx->>Clog: committed
-    Note over Index: version now visible
-```
-
-Key semantics:
-
-* **`xid` is assigned at `BEGIN`**, not at commit time. Every WAL record (`BEGIN`/`SET`/`DEL`/`COMMIT`/`ABORT`) also gets its own monotonically increasing `opID`, which remains the replication cursor.
-* **`SET`/`DEL` write immediately.** Values land in the VLog and an index version is inserted (`xmin = xid`, initially "in progress") as soon as the client calls `SET`/`DEL` — not buffered until `COMMIT`. This data is **not fsynced** at write time; it is recovered from the WAL on crash, the same way Postgres relies on WAL replay rather than fsyncing every row.
-* **`COMMIT` group-fsyncs a tiny record.** Because `SET`/`DEL` already did the heavy I/O, `COMMIT` only has to append and fsync a `COMMIT` WAL record (batched with other concurrent commits), then flip the transaction's status to `committed` in the commit log (`clog`). This is cheaper and more predictable than fsyncing an entire write-set at commit time.
-* **Read-your-own-writes** works without a separate write-cache: `Get` inside a transaction simply treats `xmin == my xid` as visible regardless of `clog` state.
-* **Isolation is now first-writer-wins, not first-committer-wins.** `SET`/`DEL` takes an exclusive, **NOWAIT** lock on the key: if another in-progress transaction already owns it, the call fails immediately with a write conflict — there is no waiting and therefore no deadlock. The write-set/blind-write half of the old commit-time conflict check is gone since it's now structurally impossible (whoever holds the key's lock is the only writer). Read-set validation (stale-read / write-skew detection) still happens at `COMMIT` for true snapshot-isolation correctness.
-* **Aborts are explicit.** Timeouts, disconnects, and conflicts all append an `ABORT` WAL record and release locks; a background reaper also force-aborts any transaction that exceeds `MaxTxDuration` even if the client goes silent, so a stalled connection can't hold a key lock forever.
-
-### What this means for clients
-
-* `SET`/`DEL` (and `MSET`/`MDEL`) can now fail with **`ResStatusTxConflict` (0x05)** directly — previously this only happened at `COMMIT`. The Go client already maps this to `ErrTxConflict`.
-* Once a transaction hits a conflict, it is marked aborted server-side (Postgres's "current transaction is aborted" behavior): every subsequent `GET`/`SET`/`COMMIT` on that connection returns `ResStatusTxConflict` until you send `ABORT` (or a fresh `BEGIN`).
-* Values are visible to other transactions only after `COMMIT` — the eager writes described above are strictly an internal engine detail; external readers never see uncommitted data (`Get`/`StreamSnapshot`/CDC/replica reads all filter by `clog` + snapshot visibility, identical to before).
-* Replication is role-filtered: `server`-role streams (used for replica apply, promotion, and `turnstone-backup`) see the full physical WAL including `BEGIN`/`ABORT`; `cdc`-role streams remain logical — they only ever emit committed `SET`/`DEL` plus a commit marker, exactly like before.
-
----
-
 ## 📦 Installation & Getting Started
 
 ### Prerequisites
@@ -241,30 +186,29 @@ OK
 **Scenario:** Moving leadership from Node A to Node B.
 
 1. **On Node A (Old Leader):**
+
 ```bash
 > select 1
 > stepdown
 
 ```
 
-
 2. **On Node B (New Leader):**
+
 ```bash
 > select 1
 > promote
 
 ```
 
-
 3. **On Node A (Old Leader):**
+
 ```bash
 # Reconfigure A to follow B
 > select 1
 > replicaof <Node_B_IP>:6379 1
 
 ```
-
-
 
 ---
 
@@ -318,6 +262,61 @@ Use `turnstone-duck` to watch CDC logs, deduplicate them (handling the "same key
 | `metrics_addr` | `:9090` | Address for Prometheus metrics. |
 | `tls_cert_file` | `certs/server.crt` | Server Certificate. |
 | `tls_client_cert_file` | `certs/server.crt` | Cert used when acting as a Replication Client. |
+
+---
+
+## 🛠️ Architecture & Internals
+
+### Architecture
+
+TurnstoneDB separates the storage of keys and values to optimize for modern SSDs:
+
+1. **LevelDB (Index)**: Stores `Key + (MaxUint64 - TxID) -> <FileID, Offset, Size>`. This encoding allows for efficient MVCC lookups (time-travel queries) and keeps the LSM tree small.
+2. **Value Log (VLog)**: Stores the actual values on disk in append-only files. Garbage collection is performed only when a file exceeds a configurable staleness threshold.
+3. **Write-Ahead Log (WAL)**: Ensures durability. Supports retention strategies based on time or replication acknowledgment. WAL rotation is checkpoint-driven (not size-triggered); checkpoints run on a timer (default 60s) or can be forced via the `checkpoint` admin command.
+
+### Transaction Model: Postgres-style Eager Logging
+
+> ⚠️ **Breaking change.** This is a new on-disk WAL format. Data directories created by older versions of TurnstoneDB cannot be opened by this version and must be rebuilt (e.g. from a backup or by resyncing from a peer). Client wire protocol opcodes (`BEGIN`/`SET`/`DEL`/`COMMIT`/`ABORT`) are unchanged — only the internal WAL framing, status semantics, and replication journal changed.
+
+Earlier versions of TurnstoneDB buffered all writes in memory between `BEGIN` and `COMMIT`, and only touched the WAL/VLog/index once, atomically, at commit time. TurnstoneDB now follows PostgreSQL's write path instead:
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Tx
+    participant WAL
+    participant VLog
+    participant Index
+    participant Clog
+    Client->>Tx: BEGIN
+    Tx->>WAL: BEGIN xid,op
+    Client->>Tx: SET k v
+    Tx->>WAL: SET xid,op,k,v
+    Tx->>VLog: append (uncommitted)
+    Tx->>Index: xmin=xid, in_progress
+    Client->>Tx: COMMIT
+    Tx->>WAL: COMMIT xid,op
+    Note over WAL: group fsync
+    Tx->>Clog: committed
+    Note over Index: version now visible
+```
+
+Key semantics:
+
+* **`xid` is assigned at `BEGIN`**, not at commit time. Every WAL record (`BEGIN`/`SET`/`DEL`/`COMMIT`/`ABORT`) also gets its own monotonically increasing `opID`, which remains the replication cursor.
+* **`SET`/`DEL` write immediately.** Values land in the VLog and an index version is inserted (`xmin = xid`, initially "in progress") as soon as the client calls `SET`/`DEL` — not buffered until `COMMIT`. This data is **not fsynced** at write time; it is recovered from the WAL on crash, the same way Postgres relies on WAL replay rather than fsyncing every row.
+* **`COMMIT` group-fsyncs a tiny record.** Because `SET`/`DEL` already did the heavy I/O, `COMMIT` only has to append and fsync a `COMMIT` WAL record (batched with other concurrent commits), then flip the transaction's status to `committed` in the commit log (`clog`). This is cheaper and more predictable than fsyncing an entire write-set at commit time.
+* **Read-your-own-writes** works without a separate write-cache: `Get` inside a transaction simply treats `xmin == my xid` as visible regardless of `clog` state.
+* **Isolation is now first-writer-wins, not first-committer-wins.** `SET`/`DEL` takes an exclusive, **NOWAIT** lock on the key: if another in-progress transaction already owns it, the call fails immediately with a write conflict — there is no waiting and therefore no deadlock. The write-set/blind-write half of the old commit-time conflict check is gone since it's now structurally impossible (whoever holds the key's lock is the only writer). Read-set validation (stale-read / write-skew detection) still happens at `COMMIT` for true snapshot-isolation correctness.
+* **Aborts are explicit.** Timeouts, disconnects, and conflicts all append an `ABORT` WAL record and release locks; a background reaper also force-aborts any transaction that exceeds `MaxTxDuration` even if the client goes silent, so a stalled connection can't hold a key lock forever.
+
+#### What this means for clients
+
+* `SET`/`DEL` (and `MSET`/`MDEL`) can now fail with **`ResStatusTxConflict` (0x05)** directly — previously this only happened at `COMMIT`. The Go client already maps this to `ErrTxConflict`.
+* Once a transaction hits a conflict, it is marked aborted server-side (Postgres's "current transaction is aborted" behavior): every subsequent `GET`/`SET`/`COMMIT` on that connection returns `ResStatusTxConflict` until you send `ABORT` (or a fresh `BEGIN`).
+* Values are visible to other transactions only after `COMMIT` — the eager writes described above are strictly an internal engine detail; external readers never see uncommitted data (`Get`/`StreamSnapshot`/CDC/replica reads all filter by `clog` + snapshot visibility, identical to before).
+* Replication is role-filtered: `server`-role streams (used for replica apply, promotion, and `turnstone-backup`) see the full physical WAL including `BEGIN`/`ABORT`; `cdc`-role streams remain logical — they only ever emit committed `SET`/`DEL` plus a commit marker, exactly like before.
 
 ---
 
