@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"log/slog"
 	"net"
@@ -14,12 +15,6 @@ import (
 
 	"turnstone/protocol"
 	"turnstone/store"
-)
-
-var (
-	// MaxTransactionBufferSize limits the size of a single transaction buffered in memory
-	// to prevent OOM attacks or leaks from malicious/broken leaders.
-	MaxTransactionBufferSize = uint64(64 * 1024 * 1024) // 64MB
 )
 
 type ReplicaSource struct {
@@ -262,6 +257,7 @@ func (rm *ReplicationManager) maintainConnection(ctx context.Context, addr strin
 	}
 }
 
+// connectAndSync connects to the remote, sends Hello, and checks the response status.
 func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, dbs []ReplicaSource, logger *slog.Logger) error {
 	dialer := net.Dialer{Timeout: 5 * time.Second}
 	conn, err := tls.DialWithDialer(&dialer, "tcp", addr, rm.tlsConf)
@@ -275,7 +271,6 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 	}()
 	defer conn.Close()
 
-	// INFO: Successfully connected to upstream
 	logger.Info("Connected to Leader", "db_count", len(dbs))
 
 	remoteToLocal := make(map[string][]string)
@@ -336,6 +331,24 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 		// Handle explicit error from server during streaming
 		if opCode == protocol.ResStatusErr {
 			return fmt.Errorf("remote error during stream: %s", string(payload))
+		}
+
+		// --- VERIFY CRC ---
+		// We expect CRC for Batch, Snapshot, SafePoint, Timeline
+		if opCode == protocol.OpCodeReplBatch || opCode == protocol.OpCodeReplSnapshot ||
+			opCode == protocol.OpCodeReplSafePoint || opCode == protocol.OpCodeReplTimeline ||
+			opCode == protocol.OpCodeReplSnapshotDone {
+
+			if len(payload) < 4 {
+				return fmt.Errorf("packet too short for crc")
+			}
+			crcReceived := binary.BigEndian.Uint32(payload[:4])
+			rawBody := payload[4:]
+			if crc32.Checksum(rawBody, protocol.Crc32Table) != crcReceived {
+				return fmt.Errorf("crc mismatch on replication stream")
+			}
+			// Strip CRC for logic processing
+			payload = rawBody
 		}
 
 		// --- Handle Safe Point Propagation ---
@@ -569,8 +582,8 @@ func processReplicationPacket(store *store.Store, buffer []protocol.LogEntry, cu
 			}
 		} else {
 			entrySize := uint64(len(key) + len(val) + 20)
-			if currentSize+entrySize > MaxTransactionBufferSize {
-				return buffer, 0, currentSize, fmt.Errorf("transaction too large: %d > %d", currentSize+entrySize, MaxTransactionBufferSize)
+			if currentSize+entrySize > protocol.MaxTransactionBufferSize {
+				return buffer, 0, currentSize, fmt.Errorf("transaction too large: %d > %d", currentSize+entrySize, protocol.MaxTransactionBufferSize)
 			}
 			currentSize += entrySize
 

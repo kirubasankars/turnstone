@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -35,34 +36,35 @@ const (
 )
 
 type Server struct {
-	stores             map[string]*store.Store
-	defaultDB          string // Renamed from defaultPartition
-	id                 string // Unique Server ID
-	addr               string
-	logger             *slog.Logger
-	listener           net.Listener
-	maxConns           int
-	sem                chan struct{}
-	wg                 sync.WaitGroup
-	totalConns         uint64
-	activeConns        int64
-	tlsConfig          *tls.Config
-	tlsCertFile        string
-	tlsKeyFile         string
-	tlsCAFile          string
-	currentTLSConfig   atomic.Value
-	replManager        *replication.ReplicationManager
+	stores           map[string]*store.Store
+	defaultDB        string
+	id               string // Unique Server ID
+	addr             string
+	logger           *slog.Logger
+	listener         net.Listener
+	maxConns         int
+	sem              chan struct{}
+	wg               sync.WaitGroup
+	totalConns       uint64
+	activeConns      int64
+	tlsConfig        *tls.Config
+	tlsCertFile      string
+	tlsKeyFile       string
+	tlsCAFile        string
+	currentTLSConfig atomic.Value
+	replManager      *replication.ReplicationManager
+	devMode          bool
 
 	// Metrics per database
 	connsMu sync.Mutex
-	dbConns map[string]int64 // Renamed from partitionConns
+	dbConns map[string]int64
 
 	// Active connections object tracking for StepDown
 	activeClientsMu sync.Mutex
 	activeClients   map[string]map[net.Conn]struct{}
 }
 
-func NewServer(id string, addr string, stores map[string]*store.Store, logger *slog.Logger, maxConns int, tlsCert, tlsKey, tlsCA string, rm *replication.ReplicationManager) (*Server, error) {
+func NewServer(id string, addr string, stores map[string]*store.Store, logger *slog.Logger, maxConns int, tlsCert, tlsKey, tlsCA string, rm *replication.ReplicationManager, devMode bool) (*Server, error) {
 	if tlsCert == "" || tlsKey == "" || tlsCA == "" {
 		return nil, fmt.Errorf("tls cert, key, and ca required")
 	}
@@ -89,6 +91,7 @@ func NewServer(id string, addr string, stores map[string]*store.Store, logger *s
 		tlsKeyFile:    tlsKey,
 		tlsCAFile:     tlsCA,
 		replManager:   rm,
+		devMode:       devMode,
 		dbConns:       make(map[string]int64),
 		activeClients: make(map[string]map[net.Conn]struct{}),
 	}
@@ -148,7 +151,7 @@ func (s *Server) Run(ctx context.Context) error {
 		return err
 	}
 	s.listener = ln
-	
+
 	// INFO: Startup configuration
 	s.logger.Info("TurnstoneDB Server Started",
 		"version", "1.0.0",
@@ -157,6 +160,7 @@ func (s *Server) Run(ctx context.Context) error {
 		"databases", len(s.stores),
 		"default_db", s.defaultDB,
 		"max_conns", s.maxConns,
+		"dev_mode", s.devMode,
 	)
 
 	go s.handleSignals(ctx)
@@ -218,11 +222,6 @@ func (s *Server) DatabaseConns(dbName string) int64 {
 	return s.dbConns[dbName]
 }
 
-// PartitionConns is kept for interface compatibility if needed, aliasing DatabaseConns.
-func (s *Server) PartitionConns(partition string) int64 {
-	return s.DatabaseConns(partition)
-}
-
 func (s *Server) registerConn(db string, conn net.Conn) {
 	s.activeClientsMu.Lock()
 	defer s.activeClientsMu.Unlock()
@@ -258,12 +257,13 @@ func (s *Server) killDBConnections(db string) {
 
 // connState is shared with replication.go
 type connState struct {
-	dbName   string
-	db       *store.Store
-	tx       *stonedb.Transaction
-	role     string
-	clientID string
-	logger   *slog.Logger // Context-aware logger for this connection
+	dbName      string
+	db          *store.Store
+	tx          *stonedb.Transaction
+	txStartTime time.Time // Track start time for timeouts
+	role        string
+	clientID    string
+	logger      *slog.Logger // Context-aware logger for this connection
 }
 
 func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
@@ -309,7 +309,7 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 
 	// Enrich logger with identity info
 	connLogger = connLogger.With("client_id", clientID, "role", role)
-	
+
 	// DEBUG: High frequency connection events
 	connLogger.Debug("Connection accepted", "auth_type", authType)
 
@@ -425,6 +425,8 @@ func (s *Server) dispatchCommand(conn net.Conn, r io.Reader, opCode uint8, paylo
 		s.handleStepDown(conn, st)
 	case protocol.OpCodeCheckpoint:
 		s.handleCheckpoint(conn, st)
+	case protocol.OpCodeStat:
+		s.handleStat(conn, st)
 	case protocol.OpCodeReplHello:
 		// Hand off control to specialized handler in replication.go
 		s.HandleReplicaConnection(conn, r, payload, st)
@@ -448,7 +450,7 @@ func (s *Server) isOpAllowed(role string, opCode uint8) bool {
 		case protocol.OpCodePing, protocol.OpCodeQuit,
 			protocol.OpCodeSelect, protocol.OpCodeBegin, protocol.OpCodeCommit, protocol.OpCodeAbort,
 			protocol.OpCodeGet, protocol.OpCodeSet, protocol.OpCodeDel,
-			protocol.OpCodeMGet, protocol.OpCodeMSet, protocol.OpCodeMDel:
+			protocol.OpCodeMGet, protocol.OpCodeMSet, protocol.OpCodeMDel, protocol.OpCodeStat:
 			return true
 		default:
 			return false
@@ -524,8 +526,9 @@ func (s *Server) handleBegin(w io.Writer, st *connState) {
 		return
 	}
 
-	// Start a read-write transaction
+	// Start a read-write transaction and record start time
 	st.tx = st.db.NewTransaction(true)
+	st.txStartTime = time.Now()
 	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
 }
 
@@ -534,6 +537,15 @@ func (s *Server) handleCommit(w io.Writer, st *connState) {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusTxRequired, nil)
 		return
 	}
+
+	// Enforce 5s Timeout on Commit (unless in Dev mode)
+	if !s.devMode && time.Since(st.txStartTime) > protocol.MaxTxDuration {
+		st.tx.Discard()
+		st.tx = nil
+		_ = s.writeBinaryResponse(w, protocol.ResStatusTxTimeout, []byte("Transaction exceeded 5s limit"))
+		return
+	}
+
 	err := st.tx.Commit()
 	st.tx = nil
 
@@ -586,7 +598,7 @@ func (s *Server) handleGet(w io.Writer, payload []byte, st *connState) {
 
 	key := string(payload)
 
-	if !isASCII(key) {
+	if !protocol.IsASCII(key) {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Key must be ASCII"))
 		return
 	}
@@ -630,9 +642,19 @@ func (s *Server) handleSet(w io.Writer, payload []byte, st *connState) {
 	val := make([]byte, len(payload[4+kLen:]))
 	copy(val, payload[4+kLen:])
 
+	// Strict Size Checks
+	if len(val) > protocol.MaxValueSize {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusEntityTooLarge, []byte("Value size exceeds 64KB limit"))
+		return
+	}
+	if len(key)+len(val) > protocol.MaxCommandSize {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusEntityTooLarge, []byte("Key+Value size exceeds limit"))
+		return
+	}
+
 	keyStr := string(key)
 
-	if !isASCII(keyStr) {
+	if !protocol.IsASCII(keyStr) {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Key must be ASCII"))
 		return
 	}
@@ -661,7 +683,7 @@ func (s *Server) handleDel(w io.Writer, payload []byte, st *connState) {
 
 	key := string(payload)
 
-	if !isASCII(key) {
+	if !protocol.IsASCII(key) {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Key must be ASCII"))
 		return
 	}
@@ -735,7 +757,7 @@ func (s *Server) handleMGet(w io.Writer, payload []byte, st *connState) {
 
 		keyStr := string(key)
 
-		if !isASCII(keyStr) {
+		if !protocol.IsASCII(keyStr) {
 			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Key must be ASCII"))
 			return
 		}
@@ -804,9 +826,19 @@ func (s *Server) handleMSet(w io.Writer, payload []byte, st *connState) {
 		val := payload[offset : offset+uint64(vLen)]
 		offset += uint64(vLen)
 
+		// Strict Size Checks
+		if len(val) > protocol.MaxValueSize {
+			_ = s.writeBinaryResponse(w, protocol.ResStatusEntityTooLarge, []byte("Value size exceeds 64KB limit"))
+			return
+		}
+		if len(key)+len(val) > protocol.MaxCommandSize {
+			_ = s.writeBinaryResponse(w, protocol.ResStatusEntityTooLarge, []byte("Key+Value size exceeds limit"))
+			return
+		}
+
 		keyStr := string(key)
 
-		if !isASCII(keyStr) {
+		if !protocol.IsASCII(keyStr) {
 			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Key must be ASCII"))
 			return
 		}
@@ -859,7 +891,7 @@ func (s *Server) handleMDel(w io.Writer, payload []byte, st *connState) {
 
 		keyStr := string(key)
 
-		if !isASCII(keyStr) {
+		if !protocol.IsASCII(keyStr) {
 			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Key must be ASCII"))
 			return
 		}
@@ -1061,6 +1093,44 @@ func (s *Server) handleCheckpoint(w io.Writer, st *connState) {
 	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
 }
 
+func (s *Server) handleStat(w io.Writer, st *connState) {
+	if st.db == nil {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Database selected"))
+		return
+	}
+	stats := st.db.Stats()
+	conns := s.DatabaseConns(st.dbName)
+
+	response := struct {
+		KeyCount          int64  `json:"key_count"`
+		GarbageBytes      int64  `json:"garbage_bytes"`
+		Conflicts         uint64 `json:"conflicts"`
+		ActiveConnections int64  `json:"active_connections"`
+		VLogFiles         int    `json:"vlog_files"`
+		WALFiles          int    `json:"wal_files"`
+		ActiveTxs         int    `json:"active_txs"`
+		ReplicaLag        uint64 `json:"replica_lag"`
+		Uptime            string `json:"uptime"`
+	}{
+		KeyCount:          stats.KeyCount,
+		GarbageBytes:      stats.GarbageBytes,
+		Conflicts:         stats.Conflicts,
+		ActiveConnections: conns,
+		VLogFiles:         stats.VLogFiles,
+		WALFiles:          stats.WALFiles,
+		ActiveTxs:         stats.ActiveTxs,
+		ReplicaLag:        stats.ReplicaLag,
+		Uptime:            stats.Uptime,
+	}
+
+	data, err := json.Marshal(response)
+	if err != nil {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte(err.Error()))
+		return
+	}
+	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, data)
+}
+
 func (s *Server) CloseAll() {
 	if s.listener != nil {
 		_ = s.listener.Close()
@@ -1068,15 +1138,6 @@ func (s *Server) CloseAll() {
 	for _, store := range s.stores {
 		_ = store.Close()
 	}
-}
-
-func isASCII(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if s[i] > 127 {
-			return false
-		}
-	}
-	return true
 }
 
 // ActiveConns returns number of activeConns
