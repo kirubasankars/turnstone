@@ -7,7 +7,7 @@
 ## 🚀 Key Features
 
 * **⚡ WiscKey-style Storage Engine**: Uses a LevelDB LSM-tree for the index (Keys) and an append-only Value Log (VLog) for values. This minimizes write amplification and drastically improves throughput for large payloads.
-* **📝 Eager Logging**: `SET`/`DEL` write to the WAL, VLog, and index immediately (not buffered until `COMMIT`). `COMMIT` only group-fsyncs a small commit record and flips visibility. See "Transaction Model: Eager Logging" below — **this is a breaking on-disk WAL format change**.
+* **📝 Eager Logging**: `SET`/`DEL` write to the WAL, VLog, and index immediately (not buffered until `COMMIT`). `COMMIT` only group-fsyncs a small commit record and flips visibility. See "Transaction Model: Eager Logging" below.
 * **🔒 ACID Transactions**: Full support for multi-key transactions with **Snapshot Isolation**. Write-write conflicts are detected eagerly at `SET`/`DEL` time via **first-writer-wins** key locking (no waiting, no deadlocks); read-set validation still runs at `COMMIT` to catch stale-read/write-skew.
 * **🛡️ Secure by Default**: All connections (Client-Server and Inter-Node) are secured via **mTLS** (Mutual TLS). Role-Based Access Control (RBAC) is enforced via X.509 Certificate Organization fields.
 * **📡 Replication & Timelines**: Database-level Leader-Follower replication. Supports **Timelines** to handle split-brain scenarios and allow safe history divergence during promotion.
@@ -277,8 +277,6 @@ TurnstoneDB separates the storage of keys and values to optimize for modern SSDs
 
 ### Transaction Model: Eager Logging
 
-> ⚠️ **Breaking change.** This is a new on-disk WAL format. Data directories created by older versions of TurnstoneDB cannot be opened by this version and must be rebuilt (e.g. from a backup or by resyncing from a peer). Client wire protocol opcodes (`BEGIN`/`SET`/`DEL`/`COMMIT`/`ABORT`) are unchanged — only the internal WAL framing, status semantics, and replication journal changed.
-
 Earlier versions of TurnstoneDB buffered all writes in memory between `BEGIN` and `COMMIT`, and only touched the WAL/VLog/index once, atomically, at commit time. TurnstoneDB now writes eagerly instead:
 
 ```mermaid
@@ -326,7 +324,6 @@ Key semantics:
 2. **Sharding**: The server is single-node (multi-db). Sharding must be handled client-side (see `cmd/turnstone-load2` for a reference implementation).
 3. **Memory**: The index (LevelDB) relies heavily on OS Page Cache. Large datasets require sufficient RAM for optimal performance.
 4. **No lock waiting**: Key-level write locks are NOWAIT (see "Transaction Model: Eager Logging" above). Under hot-key contention this shows up as `TxConflict` abort storms rather than a queuing/blocking row-lock behavior — the client is expected to retry, not wait.
-5. **No WAL migration**: The eager-logging WAL format is a breaking change from prior releases; existing data directories must be rebuilt or resynced, they cannot be opened in-place.
 
 ---
 
