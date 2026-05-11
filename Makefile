@@ -3,6 +3,8 @@ build:
 	go build -o bin/turnstone cmd/turnstone/main.go
 	go build -o bin/turnstone-cli cmd/turnstone-cli/main.go
 	go build -o bin/turnstone-generate-config cmd/turnstone-generate-config/main.go
+	go build -o bin/turnstone-backup cmd/turnstone-backup/main.go
+	go build -o bin/turnstone-restore cmd/turnstone-restore/main.go
 	go build -o bin/turnstone-bench cmd/turnstone-bench/main.go
 	go build -o bin/turnstone-load cmd/turnstone-load/main.go
 	go build -o bin/turnstone-load2 cmd/turnstone-load2/main.go
