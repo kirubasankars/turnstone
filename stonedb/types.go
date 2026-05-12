@@ -141,6 +141,21 @@ type Options struct {
 	// background liveness reaper force-aborts it, independent of client
 	// activity. If 0, defaults to protocol.MaxTxDuration.
 	TxTimeout time.Duration
+
+	// CommitDelay is a short bounded wait the group-commit worker takes
+	// after the first pending commit arrives, giving other
+	// concurrently-committing transactions a chance to join the same WAL
+	// fsync before it fires (mirrors PostgreSQL's commit_delay). It is only
+	// applied when CommitSiblings indicates real concurrency, so a single,
+	// unbatched client never pays it as pure added latency.
+	// If 0, defaults to 2ms. Set to a negative value to disable grouping.
+	CommitDelay time.Duration
+
+	// CommitSiblings is the minimum number of concurrently active
+	// transactions (counting the one about to commit) required before
+	// CommitDelay is applied (mirrors PostgreSQL's commit_siblings).
+	// If 0, defaults to 2.
+	CommitSiblings int
 }
 
 // WALLocation points to a specific batch in the WAL files
