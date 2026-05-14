@@ -51,6 +51,7 @@ const (
 	OpCodePromote          uint8 = 0x34
 	OpCodeStepDown         uint8 = 0x35
 	OpCodeCheckpoint       uint8 = 0x36 // Force WAL Flush/VLog Rotation
+	OpCodeFlushDB          uint8 = 0x37 // Wipe Database
 
 	OpCodeReplHello        uint8 = 0x50
 	OpCodeReplBatch        uint8 = 0x51
