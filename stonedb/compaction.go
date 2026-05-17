@@ -7,9 +7,7 @@ import (
 	"os"
 	"sync/atomic"
 
-	"github.com/syndtr/goleveldb/leveldb"
-	"github.com/syndtr/goleveldb/leveldb/iterator"
-	"github.com/syndtr/goleveldb/leveldb/opt"
+	"turnstone/stonedb/index"
 )
 
 // relocateEntry pairs a ValueLog entry being compacted forward with its
@@ -69,15 +67,30 @@ func (db *DB) RunCompaction() (bool, error) {
 	const maxBatchCount = 1000
 
 	// Batch for deleting stale index entries
-	staleBatch := new(leveldb.Batch)
+	staleBatch := new(index.Batch)
 
-	// Helper to flush stale deletes
+	// Create an iterator to check validity against the index *before* moving data.
+	var iter index.Iterator
+	newIter := func() { iter = db.ldb.NewIterator(nil, nil) }
+	releaseIter := func() {
+		if iter != nil {
+			iter.Release()
+			iter = nil
+		}
+	}
+	newIter()
+	defer releaseIter()
+
+	// Helper to flush stale deletes. The iterator holds a snapshot read lock,
+	// so it must be released before any index write to avoid deadlock.
 	flushStale := func() error {
 		if staleBatch.Len() > 0 {
-			if err := db.ldb.Write(staleBatch, &opt.WriteOptions{Sync: true}); err != nil {
+			releaseIter()
+			if err := db.ldb.Write(staleBatch, &index.WriteOptions{Sync: true}); err != nil {
 				return err
 			}
 			staleBatch.Reset()
+			newIter()
 		}
 		return nil
 	}
@@ -85,23 +98,23 @@ func (db *DB) RunCompaction() (bool, error) {
 	// Helper to flush valid entries
 	flushValid := func() error {
 		if len(validEntries) > 0 {
-			// rewriteBatch will handle re-verification and index updates for these
+			releaseIter()
 			if err := db.rewriteBatch(validEntries, bestFid); err != nil {
 				return err
 			}
 			validEntries = validEntries[:0]
 			currentBatchSize = 0
+			newIter()
 		}
 		return nil
 	}
 
-	// Create an iterator to check validity against the index *before* moving data.
-	iter := db.ldb.NewIterator(nil, nil)
-	defer iter.Release()
-
 	horizon := db.minActiveSnapshotXmax()
 
 	err := db.valueLog.IterateFile(bestFid, func(e ValueLogEntry, m EntryMeta) error {
+		if iter == nil {
+			newIter()
+		}
 		isAlive, isCurrentPointer := db.isEntryAlive(iter, e, horizon)
 
 		if isAlive {
@@ -188,7 +201,7 @@ func (db *DB) RunCompaction() (bool, error) {
 // the current visible pointer for its key (no newer committed version
 // exists, or the newer one is itself still in-progress), or if some active
 // snapshot's horizon still needs it (vacuum horizon).
-func (db *DB) isEntryAlive(iter iterator.Iterator, e ValueLogEntry, horizon uint64) (isAlive bool, isCurrentPointer bool) {
+func (db *DB) isEntryAlive(iter index.Iterator, e ValueLogEntry, horizon uint64) (isAlive bool, isCurrentPointer bool) {
 	seekKey := encodeIndexKey(e.Key, math.MaxUint64)
 
 	var newerCommittedXmin uint64
@@ -208,7 +221,7 @@ func (db *DB) isEntryAlive(iter iterator.Iterator, e ValueLogEntry, horizon uint
 				return false, false
 			}
 			isCurrentPointer = true
-			switch db.clogStatus(xmin) {
+			switch db.clogStatusUnlocked(xmin) {
 			case TxAborted:
 				return false, true
 			case TxInProgress:
@@ -232,7 +245,7 @@ func (db *DB) isEntryAlive(iter iterator.Iterator, e ValueLogEntry, horizon uint
 			}
 		}
 
-		switch db.clogStatus(xmin) {
+		switch db.clogStatusUnlocked(xmin) {
 		case TxCommitted:
 			if !haveNewerCommitted {
 				haveNewerCommitted = true
@@ -313,7 +326,7 @@ func (db *DB) rewriteBatch(entries []relocateEntry, origFileID uint32) error {
 	db.commitMu.Lock()
 	defer db.commitMu.Unlock()
 
-	batch := new(leveldb.Batch)
+	batch := new(index.Batch)
 
 	currentOffset := baseOffset
 	var newGarbage int64
@@ -389,7 +402,7 @@ func (db *DB) rewriteBatch(entries []relocateEntry, origFileID uint32) error {
 		// Use Sync: true to ensure index updates are persisted before we consider the old file obsolete.
 		// If we crash before this sync, the old file is still valid (not deleted yet).
 		// If we crash after, the index points to the new file.
-		if err := db.ldb.Write(batch, &opt.WriteOptions{Sync: true}); err != nil {
+		if err := db.ldb.Write(batch, &index.WriteOptions{Sync: true}); err != nil {
 			return err
 		}
 	}

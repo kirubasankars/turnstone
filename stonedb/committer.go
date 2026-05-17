@@ -5,7 +5,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/syndtr/goleveldb/leveldb"
+	"turnstone/stonedb/index"
 )
 
 // testingProcessCommitBatchErr allows tests to inject a system-level error
@@ -104,7 +104,7 @@ func (db *DB) processCommitBatch(requests []commitRequest) {
 			return
 		}
 
-		clogBatch := new(leveldb.Batch)
+		clogBatch := new(index.Batch)
 		for _, tx := range valid {
 			clogBatch.Put(encodeClogKey(tx.xid), []byte{byte(TxCommitted)})
 		}

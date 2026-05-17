@@ -130,7 +130,7 @@ type Options struct {
 	// If 0, disabled.
 	MaxDiskUsagePercent int
 
-	// BlockCacheSize is the capacity of the LevelDB block cache in bytes.
+	// BlockCacheSize is reserved for future index caching tuning.
 	// If 0, defaults to 64MB.
 	BlockCacheSize int
 
@@ -192,7 +192,7 @@ type ValueLogEntry struct {
 	IsDelete      bool
 }
 
-// EntryMeta is the pointer stored in LevelDB (formerly valueMeta)
+// EntryMeta is the pointer stored in the index (formerly valueMeta)
 type EntryMeta struct {
 	FileID        uint32
 	ValueOffset   int64 // Updated to int64 (8 bytes) to remove 4GB limit
