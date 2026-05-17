@@ -75,10 +75,13 @@ const (
 
 	OpCodeQuit uint8 = 0xFF
 
-	// Journal Specific Ops
+	// Journal Specific Ops (inner opcode carried inside OpCodeReplBatch).
+	// These mirror stonedb.WALRecordType 1:1.
+	OpJournalBegin  uint8 = 4
 	OpJournalSet    uint8 = 1
 	OpJournalDelete uint8 = 2
 	OpJournalCommit uint8 = 3
+	OpJournalAbort  uint8 = 5
 )
 
 // Response Status Codes

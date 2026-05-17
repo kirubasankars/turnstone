@@ -12,8 +12,9 @@ import (
 
 func TestWAL_RotationAndPurge(t *testing.T) {
 	dir := t.TempDir()
-	// Set very small WAL size to force rapid rotation (1KB)
-	opts := Options{MaxWALSize: 1024}
+	// WAL rotation is checkpoint-driven (not size-triggered per-write), so
+	// force rotation periodically via Checkpoint to create multiple files.
+	opts := Options{}
 	db, err := Open(dir, opts)
 	if err != nil {
 		t.Fatal(err)
@@ -26,6 +27,11 @@ func TestWAL_RotationAndPurge(t *testing.T) {
 		tx.Put([]byte(fmt.Sprintf("k%d", i)), []byte(fmt.Sprintf("v%d", i)))
 		if err := tx.Commit(); err != nil {
 			t.Fatal(err)
+		}
+		if i%20 == 19 {
+			if err := db.Checkpoint(); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
 
@@ -61,7 +67,7 @@ func TestWAL_ScanErrors(t *testing.T) {
 	defer db.Close()
 
 	// 1. Scan Future OpID (Log Unavailable)
-	err = db.ScanWAL(999999, func(entries []ValueLogEntry) error { return nil })
+	err = db.ScanWAL(999999, func(recs []WALRecord) error { return nil })
 	if err != ErrLogUnavailable {
 		t.Errorf("Expected ErrLogUnavailable for future OpID, got %v", err)
 	}
@@ -69,7 +75,7 @@ func TestWAL_ScanErrors(t *testing.T) {
 
 func TestWAL_Locate_IndexFallback(t *testing.T) {
 	dir := t.TempDir()
-	db, err := Open(dir, Options{MaxWALSize: 1024})
+	db, err := Open(dir, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +114,7 @@ func TestWAL_Locate_IndexFallback(t *testing.T) {
 func TestWAL_Corruption_Truncate(t *testing.T) {
 	dir := t.TempDir()
 	// Use small max size to ensure we generate multiple files easily
-	opts := Options{TruncateCorruptWAL: true, MaxWALSize: 1024}
+	opts := Options{TruncateCorruptWAL: true}
 
 	// 1. Create DB and Write enough to generate at least 2 files
 	db, err := Open(dir, opts)
@@ -164,31 +170,32 @@ func TestWAL_Corruption_Truncate(t *testing.T) {
 
 func TestWAL_RotateHookFailure(t *testing.T) {
 	dir := t.TempDir()
-	db, err := Open(dir, Options{MaxWALSize: 100}) // Small size to force rotation
+	db, err := Open(dir, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
 
-	// Inject failing hook
+	// Write something to WAL so the pending rotate has a non-empty batchIndex
+	// (rotate() skips the hook entirely for an empty file/index).
+	tx := db.NewTransaction(true)
+	tx.Put(make([]byte, 50), make([]byte, 50))
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Inject failing hook, then force rotation explicitly via Checkpoint
+	// (WAL rotation is now checkpoint-driven, not size-triggered per-write).
 	db.writeAheadLog.SetOnRotate(func(m map[uint64]WALLocation) error {
 		return errors.New("boom")
 	})
 
-	// Write enough to trigger rotation
-	tx := db.NewTransaction(true)
-	tx.Put(make([]byte, 50), make([]byte, 50))
-	if err := tx.Commit(); err != nil {
-		if err.Error() != "wal write failed: wal rotate hook failed: boom" && err.Error() != "wal failed: wal rotate hook failed: boom" {
-			t.Errorf("Expected hook failure error, got: %v", err)
-		}
-	} else {
-		// Attempt 2 in case first write was too small
-		tx = db.NewTransaction(true)
-		tx.Put(make([]byte, 50), make([]byte, 50))
-		if err := tx.Commit(); err == nil {
-			t.Error("Expected rotation error")
-		}
+	err = db.Checkpoint()
+	if err == nil {
+		t.Fatal("Expected rotation error from failing onRotate hook")
+	}
+	if err.Error() != "wal rotate failed: wal rotate hook failed: boom" {
+		t.Errorf("Expected hook failure error, got: %v", err)
 	}
 }
 
@@ -211,8 +218,8 @@ func TestWAL_ReadFirstOpID_Failures(t *testing.T) {
 
 	// Case 4: Short Payload
 	buf.Reset()
-	binary.Write(buf, binary.BigEndian, uint32(WALBatchHeaderSize)) // Length
-	binary.Write(buf, binary.BigEndian, uint32(0))                  // Checksum
+	binary.Write(buf, binary.BigEndian, uint32(WALRecordHeaderSize)) // Length
+	binary.Write(buf, binary.BigEndian, uint32(0))                   // Checksum
 	os.WriteFile(filepath.Join(walDir, "wal_1_0004.wal"), buf.Bytes(), 0o644)
 
 	wal, _ := OpenWriteAheadLog(walDir, 1024, 1, nil)
@@ -238,16 +245,16 @@ func TestWAL_TimelineFork(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Write batch on T1
-	wal.AppendBatch(makeBatch(1, 1, "k1", "v1"))
+	// Write record on T1
+	wal.AppendReplicatedRecord(makeSetRecord(1, 1, "k1", "v1"), false)
 
 	// 2. Promote to Timeline 2
 	if err := wal.ForceNewTimeline(2); err != nil {
 		t.Fatalf("ForceNewTimeline failed: %v", err)
 	}
 
-	// Write batch on T2
-	wal.AppendBatch(makeBatch(2, 2, "k2", "v2"))
+	// Write record on T2
+	wal.AppendReplicatedRecord(makeSetRecord(2, 2, "k2", "v2"), false)
 	wal.Close()
 
 	// 3. Verify Files
@@ -278,7 +285,7 @@ func TestWAL_Promotion_Persistence(t *testing.T) {
 	}
 
 	// 1. Write on Timeline 1
-	if err := wal.AppendBatch(makeBatch(100, 1, "k1", "v1")); err != nil {
+	if err := wal.AppendReplicatedRecord(makeSetRecord(100, 1, "k1", "v1"), false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -288,7 +295,7 @@ func TestWAL_Promotion_Persistence(t *testing.T) {
 	}
 
 	// 3. Write on Timeline 5
-	if err := wal.AppendBatch(makeBatch(101, 2, "k2", "v2")); err != nil {
+	if err := wal.AppendReplicatedRecord(makeSetRecord(101, 2, "k2", "v2"), false); err != nil {
 		t.Fatal(err)
 	}
 	wal.Close()
@@ -305,12 +312,12 @@ func TestWAL_Promotion_Persistence(t *testing.T) {
 	foundK2 := false
 
 	// Scan should cover all histories leading up to current
-	err = wal2.Scan(WALLocation{FileStartOffset: 0, RelativeOffset: 0}, func(entries []ValueLogEntry) error {
-		for _, e := range entries {
-			if string(e.Key) == "k1" {
+	err = wal2.Scan(WALLocation{FileStartOffset: 0, RelativeOffset: 0}, func(recs []WALRecord) error {
+		for _, r := range recs {
+			if string(r.Key) == "k1" {
 				foundK1 = true
 			}
-			if string(e.Key) == "k2" {
+			if string(r.Key) == "k2" {
 				foundK2 = true
 			}
 		}
@@ -353,19 +360,7 @@ func ioIsPrefix(s, prefix string) bool {
 	return len(s) >= len(prefix) && s[0:len(prefix)] == prefix
 }
 
-// Helper to make a raw WAL batch payload for testing
-func makeBatch(txID, opID uint64, k, v string) []byte {
-	var buf bytes.Buffer
-	binary.Write(&buf, binary.BigEndian, txID)
-	binary.Write(&buf, binary.BigEndian, opID)
-	binary.Write(&buf, binary.BigEndian, uint32(1)) // count
-
-	key := []byte(k)
-	val := []byte(v)
-	binary.Write(&buf, binary.BigEndian, uint32(len(key)))
-	buf.Write(key)
-	binary.Write(&buf, binary.BigEndian, uint32(len(val)))
-	buf.Write(val)
-	buf.WriteByte(0)
-	return buf.Bytes()
+// Helper to make a raw WAL SET record payload for testing
+func makeSetRecord(xid, opID uint64, k, v string) []byte {
+	return encodeWALRecord(WALRecord{Type: WALRecordSet, XID: xid, OpID: opID, Key: []byte(k), Value: []byte(v)})
 }

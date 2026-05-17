@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"turnstone/protocol"
+	"turnstone/stonedb"
 	"turnstone/store"
 )
 
@@ -290,8 +291,6 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 	logger.Info("Connected to Leader", "db_count", len(dbs))
 
 	remoteToLocal := make(map[string][]string)
-	txBuffers := make(map[string][]protocol.LogEntry)
-	txBufferSizes := make(map[string]uint64)
 	snapshotStarted := make(map[string]bool)
 
 	// Handshake
@@ -314,8 +313,6 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 		logger.Debug("Sending Hello for DB", "remote_db", cfg.RemoteDB, "local_db", cfg.LocalDB, "start_log_id", logID)
 
 		remoteToLocal[cfg.RemoteDB] = append(remoteToLocal[cfg.RemoteDB], cfg.LocalDB)
-		txBuffers[cfg.LocalDB] = make([]protocol.LogEntry, 0)
-		txBufferSizes[cfg.LocalDB] = 0
 	}
 
 	header := make([]byte, 5)
@@ -459,7 +456,7 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 					if st, ok := rm.stores[localDBName]; ok {
 						logger.Info("Applying snapshot batch", "db", localDBName, "count", count, "bytes", len(data))
 						dCursor := 0
-						var entries []protocol.LogEntry
+						tx := st.DB.NewTransaction(true)
 						for i := 0; i < int(count); i++ {
 							kLen := int(binary.BigEndian.Uint32(data[dCursor:]))
 							dCursor += 4
@@ -470,11 +467,16 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 							val := data[dCursor : dCursor+vLen]
 							dCursor += vLen
 
-							entries = append(entries, protocol.LogEntry{
-								Key: key, Value: val, OpCode: protocol.OpCodeSet,
-							})
+							if err := tx.Put(key, val); err != nil {
+								tx.Discard()
+								logger.Error("Failed to apply snapshot entry", "db", localDBName, "err", err)
+								return err
+							}
 						}
-						st.ReplicateBatch(entries)
+						if err := tx.Commit(); err != nil {
+							logger.Error("Failed to commit snapshot batch", "db", localDBName, "err", err)
+							return err
+						}
 					}
 				}
 			}
@@ -523,15 +525,11 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 			if localDBNames, ok := remoteToLocal[remoteDBName]; ok {
 				for _, localDBName := range localDBNames {
 					if st, ok := rm.stores[localDBName]; ok {
-						buffer := txBuffers[localDBName]
-						sze := txBufferSizes[localDBName]
-						newBuffer, lastID, newSze, err := processReplicationPacket(st, buffer, sze, count, data)
+						lastID, err := processReplicationPacket(st, count, data)
 						if err != nil {
 							logger.Error("Failed to process WAL batch", "db", localDBName, "err", err)
 							return err
 						}
-						txBuffers[localDBName] = newBuffer
-						txBufferSizes[localDBName] = newSze
 
 						if lastID > 0 {
 							ackBuf := new(bytes.Buffer)
@@ -557,24 +555,46 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 	}
 }
 
-func processReplicationPacket(store *store.Store, buffer []protocol.LogEntry, currentSize uint64, count uint32, data []byte) ([]protocol.LogEntry, uint64, uint64, error) {
+// walRecordTypeForJournalOp maps the wire journal opcode back to the typed
+// WAL record kind so followers can apply a physical stream directly through
+// the same eager engine path the leader used to produce it.
+func walRecordTypeForJournalOp(op uint8) (stonedb.WALRecordType, bool) {
+	switch op {
+	case protocol.OpJournalBegin:
+		return stonedb.WALRecordBegin, true
+	case protocol.OpJournalSet:
+		return stonedb.WALRecordSet, true
+	case protocol.OpJournalDelete:
+		return stonedb.WALRecordDelete, true
+	case protocol.OpJournalCommit:
+		return stonedb.WALRecordCommit, true
+	case protocol.OpJournalAbort:
+		return stonedb.WALRecordAbort, true
+	}
+	return 0, false
+}
+
+// processReplicationPacket applies each replicated WAL record directly and
+// immediately (no client-side buffering): the leader has already resolved
+// eager visibility, so followers just mirror it record-for-record.
+func processReplicationPacket(st *store.Store, count uint32, data []byte) (uint64, error) {
 	cursor := 0
-	var lastCommittedID uint64
-	var pendingBatches [][]protocol.LogEntry
+	var lastAppliedID uint64
 
 	for i := 0; i < int(count); i++ {
 		// Entry: [LogID(8)][TxID(8)][Op(1)][KLen(4)][Key][VLen(4)][Val]
 		if cursor+17 > len(data) {
-			return buffer, 0, currentSize, fmt.Errorf("malformed batch entry header")
+			return lastAppliedID, fmt.Errorf("malformed batch entry header")
 		}
 		lid := binary.BigEndian.Uint64(data[cursor : cursor+8])
+		xid := binary.BigEndian.Uint64(data[cursor+8 : cursor+16])
 		op := data[cursor+16]
 		cursor += 17
 
 		kLen := int(binary.BigEndian.Uint32(data[cursor : cursor+4]))
 		cursor += 4
 		if cursor+kLen > len(data) {
-			return buffer, 0, currentSize, fmt.Errorf("malformed batch entry key")
+			return lastAppliedID, fmt.Errorf("malformed batch entry key")
 		}
 		key := data[cursor : cursor+kLen]
 		cursor += kLen
@@ -582,41 +602,22 @@ func processReplicationPacket(store *store.Store, buffer []protocol.LogEntry, cu
 		vLen := int(binary.BigEndian.Uint32(data[cursor : cursor+4]))
 		cursor += 4
 		if cursor+vLen > len(data) {
-			return buffer, 0, currentSize, fmt.Errorf("malformed batch entry val")
+			return lastAppliedID, fmt.Errorf("malformed batch entry val")
 		}
 		val := data[cursor : cursor+vLen]
 		cursor += vLen
 
-		if op == protocol.OpJournalCommit {
-			if len(buffer) > 0 {
-				pendingBatches = append(pendingBatches, buffer)
-				lastCommittedID = lid
-				buffer = nil
-				currentSize = 0
-			} else {
-				lastCommittedID = lid
-			}
-		} else {
-			entrySize := uint64(len(key) + len(val) + 20)
-			if currentSize+entrySize > protocol.MaxTransactionBufferSize {
-				return buffer, 0, currentSize, fmt.Errorf("transaction too large: %d > %d", currentSize+entrySize, protocol.MaxTransactionBufferSize)
-			}
-			currentSize += entrySize
-
-			buffer = append(buffer, protocol.LogEntry{
-				LogSeq: lid,
-				OpCode: op,
-				Key:    key,
-				Value:  val,
-			})
+		recType, ok := walRecordTypeForJournalOp(op)
+		if !ok {
+			return lastAppliedID, fmt.Errorf("unknown journal opcode: %d", op)
 		}
+
+		rec := stonedb.WALRecord{Type: recType, XID: xid, OpID: lid, Key: key, Value: val}
+		if err := st.ApplyRecord(rec); err != nil {
+			return lastAppliedID, fmt.Errorf("apply record (op=%d, opid=%d): %w", op, lid, err)
+		}
+		lastAppliedID = lid
 	}
 
-	if len(pendingBatches) > 0 {
-		if err := store.ReplicateBatches(pendingBatches); err != nil {
-			return buffer, lastCommittedID, currentSize, err
-		}
-	}
-
-	return buffer, lastCommittedID, currentSize, nil
+	return lastAppliedID, nil
 }

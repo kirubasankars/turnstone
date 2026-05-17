@@ -9,7 +9,7 @@ import (
 // BenchmarkDB_Insert measures performance of inserting NEW unique keys.
 func BenchmarkDB_Insert(b *testing.B) {
 	dir := b.TempDir()
-	opts := Options{MaxWALSize: 64 * 1024 * 1024}
+	opts := Options{}
 	db, err := Open(dir, opts)
 	if err != nil {
 		b.Fatal(err)
@@ -36,7 +36,7 @@ func BenchmarkDB_Insert(b *testing.B) {
 // This stresses the MVCC mechanism and Garbage Collection more than pure inserts.
 func BenchmarkDB_Update(b *testing.B) {
 	dir := b.TempDir()
-	opts := Options{MaxWALSize: 64 * 1024 * 1024}
+	opts := Options{}
 	db, err := Open(dir, opts)
 	if err != nil {
 		b.Fatal(err)
@@ -73,7 +73,7 @@ func BenchmarkDB_Update(b *testing.B) {
 // BenchmarkDB_Read measures random read performance on existing keys.
 func BenchmarkDB_Read(b *testing.B) {
 	dir := b.TempDir()
-	opts := Options{MaxWALSize: 64 * 1024 * 1024}
+	opts := Options{}
 	db, err := Open(dir, opts)
 	if err != nil {
 		b.Fatal(err)
@@ -113,7 +113,7 @@ func BenchmarkDB_Read(b *testing.B) {
 // BenchmarkDB_Mixed measures a 50/50 mix of Reads and Updates.
 func BenchmarkDB_Mixed(b *testing.B) {
 	dir := b.TempDir()
-	opts := Options{MaxWALSize: 64 * 1024 * 1024}
+	opts := Options{}
 	db, err := Open(dir, opts)
 	if err != nil {
 		b.Fatal(err)
