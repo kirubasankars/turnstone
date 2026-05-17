@@ -174,8 +174,8 @@ func TestDB_LDB_CorruptFile(t *testing.T) {
 	db, _ := Open(dir, Options{})
 	db.Close()
 
-	// Corrupt the CURRENT file to be garbage (not missing)
-	os.WriteFile(filepath.Join(dir, "index", "CURRENT"), []byte("GARBAGE"), 0o644)
+	// Corrupt the index data file to simulate corruption (not missing).
+	os.WriteFile(filepath.Join(dir, "index", "data.bt"), []byte("GARBAGE"), 0o644)
 
 	// Open should fail or rebuild
 	db2, err := Open(dir, Options{})
