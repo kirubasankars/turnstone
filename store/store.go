@@ -20,15 +20,15 @@ import (
 type StoreStats struct {
 	ActiveTxs    int
 	Uptime       string
-	Offset       int64 // Represents the WAL/VLog offset or similar metric
+	Offset       int64
 	Conflicts    uint64
-	ReplicaLag   uint64 // Least replica lag among all replicas
-	WALFiles     int
-	WALSize      int64
-	VLogFiles    int
-	VLogSize     int64
-	KeyCount     int64 // Number of live keys in the database
-	GarbageBytes int64 // Total stale bytes in VLog
+	ReplicaLag   uint64
+	WALFiles     int     // always 1 (single data.log)
+	WALSize      int64   // logical size of data.log
+	VLogFiles    int     // deprecated, always 0
+	VLogSize     int64   // allocated on-disk bytes (sparse)
+	KeyCount     int64
+	GarbageBytes int64
 }
 
 const (
@@ -104,19 +104,17 @@ func (s *Store) UnlockAdmin() {
 	s.adminMu.Unlock()
 }
 
-func NewStore(dir string, logger *slog.Logger, minReplicas int, walStrategy string, maxDiskUsage int, blockCacheSize int) (*Store, error) {
+func NewStore(dir string, logger *slog.Logger, minReplicas int, walStrategy string, maxDiskUsage int) (*Store, error) {
 	truncateWAL := false
 	if os.Getenv("TS_TEST_WAL_TRUNCATE") == "true" {
 		truncateWAL = true
 	}
 
 	opts := stonedb.Options{
-		// MaxWALSize removed - handled by time-based checkpointing
 		CompactionMinGarbage: 64 * 1024 * 1024,
 		TruncateCorruptWAL:   truncateWAL,
 		MaxDiskUsagePercent:  maxDiskUsage,
-		BlockCacheSize:       blockCacheSize,
-		Logger:               logger, // Ensure logger is passed down
+		Logger:               logger,
 		UnsafeDisableFsync:   os.Getenv("TS_UNSAFE_DISABLE_FSYNC") == "true",
 	}
 
@@ -485,7 +483,7 @@ func (s *Store) Stats() StoreStats {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 
-	wf, ws, vf, vs := s.DB.StorageStats()
+	_, logical, allocated := s.DB.StorageStats()
 	keyCount, _ := s.DB.KeyCount()
 	head := s.DB.LastOpID()
 	garbage := s.DB.TotalGarbageBytes()
@@ -516,10 +514,10 @@ func (s *Store) Stats() StoreStats {
 		Offset:       int64(head),
 		Conflicts:    s.DB.GetConflicts(),
 		ReplicaLag:   minLag,
-		WALFiles:     wf,
-		WALSize:      ws,
-		VLogFiles:    vf,
-		VLogSize:     vs,
+		WALFiles:     1,
+		WALSize:      logical,
+		VLogFiles:    0,
+		VLogSize:     allocated,
 		KeyCount:     keyCount,
 		GarbageBytes: garbage,
 	}

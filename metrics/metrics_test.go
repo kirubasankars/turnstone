@@ -47,7 +47,7 @@ func TestNewTurnstoneCollector(t *testing.T) {
 	// Create a new store (MinReplicas=0, Strategy="time")
 	// Removed isSystem (bool) argument.
 	// Signature: (dir, logger, minReplicas, walStrategy, maxDiskUsage, blockCacheSize)
-	st, err := store.NewStore(tmpDir, logger, 0, "time", 90, 0)
+	st, err := store.NewStore(tmpDir, logger, 0, "time", 90)
 	if err != nil {
 		t.Fatalf("Failed to create test store: %v", err)
 	}

@@ -58,12 +58,12 @@ func NewTurnstoneCollector(stores map[string]*store.Store, stats ServerStatsProv
 		dbConnections: newDescWithLabels("db", "connections", "Active connections to this database", []string{"db"}),
 		dbActiveTxs:   newDescWithLabels("db", "active_txs", "Active transactions in database", []string{"db"}),
 		dbConflicts:   newDescWithLabels("db", "conflicts_total", "Total transaction conflicts in database", []string{"db"}),
-		dbOffset:      newDescWithLabels("db", "offset", "Current WAL/VLog offset (LogID)", []string{"db"}),
+		dbOffset:      newDescWithLabels("db", "offset", "Current operation ID (LogID)", []string{"db"}),
 		dbReplicaLag:  newDescWithLabels("db", "replica_lag", "Lag of the slowest replica in operations", []string{"db"}),
-		dbWALFiles:    newDescWithLabels("db", "wal_files", "Number of WAL files", []string{"db"}),
-		dbWALBytes:    newDescWithLabels("db", "wal_bytes", "Total size of WAL in bytes", []string{"db"}),
-		dbVLogFiles:   newDescWithLabels("db", "vlog_files", "Number of VLog files", []string{"db"}),
-		dbVLogBytes:   newDescWithLabels("db", "vlog_bytes", "Total size of VLog in bytes", []string{"db"}),
+		dbWALFiles:    newDescWithLabels("db", "wal_files", "Number of log files (always 1)", []string{"db"}),
+		dbWALBytes:    newDescWithLabels("db", "wal_bytes", "Logical size of data.log in bytes", []string{"db"}),
+		dbVLogFiles:   newDescWithLabels("db", "vlog_files", "Deprecated; always 0 (single log file)", []string{"db"}),
+		dbVLogBytes:   newDescWithLabels("db", "vlog_bytes", "Allocated on-disk bytes for data.log (sparse)", []string{"db"}),
 		dbKeyCount:    newDescWithLabels("db", "key_count", "Approximate number of live keys in database", []string{"db"}),
 	}
 }

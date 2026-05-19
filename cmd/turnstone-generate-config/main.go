@@ -46,7 +46,6 @@ func main() {
 		TLSClientKeyFile:     "certs/client.key",
 		MetricsAddr:          ":9090",
 		WALRetentionStrategy: "replication",
-		BlockCacheSize:       "64MB",
 	}
 
 	configPath := filepath.Join(*homeDir, "turnstone.json")

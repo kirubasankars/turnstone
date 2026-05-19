@@ -31,7 +31,6 @@ type Config struct {
 	NumberOfDatabases    int    `json:"number_of_databases"`
 	WALRetentionStrategy string `json:"wal_retention_strategy"` // "replication" or "checkpoint"
 	MaxDiskUsagePercent  int    `json:"max_disk_usage_percent"`
-	BlockCacheSize       string `json:"block_cache_size"` // Size string e.g. "64MB"
 }
 
 // ResolvePath returns an absolute path relative to the home directory if strictly necessary.
@@ -109,11 +108,6 @@ func GenerateConfigArtifacts(homeDir string, defaultCfg Config, configPath strin
 	if defaultCfg.MaxDiskUsagePercent == 0 {
 		defaultCfg.MaxDiskUsagePercent = 90
 	}
-	// Default Block Cache
-	if defaultCfg.BlockCacheSize == "" {
-		defaultCfg.BlockCacheSize = "64MB"
-	}
-
 	// Set default ID if not provided
 	if defaultCfg.ID == "" {
 		hostname, _ := os.Hostname()

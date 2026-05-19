@@ -11,7 +11,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"syscall"
 
 	"turnstone/config"
@@ -46,35 +45,6 @@ func main() {
 	runServer(logger, *mode == "dev")
 }
 
-func parseBytes(s string) (int, error) {
-	s = strings.TrimSpace(strings.ToUpper(s))
-	if s == "" {
-		return 0, nil
-	}
-	var mult int64 = 1
-	suffix := ""
-	if strings.HasSuffix(s, "GB") {
-		mult = 1024 * 1024 * 1024
-		suffix = "GB"
-	} else if strings.HasSuffix(s, "MB") {
-		mult = 1024 * 1024
-		suffix = "MB"
-	} else if strings.HasSuffix(s, "KB") {
-		mult = 1024
-		suffix = "KB"
-	} else if strings.HasSuffix(s, "B") {
-		mult = 1
-		suffix = "B"
-	}
-
-	numStr := strings.TrimSuffix(s, suffix)
-	val, err := strconv.ParseInt(strings.TrimSpace(numStr), 10, 64)
-	if err != nil {
-		return 0, err
-	}
-	return int(val * mult), nil
-}
-
 func runServer(logger *slog.Logger, devMode bool) {
 	if devMode {
 		logger.Info("Starting in DEV mode: Transaction timeouts disabled, all DBs auto-promoted")
@@ -100,16 +70,6 @@ func runServer(logger *slog.Logger, devMode bool) {
 		logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	}
 
-	// Parse Block Cache
-	blockCacheSize := 64 * 1024 * 1024 // Default 64MB
-	if cfg.BlockCacheSize != "" {
-		if s, err := parseBytes(cfg.BlockCacheSize); err == nil {
-			blockCacheSize = s
-		} else {
-			logger.Warn("Invalid block_cache_size, using default 64MB", "val", cfg.BlockCacheSize, "err", err)
-		}
-	}
-
 	// Set default strategy if missing
 	if cfg.WALRetentionStrategy == "" {
 		cfg.WALRetentionStrategy = "replication"
@@ -131,7 +91,7 @@ func runServer(logger *slog.Logger, devMode bool) {
 
 		// DB 0 is now treated as a regular database (minReplicas configurable, not implicitly system)
 		// We hardcode minReplicas=0 for initial startup, but it can be promoted later.
-		st, err := store.NewStore(path, logger.With("db", name), 0, cfg.WALRetentionStrategy, cfg.MaxDiskUsagePercent, blockCacheSize)
+		st, err := store.NewStore(path, logger.With("db", name), 0, cfg.WALRetentionStrategy, cfg.MaxDiskUsagePercent)
 		if err != nil {
 			logger.Error("Failed to initialize store", "db", name, "err", err)
 			os.Exit(1)

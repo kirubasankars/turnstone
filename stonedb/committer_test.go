@@ -2,6 +2,7 @@ package stonedb
 
 import (
 	"errors"
+	"sync/atomic"
 	"testing"
 )
 
@@ -144,7 +145,7 @@ func TestProcessCommitBatch_WALFsyncFailure(t *testing.T) {
 	}
 
 	// Sabotage the WAL's underlying file so the COMMIT record's fsync fails.
-	db.writeAheadLog.currentFile.Close()
+	db.log.file.Close()
 
 	reqs := []commitRequest{{tx: tx, resp: make(chan error, 1)}}
 	db.processCommitBatch(reqs)
@@ -153,7 +154,7 @@ func TestProcessCommitBatch_WALFsyncFailure(t *testing.T) {
 		t.Fatal("expected error from sabotaged WAL fsync, got nil")
 	}
 
-	if db.isCorrupt != 1 {
+	if atomic.LoadInt32(&db.isCorrupt) != 1 {
 		t.Error("expected DB to be marked corrupt after WAL commit-fsync failure")
 	}
 }

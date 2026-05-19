@@ -24,7 +24,6 @@ const (
 	ProtoHeaderSize    = 5
 	CheckpointInterval = 512 * 1024 * 1024
 	SlowOpThreshold    = 500 * time.Millisecond
-	DefaultMaxVLogSize = 200 * 1024 * 1024 // 200MB Limit for VLog files
 )
 
 // Variables (Mutable for testing)
@@ -50,7 +49,7 @@ const (
 	OpCodeSlotDel    uint8 = 0x33
 	OpCodePromote    uint8 = 0x34
 	OpCodeStepDown   uint8 = 0x35
-	OpCodeCheckpoint uint8 = 0x36 // Force WAL Flush/VLog Rotation
+	OpCodeCheckpoint uint8 = 0x36 // Force checkpoint (records last op ID for retention)
 	OpCodeFlushDB    uint8 = 0x37 // Wipe Database
 
 	OpCodeReplHello uint8 = 0x50

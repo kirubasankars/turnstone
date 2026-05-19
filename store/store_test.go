@@ -23,7 +23,7 @@ func TestStore_Recover_Basic(t *testing.T) {
 
 	// 1. Initialize Store and write data
 	// Signature: (dir, logger, minReplicas, walStrategy, maxDiskUsage, blockCacheSize)
-	s1, err := NewStore(dir, logger, 0, "time", 90, 0)
+	s1, err := NewStore(dir, logger, 0, "time", 90)
 	if err != nil {
 		t.Fatalf("Failed to create initial store: %v", err)
 	}
@@ -46,7 +46,7 @@ func TestStore_Recover_Basic(t *testing.T) {
 	}
 
 	// 2. Re-open Store
-	s2, err := NewStore(dir, logger, 0, "time", 90, 0)
+	s2, err := NewStore(dir, logger, 0, "time", 90)
 	if err != nil {
 		t.Fatalf("Failed to create recovered store: %v", err)
 	}
@@ -73,7 +73,7 @@ func TestStore_Recover_CRC_Corruption(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	// 1. Create Store and write two entries
-	s1, err := NewStore(dir, logger, 0, "time", 90, 0)
+	s1, err := NewStore(dir, logger, 0, "time", 90)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,71 +89,31 @@ func TestStore_Recover_CRC_Corruption(t *testing.T) {
 
 	s1.Close()
 
-	// 2. Corrupt the WAL manually
-	// Find the WAL file (stonedb stores them in 'wal' subdir)
-	walDir := filepath.Join(dir, "wal")
-	matches, err := filepath.Glob(filepath.Join(walDir, "*.wal"))
-	if err != nil || len(matches) == 0 {
-		t.Fatalf("No WAL files found in %s", walDir)
-	}
-	// Close() rotates the WAL, leaving a fresh empty file after the one that
-	// holds our data. Recovery only tolerates trailing corruption in the
-	// genuinely last WAL file, so remove the empty rotated file(s) and
-	// corrupt the one that actually contains our entries.
-	walPath := ""
-	for i := len(matches) - 1; i >= 0; i-- {
-		info, err := os.Stat(matches[i])
-		if err != nil {
-			continue
-		}
-		if info.Size() == 0 {
-			if err := os.Remove(matches[i]); err != nil {
-				t.Fatal(err)
-			}
-			continue
-		}
-		if walPath == "" {
-			walPath = matches[i]
-		}
-	}
-	if walPath == "" {
-		t.Fatalf("No non-empty WAL files found in %s", walDir)
+	// 2. Corrupt the log manually
+	logPath := filepath.Join(dir, "data.log")
+	if _, err := os.Stat(logPath); err != nil {
+		t.Fatalf("No data.log found in %s", dir)
 	}
 
-	// Open file, flip the last byte.
-	f, err := os.OpenFile(walPath, os.O_RDWR, 0o644)
+	f, err := os.OpenFile(logPath, os.O_RDWR, 0o644)
 	if err != nil {
 		t.Fatal(err)
 	}
 	stat, _ := f.Stat()
 	size := stat.Size()
 
-	// Read last byte
 	b := make([]byte, 1)
 	if _, err := f.ReadAt(b, size-1); err != nil {
 		t.Fatal(err)
 	}
-
-	// Flip bit
 	b[0] ^= 0xFF
-
-	// Write back
 	if _, err := f.WriteAt(b, size-1); err != nil {
 		t.Fatal(err)
 	}
 	f.Close()
 
-	// FORCE FULL RECOVERY:
-	// Wipe internal storage to force replay from WAL
-	if err := os.RemoveAll(filepath.Join(dir, "vlog")); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.RemoveAll(filepath.Join(dir, "index")); err != nil {
-		t.Fatal(err)
-	}
-
-	// 3. Re-open Store (Should trigger truncate)
-	s2, err := NewStore(dir, logger, 0, "time", 90, 0)
+	// 3. Re-open Store (should truncate corrupt tail)
+	s2, err := NewStore(dir, logger, 0, "time", 90)
 	if err != nil {
 		t.Fatalf("Failed to recover store: %v", err)
 	}
@@ -182,33 +142,26 @@ func TestStore_Recover_PartialWrite(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	// 1. Create Store and write data
-	s1, err := NewStore(dir, logger, 0, "time", 90, 0)
+	s1, err := NewStore(dir, logger, 0, "time", 90)
 	if err != nil {
 		t.Fatal(err)
 	}
 	s1.ApplyBatch([]protocol.LogEntry{{OpCode: protocol.OpJournalSet, Key: []byte("key1"), Value: []byte("val1")}})
 	s1.Close()
 
-	// 2. Append garbage (partial header)
-	walDir := filepath.Join(dir, "wal")
-	matches, err := filepath.Glob(filepath.Join(walDir, "*.wal"))
-	if err != nil || len(matches) == 0 {
-		t.Fatalf("No WAL files found")
-	}
-	walPath := matches[len(matches)-1]
-
-	f, err := os.OpenFile(walPath, os.O_APPEND|os.O_WRONLY, 0o644)
+	// 2. Append garbage at EOF
+	logPath := filepath.Join(dir, "data.log")
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Append 4 bytes (partial header)
-	if _, err := f.Write(make([]byte, 4)); err != nil {
+	if _, err := f.Write([]byte{0xFF, 0xFF, 0xFF, 0xFF}); err != nil {
 		t.Fatal(err)
 	}
 	f.Close()
 
 	// 3. Re-open
-	s2, err := NewStore(dir, logger, 0, "time", 90, 0)
+	s2, err := NewStore(dir, logger, 0, "time", 90)
 	if err != nil {
 		t.Fatalf("Recovery failed on partial write: %v", err)
 	}
@@ -226,7 +179,7 @@ func TestStore_Replication_Quorum(t *testing.T) {
 
 	// 1. Create Store with MinReplicas = 1
 	// This ensures that any write operation must wait for at least 1 replica to acknowledge.
-	s, err := NewStore(dir, logger, 1, "time", 90, 0)
+	s, err := NewStore(dir, logger, 1, "time", 90)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -277,7 +230,7 @@ func TestStore_Replication_ApplyBatch(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	// Replica store (MinReplicas=0)
-	s, err := NewStore(dir, logger, 0, "time", 90, 0)
+	s, err := NewStore(dir, logger, 0, "time", 90)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -316,7 +269,7 @@ func TestStoreStats_ConflictsAndStorage(t *testing.T) {
 	defer os.RemoveAll(dir)
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
-	s, err := NewStore(dir, logger, 0, "time", 90, 0)
+	s, err := NewStore(dir, logger, 0, "time", 90)
 	if err != nil {
 		t.Fatalf("NewStore failed: %v", err)
 	}
@@ -352,7 +305,7 @@ func TestStoreStats_ConflictsAndStorage(t *testing.T) {
 		t.Errorf("expected 1 conflict, got %d", stats.Conflicts)
 	}
 
-	// 4. Write data to generate WAL/VLog usage
+	// 4. Write data to generate log usage
 	entries := []protocol.LogEntry{
 		{Key: []byte("k1"), Value: []byte("v1"), OpCode: protocol.OpJournalSet},
 		{Key: []byte("k2"), Value: []byte("v2"), OpCode: protocol.OpJournalSet},
@@ -363,17 +316,11 @@ func TestStoreStats_ConflictsAndStorage(t *testing.T) {
 
 	// 5. Verify Storage Metrics
 	stats = s.Stats()
-	if stats.WALFiles == 0 {
-		t.Error("expected >0 WAL files")
-	}
-	if stats.VLogFiles == 0 {
-		t.Error("expected >0 VLog files")
+	if stats.WALFiles != 1 {
+		t.Errorf("expected 1 log file, got %d", stats.WALFiles)
 	}
 	if stats.WALSize == 0 {
-		t.Error("expected >0 bytes WAL size")
-	}
-	if stats.VLogSize == 0 {
-		t.Error("expected >0 bytes VLog size")
+		t.Error("expected >0 bytes log logical size")
 	}
 }
 
@@ -382,7 +329,7 @@ func TestStore_ReplicaLag(t *testing.T) {
 	defer os.RemoveAll(dir)
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
-	s, err := NewStore(dir, logger, 0, "time", 90, 0)
+	s, err := NewStore(dir, logger, 0, "time", 90)
 	if err != nil {
 		t.Fatalf("NewStore failed: %v", err)
 	}
@@ -414,16 +361,12 @@ func TestStore_ReplicaLag(t *testing.T) {
 	}
 }
 
-// TestStore_BlockCacheConfiguration verifies that the store initializes correctly
-// with a custom block cache size.
-func TestStore_BlockCacheConfiguration(t *testing.T) {
+// TestStore_BasicInit verifies that the store initializes and accepts writes.
+func TestStore_BasicInit(t *testing.T) {
 	dir := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	// 1. Initialize with explicit block cache size (e.g., 16MB)
-	// Passing a specific size to ensure the option is accepted down the stack.
-	blockCacheSize := 16 * 1024 * 1024
-	s, err := NewStore(dir, logger, 0, "time", 90, blockCacheSize)
+	s, err := NewStore(dir, logger, 0, "time", 90)
 	if err != nil {
 		t.Fatalf("Failed to create store with block cache: %v", err)
 	}

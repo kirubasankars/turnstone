@@ -70,7 +70,7 @@ func setupTestEnv(t *testing.T) (string, map[string]*store.Store, *Server, func(
 	stores := make(map[string]*store.Store)
 	for i := 0; i < 4; i++ {
 		dbName := strconv.Itoa(i)
-		s, err := store.NewStore(filepath.Join(dir, "data", dbName), logger, 0, "time", 90, 0)
+		s, err := store.NewStore(filepath.Join(dir, "data", dbName), logger, 0, "time", 90)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -518,7 +518,7 @@ func TestMetrics_StorageIO(t *testing.T) {
 	client.AssertStatus(protocol.OpCodeSet, setPayload, protocol.ResStatusOK)
 	client.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusOK)
 
-	// Verify that VLog size increased
+	// Verify that allocated log bytes increased (sparse data.log)
 	m1 := gatherMetrics(t, srv)
 	if m1["turnstone_db_vlog_bytes"] <= baseVLogBytes {
 		t.Errorf("Expected vlog bytes increase, got %v (was %v)", m1["turnstone_db_vlog_bytes"], baseVLogBytes)
