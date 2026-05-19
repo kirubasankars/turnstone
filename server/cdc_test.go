@@ -278,7 +278,7 @@ func TestCDC_PurgedWAL_TriggersSnapshot(t *testing.T) {
 	go srv.Run(ctx)
 	time.Sleep(100 * time.Millisecond)
 
-	addr := srv.listener.Addr().String()
+	addr := srv.Addr().String()
 	// Removed redundant promoteNode call as setupTestEnv already sets Primary state
 	
 	clientTLS := getClientTLS(t, dir)

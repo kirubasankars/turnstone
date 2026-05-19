@@ -143,7 +143,14 @@ func StartFileConsumer(homeDir string, logger *slog.Logger) {
 	// Start Metrics Server
 	go startMetricsServer(cfg.MetricsAddr, logger)
 
-	lastSeenSeq := startSeq
+	// lastSeenSeq is read by the ticker goroutine and written by the
+	// Subscribe callback (both running concurrently), so it must be
+	// atomic -- a plain uint64 here was previously read/written from both
+	// goroutines without any consistent synchronization (some sites were
+	// under fileMutex, others, like the IsSnapshotDone branch below,
+	// weren't).
+	var lastSeenSeq atomic.Uint64
+	lastSeenSeq.Store(startSeq)
 	var currentFile *os.File
 	var currentBytes int64
 	lastRotationTime := time.Now()
@@ -179,7 +186,7 @@ func StartFileConsumer(homeDir string, logger *slog.Logger) {
 					return err
 				} else {
 					logger.Info("Finalized log file", "path", newPath)
-					saveState(lastSeenSeq)
+					saveState(lastSeenSeq.Load())
 				}
 			}
 		}
@@ -198,7 +205,7 @@ func StartFileConsumer(homeDir string, logger *slog.Logger) {
 		return nil
 	}
 
-	if err := rotateFile(lastSeenSeq); err != nil {
+	if err := rotateFile(lastSeenSeq.Load()); err != nil {
 		logger.Error("Failed to create initial log file", "err", err)
 		os.Exit(1)
 	}
@@ -229,7 +236,7 @@ func StartFileConsumer(homeDir string, logger *slog.Logger) {
 				if currentFile != nil {
 					currentFile.Sync()
 				}
-				currentSeq := lastSeenSeq
+				currentSeq := lastSeenSeq.Load()
 				needsAgeRotation := time.Since(lastRotationTime) > rotateDuration
 				needsIdleRotation := time.Since(lastWriteTime) > flushDuration
 				hasBytes := currentBytes > 0
@@ -294,7 +301,7 @@ Loop:
 			}
 		}
 
-		logger.Info("Connected, subscribing...", "seq", lastSeenSeq)
+		logger.Info("Connected, subscribing...", "seq", lastSeenSeq.Load())
 
 		doneCh := make(chan struct{})
 		go func() {
@@ -305,11 +312,11 @@ Loop:
 			}
 		}()
 
-		err = cli.Subscribe(cfg.Database, lastSeenSeq, func(c client.Change) error {
+		err = cli.Subscribe(cfg.Database, lastSeenSeq.Load(), func(c client.Change) error {
 			if c.IsSnapshotDone {
-				lastSeenSeq = c.LogSeq
-				logger.Info("Snapshot sync complete, updated sequence", "seq", lastSeenSeq)
-				saveState(lastSeenSeq)
+				lastSeenSeq.Store(c.LogSeq)
+				logger.Info("Snapshot sync complete, updated sequence", "seq", c.LogSeq)
+				saveState(c.LogSeq)
 				return nil
 			}
 
@@ -357,12 +364,12 @@ Loop:
 				return err
 			}
 			currentBytes += int64(n)
-			lastSeenSeq = c.LogSeq
+			lastSeenSeq.Store(c.LogSeq)
 			lastWriteTime = time.Now()
 
 			if currentBytes > int64(cfg.MaxFileSizeMB*1024*1024) {
 				fileMutex.Unlock()
-				if err := rotateFile(lastSeenSeq); err != nil {
+				if err := rotateFile(c.LogSeq); err != nil {
 					logger.Error("Rotation failed", "err", err)
 					fileMutex.Lock()
 				} else {
@@ -398,7 +405,7 @@ Loop:
 	}
 
 	logger.Info("CDC shutting down, finalizing state...")
-	if err := rotateFile(lastSeenSeq); err != nil {
+	if err := rotateFile(lastSeenSeq.Load()); err != nil {
 		logger.Error("Final rotation failed", "err", err)
 	}
 }
