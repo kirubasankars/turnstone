@@ -2,166 +2,193 @@ package stonedb
 
 import (
 	"bytes"
-	"sync"
+	"encoding/binary"
+	"errors"
+	"math"
+	"os"
+	"path/filepath"
+
+	"turnstone/stonedb/btree"
 )
 
-// MemIndex is an in-memory MVCC index: key -> version chain (newest xmin first).
-type MemIndex struct {
-	mu       sync.RWMutex
-	versions map[string][]indexVersion
+const indexVersionSize = 29 // offset(8)+valueLen(4)+xmin(8)+opID(8)+tombstone(1)
+
+// Index is an MVCC index backed by a memory-mapped B+ tree (stonedb/btree).
+type Index struct {
+	tree *btree.Tree
 }
 
-func NewMemIndex() *MemIndex {
-	return &MemIndex{versions: make(map[string][]indexVersion)}
+// OpenIndex opens (or recreates) the B+ tree index under dbDir/index.
+// The log replay on Open rebuilds index contents from scratch.
+func OpenIndex(dbDir string) (*Index, error) {
+	indexDir := filepath.Join(dbDir, "index")
+	if err := os.RemoveAll(indexDir); err != nil {
+		return nil, err
+	}
+	tree, err := btree.Open(indexDir)
+	if err != nil {
+		return nil, err
+	}
+	return &Index{tree: tree}, nil
 }
 
-func (idx *MemIndex) Put(key []byte, v indexVersion) {
-	keyStr := string(key)
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
-	chain := idx.versions[keyStr]
-	idx.versions[keyStr] = append([]indexVersion{v}, chain...)
+func (idx *Index) Close() error {
+	if idx.tree == nil {
+		return nil
+	}
+	return idx.tree.Close()
 }
 
-func (idx *MemIndex) DropXid(xid uint64) {
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
-	for k, chain := range idx.versions {
-		filtered := chain[:0]
-		for _, v := range chain {
-			if v.xmin != xid {
-				filtered = append(filtered, v)
-			}
+func (idx *Index) Put(key []byte, v indexVersion) {
+	_ = idx.tree.Put(encodeIndexKey(key, v.xmin), encodeIndexVersion(v))
+}
+
+func (idx *Index) DropXid(xid uint64) {
+	var toDelete [][]byte
+	idx.scanEntries(func(uk []byte, xmin uint64, idxKey []byte, _ indexVersion) {
+		if xmin == xid {
+			toDelete = append(toDelete, append([]byte(nil), idxKey...))
 		}
-		if len(filtered) == 0 {
-			delete(idx.versions, k)
-		} else {
-			idx.versions[k] = filtered
-		}
+	})
+	for _, k := range toDelete {
+		_ = idx.tree.Delete(k)
 	}
 }
 
-func (idx *MemIndex) LatestResolved(key []byte, excludeXid uint64, clog func(uint64) TxStatus) (*indexVersion, uint64, bool) {
-	keyStr := string(key)
-	idx.mu.RLock()
-	defer idx.mu.RUnlock()
-	for _, v := range idx.versions[keyStr] {
+func (idx *Index) LatestResolved(key []byte, excludeXid uint64, clog func(uint64) TxStatus) (*indexVersion, uint64, bool) {
+	var found *indexVersion
+	var foundXmin uint64
+	idx.walkKeyVersions(key, func(v indexVersion) bool {
 		if v.xmin == excludeXid {
-			continue
+			return true
 		}
-		st := clog(v.xmin)
-		if st == TxAborted {
-			continue
+		if clog(v.xmin) == TxAborted {
+			return true
 		}
-		ver := v
-		return &ver, v.xmin, true
+		cp := v
+		found = &cp
+		foundXmin = v.xmin
+		return false
+	})
+	if found == nil {
+		return nil, 0, false
 	}
-	return nil, 0, false
+	return found, foundXmin, true
 }
 
-func (idx *MemIndex) GetVisible(key []byte, snap Snapshot, myXid uint64, update bool, visible func(uint64, Snapshot) bool) (*indexVersion, bool) {
-	keyStr := string(key)
-	idx.mu.RLock()
-	defer idx.mu.RUnlock()
-	for _, v := range idx.versions[keyStr] {
+func (idx *Index) GetVisible(key []byte, snap Snapshot, myXid uint64, update bool, visible func(uint64, Snapshot) bool) (*indexVersion, bool) {
+	var found *indexVersion
+	idx.walkKeyVersions(key, func(v indexVersion) bool {
 		if update && v.xmin == myXid {
-			ver := v
-			return &ver, true
+			cp := v
+			found = &cp
+			return false
 		}
 		if visible(v.xmin, snap) {
-			ver := v
-			return &ver, true
+			cp := v
+			found = &cp
+			return false
 		}
+		return true
+	})
+	if found == nil {
+		return nil, false
 	}
-	return nil, false
+	return found, true
 }
 
-func (idx *MemIndex) HasNewerCommitted(key []byte, excludeXid uint64, snap Snapshot, clog func(uint64) TxStatus) bool {
-	keyStr := string(key)
-	idx.mu.RLock()
-	defer idx.mu.RUnlock()
-	for _, v := range idx.versions[keyStr] {
+func (idx *Index) HasNewerCommitted(key []byte, excludeXid uint64, snap Snapshot, clog func(uint64) TxStatus) bool {
+	found := false
+	idx.walkKeyVersions(key, func(v indexVersion) bool {
 		if v.xmin == excludeXid {
-			continue
+			return true
 		}
 		if clog(v.xmin) != TxCommitted {
-			continue
+			return true
 		}
-		return v.xmin >= snap.Xmax || snap.contains(v.xmin)
-	}
-	return false
+		found = v.xmin >= snap.Xmax || snap.contains(v.xmin)
+		return false
+	})
+	return found
 }
 
-func (idx *MemIndex) ForEachKey(fn func(key []byte, chain []indexVersion)) {
-	idx.mu.RLock()
-	defer idx.mu.RUnlock()
-	for k, chain := range idx.versions {
-		cp := append([]indexVersion(nil), chain...)
-		fn([]byte(k), cp)
+func (idx *Index) ForEachKey(fn func(key []byte, chain []indexVersion)) {
+	it := idx.tree.NewIterator(nil)
+	defer it.Release()
+	if !it.First() {
+		return
 	}
-}
 
-func (idx *MemIndex) RemoveVersion(key []byte, xmin uint64) {
-	keyStr := string(key)
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
-	chain := idx.versions[keyStr]
-	filtered := chain[:0]
-	for _, v := range chain {
-		if v.xmin != xmin {
-			filtered = append(filtered, v)
+	var curKey []byte
+	var chain []indexVersion
+	flush := func() {
+		if curKey != nil && len(chain) > 0 {
+			fn(curKey, chain)
 		}
 	}
-	if len(filtered) == 0 {
-		delete(idx.versions, keyStr)
-	} else {
-		idx.versions[keyStr] = filtered
+
+	for {
+		uk, xmin, err := decodeIndexKey(it.Key())
+		if err != nil {
+			break
+		}
+		ver, err := decodeIndexVersion(it.Value())
+		if err != nil {
+			break
+		}
+		ver.xmin = xmin
+		if curKey != nil && !bytes.Equal(curKey, uk) {
+			flush()
+			chain = chain[:0]
+		}
+		curKey = append(curKey[:0], uk...)
+		chain = append(chain, ver)
+		if !it.Next() {
+			break
+		}
 	}
+	flush()
 }
 
-func (idx *MemIndex) LiveKeyCount(clog func(uint64) TxStatus) int64 {
-	idx.mu.RLock()
-	defer idx.mu.RUnlock()
+func (idx *Index) RemoveVersion(key []byte, xmin uint64) {
+	_ = idx.tree.Delete(encodeIndexKey(key, xmin))
+}
+
+func (idx *Index) LiveKeyCount(clog func(uint64) TxStatus) int64 {
 	var count int64
-	for _, chain := range idx.versions {
+	idx.ForEachKey(func(_ []byte, chain []indexVersion) {
 		for _, v := range chain {
 			if clog(v.xmin) == TxCommitted && !v.tombstone {
 				count++
 				break
 			}
 		}
-	}
+	})
 	return count
 }
 
-// collectDeadVersions returns index versions that can be dropped from the
-// hashmap and their on-disk spans eligible for punch (subject to external floors).
-func (idx *MemIndex) collectDeadVersions(horizon uint64, clog func(uint64) TxStatus) []struct {
+func (idx *Index) collectDeadVersions(horizon uint64, clog func(uint64) TxStatus) []struct {
 	key string
 	ver indexVersion
 } {
-	idx.mu.RLock()
-	defer idx.mu.RUnlock()
-
 	var dead []struct {
 		key string
 		ver indexVersion
 	}
 
-	for k, chain := range idx.versions {
+	idx.ForEachKey(func(uk []byte, chain []indexVersion) {
 		var newestCommitted *indexVersion
 		for i := range chain {
 			v := chain[i]
 			if clog(v.xmin) == TxCommitted {
-				if newestCommitted == nil {
-					cp := v
-					newestCommitted = &cp
-				}
+				cp := v
+				newestCommitted = &cp
 				break
 			}
 		}
 
-		for i, v := range chain {
+		k := string(uk)
+		for _, v := range chain {
 			if clog(v.xmin) == TxInProgress {
 				continue
 			}
@@ -172,7 +199,6 @@ func (idx *MemIndex) collectDeadVersions(horizon uint64, clog func(uint64) TxSta
 				}{k, v})
 				continue
 			}
-			// committed
 			isNewest := newestCommitted != nil && v.offset == newestCommitted.offset
 			if isNewest {
 				continue
@@ -182,54 +208,157 @@ func (idx *MemIndex) collectDeadVersions(horizon uint64, clog func(uint64) TxSta
 					key string
 					ver indexVersion
 				}{k, v})
-				continue
 			}
-			_ = i
 		}
-	}
+	})
 	return dead
 }
 
-func (idx *MemIndex) RemoveDead(dead []struct {
+func (idx *Index) RemoveDead(dead []struct {
 	key string
 	ver indexVersion
 }) {
-	if len(dead) == 0 {
+	for _, d := range dead {
+		_ = idx.tree.Delete(encodeIndexKey([]byte(d.key), d.ver.xmin))
+	}
+}
+
+func (idx *Index) HasLiveRefAtOffset(offset int64) bool {
+	found := false
+	idx.scanEntries(func(_ []byte, _ uint64, _ []byte, v indexVersion) {
+		if v.offset == offset {
+			found = true
+		}
+	})
+	return found
+}
+
+func (idx *Index) KeysEqual(a, b []byte) bool {
+	return bytes.Equal(a, b)
+}
+
+func (idx *Index) CountKeys() int {
+	n := 0
+	idx.ForEachKey(func(_ []byte, _ []indexVersion) {
+		n++
+	})
+	return n
+}
+
+func (idx *Index) walkKeyVersions(key []byte, fn func(indexVersion) bool) {
+	rng := userKeyRange(key)
+	it := idx.tree.NewIterator(rng)
+	defer it.Release()
+	if !it.First() {
 		return
 	}
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
-	for _, d := range dead {
-		chain := idx.versions[d.key]
-		filtered := chain[:0]
-		for _, v := range chain {
-			if v.offset != d.ver.offset || v.xmin != d.ver.xmin {
-				filtered = append(filtered, v)
-			}
+	for it.Valid() {
+		uk, xmin, err := decodeIndexKey(it.Key())
+		if err != nil || !bytes.Equal(uk, key) {
+			break
 		}
-		if len(filtered) == 0 {
-			delete(idx.versions, d.key)
-		} else {
-			idx.versions[d.key] = filtered
+		ver, err := decodeIndexVersion(it.Value())
+		if err != nil {
+			break
+		}
+		ver.xmin = xmin
+		if !fn(ver) {
+			break
+		}
+		if !it.Next() {
+			break
 		}
 	}
 }
 
-func (idx *MemIndex) HasLiveRefAtOffset(offset int64) bool {
-	idx.mu.RLock()
-	defer idx.mu.RUnlock()
-	for _, chain := range idx.versions {
-		for _, v := range chain {
-			if v.offset == offset {
-				return true
-			}
+func (idx *Index) scanEntries(fn func(userKey []byte, xmin uint64, idxKey []byte, ver indexVersion)) {
+	it := idx.tree.NewIterator(nil)
+	defer it.Release()
+	if !it.First() {
+		return
+	}
+	for it.Valid() {
+		idxKey := append([]byte(nil), it.Key()...)
+		uk, xmin, err := decodeIndexKey(idxKey)
+		if err != nil {
+			break
+		}
+		ver, err := decodeIndexVersion(it.Value())
+		if err != nil {
+			break
+		}
+		ver.xmin = xmin
+		fn(uk, xmin, idxKey, ver)
+		if !it.Next() {
+			break
 		}
 	}
-	return false
 }
 
-func (idx *MemIndex) KeysEqual(a, b []byte) bool {
-	return bytes.Equal(a, b)
+func userKeyRange(userKey []byte) *btree.Range {
+	start := encodeIndexKey(userKey, math.MaxUint64)
+	limit := indexKeyUpperBound(userKey)
+	if limit == nil {
+		return &btree.Range{Start: start}
+	}
+	return &btree.Range{Start: start, Limit: limit}
+}
+
+func indexKeyUpperBound(userKey []byte) []byte {
+	if len(userKey) == 0 {
+		return []byte{0x00}
+	}
+	next := make([]byte, len(userKey))
+	copy(next, userKey)
+	for i := len(next) - 1; i >= 0; i-- {
+		next[i]++
+		if next[i] != 0 {
+			return append(next, 0x00)
+		}
+	}
+	return nil
+}
+
+func encodeIndexKey(key []byte, xmin uint64) []byte {
+	out := make([]byte, len(key)+9)
+	copy(out, key)
+	out[len(key)] = 0x00
+	binary.BigEndian.PutUint64(out[len(key)+1:], math.MaxUint64-xmin)
+	return out
+}
+
+func decodeIndexKey(data []byte) ([]byte, uint64, error) {
+	if len(data) < 9 {
+		return nil, 0, errors.New("invalid index key length")
+	}
+	userKey := data[:len(data)-9]
+	invTs := binary.BigEndian.Uint64(data[len(data)-8:])
+	return userKey, math.MaxUint64 - invTs, nil
+}
+
+func encodeIndexVersion(v indexVersion) []byte {
+	buf := make([]byte, indexVersionSize)
+	binary.BigEndian.PutUint64(buf[0:], uint64(v.offset))
+	binary.BigEndian.PutUint32(buf[8:], v.valueLen)
+	binary.BigEndian.PutUint64(buf[12:], v.xmin)
+	binary.BigEndian.PutUint64(buf[20:], v.opID)
+	if v.tombstone {
+		buf[28] = 1
+	}
+	return buf
+}
+
+func decodeIndexVersion(data []byte) (indexVersion, error) {
+	if len(data) < indexVersionSize {
+		return indexVersion{}, errors.New("invalid index version length")
+	}
+	return indexVersion{
+		offset:    int64(binary.BigEndian.Uint64(data[0:])),
+		valueLen:  binary.BigEndian.Uint32(data[8:]),
+		xmin:      binary.BigEndian.Uint64(data[12:]),
+		opID:      binary.BigEndian.Uint64(data[20:]),
+		tombstone: data[28] == 1,
+	}, nil
 }
 
 func alignRange(start, end, blockSize int64) (int64, int64) {
@@ -255,12 +384,6 @@ func recordSpanSize(keyLen, valLen int, recType WALRecordType) int64 {
 	return frameSize(LogRecordHeaderSize + body)
 }
 
-func (idx *MemIndex) CountKeys() int {
-	idx.mu.RLock()
-	defer idx.mu.RUnlock()
-	return len(idx.versions)
-}
-
 // visibleVersionForKey returns the first visible version for key in snapshot.
 func visibleVersionForKey(chain []indexVersion, snap Snapshot, myXid uint64, update bool, isVisible func(uint64, Snapshot) bool) (*indexVersion, bool) {
 	for _, v := range chain {
@@ -275,4 +398,3 @@ func visibleVersionForKey(chain []indexVersion, snap Snapshot, myXid uint64, upd
 	}
 	return nil, false
 }
-
