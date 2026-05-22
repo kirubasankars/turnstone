@@ -22,6 +22,15 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      - name: Gofmt
+        run: |
+          fmt_out="$(gofmt -l .)"
+          if [ -n "$fmt_out" ]; then
+            echo "The following files are not gofmt-formatted:"
+            echo "$fmt_out"
+            exit 1
+          fi
+
       # IMPORTANT: this must run as a single `./...` invocation covering
       # every package in one `go test` process per package binary, rather
       # than scoping down to a subset of packages. Concurrency bugs in this
@@ -30,3 +39,27 @@ jobs:
       # so CI must always exercise all packages, not a hand-picked subset.
       - name: Test (race detector, all packages)
         run: go test -race -count=1 ./...
+
+  connectors:
+    name: Build connector modules (turnstone-duck, turnstone-clickhouse)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        module: [cmd/turnstone-duck, cmd/turnstone-clickhouse]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      # These are separate Go modules (they pull in heavier dependencies
+      # like DuckDB/ClickHouse drivers) so they're excluded from the root
+      # module's `./...` and get their own build check here instead.
+      - name: Build
+        working-directory: ${{ matrix.module }}
+        run: go build ./...
+
+      - name: Vet
+        working-directory: ${{ matrix.module }}
+        run: go vet ./...

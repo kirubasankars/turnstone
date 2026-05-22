@@ -3,6 +3,7 @@ package stonedb
 import (
 	"bufio"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -11,7 +12,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"errors"
 	"strconv"
 	"strings"
 	"sync"
@@ -276,7 +276,7 @@ func (wal *WriteAheadLog) FindInMemory(opID uint64) (WALLocation, bool) {
 			if !found || op > bestOp {
 				bestOp = op
 				found = true
-						}
+			}
 		}
 	}
 
