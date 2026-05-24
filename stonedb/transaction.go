@@ -23,10 +23,10 @@ type Transaction struct {
 	keyDelta        int64
 	readSet         map[string]struct{}
 
-	snapshot Snapshot
-	snapOpID uint64
-	aborted  int32
-	finished bool
+	snapshot  Snapshot
+	snapOpID  uint64
+	aborted   int32
+	finished  bool
 	abortOnce sync.Once
 	decided   int32
 
