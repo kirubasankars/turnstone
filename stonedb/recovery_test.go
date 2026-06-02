@@ -64,8 +64,9 @@ func TestRecovery_LogReplay(t *testing.T) {
 	if err != nil || string(val) != "value" {
 		t.Fatalf("replay failed: %v %q", err, val)
 	}
-	if db2.index.CountKeys() == 0 {
-		t.Error("index empty after replay")
+	count, err := db2.KeyCount()
+	if err != nil || count == 0 {
+		t.Errorf("index empty after replay: count=%d err=%v", count, err)
 	}
 }
 

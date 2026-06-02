@@ -171,9 +171,7 @@ func (t *Tree) ApplyBatch(puts [][2][]byte, deletes [][]byte, sync bool) error {
 		}
 	}
 	for _, k := range deletes {
-		if err := t.deleteLocked(k); err != nil {
-			return err
-		}
+		_ = t.deleteLocked(k)
 	}
 	if sync {
 		return t.mf.sync()
@@ -236,9 +234,16 @@ func (t *Tree) setLeafLinks(page, prev, next uint64) {
 
 func (t *Tree) leafEntrySize(page uint64, idx int) int {
 	off := leafHeaderSize
+	p := t.mf.page(page)
 	for i := 0; i < idx; i++ {
-		kl := int(readU32(t.mf.page(page), off))
-		vl := int(readU32(t.mf.page(page), off+4))
+		if off+8 > len(p) {
+			return off
+		}
+		kl := int(readU32(p, off))
+		vl := int(readU32(p, off+4))
+		if kl < 0 || vl < 0 || off+8+kl+vl > len(p) {
+			return off
+		}
 		off += 8 + kl + vl
 	}
 	return off
@@ -252,6 +257,9 @@ func (t *Tree) leafEntry(page uint64, idx int) (key, val []byte, err error) {
 	p := t.mf.page(page)
 	kl := int(readU32(p, off))
 	vl := int(readU32(p, off+4))
+	if kl < 0 || vl < 0 || off+8+kl+vl > len(p) {
+		return nil, nil, errors.New("corrupt leaf entry")
+	}
 	off += 8
 	key = cloneBytes(p[off : off+kl])
 	val = cloneBytes(p[off+kl : off+kl+vl])
