@@ -14,26 +14,14 @@ import (
 // --- Constants ---
 
 const (
-	DefaultPort              = ":6379"
-	DefaultReadTimeout       = 5 * time.Second
-	DefaultWriteTimeout      = 5 * time.Second
-	IdleTimeout              = 3 * 60 * time.Second
-	ShutdownTimeout          = 10 * time.Second
-	MaxTxDuration            = 30 * time.Second  // Strict 30s limit
-	MaxTxSize                = 200 * 1024 * 1024 // 200MB Limit
-	MaxValueSize             = 4 * 1024 * 1024   // 4MB Limit
-	MaxCommandSize           = 512 * 1024 * 1024 // 512MB Limit (Must fit in uint32)
-	MaxTransactionBufferSize = 64 * 1024 * 1024  // 64MB Limit for buffering a tx in memory (replication/server)
-	HeaderSize               = 16                // Meta(4) + LogSeq(8) + CRC(4)
+	DefaultWriteTimeout = 5 * time.Second
+	IdleTimeout         = 3 * 60 * time.Second
+	MaxTxDuration       = 30 * time.Second  // Strict 30s limit
+	MaxTxSize           = 200 * 1024 * 1024 // 200MB Limit
+	MaxValueSize        = 4 * 1024 * 1024   // 4MB Limit
+	MaxCommandSize      = 512 * 1024 * 1024 // 512MB Limit (Must fit in uint32)
 
-	ProtoHeaderSize    = 5
-	CheckpointInterval = 512 * 1024 * 1024
-	SlowOpThreshold    = 500 * time.Millisecond
-)
-
-// Variables (Mutable for testing)
-var (
-	ReplicationTimeout = 30 * time.Second
+	ProtoHeaderSize = 5
 )
 
 // OpCodes define the available commands in the TurnstoneDB wire protocol.
@@ -51,7 +39,6 @@ const (
 	OpCodeAbort      uint8 = 0x12
 	OpCodeStat       uint8 = 0x20
 	OpCodeReplicaOf  uint8 = 0x32
-	OpCodeSlotDel    uint8 = 0x33
 	OpCodePromote    uint8 = 0x34
 	OpCodeStepDown   uint8 = 0x35
 	OpCodeCheckpoint uint8 = 0x36 // Force checkpoint (records last op ID for retention)
@@ -99,21 +86,11 @@ const (
 	ResTxInProgress         = 0x06
 	ResStatusServerBusy     = 0x07
 	ResStatusEntityTooLarge = 0x08
-	ResStatusMemoryLimit    = 0x09
 )
 
 // Errors
 var (
-	ErrKeyNotFound         = errors.New("key does not exist")
-	ErrCrcMismatch         = errors.New("crc checksum mismatch")
-	ErrClosed              = errors.New("store closed")
-	ErrCommandTooLarge     = errors.New("command line too large")
-	ErrConflict            = errors.New("transaction conflict")
-	ErrBusy                = errors.New("server busy")
-	ErrTransactionTimeout  = errors.New("transaction timeout")
-	ErrReadOnly            = errors.New("server is read-only")
-	ErrMemoryLimitExceeded = errors.New("memory limit exceeded")
-	ErrDatabaseNotFound    = errors.New("database not found")
+	ErrKeyNotFound = errors.New("key does not exist")
 )
 
 var Crc32Table = crc32.MakeTable(crc32.Castagnoli)
@@ -124,7 +101,6 @@ type LogEntry struct {
 	OpCode uint8
 	Key    []byte
 	Value  []byte
-	Offset int64 // Virtual Offset in the WAL (internal use for checkpoints)
 }
 
 // IsASCII validates if a string contains only ASCII characters.

@@ -69,7 +69,6 @@ var Crc32Table = crc32.MakeTable(crc32.Castagnoli)
 var (
 	ErrTxnFinished    = errors.New("transaction is already finished")
 	ErrWriteConflict  = errors.New("write conflict detected")
-	ErrTxAborted      = errors.New("current transaction is aborted, commands ignored until end of transaction block")
 	ErrKeyNotFound    = errors.New("key not found")
 	ErrChecksum       = errors.New("checksum mismatch")
 	ErrCorruptData    = errors.New("data corruption detected")

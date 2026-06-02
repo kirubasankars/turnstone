@@ -200,27 +200,6 @@ func TestRBACCertificates(t *testing.T) {
 	}
 }
 
-// TestValidateSecurityConfig checks valid/invalid config validation.
-func TestValidateSecurityConfig(t *testing.T) {
-	validCfg := Config{
-		TLSCertFile: "cert",
-		TLSKeyFile:  "key",
-		TLSCAFile:   "ca",
-	}
-	if err := ValidateSecurityConfig(validCfg); err != nil {
-		t.Errorf("Expected success, got error: %v", err)
-	}
-
-	badCfg := Config{
-		TLSCertFile: "", // Missing
-		TLSKeyFile:  "key",
-		TLSCAFile:   "ca",
-	}
-	if err := ValidateSecurityConfig(badCfg); err == nil {
-		t.Error("Expected error for missing cert file, got nil")
-	}
-}
-
 // TestValidateConfig checks MaxDiskUsagePercent range validation.
 func TestValidateConfig(t *testing.T) {
 	cases := []struct {

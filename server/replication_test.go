@@ -416,9 +416,9 @@ func TestReplication_SameServer_Loopback(t *testing.T) {
 
 func TestReplication_SlowConsumer_Dropped(t *testing.T) {
 	// 1. Lower timeout to speed up test
-	originalTimeout := protocol.ReplicationTimeout
-	protocol.ReplicationTimeout = 200 * time.Millisecond
-	defer func() { protocol.ReplicationTimeout = originalTimeout }()
+	originalTimeout := ReplicaWriteTimeout
+	ReplicaWriteTimeout = 200 * time.Millisecond
+	defer func() { ReplicaWriteTimeout = originalTimeout }()
 
 	// 2. Setup Single Node Environment
 	baseDir, clientTLS := setupSharedCertEnv(t)
@@ -940,10 +940,8 @@ func TestReplication_Retention_LeaderProtectsSlowFollower(t *testing.T) {
 		t.Fatal("Expected replica slot to constrain retention")
 	}
 
-	// 10. Delete the Replica Slot manually on Leader
-	if err := st1.DeleteReplica("replica_ret"); err != nil {
-		t.Fatalf("Failed to delete replica slot: %v", err)
-	}
+	// 10. Remove all replica slots on Leader
+	st1.RemoveAllReplicas()
 
 	// 11. Run Retention again
 	st1.EnforceRetentionPolicy()

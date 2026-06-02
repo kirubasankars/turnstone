@@ -56,19 +56,14 @@ const (
 	OpCodeReplSnapshotDone = 0x54
 	OpCodeReplSafePoint    = 0x55
 	OpCodeReplTimeline     = 0x56
-	OpCodeQuit             = 0xFF
 )
 
-// Journal opcodes mirror protocol.OpJournal* / stonedb.WALRecordType. Begin
-// and Abort are only ever sent on a "server" (physical) replication stream;
-// a "cdc" role client (the only user of Subscribe) never receives them since
-// the leader buffers per-xid and only forwards committed Set/Delete/Commit.
+// Journal opcodes mirror protocol.OpJournal* / stonedb.WALRecordType. Subscribe
+// only receives committed Set/Delete/Commit on CDC streams.
 const (
 	OpJournalSet    = 1
 	OpJournalDelete = 2
 	OpJournalCommit = 3
-	OpJournalBegin  = 4
-	OpJournalAbort  = 5
 )
 
 const (
@@ -79,7 +74,6 @@ const (
 	ResStatusTxTimeout      = 0x04
 	ResStatusTxConflict     = 0x05
 	ResStatusTxInProgress   = 0x06
-	ResStatusTxCommitted    = 0x0A
 	ResStatusServerBusy     = 0x07
 	ResStatusEntityTooLarge = 0x08
 	ResStatusMemoryLimit    = 0x09
@@ -146,13 +140,11 @@ type Config struct {
 }
 
 type Client struct {
-	conn     net.Conn
-	mu       sync.Mutex
-	config   Config
-	logger   *slog.Logger
-	pool     *Pool
-	poisoned bool
-	closed   bool
+	conn   net.Conn
+	mu     sync.Mutex
+	config Config
+	logger *slog.Logger
+	closed bool
 }
 
 func NewClient(cfg Config) (*Client, error) {
@@ -221,12 +213,7 @@ func (c *Client) connect() error {
 	return nil
 }
 
-// Close either returns c to its pool (if it's healthy and the pool isn't
-// shutting down) or closes its underlying connection directly. It is
-// idempotent: calling Close() more than once on the same *Client is a
-// no-op after the first call, so a double-Close (e.g. a defer plus an
-// explicit early Close()) can't push the same client into the pool's idle
-// set twice.
+// Close closes the underlying connection. It is idempotent.
 func (c *Client) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -234,9 +221,6 @@ func (c *Client) Close() error {
 		return nil
 	}
 	c.closed = true
-	if c.pool != nil {
-		return c.pool.releaseOrClose(c)
-	}
 	if c.conn != nil {
 		c.logger.Info("Closing connection", "addr", c.config.Address)
 		return c.conn.Close()
@@ -244,127 +228,10 @@ func (c *Client) Close() error {
 	return nil
 }
 
-func (c *Client) markPoisoned() {
-	c.poisoned = true
-}
-
-type Pool struct {
-	config     Config
-	idle       chan *Client
-	maxCap     int
-	mu         sync.Mutex
-	currentCap int
-	closed     bool
-}
-
-func NewClientPool(cfg Config, maxConns int) (*Pool, error) {
-	if maxConns <= 0 {
-		return nil, errors.New("maxConns must be > 0")
-	}
-	if cfg.Logger == nil {
-		cfg.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
-	}
-	return &Pool{
-		config: cfg,
-		idle:   make(chan *Client, maxConns),
-		maxCap: maxConns,
-	}, nil
-}
-
-func (p *Pool) Get() (*Client, error) {
-	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
-		return nil, errors.New("pool is closed")
-	}
-	select {
-	case c := <-p.idle:
-		p.mu.Unlock()
-		return c, nil
-	default:
-	}
-	if p.currentCap < p.maxCap {
-		p.currentCap++
-		p.mu.Unlock()
-		c, err := NewClient(p.config)
-		if err != nil {
-			p.reportClosed()
-			return nil, err
-		}
-		c.pool = p
-		return c, nil
-	}
-	p.mu.Unlock()
-	c, ok := <-p.idle
-	if !ok {
-		return nil, errors.New("pool is closed")
-	}
-	return c, nil
-}
-
-func (p *Pool) reportClosed() {
-	p.mu.Lock()
-	p.currentCap--
-	p.mu.Unlock()
-}
-
-// releaseOrClose returns c to the pool's idle set if it's healthy and the
-// pool isn't shutting down; otherwise it closes c's connection directly and
-// decrements currentCap. The idle-channel send happens while holding p.mu,
-// which is what makes this safe against a concurrent Pool.Close(): that
-// function also takes p.mu before setting p.closed and closing the idle
-// channel, so the two can never interleave as "send" then "close on a
-// channel a send is still in flight for". Without this shared lock,
-// Client.Close() sending on p.idle after Pool.Close() has already closed
-// it panics with "send on closed channel".
-func (p *Pool) releaseOrClose(c *Client) error {
-	p.mu.Lock()
-	if p.closed || c.poisoned {
-		p.currentCap--
-		p.mu.Unlock()
-		if c.conn != nil {
-			if c.poisoned {
-				c.logger.Info("Closing poisoned connection", "addr", c.config.Address)
-			}
-			return c.conn.Close()
-		}
-		return nil
-	}
-	select {
-	case p.idle <- c:
-		p.mu.Unlock()
-		return nil
-	default:
-		p.currentCap--
-		p.mu.Unlock()
-		if c.conn != nil {
-			return c.conn.Close()
-		}
-		return nil
-	}
-}
-
-func (p *Pool) Close() {
-	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
-		return
-	}
-	p.closed = true
-	close(p.idle)
-	p.mu.Unlock()
-	for c := range p.idle {
-		if c.conn != nil {
-			c.conn.Close()
-		}
-	}
-}
-
 func (c *Client) roundTrip(op byte, payload []byte) ([]byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.conn == nil {
-		c.markPoisoned()
 		return nil, ErrConnection
 	}
 	if c.config.WriteTimeout > 0 {
@@ -377,14 +244,12 @@ func (c *Client) roundTrip(op byte, payload []byte) ([]byte, error) {
 	reqHeader[0] = op
 	binary.BigEndian.PutUint32(reqHeader[1:], uint32(len(payload)))
 	if _, err := c.conn.Write(reqHeader); err != nil {
-		c.markPoisoned()
 		c.conn.Close()
 		c.conn = nil
 		return nil, fmt.Errorf("%w: write header failed: %v", ErrConnection, err)
 	}
 	if len(payload) > 0 {
 		if _, err := c.conn.Write(payload); err != nil {
-			c.markPoisoned()
 			c.conn.Close()
 			c.conn = nil
 			return nil, fmt.Errorf("%w: write payload failed: %v", ErrConnection, err)
@@ -392,7 +257,6 @@ func (c *Client) roundTrip(op byte, payload []byte) ([]byte, error) {
 	}
 	respHeader := make([]byte, ProtoHeaderSize)
 	if _, err := io.ReadFull(c.conn, respHeader); err != nil {
-		c.markPoisoned()
 		c.conn.Close()
 		c.conn = nil
 		return nil, fmt.Errorf("%w: read header failed: %v", ErrConnection, err)
@@ -403,7 +267,6 @@ func (c *Client) roundTrip(op byte, payload []byte) ([]byte, error) {
 	if length > 0 {
 		body = make([]byte, length)
 		if _, err := io.ReadFull(c.conn, body); err != nil {
-			c.markPoisoned()
 			c.conn.Close()
 			c.conn = nil
 			return nil, fmt.Errorf("%w: read body failed: %v", ErrConnection, err)

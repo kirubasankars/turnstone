@@ -41,9 +41,13 @@ var (
 	ErrBatchFull            = errors.New("replication batch full")
 )
 
-const (
+var (
 	// ReplicaWriteTimeout ensures we don't block indefinitely on a hung consumer.
+	// Mutable for testing.
 	ReplicaWriteTimeout = 10 * 60 * time.Second
+)
+
+const (
 	// SnapshotRateLimit caps the full-sync bandwidth to prevent disk/network thrashing (32MB/s).
 	SnapshotRateLimit = 32 * 1024 * 1024
 	// MaxReplAckSize bounds the ACK-reader's per-frame allocation. A real

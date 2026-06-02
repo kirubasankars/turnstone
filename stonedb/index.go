@@ -155,10 +155,6 @@ func (idx *Index) ForEachKey(fn func(key []byte, chain []indexVersion)) {
 	flush()
 }
 
-func (idx *Index) RemoveVersion(key []byte, xmin uint64) {
-	_ = idx.tree.Delete(encodeIndexKey(key, xmin))
-}
-
 func (idx *Index) LiveKeyCount(clog func(uint64) TxStatus) int64 {
 	var count int64
 	idx.ForEachKey(func(_ []byte, chain []indexVersion) {
@@ -236,18 +232,6 @@ func (idx *Index) HasLiveRefAtOffset(offset int64) bool {
 		}
 	})
 	return found
-}
-
-func (idx *Index) KeysEqual(a, b []byte) bool {
-	return bytes.Equal(a, b)
-}
-
-func (idx *Index) CountKeys() int {
-	n := 0
-	idx.ForEachKey(func(_ []byte, _ []indexVersion) {
-		n++
-	})
-	return n
 }
 
 func (idx *Index) walkKeyVersions(key []byte, fn func(indexVersion) bool) {

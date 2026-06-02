@@ -418,12 +418,6 @@ func (db *DB) runGroupCommits() {
 	}
 }
 
-func (db *DB) SetCompactionMinGarbage(minGarbage int64) {
-	db.mu.Lock()
-	db.minGarbageThreshold = minGarbage
-	db.mu.Unlock()
-}
-
 func (db *DB) runAutoCheckpoint() {
 	defer db.wg.Done()
 	ticker := time.NewTicker(db.autoCheckpointInterval)
@@ -745,14 +739,4 @@ func (db *DB) checkDisk() {
 	} else {
 		atomic.StoreInt32(&db.isDiskFull, 0)
 	}
-}
-
-func (db *DB) markCorrupt(err error) {
-	db.logger.Error("CRITICAL: storage write failed", "err", err)
-	atomic.StoreInt32(&db.isCorrupt, 1)
-}
-
-// RunCompaction is kept as an alias for callers expecting the old name.
-func (db *DB) RunCompaction() (bool, error) {
-	return db.RunVacuum()
 }

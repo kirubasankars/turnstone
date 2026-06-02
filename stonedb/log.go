@@ -6,7 +6,6 @@
 package stonedb
 
 import (
-	"bufio"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -56,8 +55,6 @@ func OpenDataLog(dir string, logger *slog.Logger) (*DataLog, error) {
 		opOffsets:   make(map[uint64]int64),
 	}, nil
 }
-
-func (l *DataLog) Path() string { return l.path }
 
 func (l *DataLog) WriteOffset() int64 {
 	l.mu.Lock()
@@ -165,19 +162,6 @@ func (l *DataLog) ReadValueAt(offset int64, valLen uint32) ([]byte, error) {
 		return nil, fmt.Errorf("value length mismatch at offset %d", offset)
 	}
 	return append([]byte(nil), rec.Value...), nil
-}
-
-func (l *DataLog) OpOffset(opID uint64) (int64, bool) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	off, ok := l.opOffsets[opID]
-	return off, ok
-}
-
-func (l *DataLog) SetOpOffset(opID uint64, offset int64) {
-	l.mu.Lock()
-	l.opOffsets[opID] = offset
-	l.mu.Unlock()
 }
 
 // Replay scans the entire log, invoking onRecord for each valid frame.
@@ -395,35 +379,4 @@ func (l *DataLog) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.file.Close()
-}
-
-// streamFrames reads frames sequentially from r (used in tests).
-func streamFrames(r io.Reader, onFrame func(offset int64, payload []byte) error) (int64, error) {
-	validOffset := int64(0)
-	reader := bufio.NewReader(r)
-	for {
-		header := make([]byte, LogFrameHeaderSize)
-		if _, err := io.ReadFull(reader, header); err != nil {
-			if err == io.EOF {
-				return validOffset, io.EOF
-			}
-			return validOffset, io.ErrUnexpectedEOF
-		}
-		length := binary.BigEndian.Uint32(header[0:])
-		checksum := binary.BigEndian.Uint32(header[4:])
-		if length > 1<<30 {
-			return validOffset, ErrCorruptData
-		}
-		payload := make([]byte, length)
-		if _, err := io.ReadFull(reader, payload); err != nil {
-			return validOffset, io.ErrUnexpectedEOF
-		}
-		if crc32.Checksum(payload, Crc32Table) != checksum {
-			return validOffset, ErrChecksum
-		}
-		if err := onFrame(validOffset, payload); err != nil {
-			return validOffset, err
-		}
-		validOffset += frameSize(int(length))
-	}
 }
