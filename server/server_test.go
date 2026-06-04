@@ -417,6 +417,43 @@ func TestServer_CRUD(t *testing.T) {
 	client.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusOK)
 }
 
+func TestServer_ReadOnlyBegin(t *testing.T) {
+	dir, _, srv, cleanup := setupTestEnv(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.Run(ctx)
+	time.Sleep(100 * time.Millisecond)
+
+	client := connectClient(t, srv.Addr().String(), getClientTLS(t, dir))
+	defer client.Close()
+
+	client.AssertStatus(protocol.OpCodeSelect, []byte("1"), protocol.ResStatusOK)
+
+	key := []byte("ro_key")
+	val := []byte("ro_val")
+	setPayload := make([]byte, 4+len(key)+len(val))
+	binary.BigEndian.PutUint32(setPayload[0:4], uint32(len(key)))
+	copy(setPayload[4:], key)
+	copy(setPayload[4+len(key):], val)
+
+	client.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
+	client.AssertStatus(protocol.OpCodeSet, setPayload, protocol.ResStatusOK)
+	client.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusOK)
+
+	client.AssertStatus(protocol.OpCodeBegin, []byte{protocol.BeginReadOnly}, protocol.ResStatusOK)
+	resp := client.AssertStatus(protocol.OpCodeGet, key, protocol.ResStatusOK)
+	client.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusOK)
+	if !bytes.Equal(resp, val) {
+		t.Fatalf("read-only get mismatch: want %q got %q", val, resp)
+	}
+
+	client.AssertStatus(protocol.OpCodeBegin, []byte{protocol.BeginReadOnly}, protocol.ResStatusOK)
+	client.AssertStatus(protocol.OpCodeSet, setPayload, protocol.ResStatusErr)
+	client.AssertStatus(protocol.OpCodeAbort, nil, protocol.ResStatusOK)
+}
+
 func TestMetrics_Connections(t *testing.T) {
 	dir, _, srv, cleanup := setupTestEnv(t)
 	defer cleanup()

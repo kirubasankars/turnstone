@@ -1,0 +1,132 @@
+// Copyright (c) 2026 Kiruba Sankar Swaminathan
+//
+// This source code is licensed under the MIT license found in the
+// LICENSE file in the root of this source tree.
+
+package segindex
+
+import (
+	"fmt"
+	"sync"
+	"testing"
+)
+
+func TestPutAndWalkVersions(t *testing.T) {
+	dir := t.TempDir()
+	idx, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idx.Close()
+
+	key := []byte("alpha")
+	idx.Put(key, Version{Offset: 10, ValueLen: 3, Xmin: 1, OpID: 1})
+	idx.Put(key, Version{Offset: 20, ValueLen: 3, Xmin: 2, OpID: 2})
+
+	var chain []Version
+	idx.WalkVersions(key, func(v Version) bool {
+		chain = append(chain, v)
+		return true
+	})
+	if len(chain) != 2 {
+		t.Fatalf("expected 2 versions, got %d", len(chain))
+	}
+	if chain[0].Xmin != 2 || chain[1].Xmin != 1 {
+		t.Fatalf("expected newest-first chain, got %+v", chain)
+	}
+}
+
+func TestForEachKeyAndDropXid(t *testing.T) {
+	dir := t.TempDir()
+	idx, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idx.Close()
+
+	idx.Put([]byte("a"), Version{Offset: 1, Xmin: 1, OpID: 1})
+	idx.Put([]byte("b"), Version{Offset: 2, Xmin: 2, OpID: 2})
+	idx.Put([]byte("a"), Version{Offset: 3, Xmin: 3, OpID: 3})
+
+	count := 0
+	idx.ForEachKey(func(_ []byte, chain []Version) {
+		count++
+		if len(chain) == 0 {
+			t.Fatal("empty chain")
+		}
+	})
+	if count != 2 {
+		t.Fatalf("expected 2 keys, got %d", count)
+	}
+
+	idx.DropXid(2)
+	found := false
+	idx.ForEachKey(func(key []byte, chain []Version) {
+		if string(key) == "b" {
+			found = true
+			if len(chain) != 0 {
+				t.Fatalf("expected b removed, chain=%+v", chain)
+			}
+		}
+	})
+	if found {
+		t.Fatal("key b should be gone after DropXid")
+	}
+}
+
+func TestRemoveVersionAndHasOffset(t *testing.T) {
+	dir := t.TempDir()
+	idx, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idx.Close()
+
+	key := []byte("k")
+	idx.Put(key, Version{Offset: 100, Xmin: 1, OpID: 1})
+	idx.Put(key, Version{Offset: 200, Xmin: 2, OpID: 2})
+
+	if !idx.HasLiveRefAtOffset(100) {
+		t.Fatal("expected live ref at 100")
+	}
+	idx.RemoveVersion(key, 1)
+	if idx.HasLiveRefAtOffset(100) {
+		t.Fatal("offset 100 should be dead")
+	}
+	if !idx.HasLiveRefAtOffset(200) {
+		t.Fatal("offset 200 should remain")
+	}
+}
+
+func TestConcurrentPutsDifferentKeys(t *testing.T) {
+	dir := t.TempDir()
+	idx, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idx.Close()
+
+	const n = 200
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			key := []byte(fmt.Sprintf("key-%d", i))
+			idx.Put(key, Version{Offset: int64(i), ValueLen: 4, Xmin: uint64(i + 1), OpID: uint64(i + 1)})
+		}()
+	}
+	wg.Wait()
+
+	seen := 0
+	idx.ForEachKey(func(_ []byte, chain []Version) {
+		seen++
+		if len(chain) != 1 {
+			t.Errorf("expected single version per key")
+		}
+	})
+	if seen != n {
+		t.Fatalf("expected %d keys, got %d", n, seen)
+	}
+}

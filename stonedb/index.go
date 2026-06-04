@@ -6,58 +6,48 @@
 package stonedb
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
-	"math"
 	"os"
 	"path/filepath"
 
-	"turnstone/stonedb/btree"
+	"turnstone/stonedb/segindex"
 )
 
 const indexVersionSize = 29 // offset(8)+valueLen(4)+xmin(8)+opID(8)+tombstone(1)
 
-// Index is an MVCC index backed by a memory-mapped B+ tree (stonedb/btree).
+// Index is an MVCC index backed by a segmented mmap hash table.
 type Index struct {
-	tree *btree.Tree
+	seg *segindex.SegmentedIndex
 }
 
-// OpenIndex opens (or recreates) the B+ tree index under dbDir/index.
+// OpenIndex opens (or recreates) the index under dbDir/index.
 // The log replay on Open rebuilds index contents from scratch.
 func OpenIndex(dbDir string) (*Index, error) {
 	indexDir := filepath.Join(dbDir, "index")
 	if err := os.RemoveAll(indexDir); err != nil {
 		return nil, err
 	}
-	tree, err := btree.Open(indexDir)
+	seg, err := segindex.Open(indexDir)
 	if err != nil {
 		return nil, err
 	}
-	return &Index{tree: tree}, nil
+	return &Index{seg: seg}, nil
 }
 
 func (idx *Index) Close() error {
-	if idx.tree == nil {
+	if idx.seg == nil {
 		return nil
 	}
-	return idx.tree.Close()
+	return idx.seg.Close()
 }
 
 func (idx *Index) Put(key []byte, v indexVersion) {
-	_ = idx.tree.Put(encodeIndexKey(key, v.xmin), encodeIndexVersion(v))
+	idx.seg.Put(key, toSegVersion(v))
 }
 
 func (idx *Index) DropXid(xid uint64) {
-	var toDelete [][]byte
-	idx.scanEntries(func(uk []byte, xmin uint64, idxKey []byte, _ indexVersion) {
-		if xmin == xid {
-			toDelete = append(toDelete, append([]byte(nil), idxKey...))
-		}
-	})
-	for _, k := range toDelete {
-		_ = idx.tree.Delete(k)
-	}
+	idx.seg.DropXid(xid)
 }
 
 func (idx *Index) LatestResolved(key []byte, excludeXid uint64, clog func(uint64) TxStatus) (*indexVersion, uint64, bool) {
@@ -118,41 +108,13 @@ func (idx *Index) HasNewerCommitted(key []byte, excludeXid uint64, snap Snapshot
 }
 
 func (idx *Index) ForEachKey(fn func(key []byte, chain []indexVersion)) {
-	it := idx.tree.NewIterator(nil)
-	defer it.Release()
-	if !it.First() {
-		return
-	}
-
-	var curKey []byte
-	var chain []indexVersion
-	flush := func() {
-		if curKey != nil && len(chain) > 0 {
-			fn(curKey, chain)
+	idx.seg.ForEachKey(func(key []byte, chain []segindex.Version) {
+		out := make([]indexVersion, len(chain))
+		for i, v := range chain {
+			out[i] = fromSegVersion(v)
 		}
-	}
-
-	for {
-		uk, xmin, err := decodeIndexKey(it.Key())
-		if err != nil {
-			break
-		}
-		ver, err := decodeIndexVersion(it.Value())
-		if err != nil {
-			break
-		}
-		ver.xmin = xmin
-		if curKey != nil && !bytes.Equal(curKey, uk) {
-			flush()
-			chain = chain[:0]
-		}
-		curKey = append(curKey[:0], uk...)
-		chain = append(chain, ver)
-		if !it.Next() {
-			break
-		}
-	}
-	flush()
+		fn(key, out)
+	})
 }
 
 func (idx *Index) LiveKeyCount(clog func(uint64) TxStatus) int64 {
@@ -220,109 +182,38 @@ func (idx *Index) RemoveDead(dead []struct {
 	ver indexVersion
 }) {
 	for _, d := range dead {
-		_ = idx.tree.Delete(encodeIndexKey([]byte(d.key), d.ver.xmin))
+		idx.seg.RemoveVersion([]byte(d.key), d.ver.xmin)
 	}
 }
 
 func (idx *Index) HasLiveRefAtOffset(offset int64) bool {
-	found := false
-	idx.scanEntries(func(_ []byte, _ uint64, _ []byte, v indexVersion) {
-		if v.offset == offset {
-			found = true
-		}
-	})
-	return found
+	return idx.seg.HasLiveRefAtOffset(offset)
 }
 
 func (idx *Index) walkKeyVersions(key []byte, fn func(indexVersion) bool) {
-	rng := userKeyRange(key)
-	it := idx.tree.NewIterator(rng)
-	defer it.Release()
-	if !it.First() {
-		return
-	}
-	for it.Valid() {
-		uk, xmin, err := decodeIndexKey(it.Key())
-		if err != nil || !bytes.Equal(uk, key) {
-			break
-		}
-		ver, err := decodeIndexVersion(it.Value())
-		if err != nil {
-			break
-		}
-		ver.xmin = xmin
-		if !fn(ver) {
-			break
-		}
-		if !it.Next() {
-			break
-		}
+	idx.seg.WalkVersions(key, func(v segindex.Version) bool {
+		return fn(fromSegVersion(v))
+	})
+}
+
+func toSegVersion(v indexVersion) segindex.Version {
+	return segindex.Version{
+		Offset:    v.offset,
+		ValueLen:  v.valueLen,
+		Xmin:      v.xmin,
+		OpID:      v.opID,
+		Tombstone: v.tombstone,
 	}
 }
 
-func (idx *Index) scanEntries(fn func(userKey []byte, xmin uint64, idxKey []byte, ver indexVersion)) {
-	it := idx.tree.NewIterator(nil)
-	defer it.Release()
-	if !it.First() {
-		return
+func fromSegVersion(v segindex.Version) indexVersion {
+	return indexVersion{
+		offset:    v.Offset,
+		valueLen:  v.ValueLen,
+		xmin:      v.Xmin,
+		opID:      v.OpID,
+		tombstone: v.Tombstone,
 	}
-	for it.Valid() {
-		idxKey := append([]byte(nil), it.Key()...)
-		uk, xmin, err := decodeIndexKey(idxKey)
-		if err != nil {
-			break
-		}
-		ver, err := decodeIndexVersion(it.Value())
-		if err != nil {
-			break
-		}
-		ver.xmin = xmin
-		fn(uk, xmin, idxKey, ver)
-		if !it.Next() {
-			break
-		}
-	}
-}
-
-func userKeyRange(userKey []byte) *btree.Range {
-	start := encodeIndexKey(userKey, math.MaxUint64)
-	limit := indexKeyUpperBound(userKey)
-	if limit == nil {
-		return &btree.Range{Start: start}
-	}
-	return &btree.Range{Start: start, Limit: limit}
-}
-
-func indexKeyUpperBound(userKey []byte) []byte {
-	if len(userKey) == 0 {
-		return []byte{0x00}
-	}
-	next := make([]byte, len(userKey))
-	copy(next, userKey)
-	for i := len(next) - 1; i >= 0; i-- {
-		next[i]++
-		if next[i] != 0 {
-			return append(next, 0x00)
-		}
-	}
-	return nil
-}
-
-func encodeIndexKey(key []byte, xmin uint64) []byte {
-	out := make([]byte, len(key)+9)
-	copy(out, key)
-	out[len(key)] = 0x00
-	binary.BigEndian.PutUint64(out[len(key)+1:], math.MaxUint64-xmin)
-	return out
-}
-
-func decodeIndexKey(data []byte) ([]byte, uint64, error) {
-	if len(data) < 9 {
-		return nil, 0, errors.New("invalid index key length")
-	}
-	userKey := data[:len(data)-9]
-	invTs := binary.BigEndian.Uint64(data[len(data)-8:])
-	return userKey, math.MaxUint64 - invTs, nil
 }
 
 func encodeIndexVersion(v indexVersion) []byte {

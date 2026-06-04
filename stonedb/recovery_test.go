@@ -106,6 +106,46 @@ func TestRecovery_TruncateCorruptTail(t *testing.T) {
 	}
 }
 
+func TestRecovery_KeyCountAfterPromote(t *testing.T) {
+	dir := t.TempDir()
+	opts := Options{}
+
+	{
+		db, err := Open(dir, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Promote(); err != nil {
+			t.Fatal(err)
+		}
+		tx := db.NewTransaction(true)
+		if err := tx.Put([]byte("after_promote"), []byte("data")); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		db.Close()
+	}
+
+	db2, err := Open(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+
+	count, err := db2.KeyCount()
+	if err != nil || count != 1 {
+		t.Fatalf("KeyCount after promote+reopen: want 1, got %d err=%v", count, err)
+	}
+	tx := db2.NewTransaction(false)
+	val, err := tx.Get([]byte("after_promote"))
+	tx.Discard()
+	if err != nil || string(val) != "data" {
+		t.Fatalf("GET after promote+reopen: err=%v val=%q", err, val)
+	}
+}
+
 func TestRecovery_TimelineMeta(t *testing.T) {
 	dir := t.TempDir()
 	db, _ := Open(dir, Options{})

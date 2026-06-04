@@ -280,3 +280,57 @@ func TestTransaction_ReadYourOwnWrites(t *testing.T) {
 		t.Errorf("Expected val_resurrected, got %s", val)
 	}
 }
+
+func TestTransaction_EmptyWritableCommitAborts(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	tx := db.NewTransaction(true)
+	xid := tx.xid
+	if xid == 0 {
+		t.Fatal("expected writable transaction to allocate xid")
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("empty commit failed: %v", err)
+	}
+	if st := db.clogStatus(xid); st != TxAborted {
+		t.Fatalf("expected TxAborted for empty writable commit, got %v", st)
+	}
+}
+
+func TestTransaction_ReadOnlyCommitNoWAL(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	key := []byte("k")
+	wtx := db.NewTransaction(true)
+	if err := wtx.Put(key, []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	if err := wtx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	beforeOps := db.operationID
+
+	rtx := db.NewTransaction(false)
+	if rtx.xid != 0 {
+		t.Fatal("read-only transaction must not allocate xid")
+	}
+	if _, err := rtx.Get(key); err != nil {
+		t.Fatal(err)
+	}
+	if err := rtx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if after := db.operationID; after != beforeOps {
+		t.Fatalf("read-only commit must not append WAL records: opID %d -> %d", beforeOps, after)
+	}
+}

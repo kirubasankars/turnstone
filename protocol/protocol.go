@@ -66,6 +66,11 @@ const (
 
 	OpCodeQuit uint8 = 0xFF
 
+	// Begin payload flags (OpCodeBegin body).
+	// Empty payload opens a writable transaction on PRIMARY (legacy default).
+	// A one-byte payload of BeginReadOnly opens a snapshot read transaction.
+	BeginReadOnly uint8 = 0
+
 	// Journal Specific Ops (inner opcode carried inside OpCodeReplBatch).
 	// These mirror stonedb.WALRecordType 1:1.
 	OpJournalBegin  uint8 = 4

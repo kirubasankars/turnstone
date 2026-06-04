@@ -17,6 +17,7 @@ import (
 	"net"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"turnstone/protocol"
@@ -42,10 +43,22 @@ var (
 )
 
 var (
-	// ReplicaWriteTimeout ensures we don't block indefinitely on a hung consumer.
-	// Mutable for testing.
-	ReplicaWriteTimeout = 10 * 60 * time.Second
+	// replicaWriteTimeoutNs ensures we don't block indefinitely on a hung consumer.
+	// Stored as nanoseconds so tests can mutate it without data races.
+	replicaWriteTimeoutNs atomic.Int64
 )
+
+func init() {
+	replicaWriteTimeoutNs.Store(int64((10 * time.Minute).Nanoseconds()))
+}
+
+func replicaWriteTimeout() time.Duration {
+	return time.Duration(replicaWriteTimeoutNs.Load())
+}
+
+func setReplicaWriteTimeout(d time.Duration) {
+	replicaWriteTimeoutNs.Store(int64(d.Nanoseconds()))
+}
 
 const (
 	// SnapshotRateLimit caps the full-sync bandwidth to prevent disk/network thrashing (32MB/s).
@@ -323,7 +336,7 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 
 			// Enforce strict Write Deadline to prevent blocking streamDB
 			// If the client is slow/hung, we drop them.
-			if err := conn.SetWriteDeadline(time.Now().Add(ReplicaWriteTimeout)); err != nil {
+			if err := conn.SetWriteDeadline(time.Now().Add(replicaWriteTimeout())); err != nil {
 				st.logger.Warn("Failed to set write deadline", "err", err)
 				return
 			}
