@@ -105,9 +105,10 @@ type DB struct {
 	closed       int32
 
 	// Group Commit Pipeline
-	commitCh       chan commitRequest
-	commitDelay    time.Duration
-	commitSiblings int
+	commitCh           chan commitRequest
+	commitDelay        time.Duration
+	commitSiblings     int
+	unsafeDisableFsync bool
 
 	// Config
 	minGarbageThreshold    int64
@@ -199,6 +200,7 @@ func Open(dir string, opts Options) (*DB, error) {
 		commitCh:               make(chan commitRequest, 500),
 		commitDelay:            opts.CommitDelay,
 		commitSiblings:         opts.CommitSiblings,
+		unsafeDisableFsync:     opts.UnsafeDisableFsync,
 		minGarbageThreshold:    opts.CompactionMinGarbage,
 		checksumInterval:       opts.ChecksumInterval,
 		autoCheckpointInterval: opts.AutoCheckpointInterval,
@@ -210,6 +212,9 @@ func Open(dir string, opts Options) (*DB, error) {
 	}
 
 	logger.Debug("Opening Database", "vlog_max_size", opts.MaxVLogSize)
+	if opts.UnsafeDisableFsync {
+		logger.Warn("UnsafeDisableFsync is enabled: COMMIT no longer fsyncs the WAL. A crash or power loss can silently lose or corrupt recently committed data. Benchmarking/debugging only.")
+	}
 
 	if err := db.recoverValueLog(); err != nil {
 		db.Close()
@@ -619,8 +624,10 @@ func (db *DB) runGroupCommits() {
 		// default of 2 really means "at least one OTHER transaction is
 		// also active right now". That keeps a single, unbatched client at
 		// its normal one-fsync-per-commit latency, and only pays the delay
-		// when there's real concurrency to amortize it against.
-		if db.commitDelay > 0 && db.ActiveTransactionCount() >= db.commitSiblings {
+		// when there's real concurrency to amortize it against. There's
+		// nothing to amortize when unsafeDisableFsync is set (no fsync is
+		// ever paid), so skip the wait entirely in that mode.
+		if db.commitDelay > 0 && !db.unsafeDisableFsync && db.ActiveTransactionCount() >= db.commitSiblings {
 			timer := time.NewTimer(db.commitDelay)
 		DelayLoop:
 			for len(batch) < maxCommitBatchSize {
