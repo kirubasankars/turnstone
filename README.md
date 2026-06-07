@@ -6,7 +6,7 @@
 
 ## 🚀 Key Features
 
-* **⚡ WiscKey-style Storage Engine**: Uses a LevelDB LSM-tree for the index (Keys) and an append-only Value Log (VLog) for values. This minimizes write amplification and drastically improves throughput for large payloads.
+* **⚡ WiscKey-style Storage Engine**: Uses a custom memory-mapped B+ tree for the index (Keys) and an append-only Value Log (VLog) for values. This minimizes write amplification and drastically improves throughput for large payloads.
 * **📝 Eager Logging**: `SET`/`DEL` write to the WAL, VLog, and index immediately (not buffered until `COMMIT`). `COMMIT` only group-fsyncs a small commit record and flips visibility. See "Transaction Model: Eager Logging" below.
 * **🔒 ACID Transactions**: Full support for multi-key transactions with **Snapshot Isolation**. Write-write conflicts are detected eagerly at `SET`/`DEL` time via **first-writer-wins** key locking (no waiting, no deadlocks); read-set validation still runs at `COMMIT` to catch stale-read/write-skew.
 * **🛡️ Secure by Default**: All connections (Client-Server and Inter-Node) are secured via **mTLS** (Mutual TLS). Role-Based Access Control (RBAC) is enforced via X.509 Certificate Organization fields.
@@ -258,7 +258,7 @@ Use `turnstone-duck` to watch CDC logs, deduplicate them (handling the "same key
 | `wal_retention` | `2h` | Duration to keep WAL files. |
 | `wal_retention_strategy` | `time` | Strategy for WAL purge: `time` or `replication` (wait for replicas). |
 | `max_disk_usage_percent` | `90` | Reject writes if disk usage exceeds this %. |
-| `block_cache_size` | `64MB` | Size of the LevelDB block cache (e.g. "128MB", "1GB"). |
+| `block_cache_size` | `64MB` | Reserved for future index cache tuning (e.g. "128MB", "1GB"). |
 | `metrics_addr` | `:9090` | Address for Prometheus metrics. |
 | `tls_cert_file` | `certs/server.crt` | Server Certificate. |
 | `tls_client_cert_file` | `certs/server.crt` | Cert used when acting as a Replication Client. |
@@ -271,7 +271,7 @@ Use `turnstone-duck` to watch CDC logs, deduplicate them (handling the "same key
 
 TurnstoneDB separates the storage of keys and values to optimize for modern SSDs:
 
-1. **LevelDB (Index)**: Stores `Key + (MaxUint64 - TxID) -> <FileID, Offset, Size>`. This encoding allows for efficient MVCC lookups (time-travel queries) and keeps the LSM tree small.
+1. **mmap B+ Tree (Index)**: Stores `Key + (MaxUint64 - TxID) -> <FileID, Offset, Size>`. This encoding allows for efficient MVCC lookups (time-travel queries) and keeps the index compact with in-place page updates.
 2. **Value Log (VLog)**: Stores the actual values on disk in append-only files. Garbage collection is performed only when a file exceeds a configurable staleness threshold.
 3. **Write-Ahead Log (WAL)**: Ensures durability. Supports retention strategies based on time or replication acknowledgment. WAL rotation is checkpoint-driven (not size-triggered); checkpoints run on a timer (default 60s) or can be forced via the `checkpoint` admin command.
 
@@ -322,7 +322,7 @@ Key semantics:
 
 1. **Consensus**: Replication uses async/sync streaming. There is no automated Raft/Paxos failover; promotion must be triggered manually via API/CLI (though `Timelines` make this safe).
 2. **Sharding**: The server is single-node (multi-db). Sharding must be handled client-side (see `cmd/turnstone-load2` for a reference implementation).
-3. **Memory**: The index (LevelDB) relies heavily on OS Page Cache. Large datasets require sufficient RAM for optimal performance.
+3. **Memory**: The mmap B+ tree index relies on OS page cache for hot pages. Large datasets require sufficient RAM for optimal performance.
 4. **No lock waiting**: Key-level write locks are NOWAIT (see "Transaction Model: Eager Logging" above). Under hot-key contention this shows up as `TxConflict` abort storms rather than a queuing/blocking row-lock behavior — the client is expected to retry, not wait.
 
 ---
