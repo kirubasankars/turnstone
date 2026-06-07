@@ -44,27 +44,3 @@ jobs:
       # so CI must always exercise all packages, not a hand-picked subset.
       - name: Test (race detector, all packages)
         run: go test -race -count=1 ./...
-
-  connectors:
-    name: Build connector modules (turnstone-duck, turnstone-clickhouse)
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        module: [cmd/turnstone-duck, cmd/turnstone-clickhouse]
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.25"
-
-      # These are separate Go modules (they pull in heavier dependencies
-      # like DuckDB/ClickHouse drivers) so they're excluded from the root
-      # module's `./...` and get their own build check here instead.
-      - name: Build
-        working-directory: ${{ matrix.module }}
-        run: go build ./...
-
-      - name: Vet
-        working-directory: ${{ matrix.module }}
-        run: go vet ./...

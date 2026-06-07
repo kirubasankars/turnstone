@@ -16,7 +16,7 @@ LICENSE file in the root of this source tree.
 - A **single-node** storage engine with Redis-style `SELECT <db>` namespaces
 - **ACID transactions** with snapshot isolation and first-writer-wins key locking
 - **Optional replication** — one primary and manually attached followers per database
-- **CDC** — stream committed changes to JSONL for ETL/analytics (DuckDB loader included)
+- **CDC** — stream committed changes to JSONL for ETL/analytics
 
 ## What it is not
 
@@ -131,12 +131,6 @@ There is no automatic leader election. Timelines record history forks so promoti
 ./bin/turnstone -mode cdc -home tsdata
 ```
 
-**DuckDB loader** ingests CDC files with deduplication:
-
-```bash
-./bin/turnstone-duck -input tsdata/cdc_logs -archive tsdata/archive -db analytics.duckdb
-```
-
 ---
 
 ## Configuration (`turnstone.json`)
@@ -208,7 +202,7 @@ Replication streams differ by role: `server` replicas see the full physical log;
 
 ## Limitations
 
-1. **Single node** — one process, local disk. Scale-out requires application-level sharding (see `cmd/turnstone-load2` for a reference).
+1. **Single node** — one process, local disk. Scale-out requires application-level sharding.
 2. **Manual failover** — no Raft/Paxos; an operator runs `stepdown` / `promote`.
 3. **No lock waiting** — hot-key contention surfaces as immediate `TxConflict`; clients must retry.
 4. **Breaking on-disk format** — the current `data.log` + segmented hash index layout is not compatible with older WAL/VLog/LevelDB directories.
