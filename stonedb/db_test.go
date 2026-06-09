@@ -7,6 +7,8 @@ package stonedb
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -163,6 +165,119 @@ func TestDB_IdempotentClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = db.Close()
+}
+
+func TestDB_EphemeralIndex_CloseSkipsUnmap(t *testing.T) {
+	dir := t.TempDir()
+	indexDir := filepath.Join(dir, "index")
+
+	db, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx := db.NewTransaction(true)
+	if err := tx.Put([]byte("ephemeral"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(indexDir); err != nil {
+		t.Fatalf("index dir should exist while db is open: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(indexDir); err != nil {
+		t.Fatalf("index dir may remain after close (fast shutdown): %v", err)
+	}
+
+	db2, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+
+	count, err := db2.KeyCount()
+	if err != nil || count != 1 {
+		t.Fatalf("KeyCount after reopen: want 1, got %d err=%v", count, err)
+	}
+	tx2 := db2.NewTransaction(false)
+	val, err := tx2.Get([]byte("ephemeral"))
+	tx2.Discard()
+	if err != nil || string(val) != "value" {
+		t.Fatalf("GET after reopen: err=%v val=%q", err, val)
+	}
+}
+
+func TestOpen_CancelDuringReplay(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Promote(); err != nil {
+		t.Fatal(err)
+	}
+	tx := db.NewTransaction(true)
+	const n = 50000
+	for i := 0; i < n; i++ {
+		key := []byte(fmt.Sprintf("cancel-replay-%d", i))
+		if err := tx.Put(key, []byte("v")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := OpenContext(ctx, dir, Options{})
+		errCh <- err
+	}()
+	cancel()
+
+	err = <-errCh
+	if err == nil {
+		t.Fatal("expected cancel during replay")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+}
+
+func TestDB_FastClose_SkipsIndexUnmap(t *testing.T) {
+	dir := t.TempDir()
+	indexDir := filepath.Join(dir, "index")
+
+	db, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx := db.NewTransaction(true)
+	for i := 0; i < 1000; i++ {
+		key := []byte(fmt.Sprintf("fast-close-%d", i))
+		if err := tx.Put(key, []byte("v")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("close took too long: %v", elapsed)
+	}
+	if _, err := os.Stat(indexDir); err != nil {
+		t.Fatalf("index dir should remain after fast close: %v", err)
+	}
 }
 
 func TestDB_Checkpoint_Empty(t *testing.T) {

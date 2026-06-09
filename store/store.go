@@ -6,6 +6,7 @@
 package store
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -94,6 +95,9 @@ type Store struct {
 	// concurrent admin connections could both pass a stale state check
 	// (e.g. both see UNDEFINED) and then race into conflicting transitions.
 	adminMu sync.Mutex
+
+	closeCh chan struct{}
+	closed  int32
 }
 
 // LockAdmin acquires the per-database administrative serialization lock.
@@ -109,7 +113,7 @@ func (s *Store) UnlockAdmin() {
 	s.adminMu.Unlock()
 }
 
-func NewStore(dir string, logger *slog.Logger, minReplicas int, walStrategy string, maxDiskUsage int) (*Store, error) {
+func NewStore(ctx context.Context, dir string, logger *slog.Logger, minReplicas int, walStrategy string, maxDiskUsage int) (*Store, error) {
 	truncateWAL := false
 	if os.Getenv("TS_TEST_WAL_TRUNCATE") == "true" {
 		truncateWAL = true
@@ -137,27 +141,25 @@ func NewStore(dir string, logger *slog.Logger, minReplicas int, walStrategy stri
 		safePointCh:    make(chan struct{}),
 		timelineCh:     make(chan struct{}),
 		replicaTimeout: 1 * time.Minute, // Default strict timeout for lagging replicas
+		closeCh:        make(chan struct{}),
 	}
 	s.cond = sync.NewCond(&s.mu)
 
 	// Load existing persistence state (if any)
 	s.loadSlots()
 
-	// Start persistence loop
-	go s.runPersistence()
-
-	// Start WAL retention manager if strategy is replication
-	if s.walStrategy == "replication" {
-		go s.runRetentionManager()
-		// SELF-HEALING: Start the zombie replica eviction monitor
-		go s.runReplicaEviction()
-	}
-
-	db, err := stonedb.Open(dir, opts)
+	db, err := stonedb.OpenContext(ctx, dir, opts)
 	if err != nil {
 		return nil, err
 	}
 	s.DB = db
+
+	// Start background loops only after DB is ready (Open can take a while during replay).
+	go s.runPersistence()
+	if s.walStrategy == "replication" {
+		go s.runRetentionManager()
+		go s.runReplicaEviction()
+	}
 
 	return s, nil
 }
@@ -196,7 +198,7 @@ func (s *Store) Reset() error {
 	}
 
 	// 5. Re-Open Database
-	newDB, err := stonedb.Open(s.dir, s.dbOpts)
+	newDB, err := stonedb.OpenContext(context.Background(), s.dir, s.dbOpts)
 	if err != nil {
 		return fmt.Errorf("reopen failed after wipe: %w", err)
 	}
@@ -264,12 +266,16 @@ func (s *Store) GetMinSlotLogSeq() uint64 {
 }
 
 func (s *Store) runRetentionManager() {
-	// Check retention every 30 seconds
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		s.EnforceRetentionPolicy()
+	for {
+		select {
+		case <-s.closeCh:
+			return
+		case <-ticker.C:
+			s.EnforceRetentionPolicy()
+		}
 	}
 }
 
@@ -278,8 +284,13 @@ func (s *Store) runReplicaEviction() {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		s.evictZombieReplicas()
+	for {
+		select {
+		case <-s.closeCh:
+			return
+		case <-ticker.C:
+			s.evictZombieReplicas()
+		}
 	}
 }
 
@@ -328,6 +339,9 @@ func (s *Store) evictZombieReplicas() {
 func (s *Store) EnforceRetentionPolicy() {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
+	if s.DB == nil {
+		return
+	}
 
 	// 1. Constraint from Downstream (Our Followers)
 	minReplicaSeq := s.GetMinSlotLogSeq()
@@ -457,15 +471,17 @@ func (s *Store) Get(key string) ([]byte, error) {
 
 // Close closes the underlying StoneDB instance.
 func (s *Store) Close() error {
-	s.logger.Debug("Closing store")
-	s.mu.Lock()
-	if s.dirty {
-		s.saveSlotsLocked()
+	if !atomic.CompareAndSwapInt32(&s.closed, 0, 1) {
+		return nil
 	}
-	s.mu.Unlock()
+	s.logger.Debug("Closing store")
+	close(s.closeCh)
 
 	s.dbMu.Lock()
 	defer s.dbMu.Unlock()
+	if s.DB == nil {
+		return nil
+	}
 	return s.DB.Close()
 }
 
@@ -473,6 +489,9 @@ func (s *Store) Close() error {
 func (s *Store) ScanWAL(startOpID uint64, fn func([]stonedb.WALRecord) error) error {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
+	if s.DB == nil {
+		return stonedb.ErrDatabaseClosed
+	}
 	return s.DB.ScanWAL(startOpID, fn)
 }
 
@@ -480,6 +499,9 @@ func (s *Store) ScanWAL(startOpID uint64, fn func([]stonedb.WALRecord) error) er
 func (s *Store) LastOpID() uint64 {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
+	if s.DB == nil {
+		return 0
+	}
 	return s.DB.LastOpID()
 }
 
@@ -747,16 +769,21 @@ func (s *Store) runPersistence() {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		s.mu.Lock()
-		if s.dirty {
-			if err := s.saveSlotsLocked(); err != nil {
-				s.logger.Error("Failed to persist replica slots", "err", err)
-			} else {
-				s.dirty = false
+	for {
+		select {
+		case <-s.closeCh:
+			return
+		case <-ticker.C:
+			s.mu.Lock()
+			if s.dirty {
+				if err := s.saveSlotsLocked(); err != nil {
+					s.logger.Error("Failed to persist replica slots", "err", err)
+				} else {
+					s.dirty = false
+				}
 			}
+			s.mu.Unlock()
 		}
-		s.mu.Unlock()
 	}
 }
 

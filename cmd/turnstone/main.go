@@ -10,13 +10,20 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
+	"sync"
 	"syscall"
+	"time"
+
+	"golang.org/x/sync/errgroup"
 
 	"turnstone/config"
 	"turnstone/metrics"
@@ -55,6 +62,9 @@ func runServer(logger *slog.Logger, devMode bool) {
 		logger.Info("Starting in DEV mode: Transaction timeouts disabled, all DBs auto-promoted")
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	configPath := filepath.Join(*homeDir, "turnstone.json")
 	cfgBytes, err := os.ReadFile(configPath)
 	if err != nil {
@@ -89,30 +99,57 @@ func runServer(logger *slog.Logger, devMode bool) {
 	clientKeyFile := config.ResolvePath(*homeDir, cfg.TLSClientKeyFile)
 
 	stores := make(map[string]*store.Store)
+	var storesMu sync.Mutex
+
+	openLimit := runtime.NumCPU()
+	if openLimit < 1 {
+		openLimit = 1
+	}
+	g, openCtx := errgroup.WithContext(ctx)
+	g.SetLimit(openLimit)
 
 	for i := 0; i <= cfg.NumberOfDatabases; i++ {
 		name := strconv.Itoa(i)
 		path := filepath.Join(*homeDir, "data", name)
+		dbLogger := logger.With("db", name)
 
-		// DB 0 is now treated as a regular database (minReplicas configurable, not implicitly system)
-		// We hardcode minReplicas=0 for initial startup, but it can be promoted later.
-		st, err := store.NewStore(path, logger.With("db", name), 0, cfg.WALRetentionStrategy, cfg.MaxDiskUsagePercent)
-		if err != nil {
-			logger.Error("Failed to initialize store", "db", name, "err", err)
-			os.Exit(1)
-		}
-
-		// DEV MODE: Auto-promote databases so they are writable immediately
-		if devMode {
-			st.SetMinReplicas(0)
-			if err := st.Promote(); err != nil {
-				logger.Error("Failed to auto-promote DB in dev mode", "db", name, "err", err)
-			} else {
-				logger.Info("Dev Mode: Auto-promoted DB to PRIMARY", "db", name)
+		g.Go(func() error {
+			if err := openCtx.Err(); err != nil {
+				return err
 			}
-		}
+			dbLogger.Info("Opening database...")
+			st, err := store.NewStore(openCtx, path, dbLogger, 0, cfg.WALRetentionStrategy, cfg.MaxDiskUsagePercent)
+			if err != nil {
+				return fmt.Errorf("db %s: %w", name, err)
+			}
 
-		stores[name] = st
+			if devMode {
+				st.SetMinReplicas(0)
+				if err := st.Promote(); err != nil {
+					_ = st.Close()
+					return fmt.Errorf("db %s promote: %w", name, err)
+				}
+				dbLogger.Info("Dev Mode: Auto-promoted DB to PRIMARY")
+			}
+
+			storesMu.Lock()
+			stores[name] = st
+			storesMu.Unlock()
+			dbLogger.Info("Database ready")
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		for _, st := range stores {
+			_ = st.Close()
+		}
+		if errors.Is(err, context.Canceled) {
+			logger.Info("Startup cancelled")
+			os.Exit(130)
+		}
+		logger.Error("Failed to initialize stores", "err", err)
+		os.Exit(1)
 	}
 
 	replTLS, err := loadClientTLS(clientCertFile, clientKeyFile, caFile)
@@ -144,9 +181,6 @@ func runServer(logger *slog.Logger, devMode bool) {
 		metrics.StartMetricsServer(cfg.MetricsAddr, stores, srv, logger)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
 	go func() {
 		if err := srv.Run(ctx); err != nil {
 			logger.Error("Server stopped unexpectedly", "err", err)
@@ -155,10 +189,30 @@ func runServer(logger *slog.Logger, devMode bool) {
 	}()
 
 	<-ctx.Done()
+	shutdownStart := time.Now()
 	logger.Info("Shutting down...")
 
-	srv.CloseAll()
-	logger.Info("Shutdown complete")
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+		<-sig
+		logger.Warn("Force exit")
+		os.Exit(130)
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		srv.CloseAll()
+		close(done)
+	}()
+	const shutdownTimeout = 5 * time.Second
+	select {
+	case <-done:
+		logger.Info("Shutdown complete", "elapsed_ms", time.Since(shutdownStart).Milliseconds())
+	case <-time.After(shutdownTimeout):
+		logger.Warn("Shutdown timeout, forcing exit", "timeout_ms", shutdownTimeout.Milliseconds())
+		os.Exit(130)
+	}
 }
 
 func loadClientTLS(certFile, keyFile, caFile string) (*tls.Config, error) {

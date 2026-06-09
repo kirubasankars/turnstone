@@ -16,9 +16,11 @@ import (
 )
 
 const (
-	numSegments   = 256
-	initialSlots  = 1024
-	headerSize    = mmapfile.PageSize
+	numSegments       = 256
+	initialSlots      = 1024
+	maxLoadFactorNum  = 3 // grow when keyCount*4 > slotCount*3
+	maxLoadFactorDen  = 4
+	headerSize        = mmapfile.PageSize
 	versionSize   = 29
 	versionNodeSz = versionSize + 8 // next pointer
 	magic         = uint64(0x5447534547) // "TGSEG"
@@ -140,7 +142,7 @@ func (s *segment) close() error {
 	if s.mf == nil {
 		return nil
 	}
-	err := s.mf.Close()
+	err := s.mf.Discard()
 	s.mf = nil
 	return err
 }
@@ -230,34 +232,164 @@ func (s *segment) findKeyRecord(key []byte) (uint64, bool) {
 	return 0, false
 }
 
-func (s *segment) findOrCreateKeyRecord(key []byte) (uint64, error) {
-	if off, ok := s.findKeyRecord(key); ok {
-		return off, nil
+func (s *segment) tableLoadHigh() bool {
+	slots := s.slotCount()
+	if slots == 0 {
+		return true
 	}
+	return uint64(s.keyCount()+1)*uint64(maxLoadFactorDen) > uint64(slots)*uint64(maxLoadFactorNum)
+}
+
+func (s *segment) bumpArenaChainRefs(recOff uint64, delta uint64) {
+	head := s.versionHead(recOff)
+	if head == 0 {
+		return
+	}
+	newHead := head + delta
+	s.setVersionHead(recOff, newHead)
+	node := newHead
+	data := s.mf.Data()
+	for node != 0 {
+		nextOff := readU64(data, int(node)+versionSize)
+		if nextOff != 0 {
+			writeU64(data, int(node)+versionSize, nextOff+delta)
+			node = nextOff + delta
+		} else {
+			node = 0
+		}
+	}
+}
+
+func readKeyFromArena(buf []byte, recOff, arenaStart uint64) []byte {
+	rel := int(recOff - arenaStart)
+	if rel+12 > len(buf) {
+		return nil
+	}
+	kLen := readU32(buf, rel)
+	out := make([]byte, kLen)
+	copy(out, buf[rel+12:rel+12+int(kLen)])
+	return out
+}
+
+func (s *segment) growHashTable() error {
+	oldSlots := s.slotCount()
+	newSlots := oldSlots * 2
+	if newSlots <= oldSlots {
+		return fmt.Errorf("segment hash table slot overflow")
+	}
+	tableStart := s.tableOff()
+	arenaStart := s.arenaOff()
+	used := s.arenaUsed()
+	newTableBytes := uint64(newSlots) * 8
+	newArenaStart := tableStart + newTableBytes
+	need := int64(newArenaStart + used)
+	if err := s.mf.Grow(need); err != nil {
+		return err
+	}
+	data := s.mf.Data()
+	arenaSnap := make([]byte, used)
+	if used > 0 {
+		copy(arenaSnap, data[int(arenaStart):int(arenaStart+used)])
+	}
+	oldTableInt := int(tableStart)
+	delta := newArenaStart - arenaStart
+	type entry struct {
+		key       []byte
+		newRecOff uint64
+	}
+	var entries []entry
+	for slot := uint32(0); slot < oldSlots; slot++ {
+		recOff := readU64(data, oldTableInt+int(slot)*8)
+		if recOff == 0 {
+			continue
+		}
+		key := readKeyFromArena(arenaSnap, recOff, arenaStart)
+		if key == nil {
+			return fmt.Errorf("segment hash table grow: bad key record")
+		}
+		entries = append(entries, entry{
+			key:       key,
+			newRecOff: recOff - arenaStart + newArenaStart,
+		})
+	}
+	newTable := int(tableStart)
+	for i := uint32(0); i < newSlots; i++ {
+		writeU64(data, newTable+int(i)*8, 0)
+	}
+	if used > 0 {
+		copy(data[int(newArenaStart):int(newArenaStart+used)], arenaSnap)
+	}
+	for _, e := range entries {
+		s.bumpArenaChainRefs(e.newRecOff, delta)
+		start := uint32(hashKey(e.key) % uint64(newSlots))
+		inserted := false
+		for i := uint32(0); i < newSlots; i++ {
+			slotOff := newTable + int((start+i)%newSlots)*8
+			if readU64(data, slotOff) == 0 {
+				writeU64(data, slotOff, e.newRecOff)
+				inserted = true
+				break
+			}
+		}
+		if !inserted {
+			return fmt.Errorf("segment hash table rehash failed")
+		}
+	}
+	writeU32(data, hdrSlotCountOff, newSlots)
+	writeU64(data, hdrArenaOffOff, newArenaStart)
+	return nil
+}
+
+func (s *segment) insertKeySlot(key []byte, recOff uint64) error {
 	slots := s.slotCount()
 	start := s.slotIndex(key)
 	data := s.mf.Data()
 	table := int(s.tableOff())
-	recSize := 12 + len(key)
-	off, err := s.alloc(recSize)
-	if err != nil {
-		return 0, err
-	}
-	data = s.mf.Data()
-	writeU32(data, int(off), uint32(len(key)))
-	writeU64(data, int(off)+4, 0)
-	copy(data[int(off)+12:], key)
-
 	for i := uint32(0); i < slots; i++ {
 		slot := (start + i) % slots
 		slotOff := table + int(slot)*8
 		if readU64(data, slotOff) == 0 {
-			writeU64(data, slotOff, off)
+			writeU64(data, slotOff, recOff)
 			s.setKeyCount(s.keyCount() + 1)
-			return off, nil
+			return nil
 		}
 	}
-	return 0, fmt.Errorf("segment hash table full")
+	return fmt.Errorf("segment hash table full")
+}
+
+func (s *segment) findOrCreateKeyRecord(key []byte) (uint64, error) {
+	if off, ok := s.findKeyRecord(key); ok {
+		return off, nil
+	}
+	recSize := 12 + len(key)
+	for {
+		if s.tableLoadHigh() {
+			if err := s.growHashTable(); err != nil {
+				return 0, err
+			}
+		}
+		off, err := s.alloc(recSize)
+		if err != nil {
+			return 0, err
+		}
+		data := s.mf.Data()
+		writeU32(data, int(off), uint32(len(key)))
+		writeU64(data, int(off)+4, 0)
+		copy(data[int(off)+12:], key)
+
+		if err := s.insertKeySlot(key, off); err == nil {
+			return off, nil
+		}
+		arenaBefore := s.arenaOff()
+		if err := s.growHashTable(); err != nil {
+			return 0, err
+		}
+		off += s.arenaOff() - arenaBefore // recOff shifts with arena relocation
+		if err := s.insertKeySlot(key, off); err != nil {
+			return 0, err
+		}
+		return off, nil
+	}
 }
 
 func (s *segment) keyAt(recOff uint64, key []byte) bool {

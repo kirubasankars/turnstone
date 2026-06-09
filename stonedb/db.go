@@ -6,6 +6,7 @@
 package stonedb
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -92,7 +93,16 @@ type DB struct {
 	timelineMeta TimelineMeta
 }
 
+// Open opens a database, replaying data.log to rebuild the ephemeral index.
 func Open(dir string, opts Options) (*DB, error) {
+	return OpenContext(context.Background(), dir, opts)
+}
+
+// OpenContext is like Open but honors cancellation during log replay.
+func OpenContext(ctx context.Context, dir string, opts Options) (*DB, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(dir, dirMode); err != nil {
 		return nil, err
 	}
@@ -170,7 +180,7 @@ func Open(dir string, opts Options) (*DB, error) {
 		logger.Warn("UnsafeDisableFsync enabled")
 	}
 
-	if err := db.replayLog(opts.TruncateCorruptWAL); err != nil {
+	if err := db.replayLog(ctx, opts.TruncateCorruptWAL); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("replay log: %w", err)
 	}
@@ -378,6 +388,36 @@ func (db *DB) ActiveTransactionCount() int {
 }
 
 const maxCommitBatchSize = 128
+const shutdownBackgroundWait = 2 * time.Second
+const shutdownCommitWait = 2 * time.Second
+
+func (db *DB) failCommitBatch(batch []commitRequest) {
+	for _, req := range batch {
+		select {
+		case req.resp <- ErrDatabaseClosed:
+		default:
+		}
+	}
+}
+
+func (db *DB) drainCommitCh() {
+	for {
+		select {
+		case req := <-db.commitCh:
+			select {
+			case req.resp <- ErrDatabaseClosed:
+			default:
+			}
+		default:
+			return
+		}
+	}
+}
+
+func (db *DB) shutdownGroupCommits(batch []commitRequest) {
+	db.failCommitBatch(batch)
+	db.drainCommitCh()
+}
 
 func (db *DB) runGroupCommits() {
 	defer db.wg.Done()
@@ -385,6 +425,7 @@ func (db *DB) runGroupCommits() {
 	for {
 		select {
 		case <-db.closeCh:
+			db.shutdownGroupCommits(batch)
 			return
 		case req := <-db.commitCh:
 			batch = append(batch, req)
@@ -395,6 +436,10 @@ func (db *DB) runGroupCommits() {
 		DelayLoop:
 			for len(batch) < maxCommitBatchSize {
 				select {
+				case <-db.closeCh:
+					timer.Stop()
+					db.shutdownGroupCommits(batch)
+					return
 				case req := <-db.commitCh:
 					batch = append(batch, req)
 				case <-timer.C:
@@ -446,6 +491,11 @@ func (db *DB) runAutoVacuum() {
 			return
 		case <-ticker.C:
 			for i := 0; i < 10; i++ {
+				select {
+				case <-db.closeCh:
+					return
+				default:
+				}
 				didWork, err := db.RunVacuum()
 				if err != nil {
 					if !strings.Contains(err.Error(), "closed") {
@@ -476,7 +526,19 @@ func (db *DB) runBackgroundChecksum() {
 }
 
 func (db *DB) VerifyChecksums() error {
-	return db.log.Replay(false, db.timelineMeta.History, func(rec WALRecord, span recordSpan) {})
+	if atomic.LoadInt32(&db.closed) == 1 {
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		select {
+		case <-db.closeCh:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return db.log.Replay(ctx, false, db.timelineMeta.History, func(rec WALRecord, span recordSpan) {})
 }
 
 func (db *DB) NewTransaction(update bool) *Transaction {
@@ -562,6 +624,7 @@ func (db *DB) PurgeWAL(minOpID uint64) error {
 	}
 	db.txMu.Unlock()
 	atomic.StoreUint64(&db.scanWALFloor, minOpID)
+	db.log.TrimOpOffsetsBelow(minOpID)
 	return nil
 }
 
@@ -602,7 +665,7 @@ func (db *DB) ApplyRecord(rec WALRecord) error {
 		if _, err := db.log.AppendReplicatedRecord(payload, true); err != nil {
 			return err
 		}
-		db.setClog(rec.XID, TxCommitted)
+		db.forgetClog(rec.XID)
 		db.txMu.Lock()
 		delete(db.activeXids, rec.XID)
 		delete(db.beginOpIDs, rec.XID)
@@ -624,6 +687,7 @@ func (db *DB) ApplyRecord(rec WALRecord) error {
 		delete(db.beginOpIDs, rec.XID)
 		delete(db.replImpact, rec.XID)
 		db.txMu.Unlock()
+		db.forgetClog(rec.XID)
 		db.ForceSetClocks(rec.XID, rec.OpID)
 		return nil
 	}
@@ -688,22 +752,45 @@ func (db *DB) Close() error {
 	if !atomic.CompareAndSwapInt32(&db.closed, 0, 1) {
 		return nil
 	}
+	start := time.Now()
 	db.shutdownMu.Lock()
 	db.shutdownMu.Unlock()
 
 	close(db.closeCh)
-	db.wg.Wait()
+	bgDone := make(chan struct{})
+	go func() {
+		db.wg.Wait()
+		close(bgDone)
+	}()
+	select {
+	case <-bgDone:
+	case <-time.After(shutdownBackgroundWait):
+		db.logger.Warn("Shutdown: background tasks did not finish in time", "wait_ms", shutdownBackgroundWait.Milliseconds())
+	}
+	db.logger.Debug("Shutdown phase complete", "phase", "background_tasks", "elapsed_ms", time.Since(start).Milliseconds())
 
-	db.commitMu.Lock()
-	defer db.commitMu.Unlock()
-
-	_ = db.Checkpoint()
+	commitDone := make(chan struct{})
+	go func() {
+		db.commitMu.Lock()
+		close(commitDone)
+	}()
+	select {
+	case <-commitDone:
+		_ = db.Checkpoint()
+		db.commitMu.Unlock()
+	case <-time.After(shutdownCommitWait):
+		db.logger.Warn("Shutdown: commit batch still active, skipping checkpoint", "wait_ms", shutdownCommitWait.Milliseconds())
+	}
 
 	if db.index != nil {
 		_ = db.index.Close()
 	}
+	db.logger.Debug("Shutdown phase complete", "phase", "index_dropped", "elapsed_ms", time.Since(start).Milliseconds())
+
 	if db.log != nil {
-		return db.log.Close()
+		err := db.log.Close()
+		db.logger.Debug("Shutdown phase complete", "phase", "log_closed", "elapsed_ms", time.Since(start).Milliseconds())
+		return err
 	}
 	return nil
 }

@@ -161,8 +161,8 @@ Vacuum          →  drop dead versions  →  punch-hole stale ranges
 
 ### Components
 
-1. **`data.log`** — one unbounded append-only file. Records: `BEGIN`, `SET`, `DEL`, `COMMIT`, `ABORT` (keys and values inline).
-2. **`index/seg-*.bin`** — 256-segment mmap hash index. Each user key holds an MVCC version chain pointing at log offsets. Rebuilt from replay on every open.
+1. **`data.log`** — one unbounded append-only file. Records: `BEGIN`, `SET`, `DEL`, `COMMIT`, `ABORT` (keys and values inline). This is the only durable database state.
+2. **`index/seg-*.bin`** — 256-segment mmap hash index (ephemeral runtime cache). Wiped on every open, dropped in memory on close without munmap/fsync (fast shutdown), and rebuilt from `data.log` replay. Stale files may remain on disk until the next open. Do not treat these files as authoritative or back them up as database state. Only `data.log` is durable.
 3. **In-memory clog** — transaction commit status, rebuilt during replay.
 4. **Vacuum** — removes dead index entries; `fallocate(PUNCH_HOLE|KEEP_SIZE)` on stale byte ranges behind the append tail and below the replication scan floor.
 
