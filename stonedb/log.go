@@ -6,6 +6,7 @@
 package stonedb
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -18,6 +19,8 @@ import (
 	"syscall"
 )
 
+const opIndexSparse = 1024
+
 // DataLog is a single append-only log file holding all records and values.
 type DataLog struct {
 	path        string
@@ -26,7 +29,11 @@ type DataLog struct {
 	mu          sync.RWMutex
 	logger      *slog.Logger
 
-	opOffsets map[uint64]int64 // opID -> frame start offset
+	opOffsets  map[uint64]int64 // sparse opID -> frame start offset (every opIndexSparse ops)
+	scanAnchor struct {
+		opID   uint64
+		offset int64
+	}
 }
 
 func OpenDataLog(dir string, logger *slog.Logger) (*DataLog, error) {
@@ -94,7 +101,7 @@ func (l *DataLog) AppendRecordsWithOpIDs(nextOpID func() uint64, builders []func
 			return nil, nil, err
 		}
 		offsets[i] = off
-		l.opOffsets[opID] = off
+		l.recordOpOffset(opID, off)
 	}
 	l.mu.Unlock()
 
@@ -112,7 +119,7 @@ func (l *DataLog) AppendReplicatedRecord(payload []byte, sync bool) (int64, erro
 		return 0, err
 	}
 	if opID, ok := peekOpID(payload); ok {
-		l.opOffsets[opID] = off
+		l.recordOpOffset(opID, off)
 	}
 	l.mu.Unlock()
 
@@ -164,9 +171,11 @@ func (l *DataLog) ReadValueAt(offset int64, valLen uint32) ([]byte, error) {
 	return append([]byte(nil), rec.Value...), nil
 }
 
+const replayCancelCheckInterval = 1024
+
 // Replay scans the entire log, invoking onRecord for each valid frame.
 // Holes are skipped via SEEK_DATA. Returns max tx/op IDs seen.
-func (l *DataLog) Replay(truncateCorrupt bool, history []TimelineHistoryItem, onRecord func(rec WALRecord, span recordSpan)) error {
+func (l *DataLog) Replay(ctx context.Context, truncateCorrupt bool, history []TimelineHistoryItem, onRecord func(rec WALRecord, span recordSpan)) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -190,8 +199,14 @@ func (l *DataLog) Replay(truncateCorrupt bool, history []TimelineHistoryItem, on
 		return err
 	}
 	fileSize := stat.Size()
+	var records uint64
 
 	for pos < fileSize {
+		if records%replayCancelCheckInterval == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
 		next, err := f.Seek(pos, seekData)
 		if err != nil {
 			if err == io.EOF {
@@ -220,10 +235,11 @@ func (l *DataLog) Replay(truncateCorrupt bool, history []TimelineHistoryItem, on
 			return fmt.Errorf("log corruption at offset %d: %w", pos, rerr)
 		}
 
-		l.opOffsets[rec.OpID] = span.offset
+		l.recordOpOffset(rec.OpID, span.offset)
 		if onRecord != nil {
 			onRecord(rec, span)
 		}
+		records++
 		pos = validEnd
 	}
 	return nil
@@ -319,6 +335,37 @@ func (l *DataLog) Scan(startOpID uint64, fn func([]WALRecord) error) error {
 	return nil
 }
 
+func (l *DataLog) recordOpOffset(opID uint64, off int64) {
+	if opID%opIndexSparse == 0 {
+		l.opOffsets[opID] = off
+	}
+}
+
+// TrimOpOffsetsBelow drops sparse index entries below floor and retains the
+// largest (opID, offset) pair as scanAnchor for WAL seek after purge.
+func (l *DataLog) TrimOpOffsetsBelow(floor uint64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	var bestBelowOp uint64
+	var bestBelowOff int64
+	foundBelow := false
+	for op, off := range l.opOffsets {
+		if op < floor {
+			if !foundBelow || op > bestBelowOp {
+				bestBelowOp = op
+				bestBelowOff = off
+				foundBelow = true
+			}
+			delete(l.opOffsets, op)
+		}
+	}
+	if foundBelow && bestBelowOp > l.scanAnchor.opID {
+		l.scanAnchor.opID = bestBelowOp
+		l.scanAnchor.offset = bestBelowOff
+	}
+}
+
 func (l *DataLog) findScanStartLocked(targetOpID uint64) (int64, bool) {
 	if off, ok := l.opOffsets[targetOpID]; ok {
 		return off, true
@@ -335,7 +382,17 @@ func (l *DataLog) findScanStartLocked(targetOpID uint64) (int64, bool) {
 			}
 		}
 	}
-	return bestOff, found
+	if l.scanAnchor.opID > 0 && l.scanAnchor.opID <= targetOpID {
+		if !found || l.scanAnchor.opID > bestOp {
+			bestOp = l.scanAnchor.opID
+			bestOff = l.scanAnchor.offset
+			found = true
+		}
+	}
+	if found {
+		return bestOff, true
+	}
+	return 0, true
 }
 
 func (l *DataLog) PunchHole(off, length int64) error {

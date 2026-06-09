@@ -75,7 +75,7 @@ func setupTestEnv(t *testing.T) (string, map[string]*store.Store, *Server, func(
 	stores := make(map[string]*store.Store)
 	for i := 0; i < 4; i++ {
 		dbName := strconv.Itoa(i)
-		s, err := store.NewStore(filepath.Join(dir, "data", dbName), logger, 0, "time", 90)
+		s, err := store.NewStore(context.Background(), filepath.Join(dir, "data", dbName), logger, 0, "time", 90)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1046,4 +1046,42 @@ func TestStepDown_SafetySequence(t *testing.T) {
 	if string(val) != "safety_val" {
 		t.Errorf("Replica missing data. Got %q, want 'safety_val'", val)
 	}
+}
+
+func TestServer_ShutdownClosesIdleConnection(t *testing.T) {
+	dir, _, srv, cleanup := setupTestEnv(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- srv.Run(ctx)
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for srv.Addr() == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("server did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	client := connectClient(t, srv.Addr().String(), getClientTLS(t, dir))
+	// Let the handler register the connection before shutdown begins.
+	time.Sleep(50 * time.Millisecond)
+
+	start := time.Now()
+	srv.CloseAll()
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("CloseAll took too long with idle client: %v", elapsed)
+	}
+	if srv.ActiveConns() != 0 {
+		t.Fatalf("expected no active connections after CloseAll, got %d", srv.ActiveConns())
+	}
+
+	_ = client.conn.Close()
+	cancel()
+	<-errCh
 }

@@ -41,6 +41,12 @@ func (db *DB) setClog(xid uint64, status TxStatus) {
 	db.clogMu.Unlock()
 }
 
+func (db *DB) forgetClog(xid uint64) {
+	db.clogMu.Lock()
+	delete(db.clog, xid)
+	db.clogMu.Unlock()
+}
+
 func (db *DB) isVisible(xmin uint64, snap Snapshot) bool {
 	if xmin >= snap.Xmax || snap.contains(xmin) {
 		return false
@@ -96,5 +102,6 @@ func (db *DB) abortTransaction(tx *Transaction) {
 			}
 		}
 		db.txMu.Unlock()
+		db.forgetClog(tx.xid)
 	})
 }
