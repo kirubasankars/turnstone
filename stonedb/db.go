@@ -1,8 +1,6 @@
 package stonedb
 
 import (
-	"bytes"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,15 +8,12 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"turnstone/protocol"
-
-	"turnstone/stonedb/index"
 )
 
 type commitRequest struct {
@@ -39,98 +34,62 @@ type TimelineMeta struct {
 
 // DB is the main database struct.
 type DB struct {
-	dir                string
-	ldb                *index.DB
-	writeAheadLog      *WriteAheadLog
-	valueLog           *ValueLog
-	deletedBytesByFile map[uint32]int64
-	logger             *slog.Logger
+	dir    string
+	log    *DataLog
+	index  *MemIndex
+	clog   map[uint64]TxStatus
+	clogMu sync.RWMutex
+	logger *slog.Logger
 
 	mu       sync.RWMutex
 	commitMu sync.Mutex
-
-	// writeSeqMu serializes opID-allocation + WAL-append + VLog-append for
-	// every eager SET/DELETE write (see Transaction.write and ApplyRecord).
-	// WAL and VLog otherwise use independent locks, so without this a
-	// preempted goroutine could let a later opID's VLog write land before
-	// an earlier opID's; a crash in that window would make the ValueLog's
-	// recovered high-water mark ("maxOp") look like it already covers an
-	// opID that was, in fact, never written, permanently and silently
-	// losing that committed write on replay.
-	writeSeqMu sync.Mutex
-
-	// shutdownMu is a shutdown barrier between Close() and Commit(): Close()
-	// takes the write lock (blocking until every in-flight Commit's RLock is
-	// released) before closing closeCh, guaranteeing no commit request can
-	// be stranded in commitCh after runGroupCommits stops draining it.
 	shutdownMu sync.RWMutex
 
-	// Clocks
 	transactionID uint64
 	operationID   uint64
-	keyCount      int64 // Persistent Key Count
+	keyCount      int64
+	staleBytes    int64
+	scanWALFloor  uint64
 
-	// Metrics (Atomic counters)
 	metricsConflicts uint64
 
-	// Transaction State (snapshot horizon tracking; value = snapshot.Xmax)
-	activeTxnsMu   sync.Mutex
-	activeTxns     map[*Transaction]uint64
-	pendingDeletes []pendingFile
+	activeTxnsMu sync.Mutex
+	activeTxns   map[*Transaction]uint64
 
-	// Postgres-style eager transaction bookkeeping.
 	txMu         sync.Mutex
-	activeXids   map[uint64]*Transaction // in-progress RW xids -> owner (nil = applied via replication)
-	keyLocks     map[string]uint64       // key -> owning xid (first-writer-wins, NOWAIT)
-	txStartTimes map[uint64]time.Time    // xid -> start time, local RW only (liveness reaper)
-	beginOpIDs   map[uint64]uint64       // xid -> opID of its BEGIN record (WAL purge floor)
-	txTimeout    time.Duration           // MaxTxDuration override for the liveness reaper
+	activeXids   map[uint64]*Transaction
+	keyLocks     map[string]uint64
+	txStartTimes map[uint64]time.Time
+	beginOpIDs   map[uint64]uint64
+	txTimeout    time.Duration
 
-	// pendingClogRebuild holds clog decisions reconstructed from the WAL during
-	// recovery, before the index is open. Flushed by persistClogRebuild.
-	pendingClogRebuild map[uint64]TxStatus
-
-	// replImpact accumulates per-xid key-count/garbage impact for replicated
-	// (ApplyRecord) writes, mirroring what a local Transaction tracks in
-	// memory between Put/Delete and Commit. Flushed to keyCount/
-	// deletedBytesByFile on a replicated COMMIT, discarded on ABORT.
 	replImpact map[uint64]*replTxImpact
 
-	// Background Tasks
 	closeCh      chan struct{}
 	wg           sync.WaitGroup
 	lastCkptOpID uint64
 	closed       int32
 
-	// Group Commit Pipeline
 	commitCh           chan commitRequest
 	commitDelay        time.Duration
 	commitSiblings     int
 	unsafeDisableFsync bool
 
-	// Config
 	minGarbageThreshold    int64
 	checksumInterval       time.Duration
 	autoCheckpointInterval time.Duration
 	compactionInterval     time.Duration
-	maxDiskUsagePercent    int   // Configured threshold
-	blockCacheSize         int   // Configured cache size
-	isDiskFull             int32 // Atomic boolean (1=Full, 0=OK)
-	isCorrupt              int32 // Atomic boolean (1=Corrupt, 0=OK) - Prevents writes after critical failure
-	compacting             int32 // Atomic boolean (1=RunCompaction in progress) - prevents overlapping compaction passes
+	maxDiskUsagePercent    int
+	isDiskFull             int32
+	isCorrupt              int32
+	vacuuming              int32
 
-	// Timeline Meta
 	timelineMeta TimelineMeta
 }
 
-// Open initializes the DB.
 func Open(dir string, opts Options) (*DB, error) {
 	if err := os.MkdirAll(dir, dirMode); err != nil {
 		return nil, err
-	}
-
-	if opts.MaxVLogSize == 0 {
-		opts.MaxVLogSize = int64(protocol.DefaultMaxVLogSize)
 	}
 	if opts.CompactionMinGarbage == 0 {
 		opts.CompactionMinGarbage = 1024 * 1024
@@ -141,16 +100,12 @@ func Open(dir string, opts Options) (*DB, error) {
 	if opts.CompactionInterval == 0 {
 		opts.CompactionInterval = 20 * time.Second
 	}
-	// Default Block Cache to 64MB if not specified
-	if opts.BlockCacheSize == 0 {
-		opts.BlockCacheSize = 64 * 1024 * 1024
-	}
 	if opts.TxTimeout == 0 {
 		opts.TxTimeout = protocol.MaxTxDuration
 	}
 	switch {
 	case opts.CommitDelay < 0:
-		opts.CommitDelay = 0 // explicitly disabled
+		opts.CommitDelay = 0
 	case opts.CommitDelay == 0:
 		opts.CommitDelay = 2 * time.Millisecond
 	}
@@ -162,7 +117,6 @@ func Open(dir string, opts Options) (*DB, error) {
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	// Enrich logger with DB directory context for easier debugging in multi-db environments
 	logger = logger.With("db_dir", filepath.Base(dir))
 
 	meta, err := loadTimelineMeta(dir)
@@ -170,23 +124,16 @@ func Open(dir string, opts Options) (*DB, error) {
 		return nil, fmt.Errorf("load timeline meta: %w", err)
 	}
 
-	// WAL now depends on explicit rotation, MaxWALSize used for safety check only
-	wal, err := OpenWriteAheadLog(filepath.Join(dir, "wal"), 0, meta.CurrentTimeline, logger)
+	logFile, err := OpenDataLog(dir, logger)
 	if err != nil {
-		return nil, fmt.Errorf("open wal: %w", err)
-	}
-
-	vl, err := OpenValueLog(filepath.Join(dir, "vlog"), opts.MaxVLogSize, logger)
-	if err != nil {
-		_ = wal.Close()
-		return nil, fmt.Errorf("open vlog: %w", err)
+		return nil, fmt.Errorf("open log: %w", err)
 	}
 
 	db := &DB{
 		dir:                    dir,
-		writeAheadLog:          wal,
-		valueLog:               vl,
-		deletedBytesByFile:     make(map[uint32]int64),
+		log:                    logFile,
+		index:                  NewMemIndex(),
+		clog:                   make(map[uint64]TxStatus),
 		activeTxns:             make(map[*Transaction]uint64),
 		activeXids:             make(map[uint64]*Transaction),
 		keyLocks:               make(map[string]uint64),
@@ -204,50 +151,20 @@ func Open(dir string, opts Options) (*DB, error) {
 		autoCheckpointInterval: opts.AutoCheckpointInterval,
 		compactionInterval:     opts.CompactionInterval,
 		maxDiskUsagePercent:    opts.MaxDiskUsagePercent,
-		blockCacheSize:         opts.BlockCacheSize,
 		timelineMeta:           meta,
 		logger:                 logger,
 	}
 
-	logger.Debug("Opening Database", "vlog_max_size", opts.MaxVLogSize)
 	if opts.UnsafeDisableFsync {
-		logger.Warn("UnsafeDisableFsync is enabled: COMMIT no longer fsyncs the WAL. A crash or power loss can silently lose or corrupt recently committed data. Benchmarking/debugging only.")
+		logger.Warn("UnsafeDisableFsync enabled")
 	}
 
-	if err := db.recoverValueLog(); err != nil {
+	if err := db.replayLog(opts.TruncateCorruptWAL); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("recover vlog: %w", err)
-	}
-
-	// FIX: Pass timeline history to ensure we don't replay orphaned writes
-	if err := db.syncWALToValueLog(opts.TruncateCorruptWAL, meta.History); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("sync wal: %w", err)
-	}
-
-	if err := db.openIndex(dir); err != nil {
-		db.Close()
-		return nil, err
-	}
-
-	// The clog can only be persisted once the index is open; apply whatever was
-	// reconstructed from the WAL replay above now.
-	if err := db.persistClogRebuild(); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("persist recovered clog: %w", err)
-	}
-
-	db.writeAheadLog.SetOnRotate(db.onWALRotate)
-
-	if err := db.loadDeletedBytesStats(); err != nil {
-		db.logger.Warn("Failed to load garbage stats", "err", err)
-	}
-	if err := db.loadKeyCount(); err != nil {
-		db.logger.Warn("Failed to load key count (recounting)", "err", err)
+		return nil, fmt.Errorf("replay log: %w", err)
 	}
 
 	db.startBackgroundTasks()
-
 	return db, nil
 }
 
@@ -255,17 +172,13 @@ func loadTimelineMeta(dir string) (TimelineMeta, error) {
 	path := filepath.Join(dir, "timeline.meta")
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
-		// DEFAULT CHANGED: Start at Timeline 0 so first promotion is 1
 		return TimelineMeta{CurrentTimeline: 0}, nil
 	}
 	if err != nil {
 		return TimelineMeta{}, err
 	}
 	var meta TimelineMeta
-	if err := json.Unmarshal(data, &meta); err != nil {
-		return TimelineMeta{}, err
-	}
-	return meta, nil
+	return meta, json.Unmarshal(data, &meta)
 }
 
 func (db *DB) saveTimelineMeta() error {
@@ -275,7 +188,7 @@ func (db *DB) saveTimelineMeta() error {
 		return err
 	}
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
+	if err := os.WriteFile(tmp, data, fileMode); err != nil {
 		return err
 	}
 	return os.Rename(tmp, path)
@@ -289,28 +202,17 @@ func (db *DB) Promote() error {
 	newTL := currentTL + 1
 	lastOp := atomic.LoadUint64(&db.operationID)
 
-	historyEntry := TimelineHistoryItem{
-		TLI:     currentTL,
-		StartOp: 0,
-		EndOp:   lastOp,
-	}
+	historyEntry := TimelineHistoryItem{TLI: currentTL, StartOp: 0, EndOp: lastOp}
 	if len(db.timelineMeta.History) > 0 {
 		historyEntry.StartOp = db.timelineMeta.History[len(db.timelineMeta.History)-1].EndOp
 	}
-
 	db.timelineMeta.History = append(db.timelineMeta.History, historyEntry)
 	db.timelineMeta.CurrentTimeline = newTL
 
 	if err := db.saveTimelineMeta(); err != nil {
-		return fmt.Errorf("failed to save timeline meta: %w", err)
+		return fmt.Errorf("save timeline meta: %w", err)
 	}
-
-	if err := db.writeAheadLog.ForceNewTimeline(newTL); err != nil {
-		return fmt.Errorf("failed to switch WAL timeline: %w", err)
-	}
-
-	// Keep INFO: Timeline Event is critical
-	db.logger.Info("Promoted to new timeline", "old_timeline", currentTL, "new_timeline", newTL, "at_op", lastOp)
+	db.logger.Info("Promoted to new timeline", "old", currentTL, "new", newTL, "at_op", lastOp)
 	return nil
 }
 
@@ -326,13 +228,8 @@ func (db *DB) SetTimeline(newTL uint64) error {
 		return fmt.Errorf("cannot rewind timeline from %d to %d", currentTL, newTL)
 	}
 
-	// Record history transition
 	lastOp := atomic.LoadUint64(&db.operationID)
-	historyEntry := TimelineHistoryItem{
-		TLI:     currentTL,
-		StartOp: 0,
-		EndOp:   lastOp,
-	}
+	historyEntry := TimelineHistoryItem{TLI: currentTL, StartOp: 0, EndOp: lastOp}
 	if len(db.timelineMeta.History) > 0 {
 		historyEntry.StartOp = db.timelineMeta.History[len(db.timelineMeta.History)-1].EndOp
 	}
@@ -340,62 +237,23 @@ func (db *DB) SetTimeline(newTL uint64) error {
 	db.timelineMeta.CurrentTimeline = newTL
 
 	if err := db.saveTimelineMeta(); err != nil {
-		return fmt.Errorf("failed to save timeline meta: %w", err)
+		return fmt.Errorf("save timeline meta: %w", err)
 	}
-
-	if err := db.writeAheadLog.ForceNewTimeline(newTL); err != nil {
-		return fmt.Errorf("failed to switch WAL timeline: %w", err)
-	}
-
-	// Keep INFO: Timeline Event is critical
-	db.logger.Info("Switched to leader timeline", "old_timeline", currentTL, "new_timeline", newTL, "at_op", lastOp)
+	db.logger.Info("Switched timeline", "old", currentTL, "new", newTL, "at_op", lastOp)
 	return nil
 }
 
 func (db *DB) ForceSetClocks(txID, opID uint64) {
-	currentTx := atomic.LoadUint64(&db.transactionID)
-	if txID > currentTx {
+	if txID > atomic.LoadUint64(&db.transactionID) {
 		atomic.StoreUint64(&db.transactionID, txID)
 	}
-	currentOp := atomic.LoadUint64(&db.operationID)
-	if opID > currentOp {
+	if opID > atomic.LoadUint64(&db.operationID) {
 		atomic.StoreUint64(&db.operationID, opID)
 	}
 }
 
-func (db *DB) openIndex(dir string) error {
-	indexPath := filepath.Join(dir, "index")
-
-	var err error
-	db.ldb, err = index.Open(indexPath, db.blockCacheSize)
-
-	needsRebuild := false
-	if err != nil {
-		db.logger.Error("Index open failed, attempting rebuild", "err", err)
-		needsRebuild = true
-		index.RemoveAll(indexPath)
-		db.ldb, err = index.Open(indexPath, db.blockCacheSize)
-		if err != nil {
-			return fmt.Errorf("open fresh index: %w", err)
-		}
-	} else if !db.isIndexConsistent() {
-		db.logger.Warn("Index state inconsistent with WAL, rebuilding")
-		needsRebuild = true
-	}
-
-	if needsRebuild {
-		start := time.Now()
-		if err := db.RebuildIndexFromVLog(); err != nil {
-			return fmt.Errorf("rebuild index: %w", err)
-		}
-		// CHANGED: Reduced from INFO to DEBUG
-		db.logger.Debug("Index rebuild complete", "duration", time.Since(start))
-	}
-	return nil
-}
-
 func (db *DB) startBackgroundTasks() {
-	db.lastCkptOpID = db.operationID
+	db.lastCkptOpID = atomic.LoadUint64(&db.operationID)
 	waitCount := 4
 	if db.checksumInterval > 0 {
 		waitCount++
@@ -406,10 +264,9 @@ func (db *DB) startBackgroundTasks() {
 	db.wg.Add(waitCount)
 
 	go db.runAutoCheckpoint()
-	go db.runAutoCompaction()
+	go db.runAutoVacuum()
 	go db.runGroupCommits()
 	go db.runLivenessReaper()
-
 	if db.checksumInterval > 0 {
 		go db.runBackgroundChecksum()
 	}
@@ -418,10 +275,6 @@ func (db *DB) startBackgroundTasks() {
 	}
 }
 
-// runLivenessReaper force-aborts any locally-owned RW transaction that has
-// been open longer than db.txTimeout, independent of client activity. This
-// bounds how long a stalled/forgotten connection can hold first-writer-wins
-// key locks.
 func (db *DB) runLivenessReaper() {
 	defer db.wg.Done()
 	interval := db.txTimeout / 4
@@ -430,7 +283,6 @@ func (db *DB) runLivenessReaper() {
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-db.closeCh:
@@ -444,7 +296,6 @@ func (db *DB) runLivenessReaper() {
 func (db *DB) reapExpiredTransactions() {
 	now := time.Now()
 	var expired []*Transaction
-
 	db.txMu.Lock()
 	for xid, start := range db.txStartTimes {
 		if now.Sub(start) > db.txTimeout {
@@ -454,31 +305,15 @@ func (db *DB) reapExpiredTransactions() {
 		}
 	}
 	db.txMu.Unlock()
-
 	for _, tx := range expired {
 		tx.markAborted()
-		db.logger.Warn("Liveness reaper force-aborted stalled transaction", "xid", tx.xid, "timeout", db.txTimeout)
+		db.logger.Warn("Force-aborted stalled transaction", "xid", tx.xid)
 		db.abortTransaction(tx)
 	}
 }
 
-// AbortAllActiveWriteTransactions force-aborts every currently in-progress,
-// locally-owned RW transaction. It uses the same claimDecision-guarded
-// abortTransaction path as the liveness reaper, so it's safe to race against
-// a concurrent Commit() on the same transaction: whichever side wins the
-// claim decides the outcome, and the loser backs off without producing a
-// conflicting durable record.
-//
-// This exists for planned failover (STEPDOWN): after draining active
-// transactions times out, the caller must not simply proceed as if they'd
-// all finished -- a straggler could otherwise still commit locally *after*
-// the final safe-point/replica-reset has already been broadcast, which
-// would silently drop that write on failover since no replica (and no
-// future primary) would ever see it. Force-aborting any stragglers here
-// closes that window.
 func (db *DB) AbortAllActiveWriteTransactions() {
 	var active []*Transaction
-
 	db.txMu.Lock()
 	for _, tx := range db.activeXids {
 		if tx != nil {
@@ -486,10 +321,8 @@ func (db *DB) AbortAllActiveWriteTransactions() {
 		}
 	}
 	db.txMu.Unlock()
-
 	for _, tx := range active {
 		tx.markAborted()
-		db.logger.Warn("Force-aborting active transaction for planned failover", "xid", tx.xid)
 		db.abortTransaction(tx)
 	}
 }
@@ -498,69 +331,14 @@ func (db *DB) KeyCount() (int64, error) {
 	return atomic.LoadInt64(&db.keyCount), nil
 }
 
-// TotalGarbageBytes calculates the total number of stale bytes in the ValueLog.
 func (db *DB) TotalGarbageBytes() int64 {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-	var total int64
-	for _, size := range db.deletedBytesByFile {
-		total += size
-	}
-	return total
+	return atomic.LoadInt64(&db.staleBytes)
 }
 
-func (db *DB) scanKeyCount() (int64, error) {
-	count := int64(0)
-	if db.ldb == nil {
-		return 0, nil
-	}
-	iter := db.ldb.NewIterator(nil, nil)
-	defer iter.Release()
-
-	var lastKey []byte
-
-	for iter.Next() {
-		if bytes.HasPrefix(iter.Key(), []byte("!sys!")) {
-			continue
-		}
-		key, _, err := decodeIndexKey(iter.Key())
-		if err != nil {
-			continue
-		}
-		if !bytes.Equal(key, lastKey) {
-			meta, err := decodeEntryMeta(iter.Value())
-			if err == nil && !meta.IsTombstone {
-				count++
-			}
-			lastKey = append([]byte(nil), key...)
-		}
-	}
-	return count, nil
-}
-
-func (db *DB) StorageStats() (walCount int, walSize int64, vlogCount int, vlogSize int64) {
-	walDir := filepath.Join(db.dir, "wal")
-	if walEntries, err := os.ReadDir(walDir); err == nil {
-		for _, e := range walEntries {
-			if !e.IsDir() && strings.HasSuffix(e.Name(), ".wal") {
-				walCount++
-				if info, err := e.Info(); err == nil {
-					walSize += info.Size()
-				}
-			}
-		}
-	}
-	vlogDir := filepath.Join(db.dir, "vlog")
-	if vlogEntries, err := os.ReadDir(vlogDir); err == nil {
-		for _, e := range vlogEntries {
-			if !e.IsDir() && strings.HasSuffix(e.Name(), ".vlog") {
-				vlogCount++
-				if info, err := e.Info(); err == nil {
-					vlogSize += info.Size()
-				}
-			}
-		}
-	}
+func (db *DB) StorageStats() (logCount int, logicalSize int64, allocatedSize int64) {
+	logCount = 1
+	logicalSize = db.log.LogicalSize()
+	allocatedSize = db.log.AllocatedSize()
 	return
 }
 
@@ -588,14 +366,11 @@ func (db *DB) ActiveTransactionCount() int {
 	return len(db.activeTxns)
 }
 
-// maxCommitBatchSize bounds how many commits a single group-commit round can
-// coalesce into one WAL fsync.
 const maxCommitBatchSize = 128
 
 func (db *DB) runGroupCommits() {
 	defer db.wg.Done()
 	var batch []commitRequest
-
 	for {
 		select {
 		case <-db.closeCh:
@@ -604,23 +379,6 @@ func (db *DB) runGroupCommits() {
 			batch = append(batch, req)
 		}
 
-		// Give other concurrently-committing transactions a brief window to
-		// join this batch before we pay its fsync cost. Without this, the
-		// drain loop below (which only grabs what's *already* queued) tends
-		// to fire off a fsync as soon as 1-2 requests have arrived, even
-		// under heavy concurrent load, because a single fsync is often
-		// faster than the time it takes many concurrent writers to reach
-		// commit -- defeating the point of group commit.
-		//
-		// db.ActiveTransactionCount() counts the transaction we just
-		// dequeued too (it isn't removed from activeTxns until its commit
-		// response comes back), so "count >= commitSiblings" with the
-		// default of 2 really means "at least one OTHER transaction is
-		// also active right now". That keeps a single, unbatched client at
-		// its normal one-fsync-per-commit latency, and only pays the delay
-		// when there's real concurrency to amortize it against. There's
-		// nothing to amortize when unsafeDisableFsync is set (no fsync is
-		// ever paid), so skip the wait entirely in that mode.
 		if db.commitDelay > 0 && !db.unsafeDisableFsync && db.ActiveTransactionCount() >= db.commitSiblings {
 			timer := time.NewTimer(db.commitDelay)
 		DelayLoop:
@@ -651,49 +409,42 @@ func (db *DB) runGroupCommits() {
 
 func (db *DB) SetCompactionMinGarbage(minGarbage int64) {
 	db.mu.Lock()
-	defer db.mu.Unlock()
 	db.minGarbageThreshold = minGarbage
+	db.mu.Unlock()
 }
 
 func (db *DB) runAutoCheckpoint() {
 	defer db.wg.Done()
 	ticker := time.NewTicker(db.autoCheckpointInterval)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-db.closeCh:
 			return
 		case <-ticker.C:
-			currentOp := atomic.LoadUint64(&db.operationID)
-			lastOp := atomic.LoadUint64(&db.lastCkptOpID)
-
-			if currentOp > lastOp {
-				if err := db.Checkpoint(); err != nil {
-					if !strings.Contains(err.Error(), "closed") {
-						db.logger.Error("Auto-checkpoint failed", "err", err)
-					}
+			if atomic.LoadUint64(&db.operationID) > atomic.LoadUint64(&db.lastCkptOpID) {
+				if err := db.Checkpoint(); err != nil && !strings.Contains(err.Error(), "closed") {
+					db.logger.Error("Auto-checkpoint failed", "err", err)
 				}
 			}
 		}
 	}
 }
 
-func (db *DB) runAutoCompaction() {
+func (db *DB) runAutoVacuum() {
 	defer db.wg.Done()
 	ticker := time.NewTicker(db.compactionInterval)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-db.closeCh:
 			return
 		case <-ticker.C:
 			for i := 0; i < 10; i++ {
-				didWork, err := db.RunCompaction()
+				didWork, err := db.RunVacuum()
 				if err != nil {
 					if !strings.Contains(err.Error(), "closed") {
-						db.logger.Error("Auto-compaction failed", "err", err)
+						db.logger.Error("Auto-vacuum failed", "err", err)
 					}
 					break
 				}
@@ -707,73 +458,27 @@ func (db *DB) runAutoCompaction() {
 
 func (db *DB) runBackgroundChecksum() {
 	defer db.wg.Done()
-	if db.checksumInterval <= 0 {
-		return
-	}
 	ticker := time.NewTicker(db.checksumInterval)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-db.closeCh:
 			return
 		case <-ticker.C:
-			if err := db.VerifyChecksums(); err != nil {
-				if !strings.Contains(err.Error(), "closed") {
-					// WARN: Integrity check failed
-					db.logger.Warn("Background checksum verification failed", "err", err)
-				}
-			}
+			_ = db.VerifyChecksums()
 		}
 	}
 }
 
 func (db *DB) VerifyChecksums() error {
-	fids, err := db.valueLog.GetImmutableFileIDs()
-	if err != nil {
-		return err
-	}
-	for _, fid := range fids {
-		if isClosed(db.closeCh) {
-			return nil
-		}
-		err := db.valueLog.IterateFile(fid, func(_ ValueLogEntry, _ EntryMeta) error {
-			if isClosed(db.closeCh) {
-				return errors.New("closed")
-			}
-			return nil
-		})
-		if err != nil && !strings.Contains(err.Error(), "closed") {
-			db.logger.Error("Corrupt VLog file detected", "file_id", fid, "err", err)
-		}
-	}
-	return nil
+	return db.log.Replay(false, db.timelineMeta.History, func(rec WALRecord, span recordSpan) {})
 }
 
-func isClosed(ch <-chan struct{}) bool {
-	select {
-	case <-ch:
-		return true
-	default:
-		return false
-	}
-}
-
-// NewTransaction starts a new transaction. Read-write transactions are
-// assigned an xid immediately and log a BEGIN WAL record (Postgres-style);
-// read-only transactions merely capture a snapshot and never touch the WAL.
 func (db *DB) NewTransaction(update bool) *Transaction {
 	if !update {
 		db.activeTxnsMu.Lock()
 		db.txMu.Lock()
 		snap := db.buildSnapshotLocked()
-		// Captured under the same txMu critical section as the snapshot
-		// boundary itself, so StreamSnapshot's returned watermark is
-		// guaranteed consistent with (never ahead of) the data it actually
-		// streamed -- reading db.operationID separately afterward could
-		// observe writes that committed after the snapshot was fixed,
-		// letting a replication/CDC consumer resuming from that watermark
-		// silently skip records.
 		snapOpID := atomic.LoadUint64(&db.operationID)
 		db.txMu.Unlock()
 		tx := &Transaction{db: db, update: false, snapshot: snap, snapOpID: snapOpID}
@@ -782,29 +487,14 @@ func (db *DB) NewTransaction(update bool) *Transaction {
 		return tx
 	}
 
-	// xid allocation and snapshot construction must be atomic with each
-	// other under txMu: if we incremented db.transactionID before taking
-	// the lock, a concurrent NewTransaction's buildSnapshotLocked (running
-	// between our increment and our own txMu acquisition) could compute an
-	// Xmax that already covers our xid (since Xmax is derived from the same
-	// counter) while our xid is not yet in activeXids/Xip -- making that
-	// other transaction's snapshot treat us as neither future nor
-	// in-progress. A write that later lands on a key we've already
-	// committed would then wrongly look "old enough" to overwrite, silently
-	// dropping our update (a lost update / torn snapshot).
 	db.txMu.Lock()
 	xid := atomic.AddUint64(&db.transactionID, 1)
 	snap := db.buildSnapshotLocked()
 	tx := &Transaction{
-		db:              db,
-		update:          true,
-		xid:             xid,
-		snapshot:        snap,
-		keyLocks:        make(map[string]struct{}),
-		dispositionSeen: make(map[string]bool),
-		ownPriorMeta:    make(map[string]*EntryMeta),
-		staleBytes:      make(map[uint32]int64),
-		readSet:         make(map[string]struct{}),
+		db: db, update: true, xid: xid, snapshot: snap,
+		keyLocks: make(map[string]struct{}), dispositionSeen: make(map[string]bool),
+		ownPriorVer: make(map[string]*indexVersion), staleBytes: make(map[int64]int64),
+		readSet: make(map[string]struct{}),
 	}
 	db.activeXids[xid] = tx
 	db.txStartTimes[xid] = time.Now()
@@ -816,7 +506,6 @@ func (db *DB) NewTransaction(update bool) *Transaction {
 
 	opID, err := db.appendRecord(WALRecordBegin, xid, nil, nil)
 	if err != nil {
-		// Best-effort: mark the transaction unusable; Put/Commit will surface the failure.
 		tx.markAborted()
 		tx.beginErr = err
 	} else {
@@ -825,52 +514,40 @@ func (db *DB) NewTransaction(update bool) *Transaction {
 		db.beginOpIDs[xid] = opID
 		db.txMu.Unlock()
 	}
-
 	return tx
 }
 
-// appendRecord assigns an opID and appends one WAL record atomically: opID
-// allocation and the physical write happen inside the same WAL-locked
-// critical section, so file order always matches opID order.
 func (db *DB) appendRecord(recType WALRecordType, xid uint64, key, value []byte) (uint64, error) {
 	nextOpID := func() uint64 { return atomic.AddUint64(&db.operationID, 1) }
 	build := func(opID uint64) []byte {
 		return encodeWALRecord(WALRecord{Type: recType, XID: xid, OpID: opID, Key: key, Value: value})
 	}
-	opIDs, err := db.writeAheadLog.AppendRecordsWithOpIDs(nextOpID, []func(uint64) []byte{build}, false)
+	opIDs, _, err := db.log.AppendRecordsWithOpIDs(nextOpID, []func(uint64) []byte{build}, false)
 	if err != nil {
 		return 0, err
 	}
 	return opIDs[0], nil
 }
 
-// ScanWAL streams typed WAL records at or after startOpID, in physical (and
-// therefore logical) order.
-func (db *DB) ScanWAL(startOpID uint64, fn func([]WALRecord) error) error {
-	loc, found, err := db.locateWALStart(startOpID)
+func (db *DB) appendRecordWithOffset(recType WALRecordType, xid uint64, key, value []byte) (uint64, int64, error) {
+	nextOpID := func() uint64 { return atomic.AddUint64(&db.operationID, 1) }
+	build := func(opID uint64) []byte {
+		return encodeWALRecord(WALRecord{Type: recType, XID: xid, OpID: opID, Key: key, Value: value})
+	}
+	opIDs, offsets, err := db.log.AppendRecordsWithOpIDs(nextOpID, []func(uint64) []byte{build}, false)
 	if err != nil {
-		return err
+		return 0, 0, err
 	}
-	if !found {
-		return ErrLogUnavailable
-	}
-	return db.writeAheadLog.Scan(loc, func(recs []WALRecord) error {
-		var filtered []WALRecord
-		for _, r := range recs {
-			if r.OpID >= startOpID {
-				filtered = append(filtered, r)
-			}
-		}
-		if len(filtered) > 0 {
-			return fn(filtered)
-		}
-		return nil
-	})
+	return opIDs[0], offsets[0], nil
 }
 
-// PurgeWAL deletes WAL files older than minOpID, but never past the oldest
-// still-open BEGIN (local or replicated) so an in-progress transaction's
-// records always remain replayable.
+func (db *DB) ScanWAL(startOpID uint64, fn func([]WALRecord) error) error {
+	if startOpID < atomic.LoadUint64(&db.scanWALFloor) {
+		return ErrLogUnavailable
+	}
+	return db.log.Scan(startOpID, fn)
+}
+
 func (db *DB) PurgeWAL(minOpID uint64) error {
 	db.txMu.Lock()
 	for _, op := range db.beginOpIDs {
@@ -879,23 +556,19 @@ func (db *DB) PurgeWAL(minOpID uint64) error {
 		}
 	}
 	db.txMu.Unlock()
-	return db.writeAheadLog.PurgeOlderThan(minOpID)
+	atomic.StoreUint64(&db.scanWALFloor, minOpID)
+	return nil
 }
 
-// ApplyRecord applies a single replicated WAL record directly to the engine,
-// mirroring the eager write path used locally: SET/DEL land in VLog+index
-// immediately (uncommitted), and COMMIT/ABORT resolve the clog. opIDs/xids
-// are taken verbatim from the leader, not reassigned.
 func (db *DB) ApplyRecord(rec WALRecord) error {
 	if atomic.LoadInt32(&db.isCorrupt) == 1 {
 		return errors.New("database is corrupt")
 	}
-
 	payload := encodeWALRecord(rec)
 
 	switch rec.Type {
 	case WALRecordBegin:
-		if err := db.writeAheadLog.AppendReplicatedRecord(payload, false); err != nil {
+		if _, err := db.log.AppendReplicatedRecord(payload, false); err != nil {
 			return err
 		}
 		db.txMu.Lock()
@@ -906,44 +579,25 @@ func (db *DB) ApplyRecord(rec WALRecord) error {
 		return nil
 
 	case WALRecordSet, WALRecordDelete:
-		// See Transaction.write: the WAL append and VLog append for a given
-		// opID must be serialized as one unit against every other writer
-		// (including the local eager-write path) so recovery's VLog
-		// high-water mark never covers an opID whose entry wasn't actually
-		// written.
-		db.writeSeqMu.Lock()
-		err := db.writeAheadLog.AppendReplicatedRecord(payload, false)
-		if err != nil {
-			db.writeSeqMu.Unlock()
-			return err
-		}
-		fileID, offset, err := db.valueLog.AppendEntries([]ValueLogEntry{{
-			Key: rec.Key, Value: rec.Value, TransactionID: rec.XID, OperationID: rec.OpID, IsDelete: rec.Type == WALRecordDelete,
-		}})
-		db.writeSeqMu.Unlock()
+		off, err := db.log.AppendReplicatedRecord(payload, false)
 		if err != nil {
 			atomic.StoreInt32(&db.isCorrupt, 1)
 			return err
 		}
-		meta := EntryMeta{
-			FileID: fileID, ValueOffset: offset, ValueLen: uint32(len(rec.Value)),
-			TransactionID: rec.XID, OperationID: rec.OpID, IsTombstone: rec.Type == WALRecordDelete,
-		}
-		if err := db.ldb.Put(encodeIndexKey(rec.Key, rec.XID), meta.Encode(), nil); err != nil {
-			atomic.StoreInt32(&db.isCorrupt, 1)
-			return err
-		}
+		isDelete := rec.Type == WALRecordDelete
+		db.index.Put(rec.Key, indexVersion{
+			offset: off, valueLen: uint32(len(rec.Value)),
+			xmin: rec.XID, opID: rec.OpID, tombstone: isDelete,
+		})
 		db.accountReplicatedWrite(rec)
 		db.ForceSetClocks(rec.XID, rec.OpID)
 		return nil
 
 	case WALRecordCommit:
-		if err := db.writeAheadLog.AppendReplicatedRecord(payload, true); err != nil {
+		if _, err := db.log.AppendReplicatedRecord(payload, true); err != nil {
 			return err
 		}
-		if err := db.ldb.Put(encodeClogKey(rec.XID), []byte{byte(TxCommitted)}, nil); err != nil {
-			panic("CRITICAL: replica clog commit persist failed: " + err.Error())
-		}
+		db.setClog(rec.XID, TxCommitted)
 		db.txMu.Lock()
 		delete(db.activeXids, rec.XID)
 		delete(db.beginOpIDs, rec.XID)
@@ -955,12 +609,11 @@ func (db *DB) ApplyRecord(rec WALRecord) error {
 		return nil
 
 	case WALRecordAbort:
-		if err := db.writeAheadLog.AppendReplicatedRecord(payload, false); err != nil {
+		if _, err := db.log.AppendReplicatedRecord(payload, false); err != nil {
 			return err
 		}
-		if err := db.ldb.Put(encodeClogKey(rec.XID), []byte{byte(TxAborted)}, nil); err != nil {
-			db.logger.Error("failed to persist replicated abort clog entry", "xid", rec.XID, "err", err)
-		}
+		db.setClog(rec.XID, TxAborted)
+		db.index.DropXid(rec.XID)
 		db.txMu.Lock()
 		delete(db.activeXids, rec.XID)
 		delete(db.beginOpIDs, rec.XID)
@@ -969,24 +622,15 @@ func (db *DB) ApplyRecord(rec WALRecord) error {
 		db.ForceSetClocks(rec.XID, rec.OpID)
 		return nil
 	}
-
 	return fmt.Errorf("unknown WAL record type: %d", rec.Type)
 }
 
-// replTxImpact accumulates the key-count/garbage impact of a single
-// replicated (ApplyRecord) transaction's writes, mirroring the bookkeeping a
-// local *Transaction keeps between Put/Delete and Commit.
 type replTxImpact struct {
 	keyDelta        int64
-	staleBytes      map[uint32]int64
+	staleBytes      int64
 	dispositionSeen map[string]bool
 }
 
-// accountReplicatedWrite updates the per-xid impact accumulator for a
-// replicated SET/DELETE record, using the same "current DB truth" comparison
-// a local write makes on its first touch of a key. Must be called after the
-// index write for rec has already landed, so latestResolvedMeta's exclusion
-// of rec.XID correctly finds the prior version (if any).
 func (db *DB) accountReplicatedWrite(rec WALRecord) {
 	keyStr := string(rec.Key)
 	isDelete := rec.Type == WALRecordDelete
@@ -994,38 +638,24 @@ func (db *DB) accountReplicatedWrite(rec WALRecord) {
 	db.txMu.Lock()
 	impact, ok := db.replImpact[rec.XID]
 	if !ok {
-		impact = &replTxImpact{staleBytes: make(map[uint32]int64), dispositionSeen: make(map[string]bool)}
+		impact = &replTxImpact{dispositionSeen: make(map[string]bool)}
 		db.replImpact[rec.XID] = impact
 	}
 	wasLiveIfSeen, seenBefore := impact.dispositionSeen[keyStr]
 	db.txMu.Unlock()
 
 	var wasLive bool
-	var staleFileID uint32
-	var staleSize int64
-	haveStale := false
-
 	if seenBefore {
-		// Second+ write to this key within the same replicated xid: compare
-		// against our own prior write in this xid, not the DB-wide index
-		// (a single-writer xid can't race itself).
 		wasLive = wasLiveIfSeen
 	} else {
-		iter := db.ldb.NewIterator(nil, nil)
-		meta, _, found := db.latestResolvedMeta(iter, rec.Key, rec.XID)
-		iter.Release()
-		wasLive = found && meta != nil && !meta.IsTombstone
-		if found && meta != nil {
-			staleFileID = meta.FileID
-			staleSize = int64(ValueLogHeaderSize) + int64(len(rec.Key)) + int64(meta.ValueLen)
-			haveStale = true
+		ver, _, found := db.index.LatestResolved(rec.Key, rec.XID, db.clogStatus)
+		wasLive = found && ver != nil && !ver.tombstone
+		if found && ver != nil {
+			impact.staleBytes += recordSpanSize(len(rec.Key), int(ver.valueLen), WALRecordSet)
 		}
 	}
 
 	db.txMu.Lock()
-	if haveStale {
-		impact.staleBytes[staleFileID] += staleSize
-	}
 	if isDelete {
 		if wasLive {
 			impact.keyDelta--
@@ -1037,8 +667,6 @@ func (db *DB) accountReplicatedWrite(rec WALRecord) {
 	db.txMu.Unlock()
 }
 
-// applyReplicatedImpact durably applies an accumulated replicated
-// transaction's key-count/garbage impact once its COMMIT record has landed.
 func (db *DB) applyReplicatedImpact(impact *replTxImpact) {
 	if impact == nil {
 		return
@@ -1046,59 +674,16 @@ func (db *DB) applyReplicatedImpact(impact *replTxImpact) {
 	if impact.keyDelta != 0 {
 		atomic.AddInt64(&db.keyCount, impact.keyDelta)
 	}
-	if len(impact.staleBytes) > 0 {
-		db.mu.Lock()
-		for fid, sz := range impact.staleBytes {
-			db.deletedBytesByFile[fid] += sz
-		}
-		db.mu.Unlock()
+	if impact.staleBytes > 0 {
+		atomic.AddInt64(&db.staleBytes, impact.staleBytes)
 	}
-}
-
-func (db *DB) locateWALStart(targetOpID uint64) (WALLocation, bool, error) {
-	if loc, ok := db.writeAheadLog.FindInMemory(targetOpID); ok {
-		return loc, true, nil
-	}
-	if db.ldb == nil {
-		return WALLocation{}, false, nil
-	}
-	iter := db.ldb.NewIterator(index.BytesPrefix(sysWALIndexPrefix), nil)
-	defer iter.Release()
-	seekKey := encodeWALIndexKey(targetOpID)
-	if iter.Seek(seekKey) {
-		key := iter.Key()
-		if decodeWALIndexKey(key) == targetOpID {
-			var loc WALLocation
-			err := json.Unmarshal(iter.Value(), &loc)
-			return loc, true, err
-		}
-		if iter.Prev() && bytes.HasPrefix(iter.Key(), sysWALIndexPrefix) {
-			var loc WALLocation
-			err := json.Unmarshal(iter.Value(), &loc)
-			return loc, true, err
-		}
-	} else if iter.Last() && bytes.HasPrefix(iter.Key(), sysWALIndexPrefix) {
-		var loc WALLocation
-		err := json.Unmarshal(iter.Value(), &loc)
-		return loc, true, err
-	}
-	return WALLocation{}, false, nil
 }
 
 func (db *DB) Close() error {
 	if !atomic.CompareAndSwapInt32(&db.closed, 0, 1) {
 		return nil
 	}
-	// CHANGED: Reduced from INFO to DEBUG
-	db.logger.Debug("Closing database instance", "dir", db.dir)
-
-	// Block until every Commit() that observed closed==0 has fully enqueued
-	// its request and received a response, so nothing can be left stranded
-	// in commitCh once runGroupCommits exits below (see Transaction.Commit).
-	// This is a deliberate empty critical section used purely as a
-	// barrier against Commit()'s shutdownMu.RLock() holders, not dead code.
 	db.shutdownMu.Lock()
-	//lint:ignore SA2001 intentional lock/unlock barrier, no data protected
 	db.shutdownMu.Unlock()
 
 	close(db.closeCh)
@@ -1107,112 +692,24 @@ func (db *DB) Close() error {
 	db.commitMu.Lock()
 	defer db.commitMu.Unlock()
 
-	if err := db.Checkpoint(); err != nil {
-		if !strings.Contains(err.Error(), "closed") {
-			db.logger.Error("Error checkpointing on close", "err", err)
-		}
-	}
-	db.persistSequences()
+	_ = db.Checkpoint()
 
-	var errs []string
-	if db.writeAheadLog != nil {
-		if err := db.writeAheadLog.Close(); err != nil {
-			errs = append(errs, err.Error())
-		}
-	}
-	if db.valueLog != nil {
-		if err := db.valueLog.Close(); err != nil {
-			errs = append(errs, err.Error())
-		}
-	}
-	if db.ldb != nil {
-		if err := db.ldb.Close(); err != nil {
-			errs = append(errs, err.Error())
-		}
-		db.ldb = nil
-	}
-	if len(errs) > 0 {
-		return fmt.Errorf("close errors: %s", strings.Join(errs, "; "))
+	if db.log != nil {
+		return db.log.Close()
 	}
 	return nil
 }
 
 func (db *DB) Checkpoint() error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	if db.ldb == nil {
-		return nil
-	}
-
-	// FIX: Clean up ALL existing garbage stats first to prevent resurrection of deleted files
-	iter := db.ldb.NewIterator(index.BytesPrefix(sysStaleBytesPrefix), nil)
-	cleanupBatch := new(index.Batch)
-	for iter.Next() {
-		cleanupBatch.Delete(iter.Key())
-	}
-	iter.Release()
-	if cleanupBatch.Len() > 0 {
-		if err := db.ldb.Write(cleanupBatch, nil); err != nil {
-			return err
-		}
-	}
-
-	batch := new(index.Batch)
-	for fileID, size := range db.deletedBytesByFile {
-		k := make([]byte, len(sysStaleBytesPrefix)+4)
-		copy(k, sysStaleBytesPrefix)
-		binary.BigEndian.PutUint32(k[len(sysStaleBytesPrefix):], fileID)
-		v := make([]byte, 8)
-		binary.BigEndian.PutUint64(v, uint64(size))
-		batch.Put(k, v)
-	}
-
-	// Always rotate VLog during checkpoint (Rotate is a no-op if the current
-	// file is empty), so compaction can treat "checkpointed" files as sealed
-	// candidates instead of waiting for MaxVLogSize to be reached.
-	if err := db.valueLog.Rotate(); err != nil {
-		return fmt.Errorf("vlog rotate failed: %w", err)
-	}
-
-	// Always rotate WAL during checkpoint
-	if err := db.writeAheadLog.Rotate(); err != nil {
-		return fmt.Errorf("wal rotate failed: %w", err)
-	}
-
 	atomic.StoreUint64(&db.lastCkptOpID, atomic.LoadUint64(&db.operationID))
-	db.persistSequences()
-
-	if batch.Len() == 0 {
-		return nil
-	}
-	return db.ldb.Write(batch, &index.WriteOptions{Sync: true})
-}
-
-func (db *DB) onWALRotate(walIndex map[uint64]WALLocation) error {
-	if len(walIndex) == 0 || db.ldb == nil {
-		return nil
-	}
-	batch := new(index.Batch)
-	var keys []uint64
-	for k := range walIndex {
-		keys = append(keys, k)
-	}
-	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
-
-	for _, opID := range keys {
-		locBytes, _ := json.Marshal(walIndex[opID])
-		batch.Put(encodeWALIndexKey(opID), locBytes)
-	}
-	return db.ldb.Write(batch, nil)
+	return nil
 }
 
 func (db *DB) runDiskMonitor() {
 	defer db.wg.Done()
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
-
 	db.checkDisk()
-
 	for {
 		select {
 		case <-db.closeCh:
@@ -1229,81 +726,19 @@ func (db *DB) checkDisk() {
 		db.logger.Error("Disk usage check failed", "err", err)
 		return
 	}
-
 	if int(usage) > db.maxDiskUsagePercent {
-		if atomic.CompareAndSwapInt32(&db.isDiskFull, 0, 1) {
-			// WARN: Resource exhaustion
-			db.logger.Warn("Disk usage exceeds limit, stopping writes", "usage_percent", usage, "limit_percent", db.maxDiskUsagePercent)
-		}
+		atomic.StoreInt32(&db.isDiskFull, 1)
 	} else {
-		if atomic.CompareAndSwapInt32(&db.isDiskFull, 1, 0) {
-			// INFO: Recovery
-			db.logger.Info("Disk usage returned to normal, resuming writes", "usage_percent", usage)
-		}
+		atomic.StoreInt32(&db.isDiskFull, 0)
 	}
 }
 
-func (db *DB) loadKeyCount() error {
-	val, err := db.ldb.Get(sysKeyCountKey, nil)
-	if err == nil && len(val) == 8 {
-		db.keyCount = int64(binary.BigEndian.Uint64(val))
-		return nil
-	}
-	if err == index.ErrNotFound {
-		// CHANGED: Reduced from INFO to DEBUG
-		db.logger.Debug("Key count not found, scanning index for initial count", "action", "full_scan")
-		count, err := db.scanKeyCount()
-		if err != nil {
-			return err
-		}
-		db.keyCount = count
-		return nil
-	}
-	return err
+func (db *DB) markCorrupt(err error) {
+	db.logger.Error("CRITICAL: storage write failed", "err", err)
+	atomic.StoreInt32(&db.isCorrupt, 1)
 }
 
-func (db *DB) loadDeletedBytesStats() error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	iter := db.ldb.NewIterator(index.BytesPrefix(sysStaleBytesPrefix), nil)
-	defer iter.Release()
-
-	for iter.Next() {
-		key := iter.Key()
-		if len(key) < len(sysStaleBytesPrefix)+4 {
-			continue
-		}
-
-		fileID := binary.BigEndian.Uint32(key[len(sysStaleBytesPrefix):])
-		val := iter.Value()
-		if len(val) != 8 {
-			continue
-		}
-		size := int64(binary.BigEndian.Uint64(val))
-		db.deletedBytesByFile[fileID] = size
-	}
-	return iter.Error()
-}
-
-func (db *DB) persistSequences() error {
-	if db.ldb == nil {
-		return nil
-	}
-
-	batch := new(index.Batch)
-
-	buf := make([]byte, 8)
-	binary.BigEndian.PutUint64(buf, atomic.LoadUint64(&db.transactionID))
-	batch.Put(sysTransactionIDKey, buf)
-
-	buf2 := make([]byte, 8)
-	binary.BigEndian.PutUint64(buf2, atomic.LoadUint64(&db.operationID))
-	batch.Put(sysOperationIDKey, buf2)
-
-	buf3 := make([]byte, 8)
-	binary.BigEndian.PutUint64(buf3, uint64(atomic.LoadInt64(&db.keyCount)))
-	batch.Put(sysKeyCountKey, buf3)
-
-	return db.ldb.Write(batch, &index.WriteOptions{Sync: true})
+// RunCompaction is kept as an alias for callers expecting the old name.
+func (db *DB) RunCompaction() (bool, error) {
+	return db.RunVacuum()
 }

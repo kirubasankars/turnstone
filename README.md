@@ -1,13 +1,13 @@
 # TurnstoneDB
 
-**TurnstoneDB** is a high-performance, persistent, distributed Key-Value store written in Go. It features a custom storage engine inspired by **WiscKey** (separating keys from values), full ACID transactions via Snapshot Isolation, and robust asynchronous replication with **Timeline** support for safe failovers.
+**TurnstoneDB** is a high-performance, persistent, distributed Key-Value store written in Go. It features a custom storage engine with a single append-only log and in-memory MVCC index, full ACID transactions via Snapshot Isolation, and robust asynchronous replication with **Timeline** support for safe failovers.
 
 > ⚠️ **Disclaimer:** TurnstoneDB is currently research-quality software. While it implements advanced mechanisms like Group Commit, MVCC, and mTLS, it is not recommended for mission-critical production workloads without further hardening.
 
 ## 🚀 Key Features
 
-* **⚡ WiscKey-style Storage Engine**: Uses a custom memory-mapped B+ tree for the index (Keys) and an append-only Value Log (VLog) for values. This minimizes write amplification and drastically improves throughput for large payloads.
-* **📝 Eager Logging**: `SET`/`DEL` write to the WAL, VLog, and index immediately (not buffered until `COMMIT`). `COMMIT` only group-fsyncs a small commit record and flips visibility. See "Transaction Model: Eager Logging" below.
+* **⚡ Append-only Log + In-Memory Index**: One unbounded `data.log` holds all records; an in-memory hashmap index tracks MVCC version chains pointing at byte offsets. Vacuum reclaims stale ranges via `fallocate` punch-hole without moving live records.
+* **📝 Eager Logging**: `SET`/`DEL` append to the log and update the in-memory index immediately (not buffered until `COMMIT`). `COMMIT` only group-fsyncs a small commit record and flips visibility. See "Transaction Model: Eager Logging" below.
 * **🔒 ACID Transactions**: Full support for multi-key transactions with **Snapshot Isolation**. Write-write conflicts are detected eagerly at `SET`/`DEL` time via **first-writer-wins** key locking (no waiting, no deadlocks); read-set validation still runs at `COMMIT` to catch stale-read/write-skew.
 * **🛡️ Secure by Default**: All connections (Client-Server and Inter-Node) are secured via **mTLS** (Mutual TLS). Role-Based Access Control (RBAC) is enforced via X.509 Certificate Organization fields.
 * **📡 Replication & Timelines**: Database-level Leader-Follower replication. Supports **Timelines** to handle split-brain scenarios and allow safe history divergence during promotion.
@@ -258,7 +258,6 @@ Use `turnstone-duck` to watch CDC logs, deduplicate them (handling the "same key
 | `wal_retention` | `2h` | Duration to keep WAL files. |
 | `wal_retention_strategy` | `time` | Strategy for WAL purge: `time` or `replication` (wait for replicas). |
 | `max_disk_usage_percent` | `90` | Reject writes if disk usage exceeds this %. |
-| `block_cache_size` | `64MB` | Reserved for future index cache tuning (e.g. "128MB", "1GB"). |
 | `metrics_addr` | `:9090` | Address for Prometheus metrics. |
 | `tls_cert_file` | `certs/server.crt` | Server Certificate. |
 | `tls_client_cert_file` | `certs/server.crt` | Cert used when acting as a Replication Client. |
@@ -269,45 +268,45 @@ Use `turnstone-duck` to watch CDC logs, deduplicate them (handling the "same key
 
 ### Architecture
 
-TurnstoneDB separates the storage of keys and values to optimize for modern SSDs:
+TurnstoneDB uses a single append-only log file plus an in-memory index:
 
-1. **mmap B+ Tree (Index)**: Stores `Key + (MaxUint64 - TxID) -> <FileID, Offset, Size>`. This encoding allows for efficient MVCC lookups (time-travel queries) and keeps the index compact with in-place page updates.
-2. **Value Log (VLog)**: Stores the actual values on disk in append-only files. Garbage collection is performed only when a file exceeds a configurable staleness threshold.
-3. **Write-Ahead Log (WAL)**: Ensures durability. Supports retention strategies based on time or replication acknowledgment. WAL rotation is checkpoint-driven (not size-triggered); checkpoints run on a timer (default 60s) or can be forced via the `checkpoint` admin command.
+1. **Data Log (`data.log`)**: One unbounded append-only file stores typed WAL records (`BEGIN`/`SET`/`DEL`/`COMMIT`/`ABORT`) with keys and values inline. Durability: eager append, group fsync on `COMMIT`. Recovery is a full replay from offset 0, skipping punched holes via `SEEK_DATA`.
+2. **In-Memory Index**: `map[key][]version` holds MVCC version chains (newest `xmin` first). Each version points at a byte offset in `data.log`. The commit log (`clog`) is also in memory, rebuilt during replay.
+3. **Vacuum**: Dead versions are dropped from the hashmap; stale byte ranges behind the append tail are reclaimed with `fallocate(PUNCH_HOLE|KEEP_SIZE)`. Logical file size never shrinks; actual disk use follows sparse allocation (`st_blocks`).
+
+Retention (`PurgeWAL`) raises a scan floor so replication/CDC cannot read ops below the safe point; vacuum may punch holes only below that floor.
 
 ### Transaction Model: Eager Logging
 
-Earlier versions of TurnstoneDB buffered all writes in memory between `BEGIN` and `COMMIT`, and only touched the WAL/VLog/index once, atomically, at commit time. TurnstoneDB now writes eagerly instead:
+Earlier versions of TurnstoneDB buffered all writes in memory between `BEGIN` and `COMMIT`, and only touched the log/index once, atomically, at commit time. TurnstoneDB now writes eagerly instead:
 
 ```mermaid
 sequenceDiagram
     participant Client
     participant Tx
-    participant WAL
-    participant VLog
+    participant Log
     participant Index
     participant Clog
     Client->>Tx: BEGIN
-    Tx->>WAL: BEGIN xid,op
+    Tx->>Log: BEGIN xid,op
     Client->>Tx: SET k v
-    Tx->>WAL: SET xid,op,k,v
-    Tx->>VLog: append (uncommitted)
+    Tx->>Log: SET xid,op,k,v
     Tx->>Index: xmin=xid, in_progress
     Client->>Tx: COMMIT
-    Tx->>WAL: COMMIT xid,op
-    Note over WAL: group fsync
+    Tx->>Log: COMMIT xid,op
+    Note over Log: group fsync
     Tx->>Clog: committed
     Note over Index: version now visible
 ```
 
 Key semantics:
 
-* **`xid` is assigned at `BEGIN`**, not at commit time. Every WAL record (`BEGIN`/`SET`/`DEL`/`COMMIT`/`ABORT`) also gets its own monotonically increasing `opID`, which remains the replication cursor.
-* **`SET`/`DEL` write immediately.** Values land in the VLog and an index version is inserted (`xmin = xid`, initially "in progress") as soon as the client calls `SET`/`DEL` — not buffered until `COMMIT`. This data is **not fsynced** at write time; it is recovered from the WAL on crash via WAL replay rather than fsyncing every row.
-* **`COMMIT` group-fsyncs a tiny record.** Because `SET`/`DEL` already did the heavy I/O, `COMMIT` only has to append and fsync a `COMMIT` WAL record (batched with other concurrent commits), then flip the transaction's status to `committed` in the commit log (`clog`). This is cheaper and more predictable than fsyncing an entire write-set at commit time.
+* **`xid` is assigned at `BEGIN`**, not at commit time. Every log record (`BEGIN`/`SET`/`DEL`/`COMMIT`/`ABORT`) also gets its own monotonically increasing `opID`, which remains the replication cursor.
+* **`SET`/`DEL` write immediately.** Records append to `data.log` and an index version is inserted (`xmin = xid`, initially "in progress") as soon as the client calls `SET`/`DEL` — not buffered until `COMMIT`. This data is **not fsynced** at write time; it is recovered from the log on crash via replay rather than fsyncing every row.
+* **`COMMIT` group-fsyncs a tiny record.** Because `SET`/`DEL` already appended to the log, `COMMIT` only has to append and fsync a `COMMIT` record (batched with other concurrent commits), then flip the transaction's status to `committed` in the commit log (`clog`). This is cheaper and more predictable than fsyncing an entire write-set at commit time.
 * **Read-your-own-writes** works without a separate write-cache: `Get` inside a transaction simply treats `xmin == my xid` as visible regardless of `clog` state.
 * **Isolation is now first-writer-wins, not first-committer-wins.** `SET`/`DEL` takes an exclusive, **NOWAIT** lock on the key: if another in-progress transaction already owns it, the call fails immediately with a write conflict — there is no waiting and therefore no deadlock. The write-set/blind-write half of the old commit-time conflict check is gone since it's now structurally impossible (whoever holds the key's lock is the only writer). Read-set validation (stale-read / write-skew detection) still happens at `COMMIT` for true snapshot-isolation correctness.
-* **Aborts are explicit.** Timeouts, disconnects, and conflicts all append an `ABORT` WAL record and release locks; a background reaper also force-aborts any transaction that exceeds `MaxTxDuration` even if the client goes silent, so a stalled connection can't hold a key lock forever.
+* **Aborts are explicit.** Timeouts, disconnects, and conflicts all append an `ABORT` record and release locks; a background reaper also force-aborts any transaction that exceeds `MaxTxDuration` even if the client goes silent, so a stalled connection can't hold a key lock forever.
 
 #### What this means for clients
 
@@ -322,7 +321,7 @@ Key semantics:
 
 1. **Consensus**: Replication uses async/sync streaming. There is no automated Raft/Paxos failover; promotion must be triggered manually via API/CLI (though `Timelines` make this safe).
 2. **Sharding**: The server is single-node (multi-db). Sharding must be handled client-side (see `cmd/turnstone-load2` for a reference implementation).
-3. **Memory**: The mmap B+ tree index relies on OS page cache for hot pages. Large datasets require sufficient RAM for optimal performance.
+3. **Memory**: The entire MVCC index lives in RAM. Large keyspaces require sufficient memory; values remain on disk in `data.log`.
 4. **No lock waiting**: Key-level write locks are NOWAIT (see "Transaction Model: Eager Logging" above). Under hot-key contention this shows up as `TxConflict` abort storms rather than a queuing/blocking row-lock behavior — the client is expected to retry, not wait.
 
 ---

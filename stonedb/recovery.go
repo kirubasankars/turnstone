@@ -1,140 +1,53 @@
 package stonedb
 
 import (
-	"encoding/binary"
-	"fmt"
-	"path/filepath"
 	"sync/atomic"
-
-	"turnstone/stonedb/index"
 )
 
-func (db *DB) recoverValueLog() error {
-	maxTx, maxOp, err := db.valueLog.Recover()
-	if err != nil {
-		return err
-	}
-	db.transactionID = maxTx
-	db.operationID = maxOp
-	// CHANGED: Reduced from INFO to DEBUG
-	db.logger.Debug("ValueLog recovered", "max_tx", maxTx, "max_op", maxOp)
-	return nil
-}
+func (db *DB) replayLog(truncateCorrupt bool) error {
+	inProgress := make(map[uint64]struct{})
 
-// syncWALToValueLog replays WAL records newer than the VLog's recovered
-// high-water mark, redoing any SET/DEL that didn't make it into the VLog
-// before a crash, and reconstructing the commit log (BEGIN/COMMIT/ABORT) so
-// it can be persisted into the index once it is reopened (see
-// persistClogRebuild). Any transaction that never reached COMMIT or ABORT by
-// the end of the WAL is a crash victim and is resolved as aborted. It uses
-// history to skip orphaned writes from stale timelines.
-func (db *DB) syncWALToValueLog(truncateCorrupt bool, history []TimelineHistoryItem) error {
-	onTruncate := func() error {
-		indexPath := filepath.Join(db.dir, "index")
-		db.logger.Warn("WAL truncated due to corruption. Deleting index to ensure consistency", "path", indexPath)
-		return index.RemoveAll(indexPath)
-	}
-
-	clogRebuild := make(map[uint64]TxStatus)
-	replayCount := 0
-
-	err := db.writeAheadLog.ReplaySinceTx(db.valueLog, db.operationID, history, truncateCorrupt, func(rec WALRecord) {
-		if rec.XID > db.transactionID {
-			db.transactionID = rec.XID
+	err := db.log.Replay(truncateCorrupt, db.timelineMeta.History, func(rec WALRecord, span recordSpan) {
+		if rec.XID > atomic.LoadUint64(&db.transactionID) {
+			atomic.StoreUint64(&db.transactionID, rec.XID)
 		}
-		if rec.OpID > db.operationID {
-			db.operationID = rec.OpID
+		if rec.OpID > atomic.LoadUint64(&db.operationID) {
+			atomic.StoreUint64(&db.operationID, rec.OpID)
 		}
+
 		switch rec.Type {
 		case WALRecordBegin:
-			clogRebuild[rec.XID] = TxInProgress
+			inProgress[rec.XID] = struct{}{}
+			db.clog[rec.XID] = TxInProgress
+		case WALRecordSet:
+			db.index.Put(rec.Key, indexVersion{
+				offset: span.offset, valueLen: uint32(len(rec.Value)),
+				xmin: rec.XID, opID: rec.OpID, tombstone: false,
+			})
+		case WALRecordDelete:
+			db.index.Put(rec.Key, indexVersion{
+				offset: span.offset, valueLen: 0,
+				xmin: rec.XID, opID: rec.OpID, tombstone: true,
+			})
 		case WALRecordCommit:
-			clogRebuild[rec.XID] = TxCommitted
+			db.clog[rec.XID] = TxCommitted
+			delete(inProgress, rec.XID)
 		case WALRecordAbort:
-			clogRebuild[rec.XID] = TxAborted
+			db.clog[rec.XID] = TxAborted
+			delete(inProgress, rec.XID)
+			db.index.DropXid(rec.XID)
 		}
-		replayCount++
-	}, onTruncate)
-	if err != nil {
-		return err
-	}
-
-	if replayCount > 0 {
-		db.logger.Debug("Replayed WAL records", "count", replayCount, "new_head_tx", db.transactionID, "new_head_op", db.operationID)
-	}
-	db.pendingClogRebuild = clogRebuild
-	return nil
-}
-
-func (db *DB) isIndexConsistent() bool {
-	if db.ldb == nil {
-		return false
-	}
-	val, err := db.ldb.Get(sysTransactionIDKey, nil)
-	if err == index.ErrNotFound {
-		return db.transactionID == 0
-	}
-	if err != nil || len(val) != 8 {
-		return false
-	}
-	ldbTxID := binary.BigEndian.Uint64(val)
-	return ldbTxID == db.transactionID
-}
-
-func (db *DB) RebuildIndexFromVLog() error {
-	if db.ldb != nil {
-		db.ldb.Close()
-		db.ldb = nil
-	}
-	indexPath := filepath.Join(db.dir, "index")
-	index.RemoveAll(indexPath)
-
-	var err error
-	db.ldb, err = index.Open(indexPath, db.blockCacheSize)
-	if err != nil {
-		return err
-	}
-
-	db.deletedBytesByFile = make(map[uint32]int64)
-
-	batch := new(index.Batch)
-	batchCount := 0
-	totalCount := 0
-
-	err = db.valueLog.Replay(0, func(e ValueLogEntry, meta EntryMeta) error {
-		encKey := encodeIndexKey(e.Key, meta.TransactionID)
-		batch.Put(encKey, meta.Encode())
-
-		batchCount++
-		totalCount++
-		if batchCount >= 1000 {
-			if err := db.ldb.Write(batch, nil); err != nil {
-				return err
-			}
-			batch.Reset()
-			batchCount = 0
-		}
-		return nil
 	})
-	if err != nil {
+	if err != nil && err != ErrTruncated {
 		return err
 	}
 
-	if batch.Len() > 0 {
-		if err := db.ldb.Write(batch, nil); err != nil {
-			return err
-		}
+	for xid := range inProgress {
+		db.clog[xid] = TxAborted
+		db.index.DropXid(xid)
 	}
 
-	// CHANGED: Reduced from INFO to DEBUG
-	db.logger.Debug("Index rebuilt from VLog", "total_entries", totalCount)
-
-	// After rebuilding index, we must recalculate the KeyCount since we lost the persisted value
-	count, err := db.scanKeyCount()
-	if err != nil {
-		return fmt.Errorf("failed to recount keys after rebuild: %w", err)
-	}
-	atomic.StoreInt64(&db.keyCount, count)
-
-	return db.persistSequences()
+	atomic.StoreInt64(&db.keyCount, db.index.LiveKeyCount(db.clogStatus))
+	db.logger.Debug("Log replay complete", "tx_id", atomic.LoadUint64(&db.transactionID), "op_id", atomic.LoadUint64(&db.operationID))
+	return nil
 }
