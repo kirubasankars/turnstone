@@ -12,11 +12,7 @@ import (
 )
 
 func TestPutAndWalkVersions(t *testing.T) {
-	dir := t.TempDir()
-	idx, err := Open(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
+	idx := Open()
 	defer idx.Close()
 
 	key := []byte("alpha")
@@ -37,11 +33,7 @@ func TestPutAndWalkVersions(t *testing.T) {
 }
 
 func TestForEachKeyAndDropXid(t *testing.T) {
-	dir := t.TempDir()
-	idx, err := Open(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
+	idx := Open()
 	defer idx.Close()
 
 	idx.Put([]byte("a"), Version{Offset: 1, Xmin: 1, OpID: 1})
@@ -75,11 +67,7 @@ func TestForEachKeyAndDropXid(t *testing.T) {
 }
 
 func TestRemoveVersionAndHasOffset(t *testing.T) {
-	dir := t.TempDir()
-	idx, err := Open(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
+	idx := Open()
 	defer idx.Close()
 
 	key := []byte("k")
@@ -99,11 +87,7 @@ func TestRemoveVersionAndHasOffset(t *testing.T) {
 }
 
 func TestHashTableGrowSameSegment(t *testing.T) {
-	dir := t.TempDir()
-	idx, err := Open(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
+	idx := Open()
 	defer idx.Close()
 
 	var keys [][]byte
@@ -130,11 +114,7 @@ func TestHashTableGrowSameSegment(t *testing.T) {
 }
 
 func TestHashTableGrowManyKeys(t *testing.T) {
-	dir := t.TempDir()
-	idx, err := Open(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
+	idx := Open()
 	defer idx.Close()
 
 	const n = 5000
@@ -156,11 +136,7 @@ func TestHashTableGrowManyKeys(t *testing.T) {
 }
 
 func TestConcurrentPutsDifferentKeys(t *testing.T) {
-	dir := t.TempDir()
-	idx, err := Open(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
+	idx := Open()
 	defer idx.Close()
 
 	const n = 200

@@ -30,7 +30,7 @@ LICENSE file in the root of this source tree.
 
 | Area | Detail |
 | --- | --- |
-| Storage | Single append-only `data.log` + segmented mmap hash index (`index/seg-*.bin`) |
+| Storage | Single append-only `data.log` + in-memory segmented hash index arena |
 | Durability | Eager append on `SET`/`DEL`; group fsync on `COMMIT` |
 | Vacuum | Drop dead MVCC versions; reclaim disk with sparse punch-hole |
 | Security | mTLS on all connections; RBAC via X.509 certificate Organization |
@@ -162,7 +162,7 @@ Vacuum          →  drop dead versions  →  punch-hole stale ranges
 ### Components
 
 1. **`data.log`** — one unbounded append-only file. Records: `BEGIN`, `SET`, `DEL`, `COMMIT`, `ABORT` (keys and values inline). This is the only durable database state.
-2. **`index/seg-*.bin`** — 256-segment mmap hash index (ephemeral runtime cache). Wiped on every open, dropped in memory on close without munmap/fsync (fast shutdown), and rebuilt from `data.log` replay. Stale files may remain on disk until the next open. Do not treat these files as authoritative or back them up as database state. Only `data.log` is durable.
+2. **In-memory index** — 256-segment hash arena (ephemeral runtime cache). Rebuilt from `data.log` replay on open and dropped on close. Only `data.log` is durable.
 3. **In-memory clog** — transaction commit status, rebuilt during replay.
 4. **Vacuum** — removes dead index entries; `fallocate(PUNCH_HOLE|KEEP_SIZE)` on stale byte ranges behind the append tail and below the replication scan floor.
 

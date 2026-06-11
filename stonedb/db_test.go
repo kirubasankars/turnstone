@@ -167,7 +167,7 @@ func TestDB_IdempotentClose(t *testing.T) {
 	_ = db.Close()
 }
 
-func TestDB_EphemeralIndex_CloseSkipsUnmap(t *testing.T) {
+func TestDB_EphemeralIndex_ReopenFromLog(t *testing.T) {
 	dir := t.TempDir()
 	indexDir := filepath.Join(dir, "index")
 
@@ -182,14 +182,11 @@ func TestDB_EphemeralIndex_CloseSkipsUnmap(t *testing.T) {
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(indexDir); err != nil {
-		t.Fatalf("index dir should exist while db is open: %v", err)
-	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(indexDir); err != nil {
-		t.Fatalf("index dir may remain after close (fast shutdown): %v", err)
+	if _, err := os.Stat(indexDir); !os.IsNotExist(err) {
+		t.Fatalf("index dir should not exist after close: err=%v", err)
 	}
 
 	db2, err := Open(dir, Options{})
@@ -249,9 +246,8 @@ func TestOpen_CancelDuringReplay(t *testing.T) {
 	}
 }
 
-func TestDB_FastClose_SkipsIndexUnmap(t *testing.T) {
+func TestDB_FastClose(t *testing.T) {
 	dir := t.TempDir()
-	indexDir := filepath.Join(dir, "index")
 
 	db, err := Open(dir, Options{})
 	if err != nil {
@@ -274,9 +270,6 @@ func TestDB_FastClose_SkipsIndexUnmap(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Fatalf("close took too long: %v", elapsed)
-	}
-	if _, err := os.Stat(indexDir); err != nil {
-		t.Fatalf("index dir should remain after fast close: %v", err)
 	}
 }
 
