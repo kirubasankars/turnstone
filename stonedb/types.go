@@ -78,16 +78,16 @@ var (
 type Options struct {
 	TruncateCorruptWAL bool
 
-	CompactionMinGarbage int64
-	CompactionInterval   time.Duration
-	ChecksumInterval     time.Duration
+	CompactionMinGarbage   int64
+	CompactionInterval     time.Duration
+	ChecksumInterval       time.Duration
 	AutoCheckpointInterval time.Duration
-	MaxDiskUsagePercent  int
-	Logger               *slog.Logger
-	TxTimeout            time.Duration
-	CommitDelay          time.Duration
-	CommitSiblings       int
-	UnsafeDisableFsync   bool
+	MaxDiskUsagePercent    int
+	Logger                 *slog.Logger
+	TxTimeout              time.Duration
+	CommitDelay            time.Duration
+	CommitSiblings         int
+	UnsafeDisableFsync     bool
 }
 
 // indexVersion points at one MVCC version in the append-only log.
@@ -101,9 +101,9 @@ type indexVersion struct {
 
 // recordSpan is the on-disk byte range of one log frame (header + payload).
 type recordSpan struct {
-	offset int64
-	length int64 // total bytes including frame header
-	opID   uint64
-	xid    uint64
+	offset  int64
+	length  int64 // total bytes including frame header
+	opID    uint64
+	xid     uint64
 	recType WALRecordType
 }
