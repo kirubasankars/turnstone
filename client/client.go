@@ -46,9 +46,8 @@ const (
 	OpCodeStat             = 0x20
 	OpCodeReplicaOf        = 0x32
 	OpCodePromote          = 0x34
-	OpCodeStepDown         = 0x35
-	OpCodeCheckpoint       = 0x36
-	OpCodeFlushDB          = 0x37
+	OpCodeStepDown = 0x35
+	OpCodeFlushDB  = 0x37
 	OpCodeReplHello        = 0x50
 	OpCodeReplBatch        = 0x51
 	OpCodeReplAck          = 0x52
@@ -317,11 +316,6 @@ func (c *Client) Promote(minReplicas int) error {
 
 func (c *Client) StepDown() error {
 	_, err := c.roundTrip(OpCodeStepDown, nil)
-	return err
-}
-
-func (c *Client) Checkpoint() error {
-	_, err := c.roundTrip(OpCodeCheckpoint, nil)
 	return err
 }
 

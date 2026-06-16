@@ -40,9 +40,8 @@ const (
 	OpCodeStat       uint8 = 0x20
 	OpCodeReplicaOf  uint8 = 0x32
 	OpCodePromote    uint8 = 0x34
-	OpCodeStepDown   uint8 = 0x35
-	OpCodeCheckpoint uint8 = 0x36 // Force checkpoint (records last op ID for retention)
-	OpCodeFlushDB    uint8 = 0x37 // Wipe Database
+	OpCodeStepDown uint8 = 0x35
+	OpCodeFlushDB  uint8 = 0x37 // Wipe Database
 
 	OpCodeReplHello uint8 = 0x50
 	OpCodeReplBatch uint8 = 0x51

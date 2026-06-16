@@ -467,7 +467,7 @@ func (s *Server) dispatchCommand(conn net.Conn, r io.Reader, opCode uint8, paylo
 	if st.tx != nil {
 		switch opCode {
 		case protocol.OpCodeSelect, protocol.OpCodeReplicaOf, protocol.OpCodeStepDown,
-			protocol.OpCodePromote, protocol.OpCodeFlushDB, protocol.OpCodeCheckpoint,
+			protocol.OpCodePromote, protocol.OpCodeFlushDB,
 			protocol.OpCodeStat, protocol.OpCodeQuit:
 			_ = s.writeBinaryResponse(conn, protocol.ResStatusErr, []byte("Command not allowed inside a transaction"))
 			return false
@@ -510,8 +510,6 @@ func (s *Server) dispatchCommand(conn net.Conn, r io.Reader, opCode uint8, paylo
 		s.handlePromote(conn, payload, st)
 	case protocol.OpCodeStepDown:
 		s.handleStepDown(conn, st)
-	case protocol.OpCodeCheckpoint:
-		s.handleCheckpoint(conn, st)
 	case protocol.OpCodeFlushDB:
 		s.handleFlushDB(conn, st)
 	case protocol.OpCodeStat:
@@ -1248,26 +1246,6 @@ func (s *Server) handleStepDown(w io.Writer, st *connState) {
 		}
 	}(connsToKill)
 
-	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
-}
-
-func (s *Server) handleCheckpoint(w io.Writer, st *connState) {
-	if st.db == nil {
-		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Database selected"))
-		return
-	}
-
-	if st.role != RoleAdmin && st.role != RoleServer {
-		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Permission Denied"))
-		return
-	}
-
-	st.logger.Info("Manual checkpoint requested", "db", st.dbName)
-	if err := st.db.Checkpoint(); err != nil {
-		st.logger.Error("Manual checkpoint failed", "err", err)
-		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte(err.Error()))
-		return
-	}
 	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
 }
 

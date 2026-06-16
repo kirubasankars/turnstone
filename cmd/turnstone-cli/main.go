@@ -82,7 +82,7 @@ func main() {
 	}
 
 	fmt.Println("Connected.")
-	fmt.Println("Commands: select <db>, replicaof <host:port> <remote_db>, promote [min_replicas], stepdown, flushdb, get <k>, set <k> <v>, del <k>, mget <k>..., mset <k> <v>..., mdel <k>..., begin [read], commit, abort, checkpoint, stat, clear, quit")
+	fmt.Println("Commands: select <db>, replicaof <host:port> <remote_db>, promote [min_replicas], stepdown, flushdb, get <k>, set <k> <v>, del <k>, mget <k>..., mset <k> <v>..., mdel <k>..., begin [read], commit, abort, stat, clear, quit")
 
 	// Track current database for the prompt (default server DB is 0)
 	currentDB := "0"
@@ -217,12 +217,6 @@ func handleCommand(cl *client.Client, cmd string, parts []string) error {
 
 	case "abort":
 		err = cl.Abort()
-		if err == nil {
-			fmt.Println("OK")
-		}
-
-	case "checkpoint":
-		err = cl.Checkpoint()
 		if err == nil {
 			fmt.Println("OK")
 		}
