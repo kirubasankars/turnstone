@@ -6,7 +6,6 @@
 package stonedb
 
 import (
-	"math"
 	"sync/atomic"
 )
 
@@ -52,21 +51,6 @@ func (db *DB) isVisible(xmin uint64, snap Snapshot) bool {
 		return false
 	}
 	return db.clogStatus(xmin) == TxCommitted
-}
-
-func (db *DB) minActiveSnapshotXmax() uint64 {
-	db.activeTxnsMu.Lock()
-	defer db.activeTxnsMu.Unlock()
-	if len(db.activeTxns) == 0 {
-		return atomic.LoadUint64(&db.transactionID) + 1
-	}
-	min := uint64(math.MaxUint64)
-	for _, xmax := range db.activeTxns {
-		if xmax < min {
-			min = xmax
-		}
-	}
-	return min
 }
 
 func (db *DB) abortTransaction(tx *Transaction) {

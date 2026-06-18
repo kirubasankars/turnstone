@@ -1303,7 +1303,6 @@ func (s *Server) handleStat(w io.Writer, st *connState) {
 	response := struct {
 		State             string `json:"state"`
 		KeyCount          int64  `json:"key_count"`
-		GarbageBytes      int64  `json:"garbage_bytes"`
 		Conflicts         uint64 `json:"conflicts"`
 		ActiveConnections int64  `json:"active_connections"`
 		VLogFiles         int    `json:"vlog_files"`
@@ -1315,7 +1314,6 @@ func (s *Server) handleStat(w io.Writer, st *connState) {
 	}{
 		State:             dbState,
 		KeyCount:          stats.KeyCount,
-		GarbageBytes:      stats.GarbageBytes,
 		Conflicts:         stats.Conflicts,
 		ActiveConnections: conns,
 		VLogFiles:         stats.VLogFiles,
