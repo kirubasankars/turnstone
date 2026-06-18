@@ -119,9 +119,7 @@ func runRestore(ctx context.Context) error {
 		return fmt.Errorf("write timeline.meta: %w", err)
 	}
 
-	opts := stonedb.Options{
-		CompactionMinGarbage: 10 * 1024 * 1024,
-	}
+	opts := stonedb.Options{}
 
 	log.Println("Initializing storage engine...")
 	db, err := stonedb.OpenContext(ctx, dbPath, opts)

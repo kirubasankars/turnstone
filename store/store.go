@@ -33,8 +33,7 @@ type StoreStats struct {
 	WALSize      int64 // logical size of data.log
 	VLogFiles    int   // deprecated, always 0
 	VLogSize     int64 // allocated on-disk bytes (sparse)
-	KeyCount     int64
-	GarbageBytes int64
+	KeyCount int64
 }
 
 const (
@@ -120,8 +119,7 @@ func NewStore(ctx context.Context, dir string, logger *slog.Logger, minReplicas 
 	}
 
 	opts := stonedb.Options{
-		CompactionMinGarbage: 64 * 1024 * 1024,
-		TruncateCorruptWAL:   truncateWAL,
+		TruncateCorruptWAL: truncateWAL,
 		MaxDiskUsagePercent:  maxDiskUsage,
 		Logger:               logger,
 		UnsafeDisableFsync:   os.Getenv("TS_UNSAFE_DISABLE_FSYNC") == "true",
@@ -513,7 +511,6 @@ func (s *Store) Stats() StoreStats {
 	_, logical, allocated := s.DB.StorageStats()
 	keyCount, _ := s.DB.KeyCount()
 	head := s.DB.LastOpID()
-	garbage := s.DB.TotalGarbageBytes()
 
 	minLag := uint64(0)
 	first := true
@@ -545,8 +542,7 @@ func (s *Store) Stats() StoreStats {
 		WALSize:      logical,
 		VLogFiles:    0,
 		VLogSize:     allocated,
-		KeyCount:     keyCount,
-		GarbageBytes: garbage,
+		KeyCount: keyCount,
 	}
 }
 

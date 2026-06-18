@@ -9,7 +9,7 @@ LICENSE file in the root of this source tree.
 
 **TurnstoneDB** is a persistent, transactional key-value store written in Go. Each server process holds multiple isolated databases on local disk. Optional leader-follower replication is configured explicitly per database — there is no built-in sharding, consensus, or automatic cluster failover.
 
-> **Disclaimer:** TurnstoneDB is research-quality software. It implements group commit, MVCC, mTLS, and punch-hole vacuum, but it is not recommended for mission-critical production use without further hardening.
+> **Disclaimer:** TurnstoneDB is research-quality software. It implements group commit, MVCC, and mTLS, but it is not recommended for mission-critical production use without further hardening.
 
 ## What it is
 
@@ -32,7 +32,6 @@ LICENSE file in the root of this source tree.
 | --- | --- |
 | Storage | Single append-only `data.log` + in-memory segmented hash index arena |
 | Durability | Eager append on `SET`/`DEL`; group fsync on `COMMIT` |
-| Vacuum | Drop dead MVCC versions; reclaim disk with sparse punch-hole |
 | Security | mTLS on all connections; RBAC via X.509 certificate Organization |
 | Replication | Async or sync (quorum ack); timeline fork on `promote` |
 | Observability | Prometheus metrics on `:9090` |
@@ -155,8 +154,7 @@ There is no automatic leader election. Timelines record history forks so promoti
 Client SET/DEL  →  append data.log  →  update segmented hash index
 Client COMMIT   →  append + fsync COMMIT  →  clog[xid] = committed
 Client GET      →  index lookup  →  ReadAt(offset) from data.log
-Open            →  replay data.log (SEEK_DATA skips holes)  →  rebuild index + clog
-Vacuum          →  drop dead versions  →  punch-hole stale ranges
+Open            →  replay data.log  →  rebuild index + clog
 ```
 
 ### Components
@@ -164,7 +162,6 @@ Vacuum          →  drop dead versions  →  punch-hole stale ranges
 1. **`data.log`** — one unbounded append-only file. Records: `BEGIN`, `SET`, `DEL`, `COMMIT`, `ABORT` (keys and values inline). This is the only durable database state.
 2. **In-memory index** — 256-segment hash arena (ephemeral runtime cache). Rebuilt from `data.log` replay on open and dropped on close. Only `data.log` is durable.
 3. **In-memory clog** — transaction commit status, rebuilt during replay.
-4. **Vacuum** — removes dead index entries; `fallocate(PUNCH_HOLE|KEEP_SIZE)` on stale byte ranges behind the append tail and below the replication scan floor.
 
 ### Transaction model (eager logging)
 

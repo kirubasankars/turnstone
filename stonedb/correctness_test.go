@@ -19,12 +19,7 @@ import (
 // At the end, the DB must match the Map exactly.
 func TestCorrectness_ModelBased(t *testing.T) {
 	dir := t.TempDir()
-	opts := Options{
-		// Force frequent internal churn to stress flushing/compaction
-		CompactionMinGarbage: 1024,
-		CompactionInterval:   10 * time.Millisecond,
-	}
-	db, err := Open(dir, opts)
+	db, err := Open(dir, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,17 +216,10 @@ func bytesToInt(b []byte) int {
 }
 
 // TestCorrectness_BankTransfers_HeavyStress performs the bank transfer test
-// with aggressive WAL rotation and compaction settings to verify data integrity
-// under system stress.
+// under heavy concurrent load to verify data integrity.
 func TestCorrectness_BankTransfers_HeavyStress(t *testing.T) {
 	dir := t.TempDir()
-	opts := Options{
-		// Very aggressive settings to force frequent rotation and compaction
-		// while transactions are in flight.
-		CompactionMinGarbage: 1024,                 // 1KB Garbage (Force frequent compaction candidates)
-		CompactionInterval:   5 * time.Millisecond, // Check for compaction very frequently
-	}
-	db, err := Open(dir, opts)
+	db, err := Open(dir, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}

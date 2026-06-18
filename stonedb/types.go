@@ -82,8 +82,6 @@ var (
 type Options struct {
 	TruncateCorruptWAL bool
 
-	CompactionMinGarbage   int64
-	CompactionInterval     time.Duration
 	ChecksumInterval       time.Duration
 	AutoCheckpointInterval time.Duration
 	MaxDiskUsagePercent    int
