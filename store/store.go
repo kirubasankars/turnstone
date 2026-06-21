@@ -453,6 +453,36 @@ func (s *Store) ApplyRecord(rec stonedb.WALRecord) error {
 	return s.DB.ApplyRecord(rec)
 }
 
+// ApplyLogSegment appends a raw, statement-aligned WAL byte range.
+func (s *Store) ApplyLogSegment(data []byte) (uint64, error) {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	return s.DB.ApplyLogSegment(data)
+}
+
+// ReadLogSegment reads complete WAL frames from a byte offset on the leader log.
+func (s *Store) ReadLogSegment(startOffset int64, maxBytes int64) ([]byte, int64, uint64, error) {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	return s.DB.ReadLogSegment(startOffset, maxBytes)
+}
+
+// ByteOffsetAfterOpID maps a replicated opID to the leader's byte offset.
+func (s *Store) ByteOffsetAfterOpID(opID uint64) (int64, bool) {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	return s.DB.ByteOffsetAfterOpID(opID)
+}
+
+// ByteOffsetForReplicationResume returns the leader log byte offset to resume
+// streaming after the follower has applied lastAppliedOpID.
+func (s *Store) ByteOffsetForReplicationResume(lastAppliedOpID uint64) (int64, bool) {
+	if lastAppliedOpID == 0 {
+		return 0, true
+	}
+	return s.ByteOffsetAfterOpID(lastAppliedOpID)
+}
+
 // Get retrieves a value by key.
 func (s *Store) Get(key string) ([]byte, error) {
 	s.dbMu.RLock()
