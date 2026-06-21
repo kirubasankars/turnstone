@@ -515,6 +515,7 @@ func writeJournalEntry(buf *bytes.Buffer, opID, xid uint64, op uint8, key, val [
 
 func (s *Server) runWALStreamLoop(name string, st *store.Store, startLogID uint64, outCh chan<- replPacket, done <-chan struct{}, logger *slog.Logger, physical bool) error {
 	currentLogID := startLogID
+	currentByteOffset, _ := st.ByteOffsetForReplicationResume(startLogID)
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -583,35 +584,62 @@ func (s *Server) runWALStreamLoop(name string, st *store.Store, startLogID uint6
 			}
 
 		case <-ticker.C:
+			if physical {
+				segData, nextOff, lastOpID, err := st.ReadLogSegment(currentByteOffset, int64(MaxReplicationBatchSize))
+				if err != nil {
+					if errors.Is(err, stonedb.ErrLogUnavailable) && currentLogID < st.LastOpID() {
+						return errors.New("OUT_OF_SYNC")
+					}
+					logger.Error("Log segment read error", "db", name, "err", err)
+					time.Sleep(100 * time.Millisecond)
+					continue
+				}
+				if len(segData) > 0 {
+					payload := make([]byte, 16+len(segData))
+					binary.BigEndian.PutUint64(payload[0:], uint64(currentByteOffset))
+					binary.BigEndian.PutUint64(payload[8:], uint64(nextOff))
+					copy(payload[16:], segData)
+					select {
+					case outCh <- replPacket{
+						dbName: name,
+						opCode: protocol.OpCodeReplLogSegment,
+						data:   payload,
+						count:  0,
+					}:
+					case <-done:
+						return nil
+					}
+					currentByteOffset = nextOff
+					if lastOpID > 0 {
+						currentLogID = lastOpID
+					}
+				}
+				continue
+			}
+
 			var batchBuf bytes.Buffer
 			var count uint32
 
 			err := st.ScanWAL(currentLogID+1, func(recs []stonedb.WALRecord) error {
 				for _, r := range recs {
-					if physical {
-						op := journalOpForRecordType(r.Type)
-						writeJournalEntry(&batchBuf, r.OpID, r.XID, op, r.Key, r.Value)
-						count++
-					} else {
-						// Logical/CDC decoding: buffer SET/DEL per-xid, only
-						// emit them (plus a commit marker) once we observe
-						// the COMMIT record; drop everything on ABORT.
-						switch r.Type {
-						case stonedb.WALRecordBegin:
-							// nothing to forward
-						case stonedb.WALRecordSet, stonedb.WALRecordDelete:
-							pending[r.XID] = append(pending[r.XID], r)
-						case stonedb.WALRecordAbort:
-							delete(pending, r.XID)
-						case stonedb.WALRecordCommit:
-							for _, br := range pending[r.XID] {
-								writeJournalEntry(&batchBuf, br.OpID, br.XID, journalOpForRecordType(br.Type), br.Key, br.Value)
-								count++
-							}
-							delete(pending, r.XID)
-							writeJournalEntry(&batchBuf, r.OpID, r.XID, protocol.OpJournalCommit, nil, nil)
+					// Logical/CDC decoding: buffer SET/DEL per-xid, only
+					// emit them (plus a commit marker) once we observe
+					// the COMMIT record; drop everything on ABORT.
+					switch r.Type {
+					case stonedb.WALRecordBegin:
+						// nothing to forward
+					case stonedb.WALRecordSet, stonedb.WALRecordDelete:
+						pending[r.XID] = append(pending[r.XID], r)
+					case stonedb.WALRecordAbort:
+						delete(pending, r.XID)
+					case stonedb.WALRecordCommit:
+						for _, br := range pending[r.XID] {
+							writeJournalEntry(&batchBuf, br.OpID, br.XID, journalOpForRecordType(br.Type), br.Key, br.Value)
 							count++
 						}
+						delete(pending, r.XID)
+						writeJournalEntry(&batchBuf, r.OpID, r.XID, protocol.OpJournalCommit, nil, nil)
+						count++
 					}
 
 					currentLogID = r.OpID

@@ -463,7 +463,7 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 		// We expect CRC for Batch, Snapshot, SafePoint, Timeline
 		if opCode == protocol.OpCodeReplBatch || opCode == protocol.OpCodeReplSnapshot ||
 			opCode == protocol.OpCodeReplSafePoint || opCode == protocol.OpCodeReplTimeline ||
-			opCode == protocol.OpCodeReplSnapshotDone {
+			opCode == protocol.OpCodeReplSnapshotDone || opCode == protocol.OpCodeReplLogSegment {
 
 			if len(payload) < 4 {
 				return fmt.Errorf("packet too short for crc")
@@ -633,7 +633,59 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 			continue
 		}
 
-		// --- Handle Standard WAL Batch ---
+		// --- Handle raw WAL byte segment (physical replication) ---
+		if opCode == protocol.OpCodeReplLogSegment {
+			remoteDBName, cursor, ok := readLenPrefixedString(payload, 0)
+			if !ok || cursor+4 > len(payload) {
+				logger.Warn("Malformed log segment packet, skipping", "len", len(payload))
+				continue
+			}
+			cursor += 4 // skip count/reserved
+			if cursor+16 > len(payload) {
+				logger.Warn("Malformed log segment header, skipping", "len", len(payload))
+				continue
+			}
+			startOff := binary.BigEndian.Uint64(payload[cursor : cursor+8])
+			endOff := binary.BigEndian.Uint64(payload[cursor+8 : cursor+16])
+			cursor += 16
+			segData := payload[cursor:]
+			if endOff < startOff || int(endOff-startOff) != len(segData) {
+				logger.Warn("Log segment offset mismatch", "start", startOff, "end", endOff, "len", len(segData))
+				continue
+			}
+
+			if localDBNames, ok := remoteToLocal[remoteDBName]; ok {
+				for _, localDBName := range localDBNames {
+					if st, ok := rm.stores[localDBName]; ok {
+						lastID, err := st.ApplyLogSegment(segData)
+						if err != nil {
+							logger.Error("Failed to apply log segment", "db", localDBName, "err", err)
+							return err
+						}
+						if lastID > 0 {
+							ackBuf := new(bytes.Buffer)
+							binary.Write(ackBuf, binary.BigEndian, uint32(len(remoteDBName)))
+							ackBuf.WriteString(remoteDBName)
+							binary.Write(ackBuf, binary.BigEndian, lastID)
+
+							h := make([]byte, 5)
+							h[0] = protocol.OpCodeReplAck
+							binary.BigEndian.PutUint32(h[1:], uint32(ackBuf.Len()))
+
+							if _, err := conn.Write(h); err != nil {
+								return err
+							}
+							if _, err := conn.Write(ackBuf.Bytes()); err != nil {
+								return err
+							}
+						}
+					}
+				}
+			}
+			continue
+		}
+
+		// --- Handle Standard WAL Batch (CDC logical replication) ---
 		if opCode == protocol.OpCodeReplBatch {
 			remoteDBName, cursor, ok := readLenPrefixedString(payload, 0)
 			if !ok || cursor+4 > len(payload) {

@@ -581,6 +581,80 @@ func (db *DB) PurgeWAL(minOpID uint64) error {
 	return nil
 }
 
+// ApplyLogSegment appends a raw byte range of complete WAL frames and applies
+// each statement to the in-memory index. Segments must be statement-aligned
+// (whole frames only); partial frames are rejected.
+func (db *DB) ApplyLogSegment(data []byte) (uint64, error) {
+	if atomic.LoadInt32(&db.isCorrupt) == 1 {
+		return 0, errors.New("database is corrupt")
+	}
+	frames, err := validateLogSegment(data)
+	if err != nil {
+		return 0, err
+	}
+	if len(frames) == 0 {
+		return 0, nil
+	}
+
+	fsync := frames[len(frames)-1].rec.Type == WALRecordCommit
+	startOff, err := db.log.AppendRawSegment(data, fsync)
+	if err != nil {
+		return 0, err
+	}
+
+	var lastOpID uint64
+	off := startOff
+	for _, fr := range frames {
+		rec := fr.rec
+		switch rec.Type {
+		case WALRecordBegin:
+			db.txMu.Lock()
+			db.activeXids[rec.XID] = nil
+			db.beginOpIDs[rec.XID] = rec.OpID
+			db.txMu.Unlock()
+		case WALRecordSet, WALRecordDelete:
+			isDelete := rec.Type == WALRecordDelete
+			db.index.Put(rec.Key, indexVersion{
+				offset: off, valueLen: uint32(len(rec.Value)),
+				xmin: rec.XID, opID: rec.OpID, tombstone: isDelete,
+			})
+			db.accountReplicatedWrite(rec)
+		case WALRecordCommit:
+			db.forgetClog(rec.XID)
+			db.txMu.Lock()
+			delete(db.activeXids, rec.XID)
+			delete(db.beginOpIDs, rec.XID)
+			impact := db.replImpact[rec.XID]
+			delete(db.replImpact, rec.XID)
+			db.txMu.Unlock()
+			db.applyReplicatedImpact(impact)
+		case WALRecordAbort:
+			db.setClog(rec.XID, TxAborted)
+			db.index.DropXid(rec.XID)
+			db.txMu.Lock()
+			delete(db.activeXids, rec.XID)
+			delete(db.beginOpIDs, rec.XID)
+			delete(db.replImpact, rec.XID)
+			db.txMu.Unlock()
+			db.forgetClog(rec.XID)
+		default:
+			return lastOpID, fmt.Errorf("unknown WAL record type: %d", rec.Type)
+		}
+		db.ForceSetClocks(rec.XID, rec.OpID)
+		lastOpID = rec.OpID
+		off += fr.length
+	}
+	return lastOpID, nil
+}
+
+func (db *DB) ReadLogSegment(startOffset int64, maxBytes int64) ([]byte, int64, uint64, error) {
+	return db.log.ReadLogSegment(startOffset, maxBytes)
+}
+
+func (db *DB) ByteOffsetAfterOpID(opID uint64) (int64, bool) {
+	return db.log.ByteOffsetAfterOpID(opID)
+}
+
 func (db *DB) ApplyRecord(rec WALRecord) error {
 	if atomic.LoadInt32(&db.isCorrupt) == 1 {
 		return errors.New("database is corrupt")
