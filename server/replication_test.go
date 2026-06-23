@@ -426,9 +426,9 @@ func TestReplication_SlowConsumer_Dropped(t *testing.T) {
 	defer cancel()
 	promoteNode(t, baseDir, addr, "1")
 
-	// 3. Connect "Slow" Replica manually using CDC role credentials
-	cdcTLS := getRoleTLS(t, baseDir, "cdc")
-	conn, err := tls.Dial("tcp", addr, cdcTLS)
+	// 3. Connect slow replica manually using server role credentials
+	replTLS := getRoleTLS(t, baseDir, "server")
+	conn, err := tls.Dial("tcp", addr, replTLS)
 	if err != nil {
 		t.Fatalf("Failed to dial: %v", err)
 	}

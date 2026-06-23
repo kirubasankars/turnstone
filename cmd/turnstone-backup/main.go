@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"turnstone/protocol"
+	"turnstone/stonedb"
 )
 
 // --- Configuration ---
@@ -218,7 +219,7 @@ func runBackup(ctx context.Context) error {
 
 		// Verify CRC for data-heavy packets
 		if opCode == protocol.OpCodeReplSnapshot || opCode == protocol.OpCodeReplSnapshotDone ||
-			opCode == protocol.OpCodeReplTimeline || opCode == protocol.OpCodeReplBatch ||
+			opCode == protocol.OpCodeReplTimeline || opCode == protocol.OpCodeReplLogSegment ||
 			opCode == protocol.OpCodeReplSafePoint {
 			if len(payload) < 4 {
 				return fmt.Errorf("payload too short for CRC")
@@ -276,72 +277,43 @@ func runBackup(ctx context.Context) error {
 			}
 			log.Printf("\nSnapshot Complete. TxID: %d, OpID: %d", meta.SnapshotTxID, meta.SnapshotOpID)
 
-		} else if opCode == protocol.OpCodeReplBatch {
-			lastDataTime = time.Now() // Valid Data -> Reset Timeout
+		} else if opCode == protocol.OpCodeReplLogSegment {
+			lastDataTime = time.Now()
 			cursor := 0
 			nLen := int(binary.BigEndian.Uint32(payload[cursor : cursor+4]))
-			cursor += 4 + nLen
-
-			if cursor+4 > len(payload) {
-				return fmt.Errorf("bad batch count")
+			cursor += 4 + nLen + 4
+			if cursor+16 > len(payload) {
+				return fmt.Errorf("bad log segment header")
 			}
-			entryCount := binary.BigEndian.Uint32(payload[cursor : cursor+4])
-			cursor += 4
-
-			for i := 0; i < int(entryCount); i++ {
-				if cursor+17 > len(payload) {
-					return fmt.Errorf("bad entry header")
-				}
-				opID := binary.BigEndian.Uint64(payload[cursor:])
-				txID := binary.BigEndian.Uint64(payload[cursor+8:])
-				opType := payload[cursor+16]
-				cursor += 17
-
-				// Key
-				if cursor+4 > len(payload) {
-					return fmt.Errorf("bad entry klen")
-				}
-				kLen := binary.BigEndian.Uint32(payload[cursor:])
-				cursor += 4
-				if cursor+int(kLen) > len(payload) {
-					return fmt.Errorf("bad entry key")
-				}
-				key := payload[cursor : cursor+int(kLen)]
-				cursor += int(kLen)
-
-				// Value
-				if cursor+4 > len(payload) {
-					return fmt.Errorf("bad entry vlen")
-				}
-				vLen := binary.BigEndian.Uint32(payload[cursor:])
-				cursor += 4
-				if cursor+int(vLen) > len(payload) {
-					return fmt.Errorf("bad entry val")
-				}
-				val := payload[cursor : cursor+int(vLen)]
-				cursor += int(vLen)
-
+			cursor += 16
+			segData := payload[cursor:]
+			recs, err := stonedb.RecordsFromLogSegment(segData)
+			if err != nil {
+				return fmt.Errorf("parse log segment: %w", err)
+			}
+			for _, rec := range recs {
+				opID := rec.OpID
+				txID := rec.XID
 				if opID > maxOpIDSeen {
 					maxOpIDSeen = opID
 				}
 				if txID > maxXidSeen {
 					maxXidSeen = txID
 				}
-
-				switch opType {
-				case protocol.OpJournalBegin:
+				switch rec.Type {
+				case stonedb.WALRecordBegin:
 					pendingBeginOpID[txID] = opID
-				case protocol.OpJournalSet, protocol.OpJournalDelete:
+				case stonedb.WALRecordSet, stonedb.WALRecordDelete:
 					entry := pendingEntry{
-						key:      append([]byte(nil), key...),
-						val:      append([]byte(nil), val...),
-						isDelete: opType == protocol.OpJournalDelete,
+						key:      append([]byte(nil), rec.Key...),
+						val:      append([]byte(nil), rec.Value...),
+						isDelete: rec.Type == stonedb.WALRecordDelete,
 					}
 					pending[txID] = append(pending[txID], entry)
-				case protocol.OpJournalAbort:
+				case stonedb.WALRecordAbort:
 					delete(pending, txID)
 					delete(pendingBeginOpID, txID)
-				case protocol.OpJournalCommit:
+				case stonedb.WALRecordCommit:
 					for _, e := range pending[txID] {
 						storageType := byte(0)
 						if e.isDelete {
@@ -351,16 +323,6 @@ func runBackup(ctx context.Context) error {
 						binary.BigEndian.PutUint32(kLenBuf, uint32(len(e.key)))
 						vLenBuf := make([]byte, 4)
 						binary.BigEndian.PutUint32(vLenBuf, uint32(len(e.val)))
-
-						// Every Write() error here must be surfaced: this
-						// pipeline writes straight to disk (via
-						// outputWriter -> [gzip ->] diskWriter -> file),
-						// so a write failure (e.g. disk full/IO error)
-						// mid-backup previously vanished silently, leaving
-						// a truncated backup file that still went on to
-						// report success (and would even pass its own
-						// checksum, since the checksum is computed over
-						// whatever bytes actually made it to disk).
 						if _, err := outputWriter.Write(kLenBuf); err != nil {
 							return fmt.Errorf("write backup entry (klen): %w", err)
 						}

@@ -20,7 +20,6 @@ import (
 	"time"
 
 	"turnstone/protocol"
-	"turnstone/stonedb"
 	"turnstone/store"
 )
 
@@ -460,8 +459,8 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 		}
 
 		// --- VERIFY CRC ---
-		// We expect CRC for Batch, Snapshot, SafePoint, Timeline
-		if opCode == protocol.OpCodeReplBatch || opCode == protocol.OpCodeReplSnapshot ||
+		// We expect CRC for Snapshot, SafePoint, Timeline, LogSegment
+		if opCode == protocol.OpCodeReplSnapshot ||
 			opCode == protocol.OpCodeReplSafePoint || opCode == protocol.OpCodeReplTimeline ||
 			opCode == protocol.OpCodeReplSnapshotDone || opCode == protocol.OpCodeReplLogSegment {
 
@@ -684,114 +683,5 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 			}
 			continue
 		}
-
-		// --- Handle Standard WAL Batch (CDC logical replication) ---
-		if opCode == protocol.OpCodeReplBatch {
-			remoteDBName, cursor, ok := readLenPrefixedString(payload, 0)
-			if !ok || cursor+4 > len(payload) {
-				logger.Warn("Malformed batch packet, skipping", "len", len(payload))
-				continue
-			}
-			count := binary.BigEndian.Uint32(payload[cursor : cursor+4])
-			cursor += 4
-			data := payload[cursor:]
-
-			if localDBNames, ok := remoteToLocal[remoteDBName]; ok {
-				for _, localDBName := range localDBNames {
-					if st, ok := rm.stores[localDBName]; ok {
-						lastID, err := processReplicationPacket(st, count, data)
-						if err != nil {
-							logger.Error("Failed to process WAL batch", "db", localDBName, "err", err)
-							return err
-						}
-
-						if lastID > 0 {
-							ackBuf := new(bytes.Buffer)
-							binary.Write(ackBuf, binary.BigEndian, uint32(len(remoteDBName)))
-							ackBuf.WriteString(remoteDBName)
-							binary.Write(ackBuf, binary.BigEndian, lastID)
-
-							h := make([]byte, 5)
-							h[0] = protocol.OpCodeReplAck
-							binary.BigEndian.PutUint32(h[1:], uint32(ackBuf.Len()))
-
-							if _, err := conn.Write(h); err != nil {
-								return err
-							}
-							if _, err := conn.Write(ackBuf.Bytes()); err != nil {
-								return err
-							}
-						}
-					}
-				}
-			}
-		}
 	}
-}
-
-// walRecordTypeForJournalOp maps the wire journal opcode back to the typed
-// WAL record kind so followers can apply a physical stream directly through
-// the same eager engine path the leader used to produce it.
-func walRecordTypeForJournalOp(op uint8) (stonedb.WALRecordType, bool) {
-	switch op {
-	case protocol.OpJournalBegin:
-		return stonedb.WALRecordBegin, true
-	case protocol.OpJournalSet:
-		return stonedb.WALRecordSet, true
-	case protocol.OpJournalDelete:
-		return stonedb.WALRecordDelete, true
-	case protocol.OpJournalCommit:
-		return stonedb.WALRecordCommit, true
-	case protocol.OpJournalAbort:
-		return stonedb.WALRecordAbort, true
-	}
-	return 0, false
-}
-
-// processReplicationPacket applies each replicated WAL record directly and
-// immediately (no client-side buffering): the leader has already resolved
-// eager visibility, so followers just mirror it record-for-record.
-func processReplicationPacket(st *store.Store, count uint32, data []byte) (uint64, error) {
-	cursor := 0
-	var lastAppliedID uint64
-
-	for i := 0; i < int(count); i++ {
-		// Entry: [LogID(8)][TxID(8)][Op(1)][KLen(4)][Key][VLen(4)][Val]
-		if cursor+17 > len(data) {
-			return lastAppliedID, fmt.Errorf("malformed batch entry header")
-		}
-		lid := binary.BigEndian.Uint64(data[cursor : cursor+8])
-		xid := binary.BigEndian.Uint64(data[cursor+8 : cursor+16])
-		op := data[cursor+16]
-		cursor += 17
-
-		kLen := int(binary.BigEndian.Uint32(data[cursor : cursor+4]))
-		cursor += 4
-		if cursor+kLen > len(data) {
-			return lastAppliedID, fmt.Errorf("malformed batch entry key")
-		}
-		key := data[cursor : cursor+kLen]
-		cursor += kLen
-
-		vLen := int(binary.BigEndian.Uint32(data[cursor : cursor+4]))
-		cursor += 4
-		if cursor+vLen > len(data) {
-			return lastAppliedID, fmt.Errorf("malformed batch entry val")
-		}
-		val := data[cursor : cursor+vLen]
-		cursor += vLen
-
-		recType, ok := walRecordTypeForJournalOp(op)
-		if !ok {
-			return lastAppliedID, fmt.Errorf("unknown journal opcode: %d", op)
-		}
-
-		rec := stonedb.WALRecord{Type: recType, XID: xid, OpID: lid, Key: key, Value: val}
-		if err := st.ApplyRecord(rec); err != nil {
-			return lastAppliedID, fmt.Errorf("apply record (op=%d, opid=%d): %w", op, lid, err)
-		}
-		lastAppliedID = lid
-	}
-
-	return lastAppliedID, nil
 }

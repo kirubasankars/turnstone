@@ -61,7 +61,7 @@ func setupTestEnv(t *testing.T) (string, map[string]*store.Store, *Server, func(
 		t.Fatal(err)
 	}
 	// Generate config with multiple databases (config param still named NumberOfPartitions)
-	// This will now generate admin and cdc certs as well due to the change in config.go
+	// This will now generate admin certs as well due to the change in config.go
 	if err := config.GenerateConfigArtifacts(dir, config.Config{
 		TLSCertFile:       "certs/server.crt",
 		TLSKeyFile:        "certs/server.key",
@@ -289,22 +289,7 @@ func TestServer_RBAC(t *testing.T) {
 		client.AssertStatus(protocol.OpCodeReplicaOf, []byte("dummy"), protocol.ResStatusErr)
 	})
 
-	// 2. CDC Role Tests
-	t.Run("CDC", func(t *testing.T) {
-		cdc := connectClient(t, addr, getRoleTLS(t, dir, "cdc"))
-		defer cdc.Close()
-
-		// Allowed: Replication Handshake
-		// We'll just check it doesn't return immediate error for permission
-		// (It might return error for malformed payload, but status shouldn't be generic Err "Permission Denied")
-		// Actually, let's send Ping first.
-		cdc.AssertStatus(protocol.OpCodePing, nil, protocol.ResStatusOK)
-
-		// Denied: KV Ops
-		cdc.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusErr)
-	})
-
-	// 3. Admin Role Tests
+	// 2. Admin Role Tests
 	t.Run("Admin", func(t *testing.T) {
 		admin := connectClient(t, addr, getRoleTLS(t, dir, "admin"))
 		defer admin.Close()

@@ -12,7 +12,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash/crc32"
 	"io"
 	"log/slog"
 	"net"
@@ -23,7 +22,7 @@ import (
 
 // defaultIOTimeout is used for Config.ReadTimeout/WriteTimeout when the
 // caller leaves them unset (zero). Without a default, a slow or
-// network-partitioned server leaves roundTrip()/Subscribe() blocked in
+// network-partitioned server leaves roundTrip() blocked in
 // I/O forever with no way for the caller to notice or recover.
 const defaultIOTimeout = 30 * time.Second
 
@@ -49,7 +48,6 @@ const (
 	OpCodeStepDown = 0x35
 	OpCodeFlushDB  = 0x37
 	OpCodeReplHello        = 0x50
-	OpCodeReplBatch        = 0x51
 	OpCodeReplAck          = 0x52
 	OpCodeReplSnapshot     = 0x53
 	OpCodeReplSnapshotDone = 0x54
@@ -60,14 +58,6 @@ const (
 // Begin payload flags (OpCodeBegin body).
 const (
 	BeginReadOnly = 0
-)
-
-// Journal opcodes mirror protocol.OpJournal* / stonedb.WALRecordType. Subscribe
-// only receives committed Set/Delete/Commit on CDC streams.
-const (
-	OpJournalSet    = 1
-	OpJournalDelete = 2
-	OpJournalCommit = 3
 )
 
 const (
@@ -95,8 +85,6 @@ var (
 	ErrMemoryLimit    = errors.New("server memory limit exceeded")
 	ErrConnection     = errors.New("connection error")
 )
-
-var Crc32Table = crc32.MakeTable(crc32.Castagnoli)
 
 type ServerError struct {
 	Message string
@@ -472,253 +460,4 @@ func (c *Client) Commit() error {
 func (c *Client) Abort() error {
 	_, err := c.roundTrip(OpCodeAbort, nil)
 	return err
-}
-
-type Change struct {
-	LogSeq         uint64
-	TxID           uint64
-	Key            []byte
-	Value          []byte
-	IsDelete       bool
-	IsSnapshotDone bool
-}
-
-// Subscribe connects to the server and starts listening for changes.
-func (c *Client) Subscribe(dbName string, startSeq uint64, handler func(Change) error) error {
-	c.mu.Lock()
-	if c.conn == nil {
-		c.mu.Unlock()
-		return ErrConnection
-	}
-	clientID := c.config.ClientID
-	if clientID == "" {
-		// The server's own handshake rejects the literal string
-		// "client-unknown" (server/replication.go treats it the same as
-		// an empty ID), so falling back to that exact value here meant
-		// every default-configured Subscribe() caller was guaranteed to
-		// fail its handshake. Generate a unique-enough fallback instead.
-		clientID = fmt.Sprintf("client-%d-%d", os.Getpid(), time.Now().UnixNano())
-	}
-	buf := new(bytes.Buffer)
-	binary.Write(buf, binary.BigEndian, uint32(1))
-	binary.Write(buf, binary.BigEndian, uint32(len(clientID)))
-	buf.WriteString(clientID)
-	binary.Write(buf, binary.BigEndian, uint32(1))
-	binary.Write(buf, binary.BigEndian, uint32(len(dbName)))
-	buf.WriteString(dbName)
-	binary.Write(buf, binary.BigEndian, startSeq)
-	reqHeader := make([]byte, ProtoHeaderSize)
-	reqHeader[0] = OpCodeReplHello
-	binary.BigEndian.PutUint32(reqHeader[1:], uint32(buf.Len()))
-	if _, err := c.conn.Write(reqHeader); err != nil {
-		c.mu.Unlock()
-		return err
-	}
-	if _, err := c.conn.Write(buf.Bytes()); err != nil {
-		c.mu.Unlock()
-		return err
-	}
-	c.mu.Unlock()
-
-	respHeader := make([]byte, ProtoHeaderSize)
-	for {
-		if c.config.ReadTimeout > 0 {
-			c.conn.SetReadDeadline(time.Now().Add(c.config.ReadTimeout))
-		}
-
-		if _, err := io.ReadFull(c.conn, respHeader); err != nil {
-			return err
-		}
-		opCode := respHeader[0]
-		length := binary.BigEndian.Uint32(respHeader[1:])
-
-		// SAFETY CHECK: Prevent OOM on huge/corrupted length
-		if length > 512*1024*1024 {
-			return ErrEntityTooLarge
-		}
-
-		payload := make([]byte, length)
-		if _, err := io.ReadFull(c.conn, payload); err != nil {
-			return err
-		}
-
-		// Handle Heartbeats (SafePoint/Timeline) to avoid fallback to error
-		if opCode == OpCodeReplSafePoint || opCode == OpCodeReplTimeline {
-			continue
-		}
-
-		if opCode == OpCodeReplBatch || opCode == OpCodeReplSnapshot || opCode == OpCodeReplSnapshotDone {
-			// PATCH: Verify CRC32
-			if len(payload) < 4 {
-				return errors.New("replication packet too short for crc")
-			}
-			crcReceived := binary.BigEndian.Uint32(payload[:4])
-			rawBody := payload[4:]
-			if crc32.Checksum(rawBody, Crc32Table) != crcReceived {
-				return errors.New("crc mismatch on replication stream")
-			}
-			payload = rawBody
-		}
-
-		if opCode == OpCodeReplBatch {
-			cursor := 0
-			if cursor+4 > len(payload) {
-				return fmt.Errorf("malformed batch: short header")
-			}
-			nLen := int(binary.BigEndian.Uint32(payload[cursor : cursor+4]))
-			cursor += 4
-			if cursor+nLen > len(payload) {
-				return fmt.Errorf("malformed batch: short name")
-			}
-			cursor += nLen
-			if cursor+4 > len(payload) {
-				return fmt.Errorf("malformed batch: short count")
-			}
-			count := binary.BigEndian.Uint32(payload[cursor : cursor+4])
-			cursor += 4
-			data := payload[cursor:]
-			dCursor := 0
-			var maxLogSeq uint64
-			for i := 0; i < int(count); i++ {
-				if dCursor+17 > len(data) {
-					return fmt.Errorf("malformed entry header")
-				}
-				logSeq := binary.BigEndian.Uint64(data[dCursor : dCursor+8])
-				txID := binary.BigEndian.Uint64(data[dCursor+8 : dCursor+16])
-				opType := data[dCursor+16]
-				dCursor += 17
-				kLen := int(binary.BigEndian.Uint32(data[dCursor : dCursor+4]))
-				dCursor += 4
-				if dCursor+kLen > len(data) {
-					return fmt.Errorf("malformed entry key")
-				}
-				key := data[dCursor : dCursor+kLen]
-				dCursor += kLen
-				vLen := int(binary.BigEndian.Uint32(data[dCursor : dCursor+4]))
-				dCursor += 4
-				if dCursor+vLen > len(data) {
-					return fmt.Errorf("malformed entry val")
-				}
-				val := data[dCursor : dCursor+vLen]
-				dCursor += vLen
-				if opType == OpJournalCommit {
-					if logSeq > maxLogSeq {
-						maxLogSeq = logSeq
-					}
-					continue
-				}
-				change := Change{
-					LogSeq:   logSeq,
-					TxID:     txID,
-					Key:      key,
-					Value:    val,
-					IsDelete: opType == OpJournalDelete,
-				}
-				if err := handler(change); err != nil {
-					return err
-				}
-				if logSeq > maxLogSeq {
-					maxLogSeq = logSeq
-				}
-			}
-			ackBuf := new(bytes.Buffer)
-			binary.Write(ackBuf, binary.BigEndian, uint32(len(dbName)))
-			ackBuf.WriteString(dbName)
-			binary.Write(ackBuf, binary.BigEndian, maxLogSeq)
-			ackHeader := make([]byte, ProtoHeaderSize)
-			ackHeader[0] = OpCodeReplAck
-			binary.BigEndian.PutUint32(ackHeader[1:], uint32(ackBuf.Len()))
-			if _, err := c.conn.Write(ackHeader); err != nil {
-				return err
-			}
-			if _, err := c.conn.Write(ackBuf.Bytes()); err != nil {
-				return err
-			}
-		} else if opCode == OpCodeReplSnapshot {
-			cursor := 0
-			if cursor+4 > len(payload) {
-				return fmt.Errorf("malformed snapshot: header")
-			}
-			nLen := int(binary.BigEndian.Uint32(payload[cursor : cursor+4]))
-			cursor += 4 + nLen
-			if cursor+4 > len(payload) {
-				return fmt.Errorf("malformed snapshot: count")
-			}
-			count := binary.BigEndian.Uint32(payload[cursor : cursor+4])
-			cursor += 4
-			data := payload[cursor:]
-			dCursor := 0
-			for i := 0; i < int(count); i++ {
-				if dCursor+4 > len(data) {
-					return fmt.Errorf("malformed snapshot entry: klen")
-				}
-				kLen := int(binary.BigEndian.Uint32(data[dCursor : dCursor+4]))
-				dCursor += 4
-				if dCursor+kLen > len(data) {
-					return fmt.Errorf("malformed snapshot entry: key")
-				}
-				key := data[dCursor : dCursor+kLen]
-				dCursor += kLen
-				if dCursor+4 > len(data) {
-					return fmt.Errorf("malformed snapshot entry: vlen")
-				}
-				vLen := int(binary.BigEndian.Uint32(data[dCursor : dCursor+4]))
-				dCursor += 4
-				if dCursor+vLen > len(data) {
-					return fmt.Errorf("malformed snapshot entry: val")
-				}
-				val := data[dCursor : dCursor+vLen]
-				dCursor += vLen
-				change := Change{
-					LogSeq:   0,
-					TxID:     0,
-					Key:      key,
-					Value:    val,
-					IsDelete: false,
-				}
-				if err := handler(change); err != nil {
-					return err
-				}
-			}
-
-			// PATCH: Send ACK for snapshot chunks to act as Heartbeat
-			// This prevents the server from disconnecting the client as a zombie during long snapshots.
-			// We send LogSeq=0 because we don't have the final seq yet, but it updates LastSeen on server.
-			ackBuf := new(bytes.Buffer)
-			binary.Write(ackBuf, binary.BigEndian, uint32(len(dbName)))
-			ackBuf.WriteString(dbName)
-			binary.Write(ackBuf, binary.BigEndian, uint64(0)) // Seq 0 for keepalive
-
-			ackHeader := make([]byte, ProtoHeaderSize)
-			ackHeader[0] = OpCodeReplAck
-			binary.BigEndian.PutUint32(ackHeader[1:], uint32(ackBuf.Len()))
-
-			if _, err := c.conn.Write(ackHeader); err != nil {
-				return err
-			}
-			if _, err := c.conn.Write(ackBuf.Bytes()); err != nil {
-				return err
-			}
-
-		} else if opCode == OpCodeReplSnapshotDone {
-			cursor := 0
-			nLen := int(binary.BigEndian.Uint32(payload[cursor : cursor+4]))
-			cursor += 4 + nLen + 4
-			if cursor+16 <= len(payload) {
-				resumeSeq := binary.BigEndian.Uint64(payload[cursor+8:])
-				if err := handler(Change{IsSnapshotDone: true, LogSeq: resumeSeq}); err != nil {
-					return err
-				}
-			} else if cursor+8 <= len(payload) {
-				resumeSeq := binary.BigEndian.Uint64(payload[cursor:])
-				if err := handler(Change{IsSnapshotDone: true, LogSeq: resumeSeq}); err != nil {
-					return err
-				}
-			}
-		} else {
-			if opCode == ResStatusErr {
-				return &ServerError{Message: string(payload)}
-			}
-		}
-	}
 }

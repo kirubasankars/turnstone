@@ -627,7 +627,7 @@ func (s *Store) UnregisterReplica(id string) {
 	}
 }
 
-// RemoveAllReplicas drops all connected replicas and CDC clients.
+// RemoveAllReplicas drops all connected replicas.
 func (s *Store) RemoveAllReplicas() {
 	s.mu.Lock()
 	defer s.mu.Unlock()

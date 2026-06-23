@@ -119,8 +119,6 @@ func TestGenerateConfigArtifacts(t *testing.T) {
 		"certs/client.key",
 		"certs/admin.crt",
 		"certs/admin.key",
-		"certs/cdc.crt",
-		"certs/cdc.key",
 	}
 	for _, f := range requiredCerts {
 		path := filepath.Join(tmpDir, f)
@@ -156,7 +154,6 @@ func TestRBACCertificates(t *testing.T) {
 	}{
 		{"certs/client.crt", "TurnstoneDB client"},
 		{"certs/admin.crt", "TurnstoneDB admin"},
-		{"certs/cdc.crt", "TurnstoneDB cdc"},
 		{"certs/server.crt", "TurnstoneDB server"},
 	}
 
@@ -184,7 +181,7 @@ func TestRBACCertificates(t *testing.T) {
 				}
 			}
 
-			// Verify key usage includes ClientAuth for clients/admin/cdc
+			// Verify key usage includes ClientAuth for clients/admin
 			if !strings.Contains(tt.file, "server.crt") { // Server can be both, but strictly checking clients here
 				hasClientAuth := false
 				for _, usage := range cert.ExtKeyUsage {

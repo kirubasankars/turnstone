@@ -44,7 +44,6 @@ const (
 	OpCodeFlushDB  uint8 = 0x37 // Wipe Database
 
 	OpCodeReplHello uint8 = 0x50
-	OpCodeReplBatch uint8 = 0x51
 	OpCodeReplAck   uint8 = 0x52
 
 	// --- SNAPSHOT OPCODES ---
@@ -75,8 +74,7 @@ const (
 	// A one-byte payload of BeginReadOnly opens a snapshot read transaction.
 	BeginReadOnly uint8 = 0
 
-	// Journal Specific Ops (inner opcode carried inside OpCodeReplBatch).
-	// These mirror stonedb.WALRecordType 1:1.
+	// Journal ops used by store.ApplyBatch (client write path).
 	OpJournalBegin  uint8 = 4
 	OpJournalSet    uint8 = 1
 	OpJournalDelete uint8 = 2

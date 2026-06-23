@@ -76,7 +76,7 @@ type replPacket struct {
 	count  uint32
 }
 
-// HandleReplicaConnection handles the handshake for incoming replicas (Followers or CDC).
+// HandleReplicaConnection handles the handshake for incoming replicas.
 // It now uses the context-aware logger from the connection state (*connState).
 func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []byte, st *connState) {
 	// We do NOT clear deadlines globally anymore. We set them per-operation.
@@ -154,7 +154,7 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 
 		// Check if this server is already a replica for this database.
 		if s.replManager != nil && s.replManager.IsReplicating(name) {
-			st.logger.Warn("Rejected downstream replication request (cascading/cdc disabled on replicas)", "db", name)
+			st.logger.Warn("Rejected downstream replication request (cascading disabled on replicas)", "db", name)
 			_ = s.writeBinaryResponse(conn, protocol.ResStatusErr, []byte(fmt.Sprintf("Cascading replication disabled for DB '%s'", name)))
 			return
 		}
@@ -226,18 +226,17 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 	for _, req := range subs {
 		if storePtr, ok := s.stores[req.name]; ok {
 			wg.Add(1)
-			physical := st.role != RoleCDC
-			go func(name string, sp *store.Store, startLogID uint64, physical bool) {
+			go func(name string, sp *store.Store, startLogID uint64) {
 				defer wg.Done()
 				defer recoverAndLog(st.logger, "streamDB:"+name)
-				if err := s.streamDB(name, sp, startLogID, outCh, done, st.logger, physical); err != nil {
+				if err := s.streamDB(name, sp, startLogID, outCh, done, st.logger); err != nil {
 					st.logger.Error("Replica stream failed", "db", name, "err", err)
 					select {
 					case errCh <- err:
 					default:
 					}
 				}
-			}(req.name, storePtr, req.logID, physical)
+			}(req.name, storePtr, req.logID)
 		}
 	}
 
@@ -364,7 +363,7 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 	}
 }
 
-func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh chan<- replPacket, done <-chan struct{}, logger *slog.Logger, physical bool) error {
+func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh chan<- replPacket, done <-chan struct{}, logger *slog.Logger) error {
 	currentLogID := minLogID
 
 	// 0. Send Initial Timeline
@@ -471,7 +470,7 @@ func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh c
 		}
 
 		// 2. WAL Streaming Loop
-		if err := s.runWALStreamLoop(name, st, currentLogID, outCh, done, logger, physical); err != nil {
+		if err := s.runWALStreamLoop(name, st, currentLogID, outCh, done, logger); err != nil {
 			// If error is OUT_OF_SYNC or ErrLogUnavailable, break inner loop and retry outer loop (which will trigger snapshot)
 			// This handles the race condition where WAL was purged between check and stream.
 			if err.Error() == "OUT_OF_SYNC" || errors.Is(err, stonedb.ErrLogUnavailable) {
@@ -484,46 +483,11 @@ func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh c
 	}
 }
 
-// journalOpForRecordType maps a stonedb WAL record type to its wire journal
-// opcode (identical numbering, kept distinct so the wire format doesn't leak
-// stonedb's internal type directly).
-func journalOpForRecordType(t stonedb.WALRecordType) uint8 {
-	switch t {
-	case stonedb.WALRecordBegin:
-		return protocol.OpJournalBegin
-	case stonedb.WALRecordSet:
-		return protocol.OpJournalSet
-	case stonedb.WALRecordDelete:
-		return protocol.OpJournalDelete
-	case stonedb.WALRecordCommit:
-		return protocol.OpJournalCommit
-	case stonedb.WALRecordAbort:
-		return protocol.OpJournalAbort
-	}
-	return 0
-}
-
-func writeJournalEntry(buf *bytes.Buffer, opID, xid uint64, op uint8, key, val []byte) {
-	binary.Write(buf, binary.BigEndian, opID)
-	binary.Write(buf, binary.BigEndian, xid)
-	buf.WriteByte(op)
-	binary.Write(buf, binary.BigEndian, uint32(len(key)))
-	buf.Write(key)
-	binary.Write(buf, binary.BigEndian, uint32(len(val)))
-	buf.Write(val)
-}
-
-func (s *Server) runWALStreamLoop(name string, st *store.Store, startLogID uint64, outCh chan<- replPacket, done <-chan struct{}, logger *slog.Logger, physical bool) error {
+func (s *Server) runWALStreamLoop(name string, st *store.Store, startLogID uint64, outCh chan<- replPacket, done <-chan struct{}, logger *slog.Logger) error {
 	currentLogID := startLogID
 	currentByteOffset, _ := st.ByteOffsetForReplicationResume(startLogID)
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
-
-	// pending buffers SET/DEL records per-xid for the CDC (logical) stream:
-	// only committed changes are ever forwarded to a cdc role, mirroring
-	// today's committed-only JSONL contract even though the leader now logs
-	// eagerly. Unused in physical mode.
-	pending := make(map[uint64][]stonedb.WALRecord)
 
 	safePointTicker := time.NewTicker(1 * time.Second)
 	defer safePointTicker.Stop()
@@ -584,96 +548,33 @@ func (s *Server) runWALStreamLoop(name string, st *store.Store, startLogID uint6
 			}
 
 		case <-ticker.C:
-			if physical {
-				segData, nextOff, lastOpID, err := st.ReadLogSegment(currentByteOffset, int64(MaxReplicationBatchSize))
-				if err != nil {
-					if errors.Is(err, stonedb.ErrLogUnavailable) && currentLogID < st.LastOpID() {
-						return errors.New("OUT_OF_SYNC")
-					}
-					logger.Error("Log segment read error", "db", name, "err", err)
-					time.Sleep(100 * time.Millisecond)
-					continue
+			segData, nextOff, lastOpID, err := st.ReadLogSegment(currentByteOffset, int64(MaxReplicationBatchSize))
+			if err != nil {
+				if errors.Is(err, stonedb.ErrLogUnavailable) && currentLogID < st.LastOpID() {
+					return errors.New("OUT_OF_SYNC")
 				}
-				if len(segData) > 0 {
-					payload := make([]byte, 16+len(segData))
-					binary.BigEndian.PutUint64(payload[0:], uint64(currentByteOffset))
-					binary.BigEndian.PutUint64(payload[8:], uint64(nextOff))
-					copy(payload[16:], segData)
-					select {
-					case outCh <- replPacket{
-						dbName: name,
-						opCode: protocol.OpCodeReplLogSegment,
-						data:   payload,
-						count:  0,
-					}:
-					case <-done:
-						return nil
-					}
-					currentByteOffset = nextOff
-					if lastOpID > 0 {
-						currentLogID = lastOpID
-					}
-				}
+				logger.Error("Log segment read error", "db", name, "err", err)
+				time.Sleep(100 * time.Millisecond)
 				continue
 			}
-
-			var batchBuf bytes.Buffer
-			var count uint32
-
-			err := st.ScanWAL(currentLogID+1, func(recs []stonedb.WALRecord) error {
-				for _, r := range recs {
-					// Logical/CDC decoding: buffer SET/DEL per-xid, only
-					// emit them (plus a commit marker) once we observe
-					// the COMMIT record; drop everything on ABORT.
-					switch r.Type {
-					case stonedb.WALRecordBegin:
-						// nothing to forward
-					case stonedb.WALRecordSet, stonedb.WALRecordDelete:
-						pending[r.XID] = append(pending[r.XID], r)
-					case stonedb.WALRecordAbort:
-						delete(pending, r.XID)
-					case stonedb.WALRecordCommit:
-						for _, br := range pending[r.XID] {
-							writeJournalEntry(&batchBuf, br.OpID, br.XID, journalOpForRecordType(br.Type), br.Key, br.Value)
-							count++
-						}
-						delete(pending, r.XID)
-						writeJournalEntry(&batchBuf, r.OpID, r.XID, protocol.OpJournalCommit, nil, nil)
-						count++
-					}
-
-					currentLogID = r.OpID
-
-					if batchBuf.Len() > MaxReplicationBatchSize {
-						return ErrBatchFull
-					}
-				}
-				return nil
-			})
-
-			if count > 0 {
+			if len(segData) > 0 {
+				payload := make([]byte, 16+len(segData))
+				binary.BigEndian.PutUint64(payload[0:], uint64(currentByteOffset))
+				binary.BigEndian.PutUint64(payload[8:], uint64(nextOff))
+				copy(payload[16:], segData)
 				select {
 				case outCh <- replPacket{
 					dbName: name,
-					opCode: protocol.OpCodeReplBatch,
-					data:   batchBuf.Bytes(),
-					count:  count,
+					opCode: protocol.OpCodeReplLogSegment,
+					data:   payload,
+					count:  0,
 				}:
 				case <-done:
 					return nil
 				}
-			}
-
-			if err != nil {
-				if err == ErrBatchFull {
-					continue
-				} else if err == stonedb.ErrLogUnavailable {
-					if currentLogID < st.LastOpID() {
-						return errors.New("OUT_OF_SYNC")
-					}
-				} else {
-					logger.Error("WAL Scan error", "db", name, "err", err)
-					time.Sleep(100 * time.Millisecond)
+				currentByteOffset = nextOff
+				if lastOpID > 0 {
+					currentLogID = lastOpID
 				}
 			}
 		}
