@@ -5,288 +5,176 @@ This source code is licensed under the MIT license found in the
 LICENSE file in the root of this source tree.
 -->
 
-
 # TurnstoneDB
 
-**TurnstoneDB** is a high-performance, persistent, distributed Key-Value store written in Go. It features a custom storage engine with a single append-only log and in-memory MVCC index, full ACID transactions via Snapshot Isolation, and robust asynchronous replication with **Timeline** support for safe failovers.
+**TurnstoneDB** is a persistent, transactional key-value store written in Go. Each server process holds multiple isolated databases on local disk. Optional leader-follower replication is configured explicitly per database — there is no built-in sharding, consensus, or automatic cluster failover.
 
-> ⚠️ **Disclaimer:** TurnstoneDB is currently research-quality software. While it implements advanced mechanisms like Group Commit, MVCC, and mTLS, it is not recommended for mission-critical production workloads without further hardening.
+> **Disclaimer:** TurnstoneDB is research-quality software. It implements group commit, MVCC, mTLS, and punch-hole vacuum, but it is not recommended for mission-critical production use without further hardening.
 
-## 🚀 Key Features
+## What it is
 
-* **⚡ Append-only Log + B+ Tree Index**: One unbounded `data.log` holds all records; an mmap B+ tree index tracks MVCC version chains pointing at byte offsets. Vacuum reclaims stale ranges via `fallocate` punch-hole without moving live records.
-* **📝 Eager Logging**: `SET`/`DEL` append to the log and update the B+ tree index immediately (not buffered until `COMMIT`). `COMMIT` only group-fsyncs a small commit record and flips visibility. See "Transaction Model: Eager Logging" below.
-* **🔒 ACID Transactions**: Full support for multi-key transactions with **Snapshot Isolation**. Write-write conflicts are detected eagerly at `SET`/`DEL` time via **first-writer-wins** key locking (no waiting, no deadlocks); read-set validation still runs at `COMMIT` to catch stale-read/write-skew.
-* **🛡️ Secure by Default**: All connections (Client-Server and Inter-Node) are secured via **mTLS** (Mutual TLS). Role-Based Access Control (RBAC) is enforced via X.509 Certificate Organization fields.
-* **📡 Replication & Timelines**: Database-level Leader-Follower replication. Supports **Timelines** to handle split-brain scenarios and allow safe history divergence during promotion.
-* **🌊 Change Data Capture (CDC)**: Built-in support for streaming data changes to local JSONL logs with configurable rotation policies.
-* **🦆 DuckDB Integration**: Includes a specialized loader (`turnstone-duck`) to ingest CDC streams directly into DuckDB for high-speed OLAP analytics.
-* **🔭 Observability**: Built-in **Prometheus** exporter (`/metrics`) for tracking active transactions, conflicts, WAL size, and replication lag.
+- A **single-node** storage engine with Redis-style `SELECT <db>` namespaces
+- **ACID transactions** with snapshot isolation and first-writer-wins key locking
+- **Optional replication** — one primary and manually attached followers per database
+- **CDC** — stream committed changes to JSONL for ETL/analytics (DuckDB loader included)
+
+## What it is not
+
+- Not a distributed database (no partition tolerance, no client-side routing, no Raft)
+- Not a managed cluster — failover is manual via `stepdown` / `promote` / `replicaof`
+- Not SQL — keys and opaque byte values only
 
 ---
 
-## 📦 Installation & Getting Started
+## Features
+
+| Area | Detail |
+| --- | --- |
+| Storage | Single append-only `data.log` + mmap B+ tree index (`index/data.bt`) |
+| Durability | Eager append on `SET`/`DEL`; group fsync on `COMMIT` |
+| Vacuum | Drop dead MVCC versions; reclaim disk with sparse punch-hole |
+| Security | mTLS on all connections; RBAC via X.509 certificate Organization |
+| Replication | Async or sync (quorum ack); timeline fork on `promote` |
+| Observability | Prometheus metrics on `:9090` |
+
+---
+
+## Quick start
 
 ### Prerequisites
 
-* Go 1.22 or higher.
+- Go 1.25+ (see `go.mod`)
 
-### 1. Build the Binaries
+### Build
 
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/turnstone.git
+git clone https://github.com/kirubasankars/turnstone.git
 cd turnstone
-
-# Build server and tools
 make build
-# OR manually:
-# go build -o bin/turnstone ./cmd/turnstone
-# go build -o bin/turnstone-cli ./cmd/turnstone-cli
-# go build -o bin/turnstone-generate-config ./cmd/turnstone-generate-config
-
 ```
 
-### 2. Initialize Configuration & Certificates
+### Initialize
 
-TurnstoneDB requires mTLS certificates. Use the generator tool to create a complete environment with a CA, server/client/admin certs, and default config files.
+Generate a home directory with TLS certificates and default config:
 
 ```bash
-# Create a data directory and generate artifacts
-# -ip allows adding SANs (Subject Alternative Names) for remote access
 ./bin/turnstone-generate-config -home tsdata -ip 192.168.1.10,myserver.local
-
-# Output:
-# Certificates generated in: tsdata/certs
-# Sample configuration written to tsdata/turnstone.json
-
 ```
 
-### 3. Start the Server
+### Run
 
 ```bash
 ./bin/turnstone -home tsdata
-
 ```
 
-* Listens on `:6379` by default.
-* **Note**: Database `0` is reserved as a read-only system database. User data goes into Databases `1` through `16` (configurable).
+The server listens on `:6379` by default. Databases `0`–`N` are independent keyspaces (`number_of_databases` in config).
 
 ---
 
-## 💻 Usage
+## CLI usage
 
-### Using the CLI (`turnstone-cli`)
-
-The CLI automatically detects certificates in the `--home` directory. You must use the `-admin` flag to perform cluster management operations.
+The CLI reads certificates from `--home`. Admin commands require the `-admin` flag.
 
 ```bash
-# Connect to the server
 ./bin/turnstone-cli -home tsdata
-
 ```
 
-#### Basic Commands
-
-**Note:** All data operations (`get`, `set`, `del`) must be performed inside a transaction block (`begin` ... `commit`).
+All reads and writes run inside a transaction:
 
 ```bash
 > select 1
 OK
-
-# Start a Transaction
 > begin
 OK
-
-# Perform Operations
-> set mykey "Hello Turnstone"
+> set mykey "hello"
 OK
-
 > get mykey
-OK: Hello Turnstone
-
-> del oldkey
-OK
-
-# Commit Changes
+OK: hello
 > commit
 OK
-
 ```
 
-#### Batch Operations (MGET / MSET)
-
-Batch operations also require an active transaction.
-
-```bash
-> begin
-OK
-
-# Batch Set (MSET) - Atomic write of multiple keys
-> mset user:1 "Alice" user:2 "Bob" user:3 "Charlie"
-OK
-
-# Batch Get (MGET) - Fetch multiple values in one round-trip
-> mget user:1 user:2 user:3 non_existent_key
-1) Alice
-2) Bob
-3) Charlie
-4) (nil)
-
-> commit
-OK
-
-```
+Batch operations (`mset`, `mget`, `mdel`) also require an active transaction.
 
 ---
 
-## 🕹️ Cluster Management & Failover
+## Replication and failover
 
-TurnstoneDB supports manual failover handling via a specific lifecycle state machine: `UNDEFINED` -> `REPLICA` -> `PRIMARY`. These commands generally require Admin privileges.
+Replication is **per database**, not whole-server. Each database follows a small state machine:
 
-### 1. Following a Leader (`replicaof`)
+`UNDEFINED` → `REPLICA` → `PRIMARY`
 
-To make the current node follow another node, use `replicaof`. This puts the database into **REPLICA** state.
+Admin commands (via `turnstone-cli -admin`):
 
-```bash
-# Replicate Database 1 from a Leader at 10.0.0.5:6379
-> select 1
-> replicaof 10.0.0.5:6379 1
-Replication started from 10.0.0.5:6379/1
+| Command | Effect |
+| --- | --- |
+| `replicaof <host:port> <db>` | Follow a remote primary (REPLICA state) |
+| `stepdown` | Drain writes, sync followers, return to UNDEFINED |
+| `promote [min_replicas]` | Become primary; bumps timeline ID; optional sync quorum |
 
-```
+### Manual failover (A → B)
 
-### 2. Graceful Step Down (`stepdown`)
+1. **Node A:** `select 1` → `stepdown`
+2. **Node B:** `select 1` → `promote`
+3. **Node A:** `select 1` → `replicaof <B>:6379 1`
 
-Before performing maintenance on a Primary, or to prepare for failover, issue `stepdown`. This command:
-
-1. Blocks new write transactions.
-2. Waits for active transactions to drain.
-3. Ensures connected replicas are synced.
-4. Transitions the database to **UNDEFINED** state (ReadOnly, no replication).
-
-```bash
-> select 1
-> stepdown
-OK
-# All clients are now disconnected from DB 1.
-
-```
-
-### 3. Promoting a Node (`promote`)
-
-To turn a node (either a Replica or an Undefined node) into a Primary, use `promote`. This bumps the **Timeline ID** (forking history safely) and enables write access.
-
-```bash
-> select 1
-# Promote to Primary. Optional arg: min_replicas for synchronous replication.
-> promote
-OK
-
-# OR: Promote with Synchronous Replication (Require 2 acks for every commit)
-> promote 2
-OK
-
-```
-
-### 4. Manual Failover Example
-
-**Scenario:** Moving leadership from Node A to Node B.
-
-1. **On Node A (Old Leader):**
-
-```bash
-> select 1
-> stepdown
-
-```
-
-2. **On Node B (New Leader):**
-
-```bash
-> select 1
-> promote
-
-```
-
-3. **On Node A (Old Leader):**
-
-```bash
-# Reconfigure A to follow B
-> select 1
-> replicaof <Node_B_IP>:6379 1
-
-```
+There is no automatic leader election. Timelines record history forks so promotion after a split is safe, but an operator must invoke it.
 
 ---
 
-## 📡 CDC & Data Integration
+## CDC and analytics
 
-### Running a Change Data Capture (CDC) Consumer
+**CDC mode** tails committed changes to JSONL:
 
-You can run a dedicated process to tail the transaction logs and output JSON for ETL pipelines.
-
-1. **Configure:** Edit `tsdata/turnstone.cdc.json` to define the target database and output format.
-2. **Run:**
 ```bash
+# Edit tsdata/turnstone.cdc.json, then:
 ./bin/turnstone -mode cdc -home tsdata
-
 ```
 
-
-3. **Output:** The CDC worker writes rotation-safe JSONL files to the `output_dir`.
-```json
-{"seq": 101, "tx": 50, "key": "device:452", "val": {"lat": 34.05}, "ts": 1709320000}
-{"seq": 103, "tx": 51, "key": "session:99", "del": true, "ts": 1709320005}
-
-```
-
-
-
-### Analytics with DuckDB
-
-Use `turnstone-duck` to watch CDC logs, deduplicate them (handling the "same key updated multiple times" scenario), and upsert them into a DuckDB database.
+**DuckDB loader** ingests CDC files with deduplication:
 
 ```bash
-# Watch cdc_logs, load into duckdb, and archive processed files
 ./bin/turnstone-duck -input tsdata/cdc_logs -archive tsdata/archive -db analytics.duckdb
-
 ```
 
 ---
 
-## ⚙️ Configuration (`turnstone.json`)
+## Configuration (`turnstone.json`)
 
 | Field | Default | Description |
 | --- | --- | --- |
-| `id` | `hostname` | Unique Node ID. |
-| `port` | `:6379` | TCP listening address. |
-| `max_conns` | `1000` | Maximum concurrent client connections. |
-| `number_of_databases` | `4` | Number of logical databases. |
-| `wal_retention` | `2h` | Duration to keep WAL files. |
-| `wal_retention_strategy` | `time` | Strategy for WAL purge: `time` or `replication` (wait for replicas). |
-| `max_disk_usage_percent` | `90` | Reject writes if disk usage exceeds this %. |
-| `metrics_addr` | `:9090` | Address for Prometheus metrics. |
-| `tls_cert_file` | `certs/server.crt` | Server Certificate. |
-| `tls_client_cert_file` | `certs/server.crt` | Cert used when acting as a Replication Client. |
+| `id` | hostname-based | Node identifier |
+| `port` | `:6379` | Listen address |
+| `max_conns` | `1000` | Max concurrent connections |
+| `number_of_databases` | `4` | Logical databases (`0` … `N`) |
+| `wal_retention_strategy` | `replication` | Purge policy: `replication` or `time` |
+| `max_disk_usage_percent` | `90` | Reject writes above this disk usage |
+| `metrics_addr` | `:9090` | Prometheus scrape address |
+| `tls_cert_file` | `certs/server.crt` | Server certificate |
+| `tls_client_cert_file` | `certs/server.crt` | Cert for outbound replication |
 
 ---
 
-## 🛠️ Architecture & Internals
+## Storage engine
 
-### Architecture
+```
+Client SET/DEL  →  append data.log  →  update B+ tree index
+Client COMMIT   →  append + fsync COMMIT  →  clog[xid] = committed
+Client GET      →  index lookup  →  ReadAt(offset) from data.log
+Open            →  replay data.log (SEEK_DATA skips holes)  →  rebuild index + clog
+Vacuum          →  drop dead versions  →  punch-hole stale ranges
+```
 
-TurnstoneDB uses a single append-only log file plus a B+ tree index:
+### Components
 
-1. **Data Log (`data.log`)**: One unbounded append-only file stores typed WAL records (`BEGIN`/`SET`/`DEL`/`COMMIT`/`ABORT`) with keys and values inline. Durability: eager append, group fsync on `COMMIT`. Recovery is a full replay from offset 0, skipping punched holes via `SEEK_DATA`.
-2. **B+ Tree Index (`index/data.bt`)**: Memory-mapped B+ tree keyed by `userKey || xmin`; values hold log offsets and MVCC metadata. Rebuilt from log replay on each open. The commit log (`clog`) is in memory.
-3. **Vacuum**: Dead versions are dropped from the index; stale byte ranges behind the append tail are reclaimed with `fallocate(PUNCH_HOLE|KEEP_SIZE)`. Logical file size never shrinks; actual disk use follows sparse allocation (`st_blocks`).
+1. **`data.log`** — one unbounded append-only file. Records: `BEGIN`, `SET`, `DEL`, `COMMIT`, `ABORT` (keys and values inline).
+2. **`index/data.bt`** — mmap B+ tree. Keys encode `userKey || (MaxUint64 − xmin)`; values hold log offset and MVCC metadata. Rebuilt from replay on every open.
+3. **In-memory clog** — transaction commit status, rebuilt during replay.
+4. **Vacuum** — removes dead index entries; `fallocate(PUNCH_HOLE|KEEP_SIZE)` on stale byte ranges behind the append tail and below the replication scan floor.
 
-Retention (`PurgeWAL`) raises a scan floor so replication/CDC cannot read ops below the safe point; vacuum may punch holes only below that floor.
+### Transaction model (eager logging)
 
-### Transaction Model: Eager Logging
-
-Earlier versions of TurnstoneDB buffered all writes in memory between `BEGIN` and `COMMIT`, and only touched the log/index once, atomically, at commit time. TurnstoneDB now writes eagerly instead:
+Writes are logged immediately at `SET`/`DEL` time, not buffered until commit:
 
 ```mermaid
 sequenceDiagram
@@ -299,41 +187,34 @@ sequenceDiagram
     Tx->>Log: BEGIN xid,op
     Client->>Tx: SET k v
     Tx->>Log: SET xid,op,k,v
-    Tx->>Index: xmin=xid, in_progress
+    Tx->>Index: xmin=xid
     Client->>Tx: COMMIT
     Tx->>Log: COMMIT xid,op
     Note over Log: group fsync
     Tx->>Clog: committed
-    Note over Index: version now visible
 ```
 
-Key semantics:
+Notable semantics:
 
-* **`xid` is assigned at `BEGIN`**, not at commit time. Every log record (`BEGIN`/`SET`/`DEL`/`COMMIT`/`ABORT`) also gets its own monotonically increasing `opID`, which remains the replication cursor.
-* **`SET`/`DEL` write immediately.** Records append to `data.log` and an index version is inserted (`xmin = xid`, initially "in progress") as soon as the client calls `SET`/`DEL` — not buffered until `COMMIT`. This data is **not fsynced** at write time; it is recovered from the log on crash via replay rather than fsyncing every row.
-* **`COMMIT` group-fsyncs a tiny record.** Because `SET`/`DEL` already appended to the log, `COMMIT` only has to append and fsync a `COMMIT` record (batched with other concurrent commits), then flip the transaction's status to `committed` in the commit log (`clog`). This is cheaper and more predictable than fsyncing an entire write-set at commit time.
-* **Read-your-own-writes** works without a separate write-cache: `Get` inside a transaction simply treats `xmin == my xid` as visible regardless of `clog` state.
-* **Isolation is now first-writer-wins, not first-committer-wins.** `SET`/`DEL` takes an exclusive, **NOWAIT** lock on the key: if another in-progress transaction already owns it, the call fails immediately with a write conflict — there is no waiting and therefore no deadlock. The write-set/blind-write half of the old commit-time conflict check is gone since it's now structurally impossible (whoever holds the key's lock is the only writer). Read-set validation (stale-read / write-skew detection) still happens at `COMMIT` for true snapshot-isolation correctness.
-* **Aborts are explicit.** Timeouts, disconnects, and conflicts all append an `ABORT` record and release locks; a background reaper also force-aborts any transaction that exceeds `MaxTxDuration` even if the client goes silent, so a stalled connection can't hold a key lock forever.
+- **`xid` at `BEGIN`**, **`opID` per record** — `opID` is the replication/CDC cursor.
+- **First-writer-wins** — `SET`/`DEL` takes a NOWAIT key lock; conflicts return immediately, no deadlock.
+- **Read-set validation at `COMMIT`** — detects stale reads / write skew under snapshot isolation.
+- **Read-your-own-writes** — uncommitted versions with `xmin == my xid` are visible inside the transaction.
+- **Aborts are explicit** — conflicts, disconnects, and timeouts append `ABORT`; a reaper aborts transactions exceeding `MaxTxDuration`.
 
-#### What this means for clients
-
-* `SET`/`DEL` (and `MSET`/`MDEL`) can now fail with **`ResStatusTxConflict` (0x05)** directly — previously this only happened at `COMMIT`. The Go client already maps this to `ErrTxConflict`.
-* Once a transaction hits a conflict, it is marked aborted server-side ("current transaction is aborted" behavior): every subsequent `GET`/`SET`/`COMMIT` on that connection returns `ResStatusTxConflict` until you send `ABORT` (or a fresh `BEGIN`).
-* Values are visible to other transactions only after `COMMIT` — the eager writes described above are strictly an internal engine detail; external readers never see uncommitted data (`Get`/`StreamSnapshot`/CDC/replica reads all filter by `clog` + snapshot visibility, identical to before).
-* Replication is role-filtered: `server`-role streams (used for replica apply, promotion, and `turnstone-backup`) see the full physical WAL including `BEGIN`/`ABORT`; `cdc`-role streams remain logical — they only ever emit committed `SET`/`DEL` plus a commit marker, exactly like before.
+Replication streams differ by role: `server` replicas see the full physical log; `cdc` consumers see committed `SET`/`DEL` only.
 
 ---
 
-## ⚠️ Current Limitations
+## Limitations
 
-1. **Consensus**: Replication uses async/sync streaming. There is no automated Raft/Paxos failover; promotion must be triggered manually via API/CLI (though `Timelines` make this safe).
-2. **Sharding**: The server is single-node (multi-db). Sharding must be handled client-side (see `cmd/turnstone-load2` for a reference implementation).
-3. **Memory**: The MVCC index lives in a memory-mapped B+ tree (`index/data.bt`), rebuilt on open via log replay. Large keyspaces benefit from btree structure; values remain on disk in `data.log`.
-4. **No lock waiting**: Key-level write locks are NOWAIT (see "Transaction Model: Eager Logging" above). Under hot-key contention this shows up as `TxConflict` abort storms rather than a queuing/blocking row-lock behavior — the client is expected to retry, not wait.
+1. **Single node** — one process, local disk. Scale-out requires application-level sharding (see `cmd/turnstone-load2` for a reference).
+2. **Manual failover** — no Raft/Paxos; an operator runs `stepdown` / `promote`.
+3. **No lock waiting** — hot-key contention surfaces as immediate `TxConflict`; clients must retry.
+4. **Breaking on-disk format** — the current `data.log` + B+ tree layout is not compatible with older WAL/VLog/LevelDB directories.
 
 ---
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+MIT — see [LICENSE](LICENSE).
