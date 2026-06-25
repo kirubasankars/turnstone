@@ -24,16 +24,16 @@ import (
 
 // StoreStats holds basic metrics.
 type StoreStats struct {
-	ActiveTxs    int
-	Uptime       string
-	Offset       int64
-	Conflicts    uint64
-	ReplicaLag   uint64
-	WALFiles     int   // always 1 (single data.log)
-	WALSize      int64 // logical size of data.log
-	VLogFiles    int   // deprecated, always 0
-	VLogSize     int64 // allocated on-disk bytes (sparse)
-	KeyCount int64
+	ActiveTxs  int
+	Uptime     string
+	Offset     int64
+	Conflicts  uint64
+	ReplicaLag uint64
+	WALFiles   int   // always 1 (single data.log)
+	WALSize    int64 // logical size of data.log
+	VLogFiles  int   // deprecated, always 0
+	VLogSize   int64 // allocated on-disk bytes (sparse)
+	KeyCount   int64
 }
 
 const (
@@ -119,10 +119,10 @@ func NewStore(ctx context.Context, dir string, logger *slog.Logger, minReplicas 
 	}
 
 	opts := stonedb.Options{
-		TruncateCorruptWAL: truncateWAL,
-		MaxDiskUsagePercent:  maxDiskUsage,
-		Logger:               logger,
-		UnsafeDisableFsync:   os.Getenv("TS_UNSAFE_DISABLE_FSYNC") == "true",
+		TruncateCorruptWAL:  truncateWAL,
+		MaxDiskUsagePercent: maxDiskUsage,
+		Logger:              logger,
+		UnsafeDisableFsync:  os.Getenv("TS_UNSAFE_DISABLE_FSYNC") == "true",
 	}
 
 	s := &Store{
@@ -563,16 +563,16 @@ func (s *Store) Stats() StoreStats {
 	}
 
 	return StoreStats{
-		ActiveTxs:    s.DB.ActiveTransactionCount(),
-		Uptime:       time.Since(s.startTime).Round(time.Second).String(),
-		Offset:       int64(head),
-		Conflicts:    s.DB.GetConflicts(),
-		ReplicaLag:   minLag,
-		WALFiles:     1,
-		WALSize:      logical,
-		VLogFiles:    0,
-		VLogSize:     allocated,
-		KeyCount: keyCount,
+		ActiveTxs:  s.DB.ActiveTransactionCount(),
+		Uptime:     time.Since(s.startTime).Round(time.Second).String(),
+		Offset:     int64(head),
+		Conflicts:  s.DB.GetConflicts(),
+		ReplicaLag: minLag,
+		WALFiles:   1,
+		WALSize:    logical,
+		VLogFiles:  0,
+		VLogSize:   allocated,
+		KeyCount:   keyCount,
 	}
 }
 

@@ -461,4 +461,3 @@ func TestDB_RunAutoCheckpoint(t *testing.T) {
 		t.Error("AutoCheckpoint did not update lastCkptOpID")
 	}
 }
-

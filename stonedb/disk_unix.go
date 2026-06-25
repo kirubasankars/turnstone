@@ -29,4 +29,3 @@ func getDiskUsage(path string) (float64, error) {
 	used := total - free
 	return (float64(used) / float64(total)) * 100.0, nil
 }
-

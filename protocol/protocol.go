@@ -26,22 +26,22 @@ const (
 
 // OpCodes define the available commands in the TurnstoneDB wire protocol.
 const (
-	OpCodePing       uint8 = 0x01
-	OpCodeGet        uint8 = 0x02
-	OpCodeSet        uint8 = 0x03
-	OpCodeDel        uint8 = 0x04
-	OpCodeSelect     uint8 = 0x05
-	OpCodeMGet       uint8 = 0x06
-	OpCodeMSet       uint8 = 0x07
-	OpCodeMDel       uint8 = 0x08
-	OpCodeBegin      uint8 = 0x10
-	OpCodeCommit     uint8 = 0x11
-	OpCodeAbort      uint8 = 0x12
-	OpCodeStat       uint8 = 0x20
-	OpCodeReplicaOf  uint8 = 0x32
-	OpCodePromote    uint8 = 0x34
-	OpCodeStepDown uint8 = 0x35
-	OpCodeFlushDB  uint8 = 0x37 // Wipe Database
+	OpCodePing      uint8 = 0x01
+	OpCodeGet       uint8 = 0x02
+	OpCodeSet       uint8 = 0x03
+	OpCodeDel       uint8 = 0x04
+	OpCodeSelect    uint8 = 0x05
+	OpCodeMGet      uint8 = 0x06
+	OpCodeMSet      uint8 = 0x07
+	OpCodeMDel      uint8 = 0x08
+	OpCodeBegin     uint8 = 0x10
+	OpCodeCommit    uint8 = 0x11
+	OpCodeAbort     uint8 = 0x12
+	OpCodeStat      uint8 = 0x20
+	OpCodeReplicaOf uint8 = 0x32
+	OpCodePromote   uint8 = 0x34
+	OpCodeStepDown  uint8 = 0x35
+	OpCodeFlushDB   uint8 = 0x37 // Wipe Database
 
 	OpCodeReplHello uint8 = 0x50
 	OpCodeReplAck   uint8 = 0x52
