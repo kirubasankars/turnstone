@@ -45,8 +45,8 @@ const (
 	OpCodeStat             = 0x20
 	OpCodeReplicaOf        = 0x32
 	OpCodePromote          = 0x34
-	OpCodeStepDown = 0x35
-	OpCodeFlushDB  = 0x37
+	OpCodeStepDown         = 0x35
+	OpCodeFlushDB          = 0x37
 	OpCodeReplHello        = 0x50
 	OpCodeReplAck          = 0x52
 	OpCodeReplSnapshot     = 0x53
