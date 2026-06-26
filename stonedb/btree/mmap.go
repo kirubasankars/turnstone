@@ -6,7 +6,6 @@
 package btree
 
 import (
-	"fmt"
 	"os"
 	"syscall"
 )
@@ -26,7 +25,6 @@ const (
 	metaNumPagesOff  = 20
 	metaFreeHeadOff  = 28
 	metaLeftLeafOff  = 36
-	metaHeaderSize   = 44
 	leafHeaderSize   = 19
 	internalHdrSize  = 19
 	pageTypeLeaf     = 1
@@ -187,11 +185,4 @@ func cloneBytes(b []byte) []byte {
 	out := make([]byte, len(b))
 	copy(out, b)
 	return out
-}
-
-func btreeErr(err error) error {
-	if err == nil {
-		return nil
-	}
-	return fmt.Errorf("btree: %w", err)
 }
