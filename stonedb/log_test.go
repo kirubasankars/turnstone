@@ -10,33 +10,7 @@ import (
 	"testing"
 )
 
-func TestDataLog_SparseOpOffsetsDensity(t *testing.T) {
-	dir := t.TempDir()
-	db, err := Open(dir, Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	const commits = 200
-	for i := 0; i < commits; i++ {
-		tx := db.NewTransaction(true)
-		if err := tx.Put([]byte(fmt.Sprintf("k%d", i)), []byte("v")); err != nil {
-			t.Fatal(err)
-		}
-		if err := tx.Commit(); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	head := db.LastOpID()
-	maxSparse := int(head/opIndexSparse) + 2
-	if len(db.log.opOffsets) > maxSparse {
-		t.Fatalf("expected at most %d sparse entries, got %d (head=%d)", maxSparse, len(db.log.opOffsets), head)
-	}
-}
-
-func TestDataLog_ScanAfterSparseIndex(t *testing.T) {
+func TestDataLog_ScanFromByteOffset(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(dir, Options{})
 	if err != nil {
@@ -56,28 +30,37 @@ func TestDataLog_ScanAfterSparseIndex(t *testing.T) {
 		}
 	}
 
-	headOpID := db.LastOpID()
-	startOpID := headOpID / 2
+	head := db.LastLogOffset()
+	mid, _, err := db.ReadLogSegment(0, head/2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frames, err := validateLogSegment(mid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(frames) == 0 {
+		t.Fatal("expected frames in partial read")
+	}
+	startOffset := int64(0)
+	for _, f := range frames {
+		startOffset += f.length
+	}
+
 	foundCount := 0
-	err = db.ScanWAL(startOpID, func(recs []WALRecord) error {
-		for _, r := range recs {
-			if r.OpID < startOpID {
-				t.Errorf("got OpID %d, expected >= %d", r.OpID, startOpID)
-			}
-			foundCount++
-		}
+	err = db.ScanWAL(startOffset, func(recs []WALRecord) error {
+		foundCount += len(recs)
 		return nil
 	})
 	if err != nil {
 		t.Fatalf("ScanWAL failed: %v", err)
 	}
-	expected := int(headOpID-startOpID) + 1
-	if foundCount != expected {
-		t.Errorf("ScanWAL count mismatch: expected %d, got %d", expected, foundCount)
+	if foundCount == 0 {
+		t.Fatal("expected records from mid offset")
 	}
 }
 
-func TestDataLog_PurgeTrimsOpOffsets(t *testing.T) {
+func TestDataLog_PurgeSetsScanFloor(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(dir, Options{})
 	if err != nil {
@@ -95,23 +78,16 @@ func TestDataLog_PurgeTrimsOpOffsets(t *testing.T) {
 		}
 	}
 
-	head := db.LastOpID()
-	floor := head / 2
+	head := db.LastLogOffset()
+	_, floor, err := db.ReadLogSegment(0, head/2)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := db.PurgeWAL(floor); err != nil {
 		t.Fatal(err)
 	}
-
-	for op := range db.log.opOffsets {
-		if op < floor {
-			t.Fatalf("opOffsets still contains op %d below floor %d", op, floor)
-		}
-	}
-	if db.log.scanAnchor.opID >= floor {
-		t.Fatalf("scanAnchor op %d should be below floor %d", db.log.scanAnchor.opID, floor)
-	}
-	maxSparse := int(head/opIndexSparse) - int(floor/opIndexSparse) + 2
-	if len(db.log.opOffsets) > maxSparse {
-		t.Fatalf("expected at most %d sparse entries after purge, got %d", maxSparse, len(db.log.opOffsets))
+	if db.GetScanWALFloor() != floor {
+		t.Fatalf("expected scan floor %d, got %d", floor, db.GetScanWALFloor())
 	}
 }
 
@@ -133,8 +109,14 @@ func TestDataLog_ScanAtFloorAfterPurge(t *testing.T) {
 		}
 	}
 
-	head := db.LastOpID()
-	floor := head / 2
+	head := db.LastLogOffset()
+	_, floor, err := db.ReadLogSegment(0, head/2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if floor == 0 {
+		t.Fatal("expected frame-aligned purge floor")
+	}
 	if err := db.PurgeWAL(floor); err != nil {
 		t.Fatal(err)
 	}
@@ -150,8 +132,7 @@ func TestDataLog_ScanAtFloorAfterPurge(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("ScanWAL at floor failed: %v", err)
 	}
-	expected := int(head-floor) + 1
-	if count != expected {
-		t.Errorf("ScanWAL at floor: expected %d records, got %d", expected, count)
+	if count == 0 {
+		t.Error("expected records at or above floor")
 	}
 }

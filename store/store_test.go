@@ -215,9 +215,9 @@ func TestStore_Replication_Quorum(t *testing.T) {
 	// 5. Ack the write.
 	// Under eager logging, a single-entry transaction writes multiple WAL
 	// records (BEGIN, SET, COMMIT), so the quorum target is the COMMIT
-	// record's opID, not a fixed LogSeq of 1. Query the actual opID the
-	// write is waiting on before acking it.
-	s.UpdateReplicaLogSeq("replica-1", s.DB.LastOpID())
+	// record's end offset, not a fixed LogSeq of 1. Query the actual offset
+	// the write is waiting on before acking it.
+	s.UpdateReplicaLogSeq("replica-1", s.LastLogOffset())
 
 	// 5. Verify Unblock
 	// Now that quorum is met, the write should complete successfully.
@@ -244,8 +244,8 @@ func TestStore_Replication_ApplyBatch(t *testing.T) {
 
 	// Simulate incoming batch from Primary
 	entries := []protocol.LogEntry{
-		{LogSeq: 100, OpCode: protocol.OpJournalSet, Key: []byte("k1"), Value: []byte("v1")},
-		{LogSeq: 101, OpCode: protocol.OpJournalSet, Key: []byte("k2"), Value: []byte("v2")},
+		{OpCode: protocol.OpJournalSet, Key: []byte("k1"), Value: []byte("v1")},
+		{OpCode: protocol.OpJournalSet, Key: []byte("k2"), Value: []byte("v2")},
 	}
 
 	if err := s.ApplyBatch(entries); err != nil {
@@ -346,7 +346,7 @@ func TestStore_ReplicaLag(t *testing.T) {
 		{Key: []byte("k1"), Value: []byte("v1"), OpCode: protocol.OpJournalSet},
 	}
 	s.ApplyBatch(entries)
-	head := s.DB.LastOpID()
+	head := s.LastLogOffset()
 
 	// Register Replica at head
 	s.RegisterReplica("r1", head, "server")
@@ -357,7 +357,7 @@ func TestStore_ReplicaLag(t *testing.T) {
 
 	// Write more data
 	s.ApplyBatch(entries)
-	newHead := s.DB.LastOpID()
+	newHead := s.LastLogOffset()
 
 	// Check Lag (should be newHead - head)
 	stats = s.Stats()

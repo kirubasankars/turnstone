@@ -32,7 +32,7 @@ LICENSE file in the root of this source tree.
 | Storage | Single append-only `data.log` + in-memory segmented hash index arena |
 | Durability | Eager append on `SET`/`DEL`; group fsync on `COMMIT` |
 | Security | mTLS on all connections; RBAC via X.509 certificate Organization |
-| Replication | Async or sync (quorum ack); timeline fork on `promote` |
+| Replication | Async or sync (quorum ack) |
 | Observability | Prometheus metrics on `:9090` |
 
 ---
@@ -108,7 +108,7 @@ Admin commands (via `turnstone-cli -admin`):
 | --- | --- |
 | `replicaof <host:port> <db>` | Follow a remote primary (REPLICA state) |
 | `stepdown` | Drain writes, sync followers, return to UNDEFINED |
-| `promote [min_replicas]` | Become primary; bumps timeline ID; optional sync quorum |
+| `promote [min_replicas]` | Become primary; optional sync quorum |
 
 ### Manual failover (A → B)
 
@@ -116,7 +116,7 @@ Admin commands (via `turnstone-cli -admin`):
 2. **Node B:** `select 1` → `promote`
 3. **Node A:** `select 1` → `replicaof <B>:6379 1`
 
-There is no automatic leader election. Timelines record history forks so promotion after a split is safe, but an operator must invoke it.
+There is no automatic leader election. An operator must invoke failover.
 
 ---
 
@@ -163,19 +163,19 @@ sequenceDiagram
     participant Index
     participant Clog
     Client->>Tx: BEGIN
-    Tx->>Log: BEGIN xid,op
+    Tx->>Log: BEGIN xid
     Client->>Tx: SET k v
-    Tx->>Log: SET xid,op,k,v
+    Tx->>Log: SET xid,k,v
     Tx->>Index: xmin=xid
     Client->>Tx: COMMIT
-    Tx->>Log: COMMIT xid,op
+    Tx->>Log: COMMIT xid
     Note over Log: group fsync
     Tx->>Clog: committed
 ```
 
 Notable semantics:
 
-- **`xid` at `BEGIN`**, **`opID` per record** — `opID` is the replication cursor.
+- **`xid` at `BEGIN`** — replication uses the leader `data.log` byte offset (exclusive end) as the LSN for handshake, acks, and retention.
 - **First-writer-wins** — `SET`/`DEL` takes a NOWAIT key lock; conflicts return immediately, no deadlock.
 - **Read-set validation at `COMMIT`** — detects stale reads / write skew under snapshot isolation.
 - **Read-your-own-writes** — uncommitted versions with `xmin == my xid` are visible inside the transaction.
