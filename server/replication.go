@@ -39,7 +39,6 @@ func recoverAndLog(logger *slog.Logger, name string) {
 
 var (
 	MaxReplicationBatchSize = 1 * 1024 * 1024 // 1MB
-	ErrBatchFull            = errors.New("replication batch full")
 )
 
 var (
@@ -61,8 +60,6 @@ func setReplicaWriteTimeout(d time.Duration) {
 }
 
 const (
-	// SnapshotRateLimit caps the full-sync bandwidth to prevent disk/network thrashing (32MB/s).
-	SnapshotRateLimit = 32 * 1024 * 1024
 	// MaxReplAckSize bounds the ACK-reader's per-frame allocation. A real
 	// ACK body is [DBNameLen(4)][DBName][LogID(8)]; 64KB is far more than
 	// any legitimate db name could need.
@@ -152,6 +149,14 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 		logID := binary.BigEndian.Uint64(payload[cursor : cursor+8])
 		cursor += 8
 
+		if storePtr, ok := s.stores[name]; ok {
+			if !storePtr.IsValidReplicationCursor(logID) {
+				st.logger.Warn("Replica handshake rejected: invalid cursor", "db", name, "cursor", logID, "head", storePtr.LastLogOffset())
+				_ = s.writeBinaryResponse(conn, protocol.ResStatusErr, []byte(fmt.Sprintf("Invalid replication cursor for DB '%s'", name)))
+				return
+			}
+		}
+
 		// Check if this server is already a replica for this database.
 		if s.replManager != nil && s.replManager.IsReplicating(name) {
 			st.logger.Warn("Rejected downstream replication request (cascading disabled on replicas)", "db", name)
@@ -189,6 +194,11 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 			_ = s.writeBinaryResponse(conn, protocol.ResStatusErr, []byte(fmt.Sprintf("Unknown database: %s", name)))
 			return
 		}
+	}
+
+	if err := s.writeBinaryResponse(conn, protocol.ResStatusOK, nil); err != nil {
+		st.logger.Warn("Failed to send replica handshake OK", "err", err)
+		return
 	}
 
 	// Create a merged kill channel. If any store triggers a kill, we drop the connection.
@@ -363,129 +373,12 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 	}
 }
 
-func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh chan<- replPacket, done <-chan struct{}, logger *slog.Logger) error {
-	currentLogID := minLogID
-
-	// 0. Send Initial Timeline
-	currentTL := st.DB.CurrentTimeline()
-	tlBuf := make([]byte, 8)
-	binary.BigEndian.PutUint64(tlBuf, currentTL)
-	select {
-	case outCh <- replPacket{
-		dbName: name,
-		opCode: protocol.OpCodeReplTimeline,
-		data:   tlBuf,
-		count:  0,
-	}:
-		logger.Debug("Sent initial timeline to replica", "db", name, "timeline", currentTL)
-	case <-done:
-		return nil
-	}
-
-	// Retry loop for WAL Streaming vs Snapshot Fallback
-	for {
-		// 1. Snapshot Check / WAL Availability
-		// Use the Store method to check if we are out of sync with the WAL
-		snapshotRequired, err := st.IsSnapshotRequired(currentLogID)
-		if err != nil {
-			return err
-		}
-
-		if snapshotRequired {
-			// INFO: Snapshot required
-			logger.Info("Replica lag exceeds WAL retention. Starting Full Snapshot.", "db", name, "req_seq", currentLogID, "head", st.LastOpID())
-
-			// Rate Limiting State
-			var bytesSent int64
-			startTime := time.Now()
-
-			snapTxID, snapOpID, snapErr := st.StreamSnapshot(func(batch []stonedb.SnapshotEntry) error {
-				var buf bytes.Buffer
-				for _, e := range batch {
-					binary.Write(&buf, binary.BigEndian, uint32(len(e.Key)))
-					buf.Write(e.Key)
-					binary.Write(&buf, binary.BigEndian, uint32(len(e.Value)))
-					buf.Write(e.Value)
-				}
-
-				// Rate Limiting Logic:
-				// Calculate expected duration for bytes sent so far.
-				// If actual duration is less, sleep the difference.
-				payloadSize := int64(buf.Len())
-				bytesSent += payloadSize
-				expectedDuration := time.Duration((float64(bytesSent) / float64(SnapshotRateLimit)) * float64(time.Second))
-				if elapsed := time.Since(startTime); elapsed < expectedDuration {
-					// Throttle
-					time.Sleep(expectedDuration - elapsed)
-				}
-
-				select {
-				case outCh <- replPacket{
-					dbName: name,
-					opCode: protocol.OpCodeReplSnapshot,
-					data:   buf.Bytes(),
-					count:  uint32(len(batch)),
-				}:
-				case <-done:
-					return io.EOF
-				}
-				return nil
-			})
-
-			if snapErr != nil {
-				return fmt.Errorf("snapshot failed: %w", snapErr)
-			}
-
-			doneBuf := make([]byte, 16)
-			binary.BigEndian.PutUint64(doneBuf[0:], snapTxID)
-			binary.BigEndian.PutUint64(doneBuf[8:], snapOpID)
-
-			select {
-			case outCh <- replPacket{
-				dbName: name,
-				opCode: protocol.OpCodeReplSnapshotDone,
-				data:   doneBuf,
-				count:  0,
-			}:
-			case <-done:
-				return nil
-			}
-			// INFO: Snapshot done
-			logger.Info("Snapshot complete. Resuming WAL stream.", "db", name, "resume_seq", snapOpID)
-			currentLogID = snapOpID
-
-			// Resend Timeline after Snapshot
-			postSnapTL := make([]byte, 8)
-			binary.BigEndian.PutUint64(postSnapTL, st.DB.CurrentTimeline())
-			select {
-			case outCh <- replPacket{
-				dbName: name,
-				opCode: protocol.OpCodeReplTimeline,
-				data:   postSnapTL,
-				count:  0,
-			}:
-			case <-done:
-				return nil
-			}
-		}
-
-		// 2. WAL Streaming Loop
-		if err := s.runWALStreamLoop(name, st, currentLogID, outCh, done, logger); err != nil {
-			// If error is OUT_OF_SYNC or ErrLogUnavailable, break inner loop and retry outer loop (which will trigger snapshot)
-			// This handles the race condition where WAL was purged between check and stream.
-			if err.Error() == "OUT_OF_SYNC" || errors.Is(err, stonedb.ErrLogUnavailable) {
-				logger.Warn("WAL unavailable during stream, falling back to snapshot", "db", name)
-				continue
-			}
-			return err
-		}
-		return nil
-	}
+func (s *Server) streamDB(name string, st *store.Store, startOffset uint64, outCh chan<- replPacket, done <-chan struct{}, logger *slog.Logger) error {
+	return s.runWALStreamLoop(name, st, startOffset, outCh, done, logger)
 }
 
-func (s *Server) runWALStreamLoop(name string, st *store.Store, startLogID uint64, outCh chan<- replPacket, done <-chan struct{}, logger *slog.Logger) error {
-	currentLogID := startLogID
-	currentByteOffset, _ := st.ByteOffsetForReplicationResume(startLogID)
+func (s *Server) runWALStreamLoop(name string, st *store.Store, startOffset uint64, outCh chan<- replPacket, done <-chan struct{}, logger *slog.Logger) error {
+	currentByteOffset := int64(startOffset)
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -496,22 +389,6 @@ func (s *Server) runWALStreamLoop(name string, st *store.Store, startLogID uint6
 		select {
 		case <-done:
 			return nil
-
-		case <-st.TimelineSignal():
-			logger.Debug("Broadcasting new timeline", "db", name)
-			currentTL := st.DB.CurrentTimeline()
-			tlBuf := make([]byte, 8)
-			binary.BigEndian.PutUint64(tlBuf, currentTL)
-			select {
-			case outCh <- replPacket{
-				dbName: name,
-				opCode: protocol.OpCodeReplTimeline,
-				data:   tlBuf,
-				count:  0,
-			}:
-			case <-done:
-				return nil
-			}
 
 		case <-safePointTicker.C:
 			minSeq := st.GetMinSlotLogSeq()
@@ -548,10 +425,14 @@ func (s *Server) runWALStreamLoop(name string, st *store.Store, startLogID uint6
 			}
 
 		case <-ticker.C:
-			segData, nextOff, lastOpID, err := st.ReadLogSegment(currentByteOffset, int64(MaxReplicationBatchSize))
+			head := st.LastLogOffset()
+			if uint64(currentByteOffset) >= head {
+				continue
+			}
+			segData, nextOff, err := st.ReadLogSegment(currentByteOffset, int64(MaxReplicationBatchSize))
 			if err != nil {
-				if errors.Is(err, stonedb.ErrLogUnavailable) && currentLogID < st.LastOpID() {
-					return errors.New("OUT_OF_SYNC")
+				if errors.Is(err, stonedb.ErrLogUnavailable) {
+					return fmt.Errorf("WAL unavailable at offset %d: %w", currentByteOffset, err)
 				}
 				logger.Error("Log segment read error", "db", name, "err", err)
 				time.Sleep(100 * time.Millisecond)
@@ -573,9 +454,6 @@ func (s *Server) runWALStreamLoop(name string, st *store.Store, startLogID uint6
 					return nil
 				}
 				currentByteOffset = nextOff
-				if lastOpID > 0 {
-					currentLogID = lastOpID
-				}
 			}
 		}
 	}

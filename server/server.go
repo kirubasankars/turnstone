@@ -657,9 +657,9 @@ func (s *Server) handleCommit(w net.Conn, st *connState) {
 	}
 	// Wait for Quorum if required
 	if st.db.MinReplicas() > 0 {
-		// Wait for the latest OpID (which includes the tx we just committed)
-		lastOpID := st.db.LastOpID()
-		if err := s.waitForQuorumOrDisconnect(w, st.db, lastOpID); err != nil {
+		// Wait for replicas to ack the commit's end byte offset.
+		commitEndOffset := st.db.LastLogOffset()
+		if err := s.waitForQuorumOrDisconnect(w, st.db, commitEndOffset); err != nil {
 			s.logger.Warn("Commit succeeded locally but quorum wait failed", "err", err)
 			_ = s.writeBinaryResponse(w, protocol.ResStatusServerBusy, []byte(err.Error()))
 			return
@@ -677,7 +677,7 @@ func (s *Server) handleCommit(w net.Conn, st *connState) {
 // timeout; a burst of such abandoned commits during an outage can exhaust
 // maxConns even though none of those clients are still waiting on a
 // response.
-func (s *Server) waitForQuorumOrDisconnect(conn net.Conn, st *store.Store, lastOpID uint64) error {
+func (s *Server) waitForQuorumOrDisconnect(conn net.Conn, st *store.Store, commitEndOffset uint64) error {
 	cancel := make(chan struct{})
 	stop := make(chan struct{})
 	defer close(stop)
@@ -698,7 +698,7 @@ func (s *Server) waitForQuorumOrDisconnect(conn net.Conn, st *store.Store, lastO
 		}
 	}()
 
-	return st.WaitForQuorum(lastOpID, 0, cancel)
+	return st.WaitForQuorum(commitEndOffset, 0, cancel)
 }
 
 func (s *Server) handleAbort(w io.Writer, st *connState) {
@@ -1105,6 +1105,13 @@ func (s *Server) handleReplicaOf(w io.Writer, payload []byte, st *connState) {
 	// INFO: Significant role change
 	st.logger.Info("Starting replication (Transition to REPLICA)", "db", st.dbName, "source", addr, "remote_db", remoteDB)
 
+	// Wipe local state so physical catch-up streams from offset 0 with a clean WAL.
+	if err := st.db.Reset(); err != nil {
+		st.logger.Error("Failed to reset database before replication", "err", err)
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte(fmt.Sprintf("reset failed: %v", err)))
+		return
+	}
+
 	// Transition State
 	// We optimistically set state to REPLICA to allow the handshake (which might check state),
 	// but we must revert if the handshake fails.
@@ -1202,13 +1209,13 @@ func (s *Server) handleStepDown(w io.Writer, st *connState) {
 		}
 
 		// State 3: Propagate changes to Replicas
-		// Wait for all replicas to acknowledge the latest OpID
+		// Wait for all replicas to acknowledge the latest log offset
 		st.logger.Info("Waiting for replicas to catch up...", "db", st.dbName)
 		if err := st.db.WaitForReplication(5 * time.Second); err != nil {
 			st.logger.Warn("Timeout waiting for replication sync", "err", err)
 		}
 
-		// State 4: Send Safe OpID (Trigger SafePoint Broadcast)
+		// State 4: Send SafePoint (Trigger SafePoint Broadcast)
 		st.logger.Info("Broadcasting final safe point...", "db", st.dbName)
 		st.db.TriggerSafePoint()
 		// Give a small moment for the broadcast loop to pick it up and write to network

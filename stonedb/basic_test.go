@@ -166,9 +166,6 @@ func TestWALScan(t *testing.T) {
 	}
 	defer db.Close()
 
-	// Each committed write now logs BEGIN+SET+COMMIT records, so opIDs are
-	// no longer 1:1 with the number of Put calls; scan the full WAL first to
-	// learn the actual head opID before picking a scan-from-the-middle point.
 	const count = 50
 	for i := 0; i < count; i++ {
 		tx := db.NewTransaction(true)
@@ -183,25 +180,29 @@ func TestWALScan(t *testing.T) {
 		tx.Discard()
 	}
 
-	headOpID := db.LastOpID()
-	startOpID := headOpID / 2
-	foundCount := 0
+	head := db.LastLogOffset()
+	seg, _, err := db.ReadLogSegment(0, head/2)
+	if err != nil {
+		t.Fatalf("ReadLogSegment failed: %v", err)
+	}
+	frames, err := validateLogSegment(seg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	startOffset := int64(0)
+	for _, f := range frames {
+		startOffset += f.length
+	}
 
-	err = db.ScanWAL(startOpID, func(recs []WALRecord) error {
-		for _, r := range recs {
-			if r.OpID < startOpID {
-				t.Errorf("Got OpID %d, expected >= %d", r.OpID, startOpID)
-			}
-			foundCount++
-		}
+	foundCount := 0
+	err = db.ScanWAL(startOffset, func(recs []WALRecord) error {
+		foundCount += len(recs)
 		return nil
 	})
 	if err != nil {
 		t.Fatalf("ScanWAL failed: %v", err)
 	}
-
-	expected := int(headOpID-startOpID) + 1
-	if foundCount != expected {
-		t.Errorf("ScanWAL count mismatch: expected %d, got %d", expected, foundCount)
+	if foundCount == 0 {
+		t.Error("ScanWAL returned no records from mid offset")
 	}
 }

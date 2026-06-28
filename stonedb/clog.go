@@ -78,7 +78,7 @@ func (db *DB) abortTransaction(tx *Transaction) {
 
 		db.txMu.Lock()
 		delete(db.activeXids, tx.xid)
-		delete(db.beginOpIDs, tx.xid)
+		delete(db.beginOffsets, tx.xid)
 		delete(db.txStartTimes, tx.xid)
 		for k := range tx.keyLocks {
 			if o, ok := db.keyLocks[k]; ok && o == tx.xid {

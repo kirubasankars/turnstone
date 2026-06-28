@@ -79,7 +79,6 @@ type Store struct {
 
 	// Coordination for StepDown
 	safePointCh chan struct{} // Signal to force broadcast of SafePoint
-	timelineCh  chan struct{} // Signal to force broadcast of TimelineID
 
 	// Leader-Propagated Safety Barrier
 	// If we are a follower, the leader tells us what the global minimum sequence is.
@@ -137,7 +136,6 @@ func NewStore(ctx context.Context, dir string, logger *slog.Logger, minReplicas 
 		dbOpts:         opts,
 		state:          StateUndefined,
 		safePointCh:    make(chan struct{}),
-		timelineCh:     make(chan struct{}),
 		replicaTimeout: 1 * time.Minute, // Default strict timeout for lagging replicas
 		closeCh:        make(chan struct{}),
 	}
@@ -211,35 +209,36 @@ func (s *Store) Reset() error {
 	return nil
 }
 
-// IsSnapshotRequired determines if a replica needs a full snapshot.
-// Returns true if the requested log sequence (plus one) is no longer available in the WAL.
-func (s *Store) IsSnapshotRequired(reqLogID uint64) (bool, error) {
+// IsValidReplicationCursor reports whether offset is a valid Hello resume point
+// for physical WAL streaming on this node.
+func (s *Store) IsValidReplicationCursor(offset uint64) bool {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
-
-	lastOp := s.DB.LastOpID()
-
-	// If up to date or ahead, no snapshot required.
-	if reqLogID >= lastOp {
-		return false, nil
+	if s.DB == nil {
+		return false
 	}
-
-	// We are behind. Check if we can stream from WAL.
-	err := s.DB.ScanWAL(reqLogID+1, func([]stonedb.WALRecord) error { return nil })
-
-	if err == stonedb.ErrLogUnavailable {
-		return true, nil
+	head := s.DB.LastLogOffset()
+	cursor := int64(offset)
+	if cursor < 0 {
+		return false
 	}
-	if err != nil {
-		return false, err
+	if cursor == 0 || uint64(cursor) == uint64(head) {
+		return true
 	}
-
-	return false, nil
+	if cursor > head {
+		return false
+	}
+	return s.DB.IsValidFrameOffset(cursor)
 }
 
 // SetLeaderSafeSeq updates the retention barrier received from the upstream leader.
 func (s *Store) SetLeaderSafeSeq(seq uint64) {
 	atomic.StoreUint64(&s.leaderSafeSeq, seq)
+}
+
+// GetLeaderSafeSeq returns the leader-propagated retention barrier.
+func (s *Store) GetLeaderSafeSeq() uint64 {
+	return atomic.LoadUint64(&s.leaderSafeSeq)
 }
 
 // GetMinSlotLogSeq calculates the minimum LogSeq required by ANY registered client.
@@ -294,10 +293,10 @@ func (s *Store) runReplicaEviction() {
 
 func (s *Store) evictZombieReplicas() {
 	// Get current head to determine if replicas are actually lagging.
-	// Goes through the dbMu-guarded wrapper (not s.DB.LastOpID() directly):
-	// s.DB itself can be swapped concurrently by Store.Reset(), which holds
-	// dbMu.Lock() while doing so.
-	headSeq := s.LastOpID()
+	// Goes through the dbMu-guarded wrapper (not s.DB.LastLogOffset()
+	// directly): s.DB itself can be swapped concurrently by Store.Reset(),
+	// which holds dbMu.Lock() while doing so.
+	headSeq := s.LastLogOffset()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -348,19 +347,25 @@ func (s *Store) EnforceRetentionPolicy() {
 	leaderSafeSeq := atomic.LoadUint64(&s.leaderSafeSeq)
 
 	// 3. Constraint from Local Disk (Checkpoint)
-	lastCkpt := s.DB.GetLastCheckpointOpID()
+	lastCkpt := s.DB.GetLastCheckpointOffset()
 
 	safeID := lastCkpt
 	constraintSource := "checkpoint"
 
-	if minReplicaSeq < safeID {
-		safeID = minReplicaSeq
-		constraintSource = "replica_lag"
+	if minReplicaSeq != math.MaxUint64 {
+		minReplica := int64(minReplicaSeq)
+		if minReplica < safeID {
+			safeID = minReplica
+			constraintSource = "replica_lag"
+		}
 	}
 
-	if leaderSafeSeq < safeID {
-		safeID = leaderSafeSeq
-		constraintSource = "leader_constraint"
+	if leaderSafeSeq != math.MaxUint64 {
+		leaderSafe := int64(leaderSafeSeq)
+		if leaderSafe < safeID {
+			safeID = leaderSafe
+			constraintSource = "leader_constraint"
+		}
 	}
 
 	s.logger.Debug("Retention check",
@@ -371,7 +376,7 @@ func (s *Store) EnforceRetentionPolicy() {
 		"checkpoint", lastCkpt,
 	)
 
-	if safeID > 0 && safeID != math.MaxUint64 {
+	if safeID > 0 {
 		// Trigger purge
 		if err := s.DB.PurgeWAL(safeID); err != nil {
 			// Ignore closed errors if we are resetting
@@ -403,7 +408,7 @@ func (s *Store) ApplyBatch(entries []protocol.LogEntry) error {
 		}
 	}
 
-	var lastOpID uint64
+	var commitEndOffset uint64
 	err := func() error {
 		s.dbMu.RLock()
 		defer s.dbMu.RUnlock()
@@ -425,7 +430,7 @@ func (s *Store) ApplyBatch(entries []protocol.LogEntry) error {
 		if err := tx.Commit(); err != nil {
 			return err
 		}
-		lastOpID = s.DB.LastOpID()
+		commitEndOffset = uint64(s.DB.LastLogOffset())
 		return nil
 	}()
 	if err != nil {
@@ -438,49 +443,24 @@ func (s *Store) ApplyBatch(entries []protocol.LogEntry) error {
 		// every other reader/writer (including Store.Reset's dbMu.Lock())
 		// for as long as replicas are catching up -- a single slow write
 		// could otherwise freeze the whole store.
-		return s.WaitForQuorum(lastOpID, 0, nil)
+		return s.WaitForQuorum(commitEndOffset, 0, nil)
 	}
 
 	return nil
 }
 
-// ApplyRecord applies a single replicated WAL record (Begin/Set/Delete/Commit/Abort)
-// directly to the engine, preserving the leader's xid/opID and eager
-// visibility semantics.
-func (s *Store) ApplyRecord(rec stonedb.WALRecord) error {
-	s.dbMu.RLock()
-	defer s.dbMu.RUnlock()
-	return s.DB.ApplyRecord(rec)
-}
-
 // ApplyLogSegment appends a raw, statement-aligned WAL byte range.
-func (s *Store) ApplyLogSegment(data []byte) (uint64, error) {
+func (s *Store) ApplyLogSegment(data []byte) (int64, error) {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 	return s.DB.ApplyLogSegment(data)
 }
 
 // ReadLogSegment reads complete WAL frames from a byte offset on the leader log.
-func (s *Store) ReadLogSegment(startOffset int64, maxBytes int64) ([]byte, int64, uint64, error) {
+func (s *Store) ReadLogSegment(startOffset int64, maxBytes int64) ([]byte, int64, error) {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 	return s.DB.ReadLogSegment(startOffset, maxBytes)
-}
-
-// ByteOffsetAfterOpID maps a replicated opID to the leader's byte offset.
-func (s *Store) ByteOffsetAfterOpID(opID uint64) (int64, bool) {
-	s.dbMu.RLock()
-	defer s.dbMu.RUnlock()
-	return s.DB.ByteOffsetAfterOpID(opID)
-}
-
-// ByteOffsetForReplicationResume returns the leader log byte offset to resume
-// streaming after the follower has applied lastAppliedOpID.
-func (s *Store) ByteOffsetForReplicationResume(lastAppliedOpID uint64) (int64, bool) {
-	if lastAppliedOpID == 0 {
-		return 0, true
-	}
-	return s.ByteOffsetAfterOpID(lastAppliedOpID)
 }
 
 // Get retrieves a value by key.
@@ -513,24 +493,14 @@ func (s *Store) Close() error {
 	return s.DB.Close()
 }
 
-// ScanWAL wrapper for thread safety
-func (s *Store) ScanWAL(startOpID uint64, fn func([]stonedb.WALRecord) error) error {
-	s.dbMu.RLock()
-	defer s.dbMu.RUnlock()
-	if s.DB == nil {
-		return stonedb.ErrDatabaseClosed
-	}
-	return s.DB.ScanWAL(startOpID, fn)
-}
-
-// LastOpID wrapper for thread safety
-func (s *Store) LastOpID() uint64 {
+// LastLogOffset returns the exclusive end of the local WAL (next byte to read).
+func (s *Store) LastLogOffset() uint64 {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 	if s.DB == nil {
 		return 0
 	}
-	return s.DB.LastOpID()
+	return uint64(s.DB.LastLogOffset())
 }
 
 // Stats returns usage statistics.
@@ -540,7 +510,7 @@ func (s *Store) Stats() StoreStats {
 
 	_, logical, allocated := s.DB.StorageStats()
 	keyCount, _ := s.DB.KeyCount()
-	head := s.DB.LastOpID()
+	head := s.LastLogOffset()
 
 	minLag := uint64(0)
 	first := true
@@ -856,20 +826,12 @@ func (s *Store) SetState(state string) {
 	s.cond.Broadcast()
 }
 
-// Promote promotes the database to a new timeline and sets state to Primary.
+// Promote sets the database state to Primary.
 func (s *Store) Promote() error {
-	s.dbMu.RLock()
-	err := s.DB.Promote()
-	s.dbMu.RUnlock()
-	if err != nil {
-		return err
-	}
 	// Reset leader constraint as we are now the leader
 	s.SetLeaderSafeSeq(math.MaxUint64)
 
-	s.TriggerTimelineUpdate()
 	s.SetState(StatePrimary)
-	// Also trigger safe point to ensure new timeline starts clean for watchers
 	s.TriggerSafePoint()
 	return nil
 }
@@ -894,27 +856,15 @@ func (s *Store) HealthyReplicaCount() int {
 	return count
 }
 
-// GetReplicaSignalChannel returns a channel that forces a SafePoint broadcast
+// SafePointSignal returns a channel that forces a SafePoint broadcast.
 func (s *Store) SafePointSignal() <-chan struct{} {
 	return s.safePointCh
-}
-
-func (s *Store) TimelineSignal() <-chan struct{} {
-	return s.timelineCh
 }
 
 // TriggerSafePoint signals replication streams to send a SafePoint immediately
 func (s *Store) TriggerSafePoint() {
 	select {
 	case s.safePointCh <- struct{}{}:
-	default:
-	}
-}
-
-// TriggerTimelineUpdate signals replication streams to send a TimelineID immediately
-func (s *Store) TriggerTimelineUpdate() {
-	select {
-	case s.timelineCh <- struct{}{}:
 	default:
 	}
 }
@@ -951,9 +901,9 @@ func (s *Store) AbortAllActiveWriteTransactions() {
 	s.DB.AbortAllActiveWriteTransactions()
 }
 
-// WaitForReplication blocks until all connected replicas have acked the current LastOpID.
+// WaitForReplication blocks until all connected replicas have acked the current log head.
 func (s *Store) WaitForReplication(timeout time.Duration) error {
-	lastOpID := s.LastOpID()
+	headOffset := s.LastLogOffset()
 	deadline := time.Now().Add(timeout)
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
@@ -965,7 +915,7 @@ func (s *Store) WaitForReplication(timeout time.Duration) error {
 			return nil // No replicas to wait for
 		}
 
-		if min >= lastOpID {
+		if min >= headOffset {
 			return nil
 		}
 

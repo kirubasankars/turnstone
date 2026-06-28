@@ -19,8 +19,6 @@ import (
 	"syscall"
 )
 
-const opIndexSparse = 1024
-
 // DataLog is a single append-only log file holding all records and values.
 type DataLog struct {
 	path        string
@@ -28,12 +26,6 @@ type DataLog struct {
 	writeOffset int64
 	mu          sync.RWMutex
 	logger      *slog.Logger
-
-	opOffsets  map[uint64]int64 // sparse opID -> frame start offset (every opIndexSparse ops)
-	scanAnchor struct {
-		opID   uint64
-		offset int64
-	}
 }
 
 func OpenDataLog(dir string, logger *slog.Logger) (*DataLog, error) {
@@ -58,7 +50,6 @@ func OpenDataLog(dir string, logger *slog.Logger) (*DataLog, error) {
 		file:        f,
 		writeOffset: stat.Size(),
 		logger:      logger,
-		opOffsets:   make(map[uint64]int64),
 	}, nil
 }
 
@@ -80,35 +71,30 @@ func (l *DataLog) strictSync() {
 	}
 }
 
-// AppendRecordsWithOpIDs assigns opIDs and appends frames. Returns opIDs and
-// the byte offset of each appended frame.
-func (l *DataLog) AppendRecordsWithOpIDs(nextOpID func() uint64, builders []func(uint64) []byte, sync bool) ([]uint64, []int64, error) {
+// AppendRecords appends frames and returns the byte offset of each frame start.
+func (l *DataLog) AppendRecords(builders []func() []byte, sync bool) ([]int64, error) {
 	if len(builders) == 0 {
-		return nil, nil, nil
+		return nil, nil
 	}
 
 	l.mu.Lock()
-	opIDs := make([]uint64, len(builders))
 	offsets := make([]int64, len(builders))
 
 	for i, build := range builders {
-		opID := nextOpID()
-		opIDs[i] = opID
-		payload := build(opID)
+		payload := build()
 		off := l.writeOffset
 		if err := l.writeFrameLocked(payload); err != nil {
 			l.mu.Unlock()
-			return nil, nil, err
+			return nil, err
 		}
 		offsets[i] = off
-		l.recordOpOffset(opID, off)
 	}
 	l.mu.Unlock()
 
 	if sync {
 		l.strictSync()
 	}
-	return opIDs, offsets, nil
+	return offsets, nil
 }
 
 func (l *DataLog) AppendReplicatedRecord(payload []byte, sync bool) (int64, error) {
@@ -117,9 +103,6 @@ func (l *DataLog) AppendReplicatedRecord(payload []byte, sync bool) (int64, erro
 	if err := l.writeFrameLocked(payload); err != nil {
 		l.mu.Unlock()
 		return 0, err
-	}
-	if opID, ok := peekOpID(payload); ok {
-		l.recordOpOffset(opID, off)
 	}
 	l.mu.Unlock()
 
@@ -174,8 +157,7 @@ func (l *DataLog) ReadValueAt(offset int64, valLen uint32) ([]byte, error) {
 const replayCancelCheckInterval = 1024
 
 // Replay scans the entire log, invoking onRecord for each valid frame.
-// Holes are skipped via SEEK_DATA. Returns max tx/op IDs seen.
-func (l *DataLog) Replay(ctx context.Context, truncateCorrupt bool, history []TimelineHistoryItem, onRecord func(rec WALRecord, span recordSpan)) error {
+func (l *DataLog) Replay(ctx context.Context, truncateCorrupt bool, onRecord func(rec WALRecord, span recordSpan)) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -192,7 +174,6 @@ func (l *DataLog) Replay(ctx context.Context, truncateCorrupt bool, history []Ti
 	if stat.Size() == 0 {
 		return nil
 	}
-	_ = history // timeline metadata is for replication; local replay includes all frames
 
 	pos, err := f.Seek(0, io.SeekStart)
 	if err != nil {
@@ -235,7 +216,6 @@ func (l *DataLog) Replay(ctx context.Context, truncateCorrupt bool, history []Ti
 			return fmt.Errorf("log corruption at offset %d: %w", pos, rerr)
 		}
 
-		l.recordOpOffset(rec.OpID, span.offset)
 		if onRecord != nil {
 			onRecord(rec, span)
 		}
@@ -274,23 +254,16 @@ func (l *DataLog) readFrameAt(f *os.File, offset, fileSize int64) (int64, WALRec
 		return offset, WALRecord{}, recordSpan{}, err
 	}
 	span := recordSpan{
-		offset:  offset,
-		length:  total,
-		opID:    rec.OpID,
-		xid:     rec.XID,
-		recType: rec.Type,
+		offset: offset,
+		length: total,
 	}
 	return offset + total, rec, span, nil
 }
 
-// Scan streams records from startOpID onward.
-func (l *DataLog) Scan(startOpID uint64, fn func([]WALRecord) error) error {
+// Scan streams records from startOffset onward (inclusive frame boundary).
+func (l *DataLog) Scan(startOffset int64, fn func([]WALRecord) error) error {
 	l.mu.RLock()
-	startOff, ok := l.findScanStartLocked(startOpID)
-	l.mu.RUnlock()
-	if !ok {
-		return ErrLogUnavailable
-	}
+	defer l.mu.RUnlock()
 
 	f, err := os.Open(l.path)
 	if err != nil {
@@ -303,8 +276,11 @@ func (l *DataLog) Scan(startOpID uint64, fn func([]WALRecord) error) error {
 		return err
 	}
 	fileSize := stat.Size()
+	if startOffset >= fileSize {
+		return nil
+	}
 
-	pos := startOff
+	pos := startOffset
 	for pos < fileSize {
 		next, err := f.Seek(pos, seekData)
 		if err != nil {
@@ -325,74 +301,32 @@ func (l *DataLog) Scan(startOpID uint64, fn func([]WALRecord) error) error {
 			}
 			return rerr
 		}
-		if rec.OpID >= startOpID {
-			if err := fn([]WALRecord{rec}); err != nil {
-				return err
-			}
+		if err := fn([]WALRecord{rec}); err != nil {
+			return err
 		}
 		pos = validEnd
 	}
 	return nil
 }
 
-func (l *DataLog) recordOpOffset(opID uint64, off int64) {
-	if opID%opIndexSparse == 0 {
-		l.opOffsets[opID] = off
+// IsFrameBoundary reports whether offset is a valid replication cursor:
+// 0, the exclusive end of the log (WriteOffset), or the start of a complete frame.
+func (l *DataLog) IsFrameBoundary(offset int64) bool {
+	if offset == 0 {
+		return true
 	}
-}
+	l.mu.RLock()
+	defer l.mu.RUnlock()
 
-// TrimOpOffsetsBelow drops sparse index entries below floor and retains the
-// largest (opID, offset) pair as scanAnchor for WAL seek after purge.
-func (l *DataLog) TrimOpOffsetsBelow(floor uint64) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	var bestBelowOp uint64
-	var bestBelowOff int64
-	foundBelow := false
-	for op, off := range l.opOffsets {
-		if op < floor {
-			if !foundBelow || op > bestBelowOp {
-				bestBelowOp = op
-				bestBelowOff = off
-				foundBelow = true
-			}
-			delete(l.opOffsets, op)
-		}
+	if offset == l.writeOffset {
+		return true
 	}
-	if foundBelow && bestBelowOp > l.scanAnchor.opID {
-		l.scanAnchor.opID = bestBelowOp
-		l.scanAnchor.offset = bestBelowOff
+	stat, err := l.file.Stat()
+	if err != nil || offset < 0 || offset >= stat.Size() {
+		return false
 	}
-}
-
-func (l *DataLog) findScanStartLocked(targetOpID uint64) (int64, bool) {
-	if off, ok := l.opOffsets[targetOpID]; ok {
-		return off, true
-	}
-	var bestOp uint64
-	var bestOff int64
-	found := false
-	for op, off := range l.opOffsets {
-		if op <= targetOpID {
-			if !found || op > bestOp {
-				bestOp = op
-				bestOff = off
-				found = true
-			}
-		}
-	}
-	if l.scanAnchor.opID > 0 && l.scanAnchor.opID <= targetOpID {
-		if !found || l.scanAnchor.opID > bestOp {
-			bestOp = l.scanAnchor.opID
-			bestOff = l.scanAnchor.offset
-			found = true
-		}
-	}
-	if found {
-		return bestOff, true
-	}
-	return 0, true
+	_, _, _, err = l.readFrameAt(l.file, offset, stat.Size())
+	return err == nil
 }
 
 func (l *DataLog) LogicalSize() int64 {

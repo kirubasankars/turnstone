@@ -210,7 +210,7 @@ func (rm *ReplicationManager) verifyHandshake(addr string, dbs []ReplicaSource) 
 	for _, cfg := range dbs {
 		var logID uint64
 		if st, ok := rm.stores[cfg.LocalDB]; ok {
-			logID = st.LastOpID()
+			logID = st.LastLogOffset()
 		}
 		binary.Write(buf, binary.BigEndian, uint32(len(cfg.RemoteDB)))
 		buf.WriteString(cfg.RemoteDB)
@@ -373,19 +373,6 @@ func readLenPrefixedString(buf []byte, cursor int) (string, int, bool) {
 	return string(buf[cursor : cursor+n]), cursor + n, true
 }
 
-// readLenPrefixedBytes is the []byte counterpart of readLenPrefixedString.
-func readLenPrefixedBytes(buf []byte, cursor int) ([]byte, int, bool) {
-	if cursor+4 > len(buf) {
-		return nil, cursor, false
-	}
-	n := int(binary.BigEndian.Uint32(buf[cursor : cursor+4]))
-	cursor += 4
-	if n < 0 || cursor+n > len(buf) {
-		return nil, cursor, false
-	}
-	return buf[cursor : cursor+n], cursor + n, true
-}
-
 // connectAndSync connects to the remote, sends Hello, and checks the response status.
 func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, dbs []ReplicaSource, logger *slog.Logger) error {
 	dialer := net.Dialer{Timeout: 5 * time.Second}
@@ -403,7 +390,6 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 	logger.Info("Connected to Leader", "db_count", len(dbs))
 
 	remoteToLocal := make(map[string][]string)
-	snapshotStarted := make(map[string]bool)
 
 	// Handshake
 	// Format: [Ver:4][IDLen:4][ID][NumDBs:4] ... [NameLen:4][Name][LogID:8]
@@ -416,7 +402,7 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 	for _, cfg := range dbs {
 		var logID uint64
 		if st, ok := rm.stores[cfg.LocalDB]; ok {
-			logID = st.LastOpID()
+			logID = st.LastLogOffset()
 		}
 		binary.Write(buf, binary.BigEndian, uint32(len(cfg.RemoteDB)))
 		buf.WriteString(cfg.RemoteDB)
@@ -459,10 +445,9 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 		}
 
 		// --- VERIFY CRC ---
-		// We expect CRC for Snapshot, SafePoint, Timeline, LogSegment
-		if opCode == protocol.OpCodeReplSnapshot ||
-			opCode == protocol.OpCodeReplSafePoint || opCode == protocol.OpCodeReplTimeline ||
-			opCode == protocol.OpCodeReplSnapshotDone || opCode == protocol.OpCodeReplLogSegment {
+		// We expect CRC for SafePoint and LogSegment
+		if opCode == protocol.OpCodeReplSafePoint ||
+			opCode == protocol.OpCodeReplLogSegment {
 
 			if len(payload) < 4 {
 				return fmt.Errorf("packet too short for crc")
@@ -505,133 +490,6 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 			continue
 		}
 
-		// --- Handle Timeline Update ---
-		if opCode == protocol.OpCodeReplTimeline {
-			cursor := 0
-			if cursor+4 > len(payload) {
-				continue
-			}
-			nLen := int(binary.BigEndian.Uint32(payload[cursor : cursor+4]))
-			cursor += 4
-			nEnd := cursor + nLen
-			if nEnd > len(payload) {
-				continue
-			}
-			remoteDBName := string(payload[cursor:nEnd])
-			cursor = nEnd
-			cursor += 4 // Skip Count/Reserved
-
-			if cursor+8 <= len(payload) {
-				tli := binary.BigEndian.Uint64(payload[cursor:])
-				if localDBNames, ok := remoteToLocal[remoteDBName]; ok {
-					for _, localDB := range localDBNames {
-						if st, ok := rm.stores[localDB]; ok {
-							if err := st.SetTimeline(tli); err != nil {
-								logger.Warn("Failed to set timeline", "db", localDB, "tli", tli, "err", err)
-							} else {
-								logger.Info("Updated timeline from leader", "db", localDB, "tli", tli)
-							}
-						}
-					}
-				}
-			}
-			continue
-		}
-
-		// --- Handle Full Snapshot ---
-		if opCode == protocol.OpCodeReplSnapshot {
-			remoteDBName, cursor, ok := readLenPrefixedString(payload, 0)
-			if !ok || cursor+4 > len(payload) {
-				logger.Warn("Malformed snapshot packet, skipping", "len", len(payload))
-				continue
-			}
-			count := binary.BigEndian.Uint32(payload[cursor : cursor+4])
-			cursor += 4
-			data := payload[cursor:]
-
-			if localDBNames, ok := remoteToLocal[remoteDBName]; ok {
-				// Detect start of a new snapshot sequence and RESET local state
-				if !snapshotStarted[remoteDBName] {
-					logger.Info("Snapshot detected, resetting local databases", "remote_db", remoteDBName)
-					for _, localDBName := range localDBNames {
-						if st, ok := rm.stores[localDBName]; ok {
-							if err := st.Reset(); err != nil {
-								logger.Error("Failed to reset database", "db", localDBName, "err", err)
-								return err
-							}
-						}
-					}
-					snapshotStarted[remoteDBName] = true
-				}
-
-				for _, localDBName := range localDBNames {
-					if st, ok := rm.stores[localDBName]; ok {
-						logger.Info("Applying snapshot batch", "db", localDBName, "count", count, "bytes", len(data))
-						dCursor := 0
-						tx := st.DB.NewTransaction(true)
-						malformed := false
-						for i := 0; i < int(count); i++ {
-							key, next, ok := readLenPrefixedBytes(data, dCursor)
-							if !ok {
-								malformed = true
-								break
-							}
-							dCursor = next
-							val, next, ok := readLenPrefixedBytes(data, dCursor)
-							if !ok {
-								malformed = true
-								break
-							}
-							dCursor = next
-
-							if err := tx.Put(key, val); err != nil {
-								tx.Discard()
-								logger.Error("Failed to apply snapshot entry", "db", localDBName, "err", err)
-								return err
-							}
-						}
-						if malformed {
-							tx.Discard()
-							return fmt.Errorf("malformed snapshot batch for db %s", localDBName)
-						}
-						if err := tx.Commit(); err != nil {
-							logger.Error("Failed to commit snapshot batch", "db", localDBName, "err", err)
-							return err
-						}
-					}
-				}
-			}
-			continue
-		}
-
-		// --- Handle Snapshot Done Signal ---
-		if opCode == protocol.OpCodeReplSnapshotDone {
-			remoteDBName, cursor, ok := readLenPrefixedString(payload, 0)
-			if !ok {
-				logger.Warn("Malformed snapshot-done packet, skipping", "len", len(payload))
-				continue
-			}
-			cursor += 4 // Skip Count(0)
-
-			if cursor+16 <= len(payload) {
-				txID := binary.BigEndian.Uint64(payload[cursor:])
-				opID := binary.BigEndian.Uint64(payload[cursor+8:])
-				logger.Info("Snapshot finished, syncing clocks", "remote_db", remoteDBName, "tx_id", txID, "resume_seq", opID)
-
-				if localDBNames, ok := remoteToLocal[remoteDBName]; ok {
-					for _, localDB := range localDBNames {
-						if st, ok := rm.stores[localDB]; ok {
-							st.DB.ForceSetClocks(txID, opID)
-						}
-					}
-				}
-			} else {
-				logger.Warn("Snapshot done signal received with insufficient payload", "len", len(payload))
-			}
-			snapshotStarted[remoteDBName] = false
-			continue
-		}
-
 		// --- Handle raw WAL byte segment (physical replication) ---
 		if opCode == protocol.OpCodeReplLogSegment {
 			remoteDBName, cursor, ok := readLenPrefixedString(payload, 0)
@@ -656,16 +514,15 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 			if localDBNames, ok := remoteToLocal[remoteDBName]; ok {
 				for _, localDBName := range localDBNames {
 					if st, ok := rm.stores[localDBName]; ok {
-						lastID, err := st.ApplyLogSegment(segData)
-						if err != nil {
+						if _, err := st.ApplyLogSegment(segData); err != nil {
 							logger.Error("Failed to apply log segment", "db", localDBName, "err", err)
 							return err
 						}
-						if lastID > 0 {
+						if endOff > 0 {
 							ackBuf := new(bytes.Buffer)
 							binary.Write(ackBuf, binary.BigEndian, uint32(len(remoteDBName)))
 							ackBuf.WriteString(remoteDBName)
-							binary.Write(ackBuf, binary.BigEndian, lastID)
+							binary.Write(ackBuf, binary.BigEndian, endOff)
 
 							h := make([]byte, 5)
 							h[0] = protocol.OpCodeReplAck

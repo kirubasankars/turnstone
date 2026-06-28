@@ -17,30 +17,6 @@ type logFrame struct {
 	length int64
 }
 
-// WALFrameBytes returns the on-disk bytes for a single WAL record (frame header + payload).
-func WALFrameBytes(rec WALRecord) []byte {
-	payload := encodeWALRecord(rec)
-	total := int(frameSize(len(payload)))
-	buf := make([]byte, total)
-	binary.BigEndian.PutUint32(buf[0:], uint32(len(payload)))
-	binary.BigEndian.PutUint32(buf[4:], crc32.Checksum(payload, Crc32Table))
-	copy(buf[8:], payload)
-	return buf
-}
-
-// RecordsFromLogSegment decodes each complete WAL record in a raw segment.
-func RecordsFromLogSegment(data []byte) ([]WALRecord, error) {
-	frames, err := validateLogSegment(data)
-	if err != nil {
-		return nil, err
-	}
-	recs := make([]WALRecord, len(frames))
-	for i, f := range frames {
-		recs[i] = f.rec
-	}
-	return recs, nil
-}
-
 // validateLogSegment ensures data is a concatenation of complete WAL frames.
 // Partial frames are rejected so replication stays statement-safe.
 func validateLogSegment(data []byte) ([]logFrame, error) {
@@ -76,9 +52,9 @@ func validateLogSegment(data []byte) ([]logFrame, error) {
 // ReadLogSegment reads complete WAL frames from startOffset, returning at most
 // maxBytes of raw on-disk frame bytes (headers included). The segment never
 // splits a frame, so each boundary aligns to a statement (BEGIN/SET/DEL/COMMIT/ABORT).
-func (l *DataLog) ReadLogSegment(startOffset int64, maxBytes int64) ([]byte, int64, uint64, error) {
+func (l *DataLog) ReadLogSegment(startOffset int64, maxBytes int64) ([]byte, int64, error) {
 	if maxBytes <= 0 {
-		return nil, startOffset, 0, nil
+		return nil, startOffset, nil
 	}
 
 	l.mu.RLock()
@@ -86,30 +62,29 @@ func (l *DataLog) ReadLogSegment(startOffset int64, maxBytes int64) ([]byte, int
 
 	f, err := os.Open(l.path)
 	if err != nil {
-		return nil, startOffset, 0, err
+		return nil, startOffset, err
 	}
 	defer f.Close()
 
 	stat, err := f.Stat()
 	if err != nil {
-		return nil, startOffset, 0, err
+		return nil, startOffset, err
 	}
 	fileSize := stat.Size()
 	if startOffset >= fileSize {
-		return nil, startOffset, 0, nil
+		return nil, startOffset, nil
 	}
 
 	var out []byte
 	pos := startOffset
-	var lastOpID uint64
 
 	for pos < fileSize {
-		validEnd, rec, span, rerr := l.readFrameAt(f, pos, fileSize)
+		validEnd, _, span, rerr := l.readFrameAt(f, pos, fileSize)
 		if rerr != nil {
 			if rerr == io.EOF {
 				break
 			}
-			return nil, startOffset, 0, rerr
+			return nil, startOffset, rerr
 		}
 		frameLen := span.length
 		if len(out) > 0 && int64(len(out))+frameLen > maxBytes {
@@ -118,14 +93,13 @@ func (l *DataLog) ReadLogSegment(startOffset int64, maxBytes int64) ([]byte, int
 
 		frame := make([]byte, frameLen)
 		if _, err := f.ReadAt(frame, pos); err != nil {
-			return nil, startOffset, 0, err
+			return nil, startOffset, err
 		}
 		out = append(out, frame...)
-		lastOpID = rec.OpID
 		pos = validEnd
 	}
 
-	return out, pos, lastOpID, nil
+	return out, pos, nil
 }
 
 // AppendRawSegment appends a validated segment of complete WAL frames.
@@ -150,55 +124,10 @@ func (l *DataLog) AppendRawSegment(data []byte, fsync bool) (int64, error) {
 		return 0, io.ErrShortWrite
 	}
 	l.writeOffset += int64(n)
-
-	frameOff := off
-	for _, fr := range frames {
-		l.recordOpOffset(fr.rec.OpID, frameOff)
-		frameOff += fr.length
-	}
 	l.mu.Unlock()
 
 	if fsync {
 		l.strictSync()
 	}
 	return off, nil
-}
-
-// ByteOffsetAfterOpID returns the byte offset immediately after the frame
-// carrying opID on this log. Used to resume byte-based replication.
-func (l *DataLog) ByteOffsetAfterOpID(opID uint64) (int64, bool) {
-	l.mu.RLock()
-	startOff, ok := l.findScanStartLocked(opID)
-	l.mu.RUnlock()
-	if !ok {
-		return 0, false
-	}
-
-	f, err := os.Open(l.path)
-	if err != nil {
-		return 0, false
-	}
-	defer f.Close()
-
-	stat, err := f.Stat()
-	if err != nil {
-		return 0, false
-	}
-	fileSize := stat.Size()
-
-	pos := startOff
-	for pos < fileSize {
-		validEnd, rec, _, rerr := l.readFrameAt(f, pos, fileSize)
-		if rerr != nil {
-			if rerr == io.EOF {
-				break
-			}
-			return 0, false
-		}
-		if rec.OpID >= opID {
-			return validEnd, true
-		}
-		pos = validEnd
-	}
-	return fileSize, true
 }

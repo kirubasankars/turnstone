@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -59,68 +58,6 @@ func TestDB_BasicCRUD(t *testing.T) {
 		t.Errorf("Expected ErrKeyNotFound, got %v", err)
 	}
 	readTx2.Discard()
-}
-
-func TestDB_Promote_Integration(t *testing.T) {
-	dir := t.TempDir()
-	db, err := Open(dir, Options{})
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
-
-	tx1 := db.NewTransaction(true)
-	tx1.Put([]byte("t1_key"), []byte("val1"))
-	if err := tx1.Commit(); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := db.Promote(); err != nil {
-		t.Fatalf("Promote failed: %v", err)
-	}
-
-	tx2 := db.NewTransaction(true)
-	tx2.Put([]byte("t2_key"), []byte("val2"))
-	if err := tx2.Commit(); err != nil {
-		t.Fatal(err)
-	}
-
-	rtx := db.NewTransaction(false)
-	v1, _ := rtx.Get([]byte("t1_key"))
-	if string(v1) != "val1" {
-		t.Error("Lost data from Timeline 0")
-	}
-	v2, _ := rtx.Get([]byte("t2_key"))
-	if string(v2) != "val2" {
-		t.Error("Missing data from Timeline 1")
-	}
-	rtx.Discard()
-
-	db.Close()
-
-	db2, err := Open(dir, Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db2.Close()
-
-	if db2.CurrentTimeline() != 1 {
-		t.Errorf("Expected timeline 1, got %d", db2.CurrentTimeline())
-	}
-
-	rtx2 := db2.NewTransaction(false)
-	defer rtx2.Discard()
-	v1, err = rtx2.Get([]byte("t1_key"))
-	if err != nil || string(v1) != "val1" {
-		t.Errorf("t1_key lost after reopen: err=%v val=%q", err, v1)
-	}
-	v2, err = rtx2.Get([]byte("t2_key"))
-	if err != nil || string(v2) != "val2" {
-		t.Errorf("t2_key lost after reopen: err=%v val=%q", err, v2)
-	}
-	count, err := db2.KeyCount()
-	if err != nil || count != 2 {
-		t.Errorf("KeyCount after reopen: want 2, got %d err=%v", count, err)
-	}
 }
 
 func TestDB_TransactionIsolation(t *testing.T) {
@@ -213,9 +150,6 @@ func TestOpen_CancelDuringReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Promote(); err != nil {
-		t.Fatal(err)
-	}
 	tx := db.NewTransaction(true)
 	const n = 50000
 	for i := 0; i < n; i++ {
@@ -292,11 +226,11 @@ func TestDB_ApplyRecord(t *testing.T) {
 
 	const xid = uint64(100)
 	recs := []WALRecord{
-		{Type: WALRecordBegin, XID: xid, OpID: 500},
-		{Type: WALRecordSet, XID: xid, OpID: 501, Key: []byte("replica_k1"), Value: []byte("val1")},
-		{Type: WALRecordSet, XID: xid, OpID: 502, Key: []byte("replica_k2"), Value: []byte("val2")},
-		{Type: WALRecordDelete, XID: xid, OpID: 503, Key: []byte("replica_k3")},
-		{Type: WALRecordCommit, XID: xid, OpID: 504},
+		{Type: WALRecordBegin, XID: xid},
+		{Type: WALRecordSet, XID: xid, Key: []byte("replica_k1"), Value: []byte("val1")},
+		{Type: WALRecordSet, XID: xid, Key: []byte("replica_k2"), Value: []byte("val2")},
+		{Type: WALRecordDelete, XID: xid, Key: []byte("replica_k3")},
+		{Type: WALRecordCommit, XID: xid},
 	}
 	for _, r := range recs {
 		if err := db.ApplyRecord(r); err != nil {
@@ -316,7 +250,7 @@ func TestDB_ApplyRecord(t *testing.T) {
 	}
 
 	foundWAL := false
-	err = db.ScanWAL(500, func(scanned []WALRecord) error {
+	err = db.ScanWAL(0, func(scanned []WALRecord) error {
 		for _, r := range scanned {
 			if r.Type == WALRecordSet && string(r.Key) == "replica_k1" {
 				foundWAL = true
@@ -342,14 +276,14 @@ func TestDataLog_AppendAndScan(t *testing.T) {
 	}
 	defer log.Close()
 
-	payload := encodeWALRecord(WALRecord{Type: WALRecordSet, XID: 999, OpID: 10, Key: []byte("k"), Value: []byte("v")})
+	payload := encodeWALRecord(WALRecord{Type: WALRecordSet, XID: 999, Key: []byte("k"), Value: []byte("v")})
 	off, err := log.AppendReplicatedRecord(payload, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	found := false
-	err = log.Scan(10, func(recs []WALRecord) error {
+	err = log.Scan(0, func(recs []WALRecord) error {
 		for _, r := range recs {
 			if r.XID == 999 {
 				found = true
@@ -432,7 +366,7 @@ func TestScanWAL_AfterReopen(t *testing.T) {
 	defer db2.Close()
 
 	count := 0
-	err = db2.ScanWAL(1, func(recs []WALRecord) error {
+	err = db2.ScanWAL(0, func(recs []WALRecord) error {
 		count += len(recs)
 		return nil
 	})
@@ -455,9 +389,9 @@ func TestDB_RunAutoCheckpoint(t *testing.T) {
 	tx := db.NewTransaction(true)
 	tx.Put([]byte("key"), []byte("val"))
 	tx.Commit()
-	currentOp := atomic.LoadUint64(&db.operationID)
+	beforeOff := db.LastLogOffset()
 	time.Sleep(150 * time.Millisecond)
-	if atomic.LoadUint64(&db.lastCkptOpID) < currentOp {
-		t.Error("AutoCheckpoint did not update lastCkptOpID")
+	if db.GetLastCheckpointOffset() < beforeOff {
+		t.Error("AutoCheckpoint did not update lastCkptOffset")
 	}
 }

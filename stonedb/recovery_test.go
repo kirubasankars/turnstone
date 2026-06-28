@@ -110,7 +110,7 @@ func TestRecovery_TruncateCorruptTail(t *testing.T) {
 	}
 }
 
-func TestRecovery_KeyCountAfterPromote(t *testing.T) {
+func TestRecovery_KeyCountAfterReopen(t *testing.T) {
 	dir := t.TempDir()
 	opts := Options{}
 
@@ -119,11 +119,8 @@ func TestRecovery_KeyCountAfterPromote(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := db.Promote(); err != nil {
-			t.Fatal(err)
-		}
 		tx := db.NewTransaction(true)
-		if err := tx.Put([]byte("after_promote"), []byte("data")); err != nil {
+		if err := tx.Put([]byte("after_reopen"), []byte("data")); err != nil {
 			t.Fatal(err)
 		}
 		if err := tx.Commit(); err != nil {
@@ -140,13 +137,13 @@ func TestRecovery_KeyCountAfterPromote(t *testing.T) {
 
 	count, err := db2.KeyCount()
 	if err != nil || count != 1 {
-		t.Fatalf("KeyCount after promote+reopen: want 1, got %d err=%v", count, err)
+		t.Fatalf("KeyCount after reopen: want 1, got %d err=%v", count, err)
 	}
 	tx := db2.NewTransaction(false)
-	val, err := tx.Get([]byte("after_promote"))
+	val, err := tx.Get([]byte("after_reopen"))
 	tx.Discard()
 	if err != nil || string(val) != "data" {
-		t.Fatalf("GET after promote+reopen: err=%v val=%q", err, val)
+		t.Fatalf("GET after reopen: err=%v val=%q", err, val)
 	}
 }
 
@@ -158,9 +155,6 @@ func TestRecovery_LargeReplay(t *testing.T) {
 	{
 		db, err := Open(dir, opts)
 		if err != nil {
-			t.Fatal(err)
-		}
-		if err := db.Promote(); err != nil {
 			t.Fatal(err)
 		}
 		tx := db.NewTransaction(true)
@@ -185,21 +179,5 @@ func TestRecovery_LargeReplay(t *testing.T) {
 	count, err := db2.KeyCount()
 	if err != nil || count != n {
 		t.Fatalf("KeyCount after large replay: want %d, got %d err=%v", n, count, err)
-	}
-}
-
-func TestRecovery_TimelineMeta(t *testing.T) {
-	dir := t.TempDir()
-	db, _ := Open(dir, Options{})
-	db.Promote()
-	db.Close()
-
-	db2, err := Open(dir, Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db2.Close()
-	if db2.CurrentTimeline() != 1 {
-		t.Errorf("expected timeline 1, got %d", db2.CurrentTimeline())
 	}
 }

@@ -13,12 +13,9 @@ import (
 func (db *DB) replayLog(ctx context.Context, truncateCorrupt bool) error {
 	inProgress := make(map[uint64]struct{})
 
-	err := db.log.Replay(ctx, truncateCorrupt, db.timelineMeta.History, func(rec WALRecord, span recordSpan) {
+	err := db.log.Replay(ctx, truncateCorrupt, func(rec WALRecord, span recordSpan) {
 		if rec.XID > atomic.LoadUint64(&db.transactionID) {
 			atomic.StoreUint64(&db.transactionID, rec.XID)
-		}
-		if rec.OpID > atomic.LoadUint64(&db.operationID) {
-			atomic.StoreUint64(&db.operationID, rec.OpID)
 		}
 
 		switch rec.Type {
@@ -27,12 +24,12 @@ func (db *DB) replayLog(ctx context.Context, truncateCorrupt bool) error {
 		case WALRecordSet:
 			db.index.Put(rec.Key, indexVersion{
 				offset: span.offset, valueLen: uint32(len(rec.Value)),
-				xmin: rec.XID, opID: rec.OpID, tombstone: false,
+				xmin: rec.XID, tombstone: false,
 			})
 		case WALRecordDelete:
 			db.index.Put(rec.Key, indexVersion{
 				offset: span.offset, valueLen: 0,
-				xmin: rec.XID, opID: rec.OpID, tombstone: true,
+				xmin: rec.XID, tombstone: true,
 			})
 		case WALRecordCommit:
 			delete(inProgress, rec.XID)
@@ -53,6 +50,9 @@ func (db *DB) replayLog(ctx context.Context, truncateCorrupt bool) error {
 	}
 
 	atomic.StoreInt64(&db.keyCount, db.index.LiveKeyCount(db.clogStatus))
-	db.logger.Debug("Log replay complete", "tx_id", atomic.LoadUint64(&db.transactionID), "op_id", atomic.LoadUint64(&db.operationID))
+	db.logger.Debug("Log replay complete",
+		"tx_id", atomic.LoadUint64(&db.transactionID),
+		"log_offset", db.log.WriteOffset(),
+	)
 	return nil
 }

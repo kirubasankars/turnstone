@@ -19,7 +19,6 @@ type Transaction struct {
 	update bool
 
 	xid             uint64
-	beginOpID       uint64
 	beginErr        error
 	keyLocks        map[string]struct{}
 	dispositionSeen map[string]bool
@@ -28,7 +27,6 @@ type Transaction struct {
 	readSet         map[string]struct{}
 
 	snapshot  Snapshot
-	snapOpID  uint64
 	aborted   int32
 	finished  bool
 	abortOnce sync.Once
@@ -145,7 +143,7 @@ func (tx *Transaction) write(key, value []byte, isDelete bool) error {
 		recType = WALRecordDelete
 	}
 
-	opID, offset, err := db.appendRecordWithOffset(recType, tx.xid, key, value)
+	offset, err := db.appendRecord(recType, tx.xid, key, value)
 	if err != nil {
 		rollbackImpact()
 		return err
@@ -153,10 +151,10 @@ func (tx *Transaction) write(key, value []byte, isDelete bool) error {
 
 	db.index.Put(key, indexVersion{
 		offset: offset, valueLen: uint32(len(value)),
-		xmin: tx.xid, opID: opID, tombstone: isDelete,
+		xmin: tx.xid, tombstone: isDelete,
 	})
 
-	ver := &indexVersion{offset: offset, valueLen: uint32(len(value)), xmin: tx.xid, opID: opID, tombstone: isDelete}
+	ver := &indexVersion{offset: offset, valueLen: uint32(len(value)), xmin: tx.xid, tombstone: isDelete}
 	tx.ownPriorVer[keyStr] = ver
 	tx.currentSize += entrySize
 	return nil

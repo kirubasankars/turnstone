@@ -124,18 +124,19 @@ func TestStepDown_DataIntegrity(t *testing.T) {
 	verifyKeys(t, keyCount, cRepl, "k")
 }
 
-// TestTimeline_Propagation verifies that timeline upgrades are propagated to replicas.
-func TestTimeline_Propagation(t *testing.T) {
+// TestReplication_ContinuesAfterRePromote verifies that a replica keeps
+// receiving writes after the primary steps down and is promoted again.
+func TestReplication_ContinuesAfterRePromote(t *testing.T) {
 	baseDir, clientTLS := setupSharedCertEnv(t)
 	adminTLS := getRoleTLS(t, baseDir, "admin")
 
-	// 1. Start Primary (TL=0, promote to 1)
-	_, primAddr, cancelPrim := startServerNode(t, baseDir, "prim_tl", clientTLS)
+	// 1. Start Primary
+	_, primAddr, cancelPrim := startServerNode(t, baseDir, "prim_rp", clientTLS)
 	defer cancelPrim()
 	promoteNode(t, baseDir, primAddr, "1")
 
 	// 2. Start Replica
-	_, replAddr, cancelRepl := startServerNode(t, baseDir, "repl_tl", clientTLS)
+	_, replAddr, cancelRepl := startServerNode(t, baseDir, "repl_rp", clientTLS)
 	defer cancelRepl()
 
 	cReplAdmin := connectClient(t, replAddr, adminTLS)
@@ -143,10 +144,10 @@ func TestTimeline_Propagation(t *testing.T) {
 	configureReplication(t, cReplAdmin, primAddr, "1")
 	cReplAdmin.Close()
 
-	// 3. Write on TL 1
+	// 3. Write before re-promote
 	cPrim := connectClient(t, primAddr, clientTLS)
 	selectDatabase(t, cPrim, "1")
-	writeKeyVal(t, cPrim, "tl1_key", "val")
+	writeKeyVal(t, cPrim, "pre_key", "val")
 	cPrim.Close()
 
 	// Wait for sync
@@ -154,32 +155,29 @@ func TestTimeline_Propagation(t *testing.T) {
 	defer cRepl.Close()
 	selectDatabase(t, cRepl, "1")
 	waitForConditionOrTimeout(t, 2*time.Second, func() bool {
-		return readKey(t, cRepl, "tl1_key") != nil
-	}, "Sync TL1 failed")
+		return readKey(t, cRepl, "pre_key") != nil
+	}, "Sync before re-promote failed")
 
-	// 4. Promote Primary AGAIN (TL 1 -> 2)
-	// Primary must StepDown first to become UNDEFINED.
+	// 4. StepDown then Promote again
 	cPrimAdmin := connectClient(t, primAddr, adminTLS)
 	selectDatabase(t, cPrimAdmin, "1")
 	cPrimAdmin.AssertStatus(protocol.OpCodeStepDown, nil, protocol.ResStatusOK)
 	cPrimAdmin.Close()
 
-	// Reconnect as Admin to Promote
 	cPrimAdmin2 := connectClient(t, primAddr, adminTLS)
 	defer cPrimAdmin2.Close()
 	selectDatabase(t, cPrimAdmin2, "1")
 	cPrimAdmin2.AssertStatus(protocol.OpCodePromote, make([]byte, 4), protocol.ResStatusOK)
 
-	// 5. Write on TL 2
+	// 5. Write after re-promote
 	cPrim2 := connectClient(t, primAddr, clientTLS)
 	defer cPrim2.Close()
 	selectDatabase(t, cPrim2, "1")
-	writeKeyVal(t, cPrim2, "tl2_key", "val")
+	writeKeyVal(t, cPrim2, "post_key", "val")
 
-	// 6. Verify Replica receives TL2 data
 	waitForConditionOrTimeout(t, 2*time.Second, func() bool {
-		return readKey(t, cRepl, "tl2_key") != nil
-	}, "Sync TL2 failed after Primary promotion")
+		return readKey(t, cRepl, "post_key") != nil
+	}, "Sync after re-promote failed")
 }
 
 // TestFailover_NoDataLoss verifies complete hand-off of data leadership

@@ -46,21 +46,11 @@ const (
 	OpCodeReplHello uint8 = 0x50
 	OpCodeReplAck   uint8 = 0x52
 
-	// --- SNAPSHOT OPCODES ---
-	OpCodeReplSnapshot     uint8 = 0x53 // Bulk data payload (Full Sync)
-	OpCodeReplSnapshotDone uint8 = 0x54 // Transition signal to WAL streaming
-
 	// --- SAFE POINT PROPAGATION ---
-	// Payload: [LogSeq(8)]
-	// Sent by Leader to Followers indicating the oldest log sequence
+	// Payload: [Offset(8)]
+	// Sent by Leader to Followers indicating the oldest log byte offset
 	// required by the cluster (min of all replica slots).
 	OpCodeReplSafePoint uint8 = 0x55
-
-	// --- TIMELINE PROPAGATION ---
-	// Payload: [TimelineID(8)]
-	// Sent by Leader to Followers to indicate the current timeline.
-	// Sent initially after handshake and upon any timeline fork (Promotion).
-	OpCodeReplTimeline uint8 = 0x56
 
 	// OpCodeReplLogSegment carries a raw byte range of complete WAL frames.
 	// Inner payload (after DB name/count): [StartOffset(8)][EndOffset(8)][RawBytes...]
@@ -75,11 +65,8 @@ const (
 	BeginReadOnly uint8 = 0
 
 	// Journal ops used by store.ApplyBatch (client write path).
-	OpJournalBegin  uint8 = 4
 	OpJournalSet    uint8 = 1
 	OpJournalDelete uint8 = 2
-	OpJournalCommit uint8 = 3
-	OpJournalAbort  uint8 = 5
 )
 
 // Response Status Codes
@@ -104,7 +91,6 @@ var Crc32Table = crc32.MakeTable(crc32.Castagnoli)
 
 // LogEntry represents a single operation in the WAL and Memory.
 type LogEntry struct {
-	LogSeq uint64
 	OpCode uint8
 	Key    []byte
 	Value  []byte
