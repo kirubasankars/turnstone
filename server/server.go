@@ -486,7 +486,7 @@ func (s *Server) dispatchCommand(conn net.Conn, r io.Reader, opCode uint8, paylo
 	case protocol.OpCodeSelect:
 		s.handleSelect(conn, payload, st)
 	case protocol.OpCodeBegin:
-		s.handleBegin(conn, st)
+		s.handleBegin(conn, payload, st)
 	case protocol.OpCodeCommit:
 		s.handleCommit(conn, st)
 	case protocol.OpCodeAbort:
@@ -603,7 +603,7 @@ func (s *Server) handleSelect(conn net.Conn, payload []byte, st *connState) {
 	}
 }
 
-func (s *Server) handleBegin(w io.Writer, st *connState) {
+func (s *Server) handleBegin(w io.Writer, payload []byte, st *connState) {
 	if st.db == nil {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Database selected"))
 		return
@@ -620,11 +620,16 @@ func (s *Server) handleBegin(w io.Writer, st *connState) {
 		return
 	}
 
-	// Only a Primary connection actually needs a writable (xid-bearing)
-	// transaction that logs a BEGIN record; a Replica's transaction is
-	// read-only (it can never SET/DEL, enforced separately below) and must
-	// not consume an xid or write to the WAL.
-	update := state == store.StatePrimary
+	readOnly := len(payload) >= 1 && payload[0] == protocol.BeginReadOnly
+	if len(payload) > 1 {
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Invalid BEGIN payload"))
+		return
+	}
+
+	// Only a Primary connection with a writable BEGIN allocates an xid and
+	// logs BEGIN to the WAL. Replica txs are always read-only. PRIMARY
+	// clients may request read-only explicitly (no WAL/fsync on COMMIT).
+	update := state == store.StatePrimary && !readOnly
 	st.tx = st.db.NewTransaction(update)
 	st.txStartTime = time.Now()
 	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)

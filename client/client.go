@@ -58,6 +58,11 @@ const (
 	OpCodeReplTimeline     = 0x56
 )
 
+// Begin payload flags (OpCodeBegin body).
+const (
+	BeginReadOnly = 0
+)
+
 // Journal opcodes mirror protocol.OpJournal* / stonedb.WALRecordType. Subscribe
 // only receives committed Set/Delete/Commit on CDC streams.
 const (
@@ -457,6 +462,11 @@ func isASCII(s string) bool {
 
 func (c *Client) Begin() error {
 	_, err := c.roundTrip(OpCodeBegin, nil)
+	return err
+}
+
+func (c *Client) BeginReadOnly() error {
+	_, err := c.roundTrip(OpCodeBegin, []byte{BeginReadOnly})
 	return err
 }
 

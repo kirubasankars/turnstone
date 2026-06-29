@@ -104,6 +104,21 @@ func TestDB_Promote_Integration(t *testing.T) {
 	if db2.CurrentTimeline() != 1 {
 		t.Errorf("Expected timeline 1, got %d", db2.CurrentTimeline())
 	}
+
+	rtx2 := db2.NewTransaction(false)
+	defer rtx2.Discard()
+	v1, err = rtx2.Get([]byte("t1_key"))
+	if err != nil || string(v1) != "val1" {
+		t.Errorf("t1_key lost after reopen: err=%v val=%q", err, v1)
+	}
+	v2, err = rtx2.Get([]byte("t2_key"))
+	if err != nil || string(v2) != "val2" {
+		t.Errorf("t2_key lost after reopen: err=%v val=%q", err, v2)
+	}
+	count, err := db2.KeyCount()
+	if err != nil || count != 2 {
+		t.Errorf("KeyCount after reopen: want 2, got %d err=%v", count, err)
+	}
 }
 
 func TestDB_TransactionIsolation(t *testing.T) {
