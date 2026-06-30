@@ -3,7 +3,7 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root of this source tree.
 
-package segindex
+package hashindex
 
 import (
 	"fmt"
@@ -12,7 +12,7 @@ import (
 )
 
 func TestPutAndWalkVersions(t *testing.T) {
-	idx := Open()
+	idx := New()
 	defer idx.Close()
 
 	key := []byte("alpha")
@@ -33,7 +33,7 @@ func TestPutAndWalkVersions(t *testing.T) {
 }
 
 func TestForEachKeyAndDropXid(t *testing.T) {
-	idx := Open()
+	idx := New()
 	defer idx.Close()
 
 	idx.Put([]byte("a"), Version{Offset: 1, Xmin: 1})
@@ -66,8 +66,8 @@ func TestForEachKeyAndDropXid(t *testing.T) {
 	}
 }
 
-func TestHashTableGrowSameSegment(t *testing.T) {
-	idx := Open()
+func TestHashTableGrowSameShard(t *testing.T) {
+	idx := New()
 	defer idx.Close()
 
 	var keys [][]byte
@@ -77,7 +77,7 @@ func TestHashTableGrowSameSegment(t *testing.T) {
 			keys = append(keys, k)
 		}
 	}
-	t.Logf("generated %d keys for segment 0", len(keys))
+	t.Logf("generated %d keys for shard 0", len(keys))
 
 	for i, key := range keys {
 		idx.Put(key, Version{Offset: int64(i), Xmin: uint64(i + 1)})
@@ -94,7 +94,7 @@ func TestHashTableGrowSameSegment(t *testing.T) {
 }
 
 func TestHashTableGrowManyKeys(t *testing.T) {
-	idx := Open()
+	idx := New()
 	defer idx.Close()
 
 	const n = 5000
@@ -116,7 +116,7 @@ func TestHashTableGrowManyKeys(t *testing.T) {
 }
 
 func TestConcurrentPutsDifferentKeys(t *testing.T) {
-	idx := Open()
+	idx := New()
 	defer idx.Close()
 
 	const n = 200

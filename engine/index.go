@@ -3,47 +3,39 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root of this source tree.
 
-package stonedb
+package engine
 
 import (
-	"os"
-	"path/filepath"
-
-	"turnstone/stonedb/segindex"
+	"turnstone/engine/hashindex"
 )
 
-// Index is an MVCC index backed by a segmented in-memory hash arena.
+// Index is an MVCC index backed by a sharded in-memory hash arena.
 // The index is ephemeral: rebuilt from data.log replay on open and dropped on close.
 type Index struct {
-	seg *segindex.SegmentedIndex
+	hash *hashindex.Index
 }
 
-// OpenIndex creates a fresh in-memory index. Any leftover index/ files from older
-// builds are removed; log replay on DB open rebuilds contents from scratch.
-func OpenIndex(dbDir string) (*Index, error) {
-	indexDir := filepath.Join(dbDir, "index")
-	if err := os.RemoveAll(indexDir); err != nil {
-		return nil, err
-	}
-	return &Index{seg: segindex.Open()}, nil
+// NewIndex creates a fresh in-memory index. Log replay on DB open rebuilds contents.
+func NewIndex() *Index {
+	return &Index{hash: hashindex.New()}
 }
 
-// Close drops the in-memory index and frees segment buffers.
+// Close drops the in-memory index and frees shard buffers.
 func (idx *Index) Close() error {
-	if idx.seg == nil {
+	if idx.hash == nil {
 		return nil
 	}
-	err := idx.seg.Close()
-	idx.seg = nil
+	err := idx.hash.Close()
+	idx.hash = nil
 	return err
 }
 
 func (idx *Index) Put(key []byte, v indexVersion) {
-	idx.seg.Put(key, toSegVersion(v))
+	idx.hash.Put(key, toHashVersion(v))
 }
 
 func (idx *Index) DropXid(xid uint64) {
-	idx.seg.DropXid(xid)
+	idx.hash.DropXid(xid)
 }
 
 func (idx *Index) LatestResolved(key []byte, excludeXid uint64, clog func(uint64) TxStatus) (*indexVersion, uint64, bool) {
@@ -104,10 +96,10 @@ func (idx *Index) HasNewerCommitted(key []byte, excludeXid uint64, snap Snapshot
 }
 
 func (idx *Index) ForEachKey(fn func(key []byte, chain []indexVersion)) {
-	idx.seg.ForEachKey(func(key []byte, chain []segindex.Version) {
+	idx.hash.ForEachKey(func(key []byte, chain []hashindex.Version) {
 		out := make([]indexVersion, len(chain))
 		for i, v := range chain {
-			out[i] = fromSegVersion(v)
+			out[i] = fromHashVersion(v)
 		}
 		fn(key, out)
 	})
@@ -127,13 +119,13 @@ func (idx *Index) LiveKeyCount(clog func(uint64) TxStatus) int64 {
 }
 
 func (idx *Index) walkKeyVersions(key []byte, fn func(indexVersion) bool) {
-	idx.seg.WalkVersions(key, func(v segindex.Version) bool {
-		return fn(fromSegVersion(v))
+	idx.hash.WalkVersions(key, func(v hashindex.Version) bool {
+		return fn(fromHashVersion(v))
 	})
 }
 
-func toSegVersion(v indexVersion) segindex.Version {
-	return segindex.Version{
+func toHashVersion(v indexVersion) hashindex.Version {
+	return hashindex.Version{
 		Offset:    v.offset,
 		ValueLen:  v.valueLen,
 		Xmin:      v.xmin,
@@ -141,7 +133,7 @@ func toSegVersion(v indexVersion) segindex.Version {
 	}
 }
 
-func fromSegVersion(v segindex.Version) indexVersion {
+func fromHashVersion(v hashindex.Version) indexVersion {
 	return indexVersion{
 		offset:    v.Offset,
 		valueLen:  v.ValueLen,

@@ -3,7 +3,7 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root of this source tree.
 
-package stonedb
+package engine
 
 import (
 	"context"
@@ -97,7 +97,7 @@ func (l *DataLog) AppendRecords(builders []func() []byte, sync bool) ([]int64, e
 	return offsets, nil
 }
 
-func (l *DataLog) AppendReplicatedRecord(payload []byte, sync bool) (int64, error) {
+func (l *DataLog) AppendEncoded(payload []byte, sync bool) (int64, error) {
 	l.mu.Lock()
 	off := l.writeOffset
 	if err := l.writeFrameLocked(payload); err != nil {
@@ -144,7 +144,7 @@ func (l *DataLog) ReadValueAt(offset int64, valLen uint32) ([]byte, error) {
 		return nil, err
 	}
 
-	rec, err := decodeWALRecord(payload)
+	rec, err := decodeRecord(payload)
 	if err != nil {
 		return nil, err
 	}
@@ -157,7 +157,7 @@ func (l *DataLog) ReadValueAt(offset int64, valLen uint32) ([]byte, error) {
 const replayCancelCheckInterval = 1024
 
 // Replay scans the entire log, invoking onRecord for each valid frame.
-func (l *DataLog) Replay(ctx context.Context, truncateCorrupt bool, onRecord func(rec WALRecord, span recordSpan)) error {
+func (l *DataLog) Replay(ctx context.Context, truncateCorrupt bool, onRecord func(rec Record, span recordSpan)) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -225,33 +225,33 @@ func (l *DataLog) Replay(ctx context.Context, truncateCorrupt bool, onRecord fun
 	return nil
 }
 
-func (l *DataLog) readFrameAt(f *os.File, offset, fileSize int64) (int64, WALRecord, recordSpan, error) {
+func (l *DataLog) readFrameAt(f *os.File, offset, fileSize int64) (int64, Record, recordSpan, error) {
 	if offset+LogFrameHeaderSize > fileSize {
-		return offset, WALRecord{}, recordSpan{}, io.ErrUnexpectedEOF
+		return offset, Record{}, recordSpan{}, io.ErrUnexpectedEOF
 	}
 	header := make([]byte, LogFrameHeaderSize)
 	if _, err := f.ReadAt(header, offset); err != nil {
-		return offset, WALRecord{}, recordSpan{}, err
+		return offset, Record{}, recordSpan{}, err
 	}
 	length := binary.BigEndian.Uint32(header[0:])
 	checksum := binary.BigEndian.Uint32(header[4:])
 	if length > 1<<30 {
-		return offset, WALRecord{}, recordSpan{}, ErrCorruptData
+		return offset, Record{}, recordSpan{}, ErrCorruptData
 	}
 	total := frameSize(int(length))
 	if offset+total > fileSize {
-		return offset, WALRecord{}, recordSpan{}, io.ErrUnexpectedEOF
+		return offset, Record{}, recordSpan{}, io.ErrUnexpectedEOF
 	}
 	payload := make([]byte, length)
 	if _, err := f.ReadAt(payload, offset+LogFrameHeaderSize); err != nil {
-		return offset, WALRecord{}, recordSpan{}, err
+		return offset, Record{}, recordSpan{}, err
 	}
 	if crc32.Checksum(payload, Crc32Table) != checksum {
-		return offset, WALRecord{}, recordSpan{}, ErrChecksum
+		return offset, Record{}, recordSpan{}, ErrChecksum
 	}
-	rec, err := decodeWALRecord(payload)
+	rec, err := decodeRecord(payload)
 	if err != nil {
-		return offset, WALRecord{}, recordSpan{}, err
+		return offset, Record{}, recordSpan{}, err
 	}
 	span := recordSpan{
 		offset: offset,
@@ -261,7 +261,7 @@ func (l *DataLog) readFrameAt(f *os.File, offset, fileSize int64) (int64, WALRec
 }
 
 // Scan streams records from startOffset onward (inclusive frame boundary).
-func (l *DataLog) Scan(startOffset int64, fn func([]WALRecord) error) error {
+func (l *DataLog) Scan(startOffset int64, fn func([]Record) error) error {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
@@ -301,7 +301,7 @@ func (l *DataLog) Scan(startOffset int64, fn func([]WALRecord) error) error {
 			}
 			return rerr
 		}
-		if err := fn([]WALRecord{rec}); err != nil {
+		if err := fn([]Record{rec}); err != nil {
 			return err
 		}
 		pos = validEnd

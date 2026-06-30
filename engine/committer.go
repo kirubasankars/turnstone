@@ -3,7 +3,7 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root of this source tree.
 
-package stonedb
+package engine
 
 import (
 	"errors"
@@ -70,7 +70,7 @@ func (db *DB) processCommitBatch(requests []commitRequest) {
 			valid = append(valid, tx)
 			xid := tx.xid
 			builders = append(builders, func() []byte {
-				return encodeWALRecord(WALRecord{Type: WALRecordCommit, XID: xid})
+				return encodeRecord(Record{Type: RecordCommit, XID: xid})
 			})
 		}
 
