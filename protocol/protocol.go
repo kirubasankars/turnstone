@@ -52,10 +52,10 @@ const (
 	// required by the cluster (min of all replica slots).
 	OpCodeReplSafePoint uint8 = 0x55
 
-	// OpCodeReplLogSegment carries a raw byte range of complete WAL frames.
+	// OpCodeReplLogRange carries a raw byte range of complete log frames.
 	// Inner payload (after DB name/count): [StartOffset(8)][EndOffset(8)][RawBytes...]
 	// EndOffset-StartOffset must equal len(RawBytes). Frames are never split.
-	OpCodeReplLogSegment uint8 = 0x57
+	OpCodeReplLogRange uint8 = 0x57
 
 	OpCodeQuit uint8 = 0xFF
 
@@ -63,10 +63,6 @@ const (
 	// Empty payload opens a writable transaction on PRIMARY (legacy default).
 	// A one-byte payload of BeginReadOnly opens a snapshot read transaction.
 	BeginReadOnly uint8 = 0
-
-	// Journal ops used by store.ApplyBatch (client write path).
-	OpJournalSet    uint8 = 1
-	OpJournalDelete uint8 = 2
 )
 
 // Response Status Codes
@@ -88,13 +84,6 @@ var (
 )
 
 var Crc32Table = crc32.MakeTable(crc32.Castagnoli)
-
-// LogEntry represents a single operation in the WAL and Memory.
-type LogEntry struct {
-	OpCode uint8
-	Key    []byte
-	Value  []byte
-}
 
 // IsASCII validates if a string contains only ASCII characters.
 func IsASCII(s string) bool {

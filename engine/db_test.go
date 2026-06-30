@@ -3,7 +3,7 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root of this source tree.
 
-package stonedb
+package engine
 
 import (
 	"bytes"
@@ -207,11 +207,11 @@ func TestDB_FastClose(t *testing.T) {
 	}
 }
 
-func TestDB_Checkpoint_Empty(t *testing.T) {
+func TestDB_MarkRetention_Empty(t *testing.T) {
 	dir := t.TempDir()
 	db, _ := Open(dir, Options{})
 	defer db.Close()
-	if err := db.Checkpoint(); err != nil {
+	if err := db.MarkRetention(); err != nil {
 		t.Error(err)
 	}
 }
@@ -225,12 +225,12 @@ func TestDB_ApplyRecord(t *testing.T) {
 	defer db.Close()
 
 	const xid = uint64(100)
-	recs := []WALRecord{
-		{Type: WALRecordBegin, XID: xid},
-		{Type: WALRecordSet, XID: xid, Key: []byte("replica_k1"), Value: []byte("val1")},
-		{Type: WALRecordSet, XID: xid, Key: []byte("replica_k2"), Value: []byte("val2")},
-		{Type: WALRecordDelete, XID: xid, Key: []byte("replica_k3")},
-		{Type: WALRecordCommit, XID: xid},
+	recs := []Record{
+		{Type: RecordBegin, XID: xid},
+		{Type: RecordSet, XID: xid, Key: []byte("replica_k1"), Value: []byte("val1")},
+		{Type: RecordSet, XID: xid, Key: []byte("replica_k2"), Value: []byte("val2")},
+		{Type: RecordDelete, XID: xid, Key: []byte("replica_k3")},
+		{Type: RecordCommit, XID: xid},
 	}
 	for _, r := range recs {
 		if err := db.ApplyRecord(r); err != nil {
@@ -249,17 +249,17 @@ func TestDB_ApplyRecord(t *testing.T) {
 		t.Errorf("Expected k3 deleted, got %v", err)
 	}
 
-	foundWAL := false
-	err = db.ScanWAL(0, func(scanned []WALRecord) error {
+	found := false
+	err = db.ScanLog(0, func(scanned []Record) error {
 		for _, r := range scanned {
-			if r.Type == WALRecordSet && string(r.Key) == "replica_k1" {
-				foundWAL = true
+			if r.Type == RecordSet && string(r.Key) == "replica_k1" {
+				found = true
 			}
 		}
 		return nil
 	})
-	if err != nil || !foundWAL {
-		t.Errorf("ScanWAL: err=%v found=%v", err, foundWAL)
+	if err != nil || !found {
+		t.Errorf("ScanLog: err=%v found=%v", err, found)
 	}
 
 	count, _ := db.KeyCount()
@@ -276,14 +276,14 @@ func TestDataLog_AppendAndScan(t *testing.T) {
 	}
 	defer log.Close()
 
-	payload := encodeWALRecord(WALRecord{Type: WALRecordSet, XID: 999, Key: []byte("k"), Value: []byte("v")})
-	off, err := log.AppendReplicatedRecord(payload, true)
+	payload := encodeRecord(Record{Type: RecordSet, XID: 999, Key: []byte("k"), Value: []byte("v")})
+	off, err := log.AppendEncoded(payload, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	found := false
-	err = log.Scan(0, func(recs []WALRecord) error {
+	err = log.Scan(0, func(recs []Record) error {
 		for _, r := range recs {
 			if r.XID == 999 {
 				found = true
@@ -348,7 +348,7 @@ func TestBackgroundChecksum_Coverage(t *testing.T) {
 	db.Close()
 }
 
-func TestScanWAL_AfterReopen(t *testing.T) {
+func TestScanLog_AfterReopen(t *testing.T) {
 	dir := t.TempDir()
 	opts := Options{}
 	db, _ := Open(dir, opts)
@@ -366,7 +366,7 @@ func TestScanWAL_AfterReopen(t *testing.T) {
 	defer db2.Close()
 
 	count := 0
-	err = db2.ScanWAL(0, func(recs []WALRecord) error {
+	err = db2.ScanLog(0, func(recs []Record) error {
 		count += len(recs)
 		return nil
 	})
@@ -378,9 +378,9 @@ func TestScanWAL_AfterReopen(t *testing.T) {
 	}
 }
 
-func TestDB_RunAutoCheckpoint(t *testing.T) {
+func TestDB_RunAutoMarkRetention(t *testing.T) {
 	dir := t.TempDir()
-	db, err := Open(dir, Options{AutoCheckpointInterval: 50 * time.Millisecond})
+	db, err := Open(dir, Options{RetentionInterval: 50 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -391,7 +391,7 @@ func TestDB_RunAutoCheckpoint(t *testing.T) {
 	tx.Commit()
 	beforeOff := db.LastLogOffset()
 	time.Sleep(150 * time.Millisecond)
-	if db.GetLastCheckpointOffset() < beforeOff {
-		t.Error("AutoCheckpoint did not update lastCkptOffset")
+	if db.RetentionOffset() < beforeOff {
+		t.Error("AutoMarkRetention did not update retentionOffset")
 	}
 }

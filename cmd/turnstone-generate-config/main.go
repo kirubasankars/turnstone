@@ -38,17 +38,17 @@ func main() {
 
 	// 1. Define Default Server Config
 	defaultCfg := config.Config{
-		Port:                 ":6379",
-		Debug:                false,
-		MaxConns:             1000,
-		NumberOfDatabases:    4,
-		TLSCertFile:          "certs/server.crt",
-		TLSKeyFile:           "certs/server.key",
-		TLSCAFile:            "certs/ca.crt",
-		TLSClientCertFile:    "certs/client.crt",
-		TLSClientKeyFile:     "certs/client.key",
-		MetricsAddr:          ":9090",
-		WALRetentionStrategy: "replication",
+		Port:              ":6379",
+		Debug:             false,
+		MaxConns:          1000,
+		NumberOfDatabases: 4,
+		TLSCertFile:       "certs/server.crt",
+		TLSKeyFile:        "certs/server.key",
+		TLSCAFile:         "certs/ca.crt",
+		TLSClientCertFile: "certs/client.crt",
+		TLSClientKeyFile:  "certs/client.key",
+		MetricsAddr:       ":9090",
+		LogRetention:      "replication",
 	}
 
 	configPath := filepath.Join(*homeDir, "turnstone.json")

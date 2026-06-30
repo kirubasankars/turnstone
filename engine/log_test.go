@@ -3,7 +3,7 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root of this source tree.
 
-package stonedb
+package engine
 
 import (
 	"fmt"
@@ -31,11 +31,11 @@ func TestDataLog_ScanFromByteOffset(t *testing.T) {
 	}
 
 	head := db.LastLogOffset()
-	mid, _, err := db.ReadLogSegment(0, head/2)
+	mid, _, err := db.ReadLogRange(0, head/2)
 	if err != nil {
 		t.Fatal(err)
 	}
-	frames, err := validateLogSegment(mid)
+	frames, err := validateFrames(mid)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,12 +48,12 @@ func TestDataLog_ScanFromByteOffset(t *testing.T) {
 	}
 
 	foundCount := 0
-	err = db.ScanWAL(startOffset, func(recs []WALRecord) error {
+	err = db.ScanLog(startOffset, func(recs []Record) error {
 		foundCount += len(recs)
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("ScanWAL failed: %v", err)
+		t.Fatalf("ScanLog failed: %v", err)
 	}
 	if foundCount == 0 {
 		t.Fatal("expected records from mid offset")
@@ -79,15 +79,15 @@ func TestDataLog_PurgeSetsScanFloor(t *testing.T) {
 	}
 
 	head := db.LastLogOffset()
-	_, floor, err := db.ReadLogSegment(0, head/2)
+	_, floor, err := db.ReadLogRange(0, head/2)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.PurgeWAL(floor); err != nil {
+	if err := db.SetScanFloor(floor); err != nil {
 		t.Fatal(err)
 	}
-	if db.GetScanWALFloor() != floor {
-		t.Fatalf("expected scan floor %d, got %d", floor, db.GetScanWALFloor())
+	if db.ScanFloor() != floor {
+		t.Fatalf("expected scan floor %d, got %d", floor, db.ScanFloor())
 	}
 }
 
@@ -110,27 +110,27 @@ func TestDataLog_ScanAtFloorAfterPurge(t *testing.T) {
 	}
 
 	head := db.LastLogOffset()
-	_, floor, err := db.ReadLogSegment(0, head/2)
+	_, floor, err := db.ReadLogRange(0, head/2)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if floor == 0 {
 		t.Fatal("expected frame-aligned purge floor")
 	}
-	if err := db.PurgeWAL(floor); err != nil {
+	if err := db.SetScanFloor(floor); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := db.ScanWAL(floor-1, func([]WALRecord) error { return nil }); err != ErrLogUnavailable {
-		t.Fatalf("ScanWAL below floor: expected ErrLogUnavailable, got %v", err)
+	if err := db.ScanLog(floor-1, func([]Record) error { return nil }); err != ErrLogUnavailable {
+		t.Fatalf("ScanLog below floor: expected ErrLogUnavailable, got %v", err)
 	}
 
 	count := 0
-	if err := db.ScanWAL(floor, func(recs []WALRecord) error {
+	if err := db.ScanLog(floor, func(recs []Record) error {
 		count += len(recs)
 		return nil
 	}); err != nil {
-		t.Fatalf("ScanWAL at floor failed: %v", err)
+		t.Fatalf("ScanLog at floor failed: %v", err)
 	}
 	if count == 0 {
 		t.Error("expected records at or above floor")

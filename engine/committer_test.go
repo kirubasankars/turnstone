@@ -3,7 +3,7 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root of this source tree.
 
-package stonedb
+package engine
 
 import (
 	"errors"
@@ -13,7 +13,7 @@ import (
 
 // TestProcessCommitBatch_MultipleValid verifies that several disjoint-key
 // transactions in the same group-commit cycle all succeed together with a
-// single WAL fsync.
+// single log fsync.
 func TestProcessCommitBatch_MultipleValid(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(dir, Options{})
@@ -101,7 +101,7 @@ func TestProcessCommitBatch_ReadSetConflict(t *testing.T) {
 
 // TestProcessCommitBatch_SystemErrorHook verifies that the
 // testingProcessCommitBatchErr hook fails every request in the batch before
-// any WAL/clog work happens.
+// any log/clog work happens.
 func TestProcessCommitBatch_SystemErrorHook(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(dir, Options{})
@@ -127,19 +127,19 @@ func TestProcessCommitBatch_SystemErrorHook(t *testing.T) {
 	}
 }
 
-// TestProcessCommitBatch_WALFsyncFailure verifies that a failure while
+// TestProcessCommitBatch_LogFsyncFailure verifies that a failure while
 // group-fsyncing COMMIT records marks the database corrupt (there is no
-// rollback of an already-eager-written transaction; the WAL append for the
+// rollback of an already-eager-written transaction; the log append for the
 // COMMIT record itself is what failed here, before it was durable).
-func TestProcessCommitBatch_WALFsyncFailure(t *testing.T) {
+func TestProcessCommitBatch_LogFsyncFailure(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(dir, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	// NOTE: deliberately not deferring db.Close() here. We sabotage the WAL's
-	// underlying file below, and a subsequent Close()/Checkpoint() would force
-	// a WAL rotation that calls strictSync directly on the closed file,
+	// NOTE: deliberately not deferring db.Close() here. We sabotage the log's
+	// underlying file below, and a subsequent Close()/MarkRetention() would force
+	// a retention marking that calls strictSync directly on the closed file,
 	// which panics by design (fail-fast on real storage failure). That crash
 	// path is exercised/covered elsewhere; this test only cares about the
 	// commit-time error and corruption flag.
@@ -149,18 +149,18 @@ func TestProcessCommitBatch_WALFsyncFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Sabotage the WAL's underlying file so the COMMIT record's fsync fails.
+	// Sabotage the log's underlying file so the COMMIT record's fsync fails.
 	db.log.file.Close()
 
 	reqs := []commitRequest{{tx: tx, resp: make(chan error, 1)}}
 	db.processCommitBatch(reqs)
 
 	if err := <-reqs[0].resp; err == nil {
-		t.Fatal("expected error from sabotaged WAL fsync, got nil")
+		t.Fatal("expected error from sabotaged log fsync, got nil")
 	}
 
 	if atomic.LoadInt32(&db.isCorrupt) != 1 {
-		t.Error("expected DB to be marked corrupt after WAL commit-fsync failure")
+		t.Error("expected DB to be marked corrupt after log commit-fsync failure")
 	}
 }
 

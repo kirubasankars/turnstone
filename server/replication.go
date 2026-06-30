@@ -20,9 +20,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"turnstone/database"
+	"turnstone/engine"
 	"turnstone/protocol"
-	"turnstone/stonedb"
-	"turnstone/store"
 )
 
 // recoverAndLog is deferred at the top of every replication goroutine. These
@@ -61,7 +61,7 @@ func setReplicaWriteTimeout(d time.Duration) {
 
 const (
 	// MaxReplAckSize bounds the ACK-reader's per-frame allocation. A real
-	// ACK body is [DBNameLen(4)][DBName][LogID(8)]; 64KB is far more than
+	// ACK body is [DBNameLen(4)][DBName][Offset(8)]; 64KB is far more than
 	// any legitimate db name could need.
 	MaxReplAckSize = 64 * 1024
 )
@@ -123,8 +123,8 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 	cursor += 4
 
 	type subReq struct {
-		name  string
-		logID uint64
+		name   string
+		offset uint64
 	}
 	var subs []subReq
 
@@ -140,51 +140,51 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 		nLen := int(binary.BigEndian.Uint32(payload[cursor : cursor+4]))
 		cursor += 4
 		if cursor+nLen+8 > len(payload) {
-			st.logger.Warn("Replica handshake failed: db name/logID truncated")
-			_ = s.writeBinaryResponse(conn, protocol.ResStatusErr, []byte("DB Name/LogID truncated"))
+			st.logger.Warn("Replica handshake failed: db name/offset truncated")
+			_ = s.writeBinaryResponse(conn, protocol.ResStatusErr, []byte("DB Name/Offset truncated"))
 			return
 		}
 		name := string(payload[cursor : cursor+nLen])
 		cursor += nLen
-		logID := binary.BigEndian.Uint64(payload[cursor : cursor+8])
+		offset := binary.BigEndian.Uint64(payload[cursor : cursor+8])
 		cursor += 8
 
 		if storePtr, ok := s.stores[name]; ok {
-			if !storePtr.IsValidReplicationCursor(logID) {
-				st.logger.Warn("Replica handshake rejected: invalid cursor", "db", name, "cursor", logID, "head", storePtr.LastLogOffset())
+			if !storePtr.IsValidReplicationCursor(offset) {
+				st.logger.Warn("Replica handshake rejected: invalid cursor", "db", name, "cursor", offset, "head", storePtr.LastLogOffset())
 				_ = s.writeBinaryResponse(conn, protocol.ResStatusErr, []byte(fmt.Sprintf("Invalid replication cursor for DB '%s'", name)))
 				return
 			}
 		}
 
 		// Check if this server is already a replica for this database.
-		if s.replManager != nil && s.replManager.IsReplicating(name) {
+		if s.replManager != nil && s.replManager.IsFollowing(name) {
 			st.logger.Warn("Rejected downstream replication request (cascading disabled on replicas)", "db", name)
 			_ = s.writeBinaryResponse(conn, protocol.ResStatusErr, []byte(fmt.Sprintf("Cascading replication disabled for DB '%s'", name)))
 			return
 		}
 
-		subs = append(subs, subReq{name, logID})
+		subs = append(subs, subReq{name, offset})
 
 		if storePtr, ok := s.stores[name]; ok {
 			// RULE: Replica can't join non promoted/undefined server
 			// We only allow replication if we are PRIMARY.
-			if storePtr.GetState() != store.StatePrimary {
+			if storePtr.GetState() != database.StatePrimary {
 				st.logger.Warn("Replica handshake rejected: Server is not PRIMARY for this DB", "db", name, "state", storePtr.GetState())
 				_ = s.writeBinaryResponse(conn, protocol.ResStatusErr, []byte(fmt.Sprintf("Replica handshake rejected: DB '%s' is %s (must be PRIMARY)", name, storePtr.GetState())))
 				return // Disconnect
 			}
 
 			// INFO: Replica Connected
-			st.logger.Info("Replica subscribed", "db", name, "start_seq", logID)
-			storePtr.RegisterReplica(replicaID, logID, st.role)
+			st.logger.Info("Replica subscribed", "db", name, "start_seq", offset)
+			storePtr.RegisterReplica(replicaID, offset, st.role)
 
 			// Capture the kill switch for this specific subscription
 			if ch := storePtr.GetReplicaSignalChannel(replicaID); ch != nil {
 				killChannels = append(killChannels, ch)
 			}
 
-			defer func(sp *store.Store, dbName string) {
+			defer func(sp *database.Database, dbName string) {
 				// INFO: Replica Disconnected
 				st.logger.Info("Replica disconnected", "db", dbName)
 				sp.UnregisterReplica(replicaID)
@@ -236,17 +236,17 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 	for _, req := range subs {
 		if storePtr, ok := s.stores[req.name]; ok {
 			wg.Add(1)
-			go func(name string, sp *store.Store, startLogID uint64) {
+			go func(name string, sp *database.Database, startOffset uint64) {
 				defer wg.Done()
 				defer recoverAndLog(st.logger, "streamDB:"+name)
-				if err := s.streamDB(name, sp, startLogID, outCh, done, st.logger); err != nil {
+				if err := s.streamDB(name, sp, startOffset, outCh, done, st.logger); err != nil {
 					st.logger.Error("Replica stream failed", "db", name, "err", err)
 					select {
 					case errCh <- err:
 					default:
 					}
 				}
-			}(req.name, storePtr, req.logID)
+			}(req.name, storePtr, req.offset)
 		}
 	}
 
@@ -267,7 +267,7 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 
 			ln := binary.BigEndian.Uint32(h[1:])
 			// Cap the allocation: this length is fully peer-controlled, and
-			// a real ACK body ([DBNameLen][DBName][LogID]) never needs more
+			// a real ACK body ([DBNameLen][DBName][Offset]) never needs more
 			// than a few hundred bytes. Without a cap, a malicious/broken
 			// peer can force an arbitrarily large (up to 4GB) allocation
 			// per frame here.
@@ -296,13 +296,13 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 				continue
 			}
 
-			// Parse ACK: [DBNameLen][DBName][LogID]
+			// Parse ACK: [DBNameLen][DBName][Offset]
 			if len(b) > 4 {
 				nL := binary.BigEndian.Uint32(b[:4])
 				if len(b) >= 4+int(nL)+8 {
-					logID := binary.BigEndian.Uint64(b[4+nL:])
+					offset := binary.BigEndian.Uint64(b[4+nL:])
 					if storePtr, ok := s.stores[string(b[4:4+nL])]; ok {
-						storePtr.UpdateReplicaLogSeq(replicaID, logID)
+						storePtr.UpdateReplicaOffset(replicaID, offset)
 					}
 				}
 			}
@@ -373,11 +373,11 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 	}
 }
 
-func (s *Server) streamDB(name string, st *store.Store, startOffset uint64, outCh chan<- replPacket, done <-chan struct{}, logger *slog.Logger) error {
-	return s.runWALStreamLoop(name, st, startOffset, outCh, done, logger)
+func (s *Server) streamDB(name string, st *database.Database, startOffset uint64, outCh chan<- replPacket, done <-chan struct{}, logger *slog.Logger) error {
+	return s.runLogStreamLoop(name, st, startOffset, outCh, done, logger)
 }
 
-func (s *Server) runWALStreamLoop(name string, st *store.Store, startOffset uint64, outCh chan<- replPacket, done <-chan struct{}, logger *slog.Logger) error {
+func (s *Server) runLogStreamLoop(name string, st *database.Database, startOffset uint64, outCh chan<- replPacket, done <-chan struct{}, logger *slog.Logger) error {
 	currentByteOffset := int64(startOffset)
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
@@ -391,10 +391,10 @@ func (s *Server) runWALStreamLoop(name string, st *store.Store, startOffset uint
 			return nil
 
 		case <-safePointTicker.C:
-			minSeq := st.GetMinSlotLogSeq()
-			if minSeq > 0 {
+			minOffset := st.MinReplicaOffset()
+			if minOffset > 0 {
 				buf := make([]byte, 8)
-				binary.BigEndian.PutUint64(buf, minSeq)
+				binary.BigEndian.PutUint64(buf, minOffset)
 				select {
 				case outCh <- replPacket{
 					dbName: name,
@@ -408,10 +408,10 @@ func (s *Server) runWALStreamLoop(name string, st *store.Store, startOffset uint
 			}
 
 		case <-st.SafePointSignal():
-			minSeq := st.GetMinSlotLogSeq()
-			if minSeq > 0 && minSeq != math.MaxUint64 {
+			minOffset := st.MinReplicaOffset()
+			if minOffset > 0 && minOffset != math.MaxUint64 {
 				buf := make([]byte, 8)
-				binary.BigEndian.PutUint64(buf, minSeq)
+				binary.BigEndian.PutUint64(buf, minOffset)
 				select {
 				case outCh <- replPacket{
 					dbName: name,
@@ -429,10 +429,10 @@ func (s *Server) runWALStreamLoop(name string, st *store.Store, startOffset uint
 			if uint64(currentByteOffset) >= head {
 				continue
 			}
-			segData, nextOff, err := st.ReadLogSegment(currentByteOffset, int64(MaxReplicationBatchSize))
+			segData, nextOff, err := st.ReadLogRange(currentByteOffset, int64(MaxReplicationBatchSize))
 			if err != nil {
-				if errors.Is(err, stonedb.ErrLogUnavailable) {
-					return fmt.Errorf("WAL unavailable at offset %d: %w", currentByteOffset, err)
+				if errors.Is(err, engine.ErrLogUnavailable) {
+					return fmt.Errorf("log unavailable at offset %d: %w", currentByteOffset, err)
 				}
 				logger.Error("Log segment read error", "db", name, "err", err)
 				time.Sleep(100 * time.Millisecond)
@@ -446,7 +446,7 @@ func (s *Server) runWALStreamLoop(name string, st *store.Store, startOffset uint
 				select {
 				case outCh <- replPacket{
 					dbName: name,
-					opCode: protocol.OpCodeReplLogSegment,
+					opCode: protocol.OpCodeReplLogRange,
 					data:   payload,
 					count:  0,
 				}:

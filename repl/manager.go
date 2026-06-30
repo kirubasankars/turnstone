@@ -3,7 +3,7 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root of this source tree.
 
-package replication
+package repl
 
 import (
 	"bytes"
@@ -19,31 +19,31 @@ import (
 	"sync"
 	"time"
 
+	"turnstone/database"
 	"turnstone/protocol"
-	"turnstone/store"
 )
 
-type ReplicaSource struct {
+type Source struct {
 	LocalDB  string `json:"local_db"`
 	RemoteDB string `json:"remote_db"`
 }
 
-type ReplicationManager struct {
+type Manager struct {
 	mu         sync.Mutex
 	serverID   string
-	peers      map[string][]ReplicaSource // Addr -> List of DBs
+	peers      map[string][]Source // Addr -> List of DBs
 	cancelFunc map[string]context.CancelFunc
-	stores     map[string]*store.Store
+	stores     map[string]*database.Database
 	tlsConf    *tls.Config
 	logger     *slog.Logger
 }
 
-// NewReplicationManager creates a manager for outgoing replication connections.
+// NewManager creates a manager for outgoing replication connections.
 // Persistence is intentionally disabled; replication must be configured at runtime.
-func NewReplicationManager(serverID string, stores map[string]*store.Store, tlsConf *tls.Config, logger *slog.Logger) *ReplicationManager {
-	return &ReplicationManager{
+func NewManager(serverID string, stores map[string]*database.Database, tlsConf *tls.Config, logger *slog.Logger) *Manager {
+	return &Manager{
 		serverID:   serverID,
-		peers:      make(map[string][]ReplicaSource),
+		peers:      make(map[string][]Source),
 		cancelFunc: make(map[string]context.CancelFunc),
 		stores:     stores,
 		tlsConf:    tlsConf,
@@ -51,9 +51,9 @@ func NewReplicationManager(serverID string, stores map[string]*store.Store, tlsC
 	}
 }
 
-// IsReplicating checks if the specific database is currently configured to replicate
-// from an upstream source. Used to prevent cascading replication.
-func (rm *ReplicationManager) IsReplicating(dbName string) bool {
+// IsFollowing checks if the specific database is currently configured to replicate
+// from an upstream source. Used to prevent cascading repl.
+func (rm *Manager) IsFollowing(dbName string) bool {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 
@@ -67,9 +67,9 @@ func (rm *ReplicationManager) IsReplicating(dbName string) bool {
 	return false
 }
 
-// GetReplicationSource returns the upstream address and remote database name for a given local database.
+// Source returns the upstream address and remote database name for a given local database.
 // Returns empty strings if the database is not replicating.
-func (rm *ReplicationManager) GetReplicationSource(dbName string) (string, string) {
+func (rm *Manager) Source(dbName string) (string, string) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 
@@ -83,7 +83,7 @@ func (rm *ReplicationManager) GetReplicationSource(dbName string) (string, strin
 	return "", ""
 }
 
-func (rm *ReplicationManager) Start() {
+func (rm *Manager) Start() {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 	for addr := range rm.peers {
@@ -95,10 +95,10 @@ func (rm *ReplicationManager) Start() {
 // NOT under keepAddr. A given local database must never replicate from more
 // than one upstream source concurrently: if the caller bypassed the normal
 // REPLICAOF/PROMOTE state-machine guard (or a stale entry was otherwise left
-// behind), this ensures AddReplica itself stays globally deduped by dbName
+// behind), this ensures Follow itself stays globally deduped by dbName
 // rather than only deduping within the same sourceAddr's entry. Must be
 // called with rm.mu held.
-func (rm *ReplicationManager) removeDBFromOtherPeersLocked(dbName, keepAddr string) {
+func (rm *Manager) removeDBFromOtherPeersLocked(dbName, keepAddr string) {
 	for addr, existingDBs := range rm.peers {
 		if addr == keepAddr {
 			continue
@@ -108,7 +108,7 @@ func (rm *ReplicationManager) removeDBFromOtherPeersLocked(dbName, keepAddr stri
 				continue
 			}
 			rm.logger.Warn("Replacing stale/duplicate replication source for db", "db", dbName, "old_source", addr, "new_source", keepAddr)
-			newDBs := make([]ReplicaSource, 0, len(existingDBs)-1)
+			newDBs := make([]Source, 0, len(existingDBs)-1)
 			newDBs = append(newDBs, existingDBs[:i]...)
 			newDBs = append(newDBs, existingDBs[i+1:]...)
 			if len(newDBs) > 0 {
@@ -125,7 +125,7 @@ func (rm *ReplicationManager) removeDBFromOtherPeersLocked(dbName, keepAddr stri
 	}
 }
 
-func (rm *ReplicationManager) AddReplica(dbName, sourceAddr, sourceDB string) error {
+func (rm *Manager) Follow(dbName, sourceAddr, sourceDB string) error {
 	rm.mu.Lock()
 
 	// Check existing
@@ -144,9 +144,9 @@ func (rm *ReplicationManager) AddReplica(dbName, sourceAddr, sourceDB string) er
 	dbs = rm.peers[sourceAddr]
 
 	// Create candidate configuration
-	candidateDBs := make([]ReplicaSource, len(dbs), len(dbs)+1)
+	candidateDBs := make([]Source, len(dbs), len(dbs)+1)
 	copy(candidateDBs, dbs)
-	candidateDBs = append(candidateDBs, ReplicaSource{LocalDB: dbName, RemoteDB: sourceDB})
+	candidateDBs = append(candidateDBs, Source{LocalDB: dbName, RemoteDB: sourceDB})
 
 	// Release lock BEFORE network call to prevent deadlock
 	rm.mu.Unlock()
@@ -169,13 +169,13 @@ func (rm *ReplicationManager) AddReplica(dbName, sourceAddr, sourceDB string) er
 		}
 	}
 
-	// Re-dedupe: another AddReplica for the same dbName under a different
+	// Re-dedupe: another Follow for the same dbName under a different
 	// address may have raced in while we were doing the network handshake.
 	rm.removeDBFromOtherPeersLocked(dbName, sourceAddr)
 	currentDBs = rm.peers[sourceAddr]
 
 	// Append to the *current* authoritative list
-	finalDBs := append(currentDBs, ReplicaSource{LocalDB: dbName, RemoteDB: sourceDB})
+	finalDBs := append(currentDBs, Source{LocalDB: dbName, RemoteDB: sourceDB})
 	rm.peers[sourceAddr] = finalDBs
 
 	if cancel, exists := rm.cancelFunc[sourceAddr]; exists {
@@ -187,7 +187,7 @@ func (rm *ReplicationManager) AddReplica(dbName, sourceAddr, sourceDB string) er
 }
 
 // verifyHandshake connects to the remote, sends Hello, and checks the response status.
-func (rm *ReplicationManager) verifyHandshake(addr string, dbs []ReplicaSource) error {
+func (rm *Manager) verifyHandshake(addr string, dbs []Source) error {
 	// Increased timeout to 10s to prevent flaky "i/o timeout" errors under load
 	dialer := net.Dialer{Timeout: 10 * time.Second}
 	conn, err := tls.DialWithDialer(&dialer, "tcp", addr, rm.tlsConf)
@@ -208,13 +208,13 @@ func (rm *ReplicationManager) verifyHandshake(addr string, dbs []ReplicaSource) 
 	binary.Write(buf, binary.BigEndian, uint32(len(dbs)))
 
 	for _, cfg := range dbs {
-		var logID uint64
+		var offset uint64
 		if st, ok := rm.stores[cfg.LocalDB]; ok {
-			logID = st.LastLogOffset()
+			offset = st.LastLogOffset()
 		}
 		binary.Write(buf, binary.BigEndian, uint32(len(cfg.RemoteDB)))
 		buf.WriteString(cfg.RemoteDB)
-		binary.Write(buf, binary.BigEndian, logID)
+		binary.Write(buf, binary.BigEndian, offset)
 	}
 
 	// Send Header
@@ -251,7 +251,7 @@ func (rm *ReplicationManager) verifyHandshake(addr string, dbs []ReplicaSource) 
 }
 
 // StopAll cancels every outbound replication connection.
-func (rm *ReplicationManager) StopAll() {
+func (rm *Manager) StopAll() {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 	for addr, cancel := range rm.cancelFunc {
@@ -262,12 +262,12 @@ func (rm *ReplicationManager) StopAll() {
 	}
 }
 
-func (rm *ReplicationManager) StopReplication(dbName string) {
+func (rm *Manager) StopFollowing(dbName string) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 
 	for addr, dbs := range rm.peers {
-		newDBs := make([]ReplicaSource, 0, len(dbs))
+		newDBs := make([]Source, 0, len(dbs))
 		changed := false
 		for _, db := range dbs {
 			if db.LocalDB != dbName {
@@ -300,7 +300,7 @@ func (rm *ReplicationManager) StopReplication(dbName string) {
 // goroutine instead of taking down the entire server process, which would
 // otherwise happen since Go does not recover panics across goroutine
 // boundaries.
-func (rm *ReplicationManager) safeGo(name string, fn func()) {
+func (rm *Manager) safeGo(name string, fn func()) {
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -311,13 +311,13 @@ func (rm *ReplicationManager) safeGo(name string, fn func()) {
 	}()
 }
 
-func (rm *ReplicationManager) spawnConnection(addr string) {
+func (rm *Manager) spawnConnection(addr string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	rm.cancelFunc[addr] = cancel
 	rm.safeGo("maintainConnection:"+addr, func() { rm.maintainConnection(ctx, addr) })
 }
 
-func (rm *ReplicationManager) maintainConnection(ctx context.Context, addr string) {
+func (rm *Manager) maintainConnection(ctx context.Context, addr string) {
 	peerLogger := rm.logger.With("peer_addr", addr)
 
 	for {
@@ -329,7 +329,7 @@ func (rm *ReplicationManager) maintainConnection(ctx context.Context, addr strin
 			rm.mu.Unlock()
 			return
 		}
-		dbs := make([]ReplicaSource, len(rm.peers[addr]))
+		dbs := make([]Source, len(rm.peers[addr]))
 		copy(dbs, rm.peers[addr])
 		rm.mu.Unlock()
 
@@ -374,7 +374,7 @@ func readLenPrefixedString(buf []byte, cursor int) (string, int, bool) {
 }
 
 // connectAndSync connects to the remote, sends Hello, and checks the response status.
-func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, dbs []ReplicaSource, logger *slog.Logger) error {
+func (rm *Manager) connectAndSync(ctx context.Context, addr string, dbs []Source, logger *slog.Logger) error {
 	dialer := net.Dialer{Timeout: 5 * time.Second}
 	conn, err := tls.DialWithDialer(&dialer, "tcp", addr, rm.tlsConf)
 	if err != nil {
@@ -392,7 +392,7 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 	remoteToLocal := make(map[string][]string)
 
 	// Handshake
-	// Format: [Ver:4][IDLen:4][ID][NumDBs:4] ... [NameLen:4][Name][LogID:8]
+	// Format: [Ver:4][IDLen:4][ID][NumDBs:4] ... [NameLen:4][Name][Offset:8]
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.BigEndian, uint32(1))
 	binary.Write(buf, binary.BigEndian, uint32(len(rm.serverID)))
@@ -400,15 +400,15 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 	binary.Write(buf, binary.BigEndian, uint32(len(dbs)))
 
 	for _, cfg := range dbs {
-		var logID uint64
+		var offset uint64
 		if st, ok := rm.stores[cfg.LocalDB]; ok {
-			logID = st.LastLogOffset()
+			offset = st.LastLogOffset()
 		}
 		binary.Write(buf, binary.BigEndian, uint32(len(cfg.RemoteDB)))
 		buf.WriteString(cfg.RemoteDB)
-		binary.Write(buf, binary.BigEndian, logID)
+		binary.Write(buf, binary.BigEndian, offset)
 
-		logger.Debug("Sending Hello for DB", "remote_db", cfg.RemoteDB, "local_db", cfg.LocalDB, "start_log_id", logID)
+		logger.Debug("Sending Hello for DB", "remote_db", cfg.RemoteDB, "local_db", cfg.LocalDB, "start_log_id", offset)
 
 		remoteToLocal[cfg.RemoteDB] = append(remoteToLocal[cfg.RemoteDB], cfg.LocalDB)
 	}
@@ -447,7 +447,7 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 		// --- VERIFY CRC ---
 		// We expect CRC for SafePoint and LogSegment
 		if opCode == protocol.OpCodeReplSafePoint ||
-			opCode == protocol.OpCodeReplLogSegment {
+			opCode == protocol.OpCodeReplLogRange {
 
 			if len(payload) < 4 {
 				return fmt.Errorf("packet too short for crc")
@@ -477,12 +477,12 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 			cursor += 4 // Skip Count/Reserved
 
 			if cursor+8 <= len(payload) {
-				safeSeq := binary.BigEndian.Uint64(payload[cursor:])
+				safeOffset := binary.BigEndian.Uint64(payload[cursor:])
 
 				if localDBNames, ok := remoteToLocal[remoteDBName]; ok {
 					for _, localDB := range localDBNames {
 						if st, ok := rm.stores[localDB]; ok {
-							st.SetLeaderSafeSeq(safeSeq)
+							st.SetLeaderRetainOffset(safeOffset)
 						}
 					}
 				}
@@ -490,8 +490,8 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 			continue
 		}
 
-		// --- Handle raw WAL byte segment (physical replication) ---
-		if opCode == protocol.OpCodeReplLogSegment {
+		// --- Handle raw log byte segment (physical replication) ---
+		if opCode == protocol.OpCodeReplLogRange {
 			remoteDBName, cursor, ok := readLenPrefixedString(payload, 0)
 			if !ok || cursor+4 > len(payload) {
 				logger.Warn("Malformed log segment packet, skipping", "len", len(payload))
@@ -514,7 +514,7 @@ func (rm *ReplicationManager) connectAndSync(ctx context.Context, addr string, d
 			if localDBNames, ok := remoteToLocal[remoteDBName]; ok {
 				for _, localDBName := range localDBNames {
 					if st, ok := rm.stores[localDBName]; ok {
-						if _, err := st.ApplyLogSegment(segData); err != nil {
+						if _, err := st.ApplyLogRange(segData); err != nil {
 							logger.Error("Failed to apply log segment", "db", localDBName, "err", err)
 							return err
 						}

@@ -3,7 +3,7 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root of this source tree.
 
-package stonedb
+package engine
 
 // checkReadSetConflicts validates the read set at COMMIT time.
 func (tx *Transaction) checkReadSetConflicts() error {

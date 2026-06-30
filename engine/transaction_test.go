@@ -3,7 +3,7 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root of this source tree.
 
-package stonedb
+package engine
 
 import (
 	"testing"
@@ -305,7 +305,7 @@ func TestTransaction_EmptyWritableCommitAborts(t *testing.T) {
 	}
 }
 
-func TestTransaction_ReadOnlyCommitNoWAL(t *testing.T) {
+func TestTransaction_ReadOnlyCommitNoLog(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(dir, Options{})
 	if err != nil {
@@ -334,6 +334,6 @@ func TestTransaction_ReadOnlyCommitNoWAL(t *testing.T) {
 		t.Fatal(err)
 	}
 	if after := db.LastLogOffset(); after != beforeOff {
-		t.Fatalf("read-only commit must not append WAL records: offset %d -> %d", beforeOff, after)
+		t.Fatalf("read-only commit must not append log records: offset %d -> %d", beforeOff, after)
 	}
 }

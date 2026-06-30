@@ -26,10 +26,10 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"turnstone/config"
+	"turnstone/database"
 	"turnstone/metrics"
-	"turnstone/replication"
+	"turnstone/repl"
 	"turnstone/server"
-	"turnstone/store"
 )
 
 var (
@@ -81,8 +81,8 @@ func runServer(logger *slog.Logger, devMode bool) {
 	}
 
 	// Set default strategy if missing
-	if cfg.WALRetentionStrategy == "" {
-		cfg.WALRetentionStrategy = "replication"
+	if cfg.LogRetention == "" {
+		cfg.LogRetention = "replication"
 	}
 
 	certFile := config.ResolvePath(*homeDir, cfg.TLSCertFile)
@@ -93,7 +93,7 @@ func runServer(logger *slog.Logger, devMode bool) {
 	clientCertFile := config.ResolvePath(*homeDir, cfg.TLSClientCertFile)
 	clientKeyFile := config.ResolvePath(*homeDir, cfg.TLSClientKeyFile)
 
-	stores := make(map[string]*store.Store)
+	stores := make(map[string]*database.Database)
 	var storesMu sync.Mutex
 
 	openLimit := runtime.NumCPU()
@@ -113,7 +113,7 @@ func runServer(logger *slog.Logger, devMode bool) {
 				return err
 			}
 			dbLogger.Info("Opening database...")
-			st, err := store.NewStore(openCtx, path, dbLogger, 0, cfg.WALRetentionStrategy, cfg.MaxDiskUsagePercent)
+			st, err := database.Open(openCtx, path, dbLogger, 0, cfg.LogRetention, cfg.MaxDiskUsagePercent)
 			if err != nil {
 				return fmt.Errorf("db %s: %w", name, err)
 			}
@@ -153,7 +153,7 @@ func runServer(logger *slog.Logger, devMode bool) {
 		os.Exit(1)
 	}
 
-	rm := replication.NewReplicationManager(cfg.ID, stores, replTLS, logger)
+	rm := repl.NewManager(cfg.ID, stores, replTLS, logger)
 
 	srv, err := server.NewServer(
 		cfg.ID,

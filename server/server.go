@@ -27,10 +27,10 @@ import (
 	"syscall"
 	"time"
 
+	"turnstone/database"
+	"turnstone/engine"
 	"turnstone/protocol"
-	"turnstone/replication"
-	"turnstone/stonedb"
-	"turnstone/store"
+	"turnstone/repl"
 )
 
 // Roles
@@ -41,7 +41,7 @@ const (
 )
 
 type Server struct {
-	stores    map[string]*store.Store
+	stores    map[string]*database.Database
 	defaultDB string
 	id        string // Unique Server ID
 	addr      string
@@ -63,7 +63,7 @@ type Server struct {
 	tlsKeyFile       string
 	tlsCAFile        string
 	currentTLSConfig atomic.Value
-	replManager      *replication.ReplicationManager
+	replManager      *repl.Manager
 	devMode          bool
 	closing          int32
 
@@ -79,7 +79,7 @@ type Server struct {
 	bufPool sync.Pool
 }
 
-func NewServer(id string, addr string, stores map[string]*store.Store, logger *slog.Logger, maxConns int, tlsCert, tlsKey, tlsCA string, rm *replication.ReplicationManager, devMode bool) (*Server, error) {
+func NewServer(id string, addr string, stores map[string]*database.Database, logger *slog.Logger, maxConns int, tlsCert, tlsKey, tlsCA string, rm *repl.Manager, devMode bool) (*Server, error) {
 	if tlsCert == "" || tlsKey == "" || tlsCA == "" {
 		return nil, fmt.Errorf("tls cert, key, and ca required")
 	}
@@ -290,8 +290,8 @@ func (s *Server) snapshotDBConnections(db string) []net.Conn {
 // connState is shared with replication.go
 type connState struct {
 	dbName      string
-	db          *store.Store
-	tx          *stonedb.Transaction
+	db          *database.Database
+	tx          *engine.Transaction
 	txStartTime time.Time // Track start time for timeouts
 	role        string
 	clientID    string
@@ -598,7 +598,7 @@ func (s *Server) handleBegin(w io.Writer, payload []byte, st *connState) {
 	}
 	// State Check: Only Primary or Replica allow transactions
 	state := st.db.GetState()
-	if state != store.StatePrimary && state != store.StateReplica {
+	if state != database.StatePrimary && state != database.StateReplica {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Database not available for transactions"))
 		return
 	}
@@ -615,9 +615,9 @@ func (s *Server) handleBegin(w io.Writer, payload []byte, st *connState) {
 	}
 
 	// Only a Primary connection with a writable BEGIN allocates an xid and
-	// logs BEGIN to the WAL. Replica txs are always read-only. PRIMARY
-	// clients may request read-only explicitly (no WAL/fsync on COMMIT).
-	update := state == store.StatePrimary && !readOnly
+	// logs BEGIN to the log. Replica txs are always read-only. PRIMARY
+	// clients may request read-only explicitly (no log/fsync on COMMIT).
+	update := state == database.StatePrimary && !readOnly
 	st.tx = st.db.NewTransaction(update)
 	st.txStartTime = time.Now()
 	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
@@ -642,10 +642,10 @@ func (s *Server) handleCommit(w net.Conn, st *connState) {
 
 	if err != nil {
 		switch err {
-		case stonedb.ErrDiskFull:
+		case engine.ErrDiskFull:
 			s.logger.Error("Commit failed: Disk Full")
 			_ = s.writeBinaryResponse(w, protocol.ResStatusServerBusy, []byte("ERR disk is full"))
-		case stonedb.ErrWriteConflict:
+		case engine.ErrWriteConflict:
 			// DEBUG: Conflicts are normal operation, not system errors
 			st.logger.Debug("Commit failed: Conflict")
 			_ = s.writeBinaryResponse(w, protocol.ResStatusTxConflict, []byte(err.Error()))
@@ -669,7 +669,7 @@ func (s *Server) handleCommit(w net.Conn, st *connState) {
 	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
 }
 
-// waitForQuorumOrDisconnect wraps Store.WaitForQuorum with a lightweight
+// waitForQuorumOrDisconnect wraps Database.WaitForQuorum with a lightweight
 // background watcher that periodically checks whether the requesting client
 // has already disconnected. Without this, a client that gives up (or
 // crashes) during a replica outage would still leave this goroutine -- and
@@ -677,7 +677,7 @@ func (s *Server) handleCommit(w net.Conn, st *connState) {
 // timeout; a burst of such abandoned commits during an outage can exhaust
 // maxConns even though none of those clients are still waiting on a
 // response.
-func (s *Server) waitForQuorumOrDisconnect(conn net.Conn, st *store.Store, commitEndOffset uint64) error {
+func (s *Server) waitForQuorumOrDisconnect(conn net.Conn, st *database.Database, commitEndOffset uint64) error {
 	cancel := make(chan struct{})
 	stop := make(chan struct{})
 	defer close(stop)
@@ -718,7 +718,7 @@ func (s *Server) handleGet(w io.Writer, payload []byte, st *connState) {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusTxRequired, nil)
 		return
 	}
-	if st.db.GetState() == store.StateUndefined {
+	if st.db.GetState() == database.StateUndefined {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Database undefined (no reads)"))
 		return
 	}
@@ -734,9 +734,9 @@ func (s *Server) handleGet(w io.Writer, payload []byte, st *connState) {
 	switch err {
 	case nil:
 		_ = s.writeBinaryResponse(w, protocol.ResStatusOK, val)
-	case stonedb.ErrKeyNotFound:
+	case engine.ErrKeyNotFound:
 		_ = s.writeBinaryResponse(w, protocol.ResStatusNotFound, nil)
-	case stonedb.ErrWriteConflict:
+	case engine.ErrWriteConflict:
 		_ = s.writeBinaryResponse(w, protocol.ResStatusTxConflict, []byte(err.Error()))
 	default:
 		st.logger.Error("Get operation failed", "key", key, "err", err)
@@ -749,7 +749,7 @@ func (s *Server) handleSet(w io.Writer, payload []byte, st *connState) {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Database selected"))
 		return
 	}
-	if st.db.GetState() != store.StatePrimary && st.db.GetState() != store.StateSteppingDown {
+	if st.db.GetState() != database.StatePrimary && st.db.GetState() != database.StateSteppingDown {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Read-only/Undefined state"))
 		return
 	}
@@ -797,15 +797,15 @@ func (s *Server) handleSet(w io.Writer, payload []byte, st *connState) {
 }
 
 // writeWriteError maps a Put/Delete error to the appropriate wire status.
-// stonedb.ErrWriteConflict now surfaces directly from SET/DEL (first-writer-wins
+// engine.ErrWriteConflict now surfaces directly from SET/DEL (first-writer-wins
 // happens eagerly, not just at COMMIT), matching Postgres's "current transaction
 // is aborted" behavior for subsequent ops on the same connection.
 func (s *Server) writeWriteError(w io.Writer, st *connState, op, key string, err error) {
 	switch err {
-	case stonedb.ErrWriteConflict:
+	case engine.ErrWriteConflict:
 		st.logger.Debug(op+" operation conflict", "key", key)
 		_ = s.writeBinaryResponse(w, protocol.ResStatusTxConflict, []byte(err.Error()))
-	case stonedb.ErrDiskFull:
+	case engine.ErrDiskFull:
 		st.logger.Error(op + " failed: Disk Full")
 		_ = s.writeBinaryResponse(w, protocol.ResStatusServerBusy, []byte("ERR disk is full"))
 	default:
@@ -819,7 +819,7 @@ func (s *Server) handleDel(w io.Writer, payload []byte, st *connState) {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Database selected"))
 		return
 	}
-	if st.db.GetState() != store.StatePrimary && st.db.GetState() != store.StateSteppingDown {
+	if st.db.GetState() != database.StatePrimary && st.db.GetState() != database.StateSteppingDown {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Read-only/Undefined state"))
 		return
 	}
@@ -837,7 +837,7 @@ func (s *Server) handleDel(w io.Writer, payload []byte, st *connState) {
 
 	// Check if key exists before deleting to provide feedback
 	_, err := st.tx.Get([]byte(key))
-	if err == stonedb.ErrKeyNotFound {
+	if err == engine.ErrKeyNotFound {
 		// Key doesn't exist, return NotFound status (client will see "(nil)" or ErrNotFound)
 		_ = s.writeBinaryResponse(w, protocol.ResStatusNotFound, nil)
 		return
@@ -862,7 +862,7 @@ func (s *Server) handleMGet(w io.Writer, payload []byte, st *connState) {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusTxRequired, nil)
 		return
 	}
-	if st.db.GetState() == store.StateUndefined {
+	if st.db.GetState() == database.StateUndefined {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Database undefined (no reads)"))
 		return
 	}
@@ -908,9 +908,9 @@ func (s *Server) handleMGet(w io.Writer, payload []byte, st *connState) {
 		}
 
 		val, err := st.tx.Get(key)
-		if err == stonedb.ErrKeyNotFound {
+		if err == engine.ErrKeyNotFound {
 			binary.Write(respBuf, binary.BigEndian, uint32(0xFFFFFFFF))
-		} else if err == stonedb.ErrWriteConflict {
+		} else if err == engine.ErrWriteConflict {
 			_ = s.writeBinaryResponse(w, protocol.ResStatusTxConflict, []byte(err.Error()))
 			return
 		} else if err != nil {
@@ -931,7 +931,7 @@ func (s *Server) handleMSet(w io.Writer, payload []byte, st *connState) {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Database selected"))
 		return
 	}
-	if st.db.GetState() != store.StatePrimary && st.db.GetState() != store.StateSteppingDown {
+	if st.db.GetState() != database.StatePrimary && st.db.GetState() != database.StateSteppingDown {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Read-only/Undefined state"))
 		return
 	}
@@ -1005,7 +1005,7 @@ func (s *Server) handleMDel(w io.Writer, payload []byte, st *connState) {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("No Database selected"))
 		return
 	}
-	if st.db.GetState() != store.StatePrimary && st.db.GetState() != store.StateSteppingDown {
+	if st.db.GetState() != database.StatePrimary && st.db.GetState() != database.StateSteppingDown {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Read-only/Undefined state"))
 		return
 	}
@@ -1044,7 +1044,7 @@ func (s *Server) handleMDel(w io.Writer, payload []byte, st *connState) {
 		}
 
 		_, err := st.tx.Get(key)
-		if err == stonedb.ErrWriteConflict {
+		if err == engine.ErrWriteConflict {
 			_ = s.writeBinaryResponse(w, protocol.ResStatusTxConflict, []byte(err.Error()))
 			return
 		}
@@ -1079,7 +1079,7 @@ func (s *Server) handleReplicaOf(w io.Writer, payload []byte, st *connState) {
 	defer st.db.UnlockAdmin()
 
 	// VALID ONLY IF UNDEFINED
-	if st.db.GetState() != store.StateUndefined {
+	if st.db.GetState() != database.StateUndefined {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Must be in UNDEFINED state to call REPLICAOF"))
 		return
 	}
@@ -1105,7 +1105,7 @@ func (s *Server) handleReplicaOf(w io.Writer, payload []byte, st *connState) {
 	// INFO: Significant role change
 	st.logger.Info("Starting replication (Transition to REPLICA)", "db", st.dbName, "source", addr, "remote_db", remoteDB)
 
-	// Wipe local state so physical catch-up streams from offset 0 with a clean WAL.
+	// Wipe local state so physical catch-up streams from offset 0 with a clean log.
 	if err := st.db.Reset(); err != nil {
 		st.logger.Error("Failed to reset database before replication", "err", err)
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte(fmt.Sprintf("reset failed: %v", err)))
@@ -1115,12 +1115,12 @@ func (s *Server) handleReplicaOf(w io.Writer, payload []byte, st *connState) {
 	// Transition State
 	// We optimistically set state to REPLICA to allow the handshake (which might check state),
 	// but we must revert if the handshake fails.
-	st.db.SetState(store.StateReplica)
+	st.db.SetState(database.StateReplica)
 
-	if err := s.replManager.AddReplica(st.dbName, addr, remoteDB); err != nil {
+	if err := s.replManager.Follow(st.dbName, addr, remoteDB); err != nil {
 		st.logger.Error("Replication handshake failed", "err", err)
 		// Revert state on failure so the user can try again or Promote
-		st.db.SetState(store.StateUndefined)
+		st.db.SetState(database.StateUndefined)
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte(err.Error()))
 		return
 	}
@@ -1138,7 +1138,7 @@ func (s *Server) handlePromote(w io.Writer, payload []byte, st *connState) {
 
 	// Consolidated check for consistency with REPLICAOF message style
 	// Valid only if UNDEFINED or REPLICA
-	if currentState != store.StateUndefined && currentState != store.StateReplica {
+	if currentState != database.StateUndefined && currentState != database.StateReplica {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Must be in UNDEFINED or REPLICA state to call PROMOTE"))
 		return
 	}
@@ -1153,7 +1153,7 @@ func (s *Server) handlePromote(w io.Writer, payload []byte, st *connState) {
 	st.logger.Info("Promoting database to PRIMARY", "db", st.dbName, "min_replicas", minReplicas)
 
 	// Stop existing replication if any
-	s.replManager.StopReplication(st.dbName)
+	s.replManager.StopFollowing(st.dbName)
 
 	// Configure the minimum replicas required for future writes on this primary
 	// This is set BEFORE promotion logic completes to ensure consistency from op 1.
@@ -1175,7 +1175,7 @@ func (s *Server) handleStepDown(w io.Writer, st *connState) {
 
 	// Only allow StepDown if actively running as Primary or Replica
 	currentState := st.db.GetState()
-	if currentState != store.StatePrimary && currentState != store.StateReplica {
+	if currentState != database.StatePrimary && currentState != database.StateReplica {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Command only valid for PRIMARY or REPLICA state"))
 		return
 	}
@@ -1183,16 +1183,16 @@ func (s *Server) handleStepDown(w io.Writer, st *connState) {
 	// INFO: Significant role change
 	st.logger.Info("Stepping down database...", "db", st.dbName, "current_state", currentState)
 
-	if currentState == store.StateReplica {
+	if currentState == database.StateReplica {
 		// State 1: Stop incoming replication immediately
 		if s.replManager != nil {
-			s.replManager.StopReplication(st.dbName)
+			s.replManager.StopFollowing(st.dbName)
 		}
 		// Transition to UNDEFINED immediately
-		st.db.SetState(store.StateUndefined)
-	} else if currentState == store.StatePrimary {
+		st.db.SetState(database.StateUndefined)
+	} else if currentState == database.StatePrimary {
 		// State 1: Block NEW transactions (Transition to STEPPING_DOWN)
-		st.db.SetState(store.StateSteppingDown)
+		st.db.SetState(database.StateSteppingDown)
 
 		// State 2: Drain ACTIVE transactions
 		st.logger.Info("Waiting for active transactions to drain...", "db", st.dbName)
@@ -1225,7 +1225,7 @@ func (s *Server) handleStepDown(w io.Writer, st *connState) {
 		st.db.ResetReplicas()
 
 		// Transition to UNDEFINED
-		st.db.SetState(store.StateUndefined)
+		st.db.SetState(database.StateUndefined)
 	}
 
 	// Disconnect ALL clients (including self/current connection). Snapshot the
@@ -1259,12 +1259,12 @@ func (s *Server) handleFlushDB(w io.Writer, st *connState) {
 	st.logger.Warn("FLUSHDB requested", "db", st.dbName, "client", st.clientID)
 
 	// 1. Stop Upstream Replication (Remove REPLICAOF)
-	if s.replManager != nil && s.replManager.IsReplicating(st.dbName) {
-		s.replManager.StopReplication(st.dbName)
+	if s.replManager != nil && s.replManager.IsFollowing(st.dbName) {
+		s.replManager.StopFollowing(st.dbName)
 	}
 
 	// 2. Perform Reset (Wipes data, disconnects downstream replicas)
-	// Reset() inside store.go handles s.RemoveAllReplicas() which kills existing downstream connections.
+	// Reset() inside database.go handles s.RemoveAllReplicas() which kills existing downstream connections.
 	if err := st.db.Reset(); err != nil {
 		st.logger.Error("FLUSHDB failed", "err", err)
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte(fmt.Sprintf("FLUSHDB failed: %v", err)))
@@ -1273,7 +1273,7 @@ func (s *Server) handleFlushDB(w io.Writer, st *connState) {
 
 	// 3. Transition to UNDEFINED
 	// The database is now empty and has no role. It requires explicit promotion or replication configuration.
-	st.db.SetState(store.StateUndefined)
+	st.db.SetState(database.StateUndefined)
 
 	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
 }
@@ -1289,8 +1289,8 @@ func (s *Server) handleStat(w io.Writer, st *connState) {
 	dbState := st.db.GetState()
 	minReplicas := st.db.MinReplicas()
 
-	if dbState == store.StateReplica && s.replManager != nil {
-		addr, remoteDB := s.replManager.GetReplicationSource(st.dbName)
+	if dbState == database.StateReplica && s.replManager != nil {
+		addr, remoteDB := s.replManager.Source(st.dbName)
 		if addr != "" {
 			dbState = fmt.Sprintf("REPLICAOF %s %s", addr, remoteDB)
 		}
@@ -1301,8 +1301,8 @@ func (s *Server) handleStat(w io.Writer, st *connState) {
 		KeyCount          int64  `json:"key_count"`
 		Conflicts         uint64 `json:"conflicts"`
 		ActiveConnections int64  `json:"active_connections"`
-		VLogFiles         int    `json:"vlog_files"`
-		WALFiles          int    `json:"wal_files"`
+		LogBytes          int64  `json:"log_bytes"`
+		LogAllocatedBytes int64  `json:"log_allocated_bytes"`
 		ActiveTxs         int    `json:"active_txs"`
 		ReplicaLag        uint64 `json:"replica_lag"`
 		Uptime            string `json:"uptime"`
@@ -1312,8 +1312,8 @@ func (s *Server) handleStat(w io.Writer, st *connState) {
 		KeyCount:          stats.KeyCount,
 		Conflicts:         stats.Conflicts,
 		ActiveConnections: conns,
-		VLogFiles:         stats.VLogFiles,
-		WALFiles:          stats.WALFiles,
+		LogBytes:          stats.LogSize,
+		LogAllocatedBytes: stats.LogAllocated,
 		ActiveTxs:         stats.ActiveTxs,
 		ReplicaLag:        stats.ReplicaLag,
 		Uptime:            stats.Uptime,
@@ -1380,7 +1380,7 @@ func (s *Server) CloseAll() {
 	var wg sync.WaitGroup
 	for _, st := range s.stores {
 		wg.Add(1)
-		go func(store *store.Store) {
+		go func(store *database.Database) {
 			defer wg.Done()
 			_ = store.Close()
 		}(st)

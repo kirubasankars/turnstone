@@ -11,7 +11,7 @@ import (
 	"log/slog"
 	"testing"
 
-	"turnstone/store"
+	"turnstone/database"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -45,21 +45,21 @@ func TestNewTurnstoneCollector(t *testing.T) {
 		},
 	}
 
-	// 2. Initialize a real Store to trigger the loop in Collect
+	// 2. Initialize a real Database to trigger the loop in Collect
 	// We use a temporary directory so we don't pollute the file system.
 	tmpDir := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	// Create a new store (MinReplicas=0, Strategy="time")
 	// Removed isSystem (bool) argument.
-	// Signature: (dir, logger, minReplicas, walStrategy, maxDiskUsage, blockCacheSize)
-	st, err := store.NewStore(context.Background(), tmpDir, logger, 0, "time", 90)
+	// Signature: (dir, logger, minReplicas, retentionStrategy, maxDiskUsage)
+	st, err := database.Open(context.Background(), tmpDir, logger, 0, "none", 90)
 	if err != nil {
 		t.Fatalf("Failed to create test store: %v", err)
 	}
 	defer st.Close()
 
-	stores := map[string]*store.Store{
+	stores := map[string]*database.Database{
 		"test_db": st,
 	}
 
@@ -93,10 +93,8 @@ func TestNewTurnstoneCollector(t *testing.T) {
 		"turnstone_db_conflicts_total":                false,
 		"turnstone_db_offset":                         false,
 		"turnstone_db_replica_lag":                    false,
-		"turnstone_db_wal_files":                      false,
-		"turnstone_db_wal_bytes":                      false,
-		"turnstone_db_vlog_files":                     false,
-		"turnstone_db_vlog_bytes":                     false,
+		"turnstone_db_log_bytes":                      false,
+		"turnstone_db_log_allocated_bytes":            false,
 	}
 
 	for _, mf := range mfs {
@@ -128,11 +126,10 @@ func TestNewTurnstoneCollector(t *testing.T) {
 			if !found {
 				t.Errorf("Expected database connections for 'test_db' to be 42")
 			}
-		case "turnstone_db_wal_files":
-			// Just ensure we are getting > 0 since a fresh store creates at least 1 WAL
+		case "turnstone_db_log_bytes":
 			for _, m := range mf.Metric {
-				if m.Gauge != nil && *m.Gauge.Value < 1 {
-					t.Errorf("Expected at least 1 WAL file, got %v", *m.Gauge.Value)
+				if m.Gauge != nil && *m.Gauge.Value < 0 {
+					t.Errorf("Expected non-negative log bytes, got %v", *m.Gauge.Value)
 				}
 			}
 		}

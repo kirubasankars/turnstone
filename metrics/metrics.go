@@ -10,7 +10,7 @@ import (
 	"net/http"
 	"strings"
 
-	"turnstone/store"
+	"turnstone/database"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
@@ -28,7 +28,7 @@ type ServerStatsProvider interface {
 }
 
 type TurnstoneCollector struct {
-	stores      map[string]*store.Store
+	stores      map[string]*database.Database
 	serverStats ServerStatsProvider
 
 	// Server-wide metrics
@@ -37,19 +37,17 @@ type TurnstoneCollector struct {
 	totalActiveTxs *prometheus.Desc
 
 	// Per-database metrics
-	dbConnections *prometheus.Desc
-	dbActiveTxs   *prometheus.Desc
-	dbConflicts   *prometheus.Desc
-	dbOffset      *prometheus.Desc
-	dbReplicaLag  *prometheus.Desc
-	dbWALFiles    *prometheus.Desc
-	dbWALBytes    *prometheus.Desc
-	dbVLogFiles   *prometheus.Desc
-	dbVLogBytes   *prometheus.Desc
-	dbKeyCount    *prometheus.Desc
+	dbConnections  *prometheus.Desc
+	dbActiveTxs    *prometheus.Desc
+	dbConflicts    *prometheus.Desc
+	dbOffset       *prometheus.Desc
+	dbReplicaLag   *prometheus.Desc
+	dbLogBytes     *prometheus.Desc
+	dbLogAllocated *prometheus.Desc
+	dbKeyCount     *prometheus.Desc
 }
 
-func NewTurnstoneCollector(stores map[string]*store.Store, stats ServerStatsProvider) *TurnstoneCollector {
+func NewTurnstoneCollector(stores map[string]*database.Database, stats ServerStatsProvider) *TurnstoneCollector {
 	return &TurnstoneCollector{
 		stores:      stores,
 		serverStats: stats,
@@ -60,16 +58,14 @@ func NewTurnstoneCollector(stores map[string]*store.Store, stats ServerStatsProv
 		totalActiveTxs: newDesc("server", "transactions_active", "Total active transactions across server"),
 
 		// Per Database
-		dbConnections: newDescWithLabels("db", "connections", "Active connections to this database", []string{"db"}),
-		dbActiveTxs:   newDescWithLabels("db", "active_txs", "Active transactions in database", []string{"db"}),
-		dbConflicts:   newDescWithLabels("db", "conflicts_total", "Total transaction conflicts in database", []string{"db"}),
-		dbOffset:      newDescWithLabels("db", "offset", "Current operation ID (LogID)", []string{"db"}),
-		dbReplicaLag:  newDescWithLabels("db", "replica_lag", "Lag of the slowest replica in operations", []string{"db"}),
-		dbWALFiles:    newDescWithLabels("db", "wal_files", "Number of log files (always 1)", []string{"db"}),
-		dbWALBytes:    newDescWithLabels("db", "wal_bytes", "Logical size of data.log in bytes", []string{"db"}),
-		dbVLogFiles:   newDescWithLabels("db", "vlog_files", "Deprecated; always 0 (single log file)", []string{"db"}),
-		dbVLogBytes:   newDescWithLabels("db", "vlog_bytes", "Allocated on-disk bytes for data.log (sparse)", []string{"db"}),
-		dbKeyCount:    newDescWithLabels("db", "key_count", "Approximate number of live keys in database", []string{"db"}),
+		dbConnections:  newDescWithLabels("db", "connections", "Active connections to this database", []string{"db"}),
+		dbActiveTxs:    newDescWithLabels("db", "active_txs", "Active transactions in database", []string{"db"}),
+		dbConflicts:    newDescWithLabels("db", "conflicts_total", "Total transaction conflicts in database", []string{"db"}),
+		dbOffset:       newDescWithLabels("db", "offset", "Exclusive end byte offset of data.log", []string{"db"}),
+		dbReplicaLag:   newDescWithLabels("db", "replica_lag", "Lag of the slowest replica in bytes", []string{"db"}),
+		dbLogBytes:     newDescWithLabels("db", "log_bytes", "Logical size of data.log in bytes", []string{"db"}),
+		dbLogAllocated: newDescWithLabels("db", "log_allocated_bytes", "Allocated on-disk bytes for data.log (sparse)", []string{"db"}),
+		dbKeyCount:     newDescWithLabels("db", "key_count", "Approximate number of live keys in database", []string{"db"}),
 	}
 }
 
@@ -90,10 +86,8 @@ func (c *TurnstoneCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.dbConflicts
 	ch <- c.dbOffset
 	ch <- c.dbReplicaLag
-	ch <- c.dbWALFiles
-	ch <- c.dbWALBytes
-	ch <- c.dbVLogFiles
-	ch <- c.dbVLogBytes
+	ch <- c.dbLogBytes
+	ch <- c.dbLogAllocated
 	ch <- c.dbKeyCount
 }
 
@@ -117,15 +111,13 @@ func (c *TurnstoneCollector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(c.dbConflicts, prometheus.CounterValue, float64(stats.Conflicts), name)
 		ch <- prometheus.MustNewConstMetric(c.dbOffset, prometheus.GaugeValue, float64(stats.Offset), name)
 		ch <- prometheus.MustNewConstMetric(c.dbReplicaLag, prometheus.GaugeValue, float64(stats.ReplicaLag), name)
-		ch <- prometheus.MustNewConstMetric(c.dbWALFiles, prometheus.GaugeValue, float64(stats.WALFiles), name)
-		ch <- prometheus.MustNewConstMetric(c.dbWALBytes, prometheus.GaugeValue, float64(stats.WALSize), name)
-		ch <- prometheus.MustNewConstMetric(c.dbVLogFiles, prometheus.GaugeValue, float64(stats.VLogFiles), name)
-		ch <- prometheus.MustNewConstMetric(c.dbVLogBytes, prometheus.GaugeValue, float64(stats.VLogSize), name)
+		ch <- prometheus.MustNewConstMetric(c.dbLogBytes, prometheus.GaugeValue, float64(stats.LogSize), name)
+		ch <- prometheus.MustNewConstMetric(c.dbLogAllocated, prometheus.GaugeValue, float64(stats.LogAllocated), name)
 		ch <- prometheus.MustNewConstMetric(c.dbKeyCount, prometheus.GaugeValue, float64(stats.KeyCount), name)
 	}
 }
 
-func StartMetricsServer(addr string, stores map[string]*store.Store, serverStats ServerStatsProvider, logger *slog.Logger) {
+func StartMetricsServer(addr string, stores map[string]*database.Database, serverStats ServerStatsProvider, logger *slog.Logger) {
 	if addr == "" {
 		return
 	}

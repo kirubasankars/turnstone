@@ -3,7 +3,7 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root of this source tree.
 
-package stonedb
+package engine
 
 import (
 	"context"
@@ -13,28 +13,28 @@ import (
 func (db *DB) replayLog(ctx context.Context, truncateCorrupt bool) error {
 	inProgress := make(map[uint64]struct{})
 
-	err := db.log.Replay(ctx, truncateCorrupt, func(rec WALRecord, span recordSpan) {
+	err := db.log.Replay(ctx, truncateCorrupt, func(rec Record, span recordSpan) {
 		if rec.XID > atomic.LoadUint64(&db.transactionID) {
 			atomic.StoreUint64(&db.transactionID, rec.XID)
 		}
 
 		switch rec.Type {
-		case WALRecordBegin:
+		case RecordBegin:
 			inProgress[rec.XID] = struct{}{}
-		case WALRecordSet:
+		case RecordSet:
 			db.index.Put(rec.Key, indexVersion{
 				offset: span.offset, valueLen: uint32(len(rec.Value)),
 				xmin: rec.XID, tombstone: false,
 			})
-		case WALRecordDelete:
+		case RecordDelete:
 			db.index.Put(rec.Key, indexVersion{
 				offset: span.offset, valueLen: 0,
 				xmin: rec.XID, tombstone: true,
 			})
-		case WALRecordCommit:
+		case RecordCommit:
 			delete(inProgress, rec.XID)
 			db.forgetClog(rec.XID)
-		case WALRecordAbort:
+		case RecordAbort:
 			delete(inProgress, rec.XID)
 			db.index.DropXid(rec.XID)
 			db.forgetClog(rec.XID)

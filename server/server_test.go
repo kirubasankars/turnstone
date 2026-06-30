@@ -21,10 +21,10 @@ import (
 	"time"
 
 	"turnstone/config"
+	"turnstone/database"
 	"turnstone/metrics"
 	"turnstone/protocol"
-	"turnstone/replication"
-	"turnstone/store"
+	"turnstone/repl"
 
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
@@ -32,7 +32,7 @@ import (
 
 // --- Test Infrastructure & Helpers ---
 
-func setupTestEnv(t *testing.T) (string, map[string]*store.Store, *Server, func()) {
+func setupTestEnv(t *testing.T) (string, map[string]*database.Database, *Server, func()) {
 	t.Helper()
 	// Use MkdirTemp to keep files (t.TempDir deletes them)
 	dir, err := os.MkdirTemp("", "turnstone-server-test-*")
@@ -72,14 +72,14 @@ func setupTestEnv(t *testing.T) (string, map[string]*store.Store, *Server, func(
 	}
 
 	// 2. Init Stores (0, 1, 2, 3)
-	stores := make(map[string]*store.Store)
+	stores := make(map[string]*database.Database)
 	for i := 0; i < 4; i++ {
 		dbName := strconv.Itoa(i)
-		s, err := store.NewStore(context.Background(), filepath.Join(dir, "data", dbName), logger, 0, "time", 90)
+		s, err := database.Open(context.Background(), filepath.Join(dir, "data", dbName), logger, 0, "none", 90)
 		if err != nil {
 			t.Fatal(err)
 		}
-		s.SetState(store.StatePrimary)
+		s.SetState(database.StatePrimary)
 		stores[dbName] = s
 	}
 
@@ -97,7 +97,7 @@ func setupTestEnv(t *testing.T) (string, map[string]*store.Store, *Server, func(
 	pool.AppendCertsFromPEM(caCert)
 	tlsConf := &tls.Config{Certificates: []tls.Certificate{clientCert}, RootCAs: pool, InsecureSkipVerify: true}
 
-	rm := replication.NewReplicationManager("test-server", stores, tlsConf, logger)
+	rm := repl.NewManager("test-server", stores, tlsConf, logger)
 
 	// 4. Init Server (Port 0 for random free port)
 	srv, err := NewServer(
@@ -524,7 +524,7 @@ func TestMetrics_StorageIO(t *testing.T) {
 	// Capture baseline metrics
 	// Note: Metric keys now use "db" prefix
 	m0 := gatherMetrics(t, srv)
-	baseVLogBytes := m0["turnstone_db_vlog_bytes"]
+	baseLogAllocated := m0["turnstone_db_log_allocated_bytes"]
 
 	// Write Data
 	client.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
@@ -539,8 +539,8 @@ func TestMetrics_StorageIO(t *testing.T) {
 
 	// Verify that allocated log bytes increased (sparse data.log)
 	m1 := gatherMetrics(t, srv)
-	if m1["turnstone_db_vlog_bytes"] <= baseVLogBytes {
-		t.Errorf("Expected vlog bytes increase, got %v (was %v)", m1["turnstone_db_vlog_bytes"], baseVLogBytes)
+	if m1["turnstone_db_log_allocated_bytes"] <= baseLogAllocated {
+		t.Errorf("Expected allocated log bytes increase, got %v (was %v)", m1["turnstone_db_log_allocated_bytes"], baseLogAllocated)
 	}
 
 	// Read Data
@@ -776,7 +776,7 @@ func TestServer_RoleTransitions(t *testing.T) {
 	defer cleanup()
 
 	// Set DB "1" to UNDEFINED for testing
-	stores["1"].SetState(store.StateUndefined)
+	stores["1"].SetState(database.StateUndefined)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -831,7 +831,7 @@ func TestServer_RoleTransitions(t *testing.T) {
 	admin = connectClient(t, addr, adminTLS)
 	admin.AssertStatus(protocol.OpCodeSelect, []byte("1"), protocol.ResStatusOK)
 	// REPLICAOF valid only in UNDEFINED.
-	// AddReplica now performs a synchronous handshake before returning, so
+	// Follow now performs a synchronous handshake before returning, so
 	// the source must be a live, reachable peer: loop back to this same
 	// server's DB "0" (already PRIMARY from setupTestEnv, no cascading
 	// concerns since it's not itself a replica).

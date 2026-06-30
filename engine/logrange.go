@@ -3,7 +3,7 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root of this source tree.
 
-package stonedb
+package engine
 
 import (
 	"encoding/binary"
@@ -13,13 +13,13 @@ import (
 )
 
 type logFrame struct {
-	rec    WALRecord
+	rec    Record
 	length int64
 }
 
-// validateLogSegment ensures data is a concatenation of complete WAL frames.
+// validateFrames ensures data is a concatenation of complete log frames.
 // Partial frames are rejected so replication stays statement-safe.
-func validateLogSegment(data []byte) ([]logFrame, error) {
+func validateFrames(data []byte) ([]logFrame, error) {
 	if len(data) == 0 {
 		return nil, nil
 	}
@@ -39,7 +39,7 @@ func validateLogSegment(data []byte) ([]logFrame, error) {
 		if crc32.Checksum(payload, Crc32Table) != checksum {
 			return nil, ErrChecksum
 		}
-		rec, err := decodeWALRecord(payload)
+		rec, err := decodeRecord(payload)
 		if err != nil {
 			return nil, err
 		}
@@ -49,10 +49,10 @@ func validateLogSegment(data []byte) ([]logFrame, error) {
 	return frames, nil
 }
 
-// ReadLogSegment reads complete WAL frames from startOffset, returning at most
+// ReadLogRange reads complete log frames from startOffset, returning at most
 // maxBytes of raw on-disk frame bytes (headers included). The segment never
 // splits a frame, so each boundary aligns to a statement (BEGIN/SET/DEL/COMMIT/ABORT).
-func (l *DataLog) ReadLogSegment(startOffset int64, maxBytes int64) ([]byte, int64, error) {
+func (l *DataLog) ReadLogRange(startOffset int64, maxBytes int64) ([]byte, int64, error) {
 	if maxBytes <= 0 {
 		return nil, startOffset, nil
 	}
@@ -102,9 +102,9 @@ func (l *DataLog) ReadLogSegment(startOffset int64, maxBytes int64) ([]byte, int
 	return out, pos, nil
 }
 
-// AppendRawSegment appends a validated segment of complete WAL frames.
-func (l *DataLog) AppendRawSegment(data []byte, fsync bool) (int64, error) {
-	frames, err := validateLogSegment(data)
+// AppendRawFrames appends a validated range of complete log frames.
+func (l *DataLog) AppendRawFrames(data []byte, fsync bool) (int64, error) {
+	frames, err := validateFrames(data)
 	if err != nil {
 		return 0, err
 	}
