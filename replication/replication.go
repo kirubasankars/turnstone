@@ -251,6 +251,18 @@ func (rm *ReplicationManager) verifyHandshake(addr string, dbs []ReplicaSource) 
 	return nil
 }
 
+// StopAll cancels every outbound replication connection.
+func (rm *ReplicationManager) StopAll() {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	for addr, cancel := range rm.cancelFunc {
+		cancel()
+		delete(rm.cancelFunc, addr)
+		delete(rm.peers, addr)
+		rm.logger.Debug("Stopped replication connection", "peer_addr", addr)
+	}
+}
+
 func (rm *ReplicationManager) StopReplication(dbName string) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()

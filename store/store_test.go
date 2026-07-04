@@ -6,6 +6,7 @@
 package store
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"os"
@@ -28,7 +29,7 @@ func TestStore_Recover_Basic(t *testing.T) {
 
 	// 1. Initialize Store and write data
 	// Signature: (dir, logger, minReplicas, walStrategy, maxDiskUsage, blockCacheSize)
-	s1, err := NewStore(dir, logger, 0, "time", 90)
+	s1, err := NewStore(context.Background(), dir, logger, 0, "time", 90)
 	if err != nil {
 		t.Fatalf("Failed to create initial store: %v", err)
 	}
@@ -51,7 +52,7 @@ func TestStore_Recover_Basic(t *testing.T) {
 	}
 
 	// 2. Re-open Store
-	s2, err := NewStore(dir, logger, 0, "time", 90)
+	s2, err := NewStore(context.Background(), dir, logger, 0, "time", 90)
 	if err != nil {
 		t.Fatalf("Failed to create recovered store: %v", err)
 	}
@@ -78,7 +79,7 @@ func TestStore_Recover_CRC_Corruption(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	// 1. Create Store and write two entries
-	s1, err := NewStore(dir, logger, 0, "time", 90)
+	s1, err := NewStore(context.Background(), dir, logger, 0, "time", 90)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +119,7 @@ func TestStore_Recover_CRC_Corruption(t *testing.T) {
 	f.Close()
 
 	// 3. Re-open Store (should truncate corrupt tail)
-	s2, err := NewStore(dir, logger, 0, "time", 90)
+	s2, err := NewStore(context.Background(), dir, logger, 0, "time", 90)
 	if err != nil {
 		t.Fatalf("Failed to recover store: %v", err)
 	}
@@ -147,7 +148,7 @@ func TestStore_Recover_PartialWrite(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	// 1. Create Store and write data
-	s1, err := NewStore(dir, logger, 0, "time", 90)
+	s1, err := NewStore(context.Background(), dir, logger, 0, "time", 90)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +167,7 @@ func TestStore_Recover_PartialWrite(t *testing.T) {
 	f.Close()
 
 	// 3. Re-open
-	s2, err := NewStore(dir, logger, 0, "time", 90)
+	s2, err := NewStore(context.Background(), dir, logger, 0, "time", 90)
 	if err != nil {
 		t.Fatalf("Recovery failed on partial write: %v", err)
 	}
@@ -184,7 +185,7 @@ func TestStore_Replication_Quorum(t *testing.T) {
 
 	// 1. Create Store with MinReplicas = 1
 	// This ensures that any write operation must wait for at least 1 replica to acknowledge.
-	s, err := NewStore(dir, logger, 1, "time", 90)
+	s, err := NewStore(context.Background(), dir, logger, 1, "time", 90)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,7 +236,7 @@ func TestStore_Replication_ApplyBatch(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	// Replica store (MinReplicas=0)
-	s, err := NewStore(dir, logger, 0, "time", 90)
+	s, err := NewStore(context.Background(), dir, logger, 0, "time", 90)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -274,7 +275,7 @@ func TestStoreStats_ConflictsAndStorage(t *testing.T) {
 	defer os.RemoveAll(dir)
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
-	s, err := NewStore(dir, logger, 0, "time", 90)
+	s, err := NewStore(context.Background(), dir, logger, 0, "time", 90)
 	if err != nil {
 		t.Fatalf("NewStore failed: %v", err)
 	}
@@ -334,7 +335,7 @@ func TestStore_ReplicaLag(t *testing.T) {
 	defer os.RemoveAll(dir)
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
-	s, err := NewStore(dir, logger, 0, "time", 90)
+	s, err := NewStore(context.Background(), dir, logger, 0, "time", 90)
 	if err != nil {
 		t.Fatalf("NewStore failed: %v", err)
 	}
@@ -371,7 +372,7 @@ func TestStore_BasicInit(t *testing.T) {
 	dir := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	s, err := NewStore(dir, logger, 0, "time", 90)
+	s, err := NewStore(context.Background(), dir, logger, 0, "time", 90)
 	if err != nil {
 		t.Fatalf("Failed to create store with block cache: %v", err)
 	}
