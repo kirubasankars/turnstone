@@ -94,7 +94,8 @@ type Options struct {
 	// exceeds this ratio during retention (0 = default 3.0).
 	IndexCompactFragmentation float64
 	// IndexCompactOnRetention runs MaybeCompactIndex on the retention ticker.
-	IndexCompactOnRetention bool
+	// Nil omits the default (enabled on open). Set explicitly to false to disable.
+	IndexCompactOnRetention *bool
 }
 
 // indexVersion points at one MVCC version in the append-only log.

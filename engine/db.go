@@ -148,7 +148,7 @@ func OpenContext(ctx context.Context, dir string, opts Options) (*DB, error) {
 		maxDiskUsagePercent: opts.MaxDiskUsagePercent,
 		logger:              logger,
 		indexFragmentationRatio: indexFrag,
-		indexCompactOnRetention: opts.IndexCompactOnRetention,
+		indexCompactOnRetention: indexCompactOnRetentionEnabled(opts),
 	}
 
 	if opts.UnsafeDisableFsync {
@@ -162,6 +162,13 @@ func OpenContext(ctx context.Context, dir string, opts Options) (*DB, error) {
 
 	db.startBackgroundTasks()
 	return db, nil
+}
+
+func indexCompactOnRetentionEnabled(opts Options) bool {
+	if opts.IndexCompactOnRetention == nil {
+		return true
+	}
+	return *opts.IndexCompactOnRetention
 }
 
 func (db *DB) AdvanceXID(txID uint64) {
