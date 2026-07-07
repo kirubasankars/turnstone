@@ -71,9 +71,14 @@ func TestIndexGCContext_LogFloorDropsVersions(t *testing.T) {
 	}
 }
 
+func indexCompactDisabled() *bool {
+	v := false
+	return &v
+}
+
 func TestDB_CompactIndex_ShrinksAfterAbortFragmentation(t *testing.T) {
 	dir := t.TempDir()
-	db, err := Open(dir, Options{IndexCompactOnRetention: false})
+	db, err := Open(dir, Options{IndexCompactOnRetention: indexCompactDisabled()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,10 +135,21 @@ func TestIndexGCContext_MinActiveSnapshotXmax(t *testing.T) {
 	}
 }
 
+func TestDB_IndexCompactOnRetention_EnabledByDefaultOnOpen(t *testing.T) {
+	db, err := Open(t.TempDir(), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if !db.indexCompactOnRetention {
+		t.Fatal("expected index compaction enabled by default on open")
+	}
+}
+
 func TestDB_MaybeCompactIndex_SkipsHealthyShards(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(dir, Options{
-		IndexCompactOnRetention:   false,
+		IndexCompactOnRetention:   indexCompactDisabled(),
 		IndexCompactFragmentation: 3.0,
 	})
 	if err != nil {
