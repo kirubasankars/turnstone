@@ -150,7 +150,7 @@ func TestProcessCommitBatch_LogFsyncFailure(t *testing.T) {
 	}
 
 	// Sabotage the log's underlying file so the COMMIT record's fsync fails.
-	db.log.file.Close()
+	db.log.closeActiveFileForTest()
 
 	reqs := []commitRequest{{tx: tx, resp: make(chan error, 1)}}
 	db.processCommitBatch(reqs)

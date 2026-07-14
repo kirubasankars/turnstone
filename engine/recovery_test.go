@@ -8,7 +8,6 @@ package engine
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"testing"
 )
 
@@ -23,7 +22,7 @@ func TestRecovery_CrashConsistency(t *testing.T) {
 	tx := db.NewTransaction(true)
 	tx.Put([]byte("crash_key"), []byte("before_commit"))
 	// Do not commit — simulate crash
-	db.log.file.Close()
+	db.log.closeActiveFileForTest()
 	db.Close()
 
 	db2, err := Open(dir, opts)
@@ -87,7 +86,7 @@ func TestRecovery_TruncateCorruptTail(t *testing.T) {
 	tx.Commit()
 	db.Close()
 
-	logPath := filepath.Join(dir, logFileName)
+	logPath := db.log.activeSegmentPath()
 	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		t.Fatal(err)

@@ -76,7 +76,7 @@ type DB struct {
 	indexCompactOnRetention bool
 }
 
-// Open opens a database, replaying data.log to rebuild the ephemeral index.
+// Open opens a database, replaying the WAL to rebuild the ephemeral index.
 func Open(dir string, opts Options) (*DB, error) {
 	return OpenContext(context.Background(), dir, opts)
 }
@@ -115,7 +115,7 @@ func OpenContext(ctx context.Context, dir string, opts Options) (*DB, error) {
 	}
 	logger = logger.With("db_dir", filepath.Base(dir))
 
-	logFile, err := OpenDataLog(dir, logger)
+	logFile, err := OpenDataLog(dir, logger, opts.WalSegmentSize)
 	if err != nil {
 		return nil, fmt.Errorf("open log: %w", err)
 	}

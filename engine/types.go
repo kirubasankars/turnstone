@@ -90,6 +90,8 @@ type Options struct {
 	CommitSiblings      int
 	UnsafeDisableFsync  bool
 
+	// WalSegmentSize rotates the active WAL segment at this many bytes (0 = default 64MB).
+	WalSegmentSize int64
 	// IndexCompactFragmentation triggers arena rewrite when arenaUsed/liveBytes
 	// exceeds this ratio during retention (0 = default 3.0).
 	IndexCompactFragmentation float64
