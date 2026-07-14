@@ -270,7 +270,7 @@ func TestDB_ApplyRecord(t *testing.T) {
 
 func TestDataLog_AppendAndScan(t *testing.T) {
 	dir := t.TempDir()
-	log, err := OpenDataLog(dir, nil)
+	log, err := OpenDataLog(dir, nil, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -331,7 +331,13 @@ func TestOpen_ErrorPaths(t *testing.T) {
 	}
 
 	dir2 := t.TempDir()
-	os.WriteFile(filepath.Join(dir2, logFileName), []byte("not-a-dir"), 0o644)
+	walDir := filepath.Join(dir2, walDirName)
+	if err := os.Mkdir(walDir, dirMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(walDir, walManifestName), []byte("not-json"), fileMode); err != nil {
+		t.Fatal(err)
+	}
 	_, err := Open(dir2, Options{})
 	if err == nil {
 		t.Error("Expected error when data.log path conflicts")
