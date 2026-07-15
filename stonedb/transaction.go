@@ -24,7 +24,6 @@ type Transaction struct {
 	keyLocks        map[string]struct{}
 	dispositionSeen map[string]bool
 	ownPriorVer     map[string]*indexVersion
-	staleBytes      map[int64]int64
 	keyDelta        int64
 	readSet         map[string]struct{}
 
@@ -118,9 +117,6 @@ func (tx *Transaction) write(key, value []byte, isDelete bool) error {
 
 	prevDelta := tx.keyDelta
 	prevDispositionSeen, hadDisposition := tx.dispositionSeen[keyStr]
-	var staleOff int64
-	var hadStale bool
-	var prevStaleVal int64
 
 	if firstWriteToKey {
 		ver, xmin, found := db.latestResolvedMeta(key, tx.xid)
@@ -130,16 +126,8 @@ func (tx *Transaction) write(key, value []byte, isDelete bool) error {
 			tx.markAborted()
 			return ErrWriteConflict
 		}
-		if ver != nil {
-			staleOff, hadStale = ver.offset, true
-			prevStaleVal = tx.staleBytes[staleOff]
-		}
 		tx.recordBaselineImpact(keyStr, ver, isDelete)
 	} else {
-		if pv, ok := tx.ownPriorVer[keyStr]; ok && pv != nil {
-			staleOff, hadStale = pv.offset, true
-			prevStaleVal = tx.staleBytes[staleOff]
-		}
 		tx.recordOwnImpact(keyStr, isDelete)
 	}
 
@@ -149,9 +137,6 @@ func (tx *Transaction) write(key, value []byte, isDelete bool) error {
 			tx.dispositionSeen[keyStr] = prevDispositionSeen
 		} else {
 			delete(tx.dispositionSeen, keyStr)
-		}
-		if hadStale {
-			tx.staleBytes[staleOff] = prevStaleVal
 		}
 	}
 
@@ -188,9 +173,6 @@ func (db *DB) releaseKeyLockAndForget(tx *Transaction, key string) {
 
 func (tx *Transaction) recordBaselineImpact(keyStr string, ver *indexVersion, isDelete bool) {
 	wasLive := ver != nil && !ver.tombstone
-	if ver != nil {
-		tx.staleBytes[ver.offset] += recordSpanSize(len(keyStr), int(ver.valueLen), WALRecordSet)
-	}
 	if isDelete {
 		if wasLive {
 			tx.keyDelta--
@@ -203,9 +185,6 @@ func (tx *Transaction) recordBaselineImpact(keyStr string, ver *indexVersion, is
 
 func (tx *Transaction) recordOwnImpact(keyStr string, isDelete bool) {
 	wasLive := tx.dispositionSeen[keyStr]
-	if pv, ok := tx.ownPriorVer[keyStr]; ok && pv != nil {
-		tx.staleBytes[pv.offset] += recordSpanSize(len(keyStr), int(pv.valueLen), WALRecordSet)
-	}
 	if isDelete {
 		if wasLive {
 			tx.keyDelta--

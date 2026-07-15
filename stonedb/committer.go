@@ -93,18 +93,11 @@ func (db *DB) processCommitBatch(requests []commitRequest) {
 		}
 
 		var totalDelta int64
-		var stale int64
 		for _, tx := range valid {
 			totalDelta += tx.keyDelta
-			for _, sz := range tx.staleBytes {
-				stale += sz
-			}
 		}
 		if totalDelta != 0 {
 			atomic.AddInt64(&db.keyCount, totalDelta)
-		}
-		if stale > 0 {
-			atomic.AddInt64(&db.staleBytes, stale)
 		}
 
 		for _, tx := range valid {
