@@ -329,7 +329,7 @@ func (s *Database) evictZombieReplicas() {
 }
 
 // EnforceRetentionPolicy raises the log scan floor from replica acks, the
-// leader retain offset, and the local retention mark. The log file is not truncated.
+// leader retain offset, and the local retention mark, then runs index/WAL maintenance.
 func (s *Database) EnforceRetentionPolicy() {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
@@ -387,6 +387,12 @@ func (s *Database) EnforceRetentionPolicy() {
 			if !strings.Contains(err.Error(), "closed") {
 				s.logger.Error("fallback scan floor update failed", "err", err)
 			}
+		}
+	}
+
+	if err := s.DB.RunWalMaintenance(); err != nil {
+		if !strings.Contains(err.Error(), "closed") {
+			s.logger.Error("wal maintenance failed", "err", err)
 		}
 	}
 }
