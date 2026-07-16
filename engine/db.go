@@ -375,10 +375,8 @@ func (db *DB) runRetentionMarker() {
 					db.logger.Error("retention mark failed", "err", err)
 				}
 			}
-			if db.indexCompactOnRetention {
-				if _, err := db.MaybeCompactIndex(); err != nil {
-					db.logger.Error("index compact failed", "err", err)
-				}
+			if err := db.RunWalMaintenance(); err != nil && !strings.Contains(err.Error(), "closed") {
+				db.logger.Error("wal maintenance failed", "err", err)
 			}
 		}
 	}
