@@ -37,7 +37,6 @@ import (
 const (
 	RoleClient = "client"
 	RoleAdmin  = "admin"
-	RoleCDC    = "cdc"
 	RoleServer = "server" // usually implies admin-like privileges for internal replication
 )
 
@@ -538,16 +537,6 @@ func (s *Server) isOpAllowed(role string, opCode uint8) bool {
 			protocol.OpCodeSelect, protocol.OpCodeBegin, protocol.OpCodeCommit, protocol.OpCodeAbort,
 			protocol.OpCodeGet, protocol.OpCodeSet, protocol.OpCodeDel,
 			protocol.OpCodeMGet, protocol.OpCodeMSet, protocol.OpCodeMDel, protocol.OpCodeStat:
-			return true
-		default:
-			return false
-		}
-	}
-
-	// CDC Role
-	if role == RoleCDC {
-		switch opCode {
-		case protocol.OpCodePing, protocol.OpCodeQuit, protocol.OpCodeReplHello:
 			return true
 		default:
 			return false

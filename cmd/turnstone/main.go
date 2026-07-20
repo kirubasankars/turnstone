@@ -33,7 +33,7 @@ import (
 )
 
 var (
-	mode    = flag.String("mode", "server", "Operation mode: 'server', 'cdc', or 'dev'")
+	mode    = flag.String("mode", "server", "Operation mode: 'server' or 'dev'")
 	homeDir = flag.String("home", "tsdata", "Home directory for data and certs")
 )
 
@@ -47,11 +47,6 @@ func main() {
 	if _, err := os.Stat(*homeDir); os.IsNotExist(err) {
 		logger.Error("Home directory does not exist. Run 'turnstone-genconfig -home <path>' first.", "path", *homeDir)
 		os.Exit(1)
-	}
-
-	if *mode == "cdc" {
-		replication.StartFileConsumer(*homeDir, logger)
-		return
 	}
 
 	runServer(logger, *mode == "dev")
