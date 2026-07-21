@@ -31,7 +31,7 @@ func (db *DB) RunWalMaintenance() error {
 		}
 	}
 	if db.walCopyForwardOnRetention {
-		if _, err := db.MaybeCopyForwardWal(db.MinDeletableLSN()); err != nil {
+		if _, err := db.MaybeCopyForwardWal(db.ScanFloor()); err != nil {
 			return err
 		}
 	}
@@ -40,16 +40,13 @@ func (db *DB) RunWalMaintenance() error {
 }
 
 // DeleteWalSegments removes sealed WAL segments whose exclusive end is at or
-// below the effective delete floor derived from minDeletableLSN and index refs.
+// below the effective delete floor derived from minDeletableLSN and MVCC refs.
 func (db *DB) DeleteWalSegments(minDeletableLSN int64) (WalRetentionResult, error) {
-	if db.log == nil || minDeletableLSN <= 0 {
+	if db.log == nil {
 		return WalRetentionResult{}, nil
 	}
 
-	deleteThrough := minDeletableLSN
-	if minOff, ok := db.indexMinReferencedOffset(); ok && minOff < deleteThrough {
-		deleteThrough = minOff
-	}
+	deleteThrough := db.effectiveWalDeleteThrough(minDeletableLSN)
 	if deleteThrough <= 0 {
 		return WalRetentionResult{}, nil
 	}
@@ -136,9 +133,52 @@ func (db *DB) MaybeCopyForwardWal(minDeletableLSN int64) (WalRetentionResult, er
 	}, nil
 }
 
-// MinDeletableLSN returns the byte offset below which WAL bytes may be deleted.
+// MinDeletableLSN returns the byte offset below which sealed WAL segments may
+// be deleted. It is the tighter of scan floor (replication / retention) and the
+// minimum offset still referenced by an MVCC-visible index version.
 func (db *DB) MinDeletableLSN() int64 {
-	return db.ScanFloor()
+	return db.effectiveWalDeleteThrough(db.ScanFloor())
+}
+
+func (db *DB) effectiveWalDeleteThrough(minDeletableLSN int64) int64 {
+	scanFloor := db.ScanFloor()
+	if minDeletableLSN > 0 {
+		scanFloor = minDeletableLSN
+	}
+
+	ctx := db.BuildIndexGCContext()
+	mvccMin, ok := db.indexMinMVCCReferencedOffset(ctx)
+	if !ok {
+		return scanFloor
+	}
+	if scanFloor <= 0 {
+		return mvccMin
+	}
+	if mvccMin < scanFloor {
+		return mvccMin
+	}
+	return scanFloor
+}
+
+func (db *DB) indexMinMVCCReferencedOffset(ctx IndexGCContext) (int64, bool) {
+	if db.index == nil {
+		return 0, false
+	}
+	minOff := int64(math.MaxInt64)
+	found := false
+	db.index.ForEachKey(func(_ []byte, chain []indexVersion) {
+		kept := ctx.FilterVersionsForWalRetain(nil, chain)
+		for _, v := range kept {
+			found = true
+			if v.offset < minOff {
+				minOff = v.offset
+			}
+		}
+	})
+	if !found {
+		return 0, false
+	}
+	return minOff, true
 }
 
 func (db *DB) collectLiveFrameOffsets(ctx IndexGCContext) ([]int64, int64, error) {
