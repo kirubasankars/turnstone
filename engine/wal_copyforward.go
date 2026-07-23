@@ -7,7 +7,6 @@ package engine
 
 import (
 	"fmt"
-	"math"
 	"os"
 )
 
@@ -71,10 +70,10 @@ type walCopyForwardOutcome struct {
 	segmentsPurged int
 }
 
-// copyForwardLiveFrames appends frame copies to a fresh active segment, remaps
-// old global offsets to new ones, and deletes sealed segments at or below
-// maxDeleteThrough (typically scan floor / replication retain horizon).
-func (l *DataLog) copyForwardLiveFrames(oldOffsets []int64, frames [][]byte, maxDeleteThrough int64) (walCopyForwardOutcome, error) {
+// appendCopyForwardFrames appends frame copies to a fresh active segment and
+// returns the old→new offset map. Segment purge is deferred until after the
+// index is remapped.
+func (l *DataLog) appendCopyForwardFrames(oldOffsets []int64, frames [][]byte) (walCopyForwardOutcome, error) {
 	if len(oldOffsets) != len(frames) {
 		return walCopyForwardOutcome{}, fmt.Errorf("wal copy-forward: offset/frame count mismatch")
 	}
@@ -113,23 +112,26 @@ func (l *DataLog) copyForwardLiveFrames(oldOffsets []int64, frames [][]byte, max
 		}
 	}
 
-	segDeleteThrough := maxDeleteThrough
-	if segDeleteThrough <= 0 || segDeleteThrough == math.MaxInt64 {
-		segDeleteThrough = out.headBefore
-	} else if segDeleteThrough > out.headBefore {
-		segDeleteThrough = out.headBefore
-	}
-	deleted, _, err := l.deleteSegmentsThroughLocked(segDeleteThrough)
-	if err != nil {
-		return walCopyForwardOutcome{}, err
-	}
-	out.segmentsPurged = deleted
 	out.bytesAfter = l.allocatedBytesLocked()
-
 	if err := l.persistManifestLocked(); err != nil {
 		return walCopyForwardOutcome{}, err
 	}
 	return out, nil
+}
+
+func copyForwardSegmentDeleteThrough(minDeletableLSN, headBefore int64, scanFloor int64) int64 {
+	deleteThrough := minDeletableLSN
+	if deleteThrough <= 0 {
+		if scanFloor > 0 {
+			deleteThrough = scanFloor
+		} else {
+			return headBefore
+		}
+	}
+	if deleteThrough > headBefore {
+		deleteThrough = headBefore
+	}
+	return deleteThrough
 }
 
 // deleteSegmentsThroughLocked is deleteSegmentsThrough with mu already held.

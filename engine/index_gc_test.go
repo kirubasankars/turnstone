@@ -71,6 +71,31 @@ func TestIndexGCContext_LogFloorDropsVersions(t *testing.T) {
 	}
 }
 
+func TestIndexGCContext_FilterVersionsForWalRetain_IgnoresLogFloor(t *testing.T) {
+	chain := []indexVersion{
+		{offset: 200, xmin: 2},
+		{offset: 50, xmin: 1},
+	}
+	ctx := IndexGCContext{
+		LogFloor: 100,
+		Readers: []IndexGCReader{{
+			Snapshot: Snapshot{Xmax: 2},
+		}},
+		Clog:    func(uint64) TxStatus { return TxCommitted },
+		Visible: func(xmin uint64, snap Snapshot) bool { return xmin < snap.Xmax },
+	}
+
+	compact := ctx.FilterVersions(nil, chain)
+	if len(compact) != 1 || compact[0].offset != 200 {
+		t.Fatalf("FilterVersions should drop below log floor, got %+v", compact)
+	}
+
+	retain := ctx.FilterVersionsForWalRetain(nil, chain)
+	if len(retain) != 2 || retain[1].offset != 50 {
+		t.Fatalf("FilterVersionsForWalRetain should keep snapshot offsets below log floor, got %+v", retain)
+	}
+}
+
 func indexCompactDisabled() *bool {
 	v := false
 	return &v
