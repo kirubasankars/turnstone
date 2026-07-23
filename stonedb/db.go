@@ -53,8 +53,8 @@ type DB struct {
 
 	transactionID uint64
 	operationID   uint64
-	keyCount     int64
-	scanWALFloor uint64
+	keyCount      int64
+	scanWALFloor  uint64
 
 	metricsConflicts uint64
 
@@ -514,7 +514,7 @@ func (db *DB) NewTransaction(update bool) *Transaction {
 		db: db, update: true, xid: xid, snapshot: snap,
 		keyLocks: make(map[string]struct{}), dispositionSeen: make(map[string]bool),
 		ownPriorVer: make(map[string]*indexVersion),
-		readSet: make(map[string]struct{}),
+		readSet:     make(map[string]struct{}),
 	}
 	db.activeXids[xid] = tx
 	db.txStartTimes[xid] = time.Now()
