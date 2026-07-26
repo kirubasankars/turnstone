@@ -29,10 +29,11 @@ LICENSE file in the root of this source tree.
 
 | Area | Detail |
 | --- | --- |
-| Storage | Single append-only `data.log` + in-memory sharded hash index arena |
+| Storage | Segmented WAL (`wal/seg-*.wal`) + global byte LSN + in-memory sharded hash index arena |
 | Durability | Eager append on `SET`/`DEL`; group fsync on `COMMIT` |
+| Retention | Scan floor, MVCC-aware segment delete, optional copy-forward and index compaction |
 | Security | mTLS on all connections; RBAC via X.509 certificate Organization |
-| Replication | Async or sync (quorum ack) |
+| Replication | Async or sync (quorum ack); byte-offset streaming from leader WAL |
 | Observability | Prometheus metrics on `:9090` |
 
 ---
@@ -139,17 +140,50 @@ There is no automatic leader election. An operator must invoke failover.
 ## Storage engine
 
 ```
-Client SET/DEL  →  append data.log  →  update sharded hash index
+Client SET/DEL  →  append wal/seg-*.wal  →  update sharded hash index
 Client COMMIT   →  append + fsync COMMIT  →  clog[xid] = committed
-Client GET      →  index lookup  →  ReadAt(offset) from data.log
-Open            →  replay data.log  →  rebuild index + clog
+Client GET      →  index lookup  →  ReadAt(global LSN) from WAL
+Open            →  replay WAL segments  →  rebuild index + clog
+Retention       →  scan floor  →  index compact / copy-forward / segment delete
 ```
+
+### On-disk layout
+
+Each database directory contains:
+
+```
+<db>/
+  wal/
+    manifest.json    # segment list, active segment, segment size
+    seg-000001.wal   # sealed segments
+    seg-000002.wal
+    ...
+  repl.slots         # replication follower ack positions (when used)
+```
+
+Legacy single-file `data.log` directories are migrated automatically on first open into `wal/seg-000001.wal`.
 
 ### Components
 
-1. **`data.log`** — one unbounded append-only file. Records: `BEGIN`, `SET`, `DEL`, `COMMIT`, `ABORT` (keys and values inline). This is the only durable database state.
-2. **In-memory index** — 256-shard hash arena (ephemeral runtime cache). Rebuilt from `data.log` replay on open and dropped on close. Only `data.log` is durable.
+1. **Segmented WAL** — append-only log split into rotating segments (default **64 MiB** per segment). Each frame has a CRC32 header. A **global byte LSN** spans all segments, so index offsets and replication cursors stay stable across rotation.
+2. **In-memory index** — 256-shard hash arena (ephemeral runtime cache). Rebuilt from WAL replay on open and dropped on close. Only the WAL is durable.
 3. **In-memory clog** — transaction commit status, rebuilt during replay.
+
+### Retention and maintenance
+
+When `log_retention` is `replication` (default), a background pass raises the **scan floor** from the tightest of:
+
+- local retention mark (`MarkRetention`)
+- slowest registered follower ack
+- leader-propagated safe point
+
+Then `RunWalMaintenance()` runs, in order:
+
+1. **Index compaction** (default on) — MVCC-aware prune of stale version chains; reclaims arena space when fragmentation exceeds ~3× live bytes.
+2. **WAL copy-forward** (default on) — when allocated WAL bytes exceed ~3× live bytes, copies MVCC-visible frames into a fresh segment, remaps index offsets, then deletes old segments. Skips while write transactions are active; read-only snapshots still pin older frames.
+3. **Segment delete** — removes sealed segments at or below the effective delete floor (`min(scan floor, MVCC-visible min offset)`).
+
+Bytes below the scan floor return `ErrLogUnavailable` for `ScanLog` / replication replay. Physical deletion respects replication and snapshot constraints.
 
 ### Transaction model (eager logging)
 
@@ -175,14 +209,14 @@ sequenceDiagram
 
 Notable semantics:
 
-- **Replication cursor** — handshake, acks, and retention use the exclusive-end **byte offset** of `data.log`, not the transaction `xid`.
+- **Replication cursor** — handshake, acks, and retention use the exclusive-end **global byte LSN** in the WAL, not the transaction `xid`.
 - **`xid` at `BEGIN`** — a monotonic transaction id stored inside log records.
 - **First-writer-wins** — `SET`/`DEL` takes a NOWAIT key lock; conflicts return immediately, no deadlock.
 - **Read-set validation at `COMMIT`** — detects stale reads / write skew under snapshot isolation.
 - **Read-your-own-writes** — uncommitted versions with `xmin == my xid` are visible inside the transaction.
 - **Aborts are explicit** — conflicts, disconnects, and timeouts append `ABORT`; a reaper aborts transactions exceeding `MaxTxDuration`.
 
-Replication streams raw physical `data.log` byte ranges to follower replicas.
+Replication streams raw physical WAL byte ranges (possibly spanning segment boundaries) to follower replicas.
 
 ---
 
@@ -191,7 +225,7 @@ Replication streams raw physical `data.log` byte ranges to follower replicas.
 1. **Single node** — one process, local disk. Scale-out requires application-level sharding.
 2. **Manual failover** — no Raft/Paxos; an operator runs `stepdown` / `promote`.
 3. **No lock waiting** — hot-key contention surfaces as immediate `TxConflict`; clients must retry.
-4. **Breaking on-disk format** — the current `data.log` + sharded hash index layout is not compatible with older WAL/VLog/LevelDB directories.
+4. **On-disk format** — uses segmented WAL under `wal/` with a global byte LSN. Legacy `data.log` is migrated on open. Not compatible with older WAL/VLog/LevelDB directory layouts.
 
 ---
 
