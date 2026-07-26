@@ -7,7 +7,6 @@ package stonedb
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -27,17 +26,6 @@ type commitRequest struct {
 	resp chan error
 }
 
-type TimelineHistoryItem struct {
-	TLI     uint64 `json:"tli"`
-	StartOp uint64 `json:"start_op"`
-	EndOp   uint64 `json:"end_op"`
-}
-
-type TimelineMeta struct {
-	CurrentTimeline uint64                `json:"current_timeline"`
-	History         []TimelineHistoryItem `json:"history"`
-}
-
 // DB is the main database struct.
 type DB struct {
 	dir    string
@@ -47,14 +35,13 @@ type DB struct {
 	clogMu sync.RWMutex
 	logger *slog.Logger
 
-	mu         sync.RWMutex
 	commitMu   sync.Mutex
 	shutdownMu sync.RWMutex
 
-	transactionID uint64
-	operationID   uint64
-	keyCount      int64
-	scanWALFloor  uint64
+	transactionID  uint64
+	keyCount       int64
+	scanWALFloor   int64
+	lastCkptOffset int64
 
 	metricsConflicts uint64
 
@@ -65,15 +52,14 @@ type DB struct {
 	activeXids   map[uint64]*Transaction
 	keyLocks     map[string]uint64
 	txStartTimes map[uint64]time.Time
-	beginOpIDs   map[uint64]uint64
+	beginOffsets map[uint64]int64
 	txTimeout    time.Duration
 
 	replImpact map[uint64]*replTxImpact
 
-	closeCh      chan struct{}
-	wg           sync.WaitGroup
-	lastCkptOpID uint64
-	closed       int32
+	closeCh chan struct{}
+	wg      sync.WaitGroup
+	closed  int32
 
 	commitCh           chan commitRequest
 	commitDelay        time.Duration
@@ -85,8 +71,6 @@ type DB struct {
 	maxDiskUsagePercent    int
 	isDiskFull             int32
 	isCorrupt              int32
-
-	timelineMeta TimelineMeta
 }
 
 // Open opens a database, replaying data.log to rebuild the ephemeral index.
@@ -124,11 +108,6 @@ func OpenContext(ctx context.Context, dir string, opts Options) (*DB, error) {
 	}
 	logger = logger.With("db_dir", filepath.Base(dir))
 
-	meta, err := loadTimelineMeta(dir)
-	if err != nil {
-		return nil, fmt.Errorf("load timeline meta: %w", err)
-	}
-
 	logFile, err := OpenDataLog(dir, logger)
 	if err != nil {
 		return nil, fmt.Errorf("open log: %w", err)
@@ -149,7 +128,7 @@ func OpenContext(ctx context.Context, dir string, opts Options) (*DB, error) {
 		activeXids:             make(map[uint64]*Transaction),
 		keyLocks:               make(map[string]uint64),
 		txStartTimes:           make(map[uint64]time.Time),
-		beginOpIDs:             make(map[uint64]uint64),
+		beginOffsets:           make(map[uint64]int64),
 		replImpact:             make(map[uint64]*replTxImpact),
 		txTimeout:              opts.TxTimeout,
 		closeCh:                make(chan struct{}),
@@ -160,7 +139,6 @@ func OpenContext(ctx context.Context, dir string, opts Options) (*DB, error) {
 		checksumInterval:       opts.ChecksumInterval,
 		autoCheckpointInterval: opts.AutoCheckpointInterval,
 		maxDiskUsagePercent:    opts.MaxDiskUsagePercent,
-		timelineMeta:           meta,
 		logger:                 logger,
 	}
 
@@ -177,92 +155,14 @@ func OpenContext(ctx context.Context, dir string, opts Options) (*DB, error) {
 	return db, nil
 }
 
-func loadTimelineMeta(dir string) (TimelineMeta, error) {
-	path := filepath.Join(dir, "timeline.meta")
-	data, err := os.ReadFile(path)
-	if os.IsNotExist(err) {
-		return TimelineMeta{CurrentTimeline: 0}, nil
-	}
-	if err != nil {
-		return TimelineMeta{}, err
-	}
-	var meta TimelineMeta
-	return meta, json.Unmarshal(data, &meta)
-}
-
-func (db *DB) saveTimelineMeta() error {
-	path := filepath.Join(db.dir, "timeline.meta")
-	data, err := json.MarshalIndent(db.timelineMeta, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, fileMode); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
-}
-
-func (db *DB) Promote() error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	currentTL := db.timelineMeta.CurrentTimeline
-	newTL := currentTL + 1
-	lastOp := atomic.LoadUint64(&db.operationID)
-
-	historyEntry := TimelineHistoryItem{TLI: currentTL, StartOp: 0, EndOp: lastOp}
-	if len(db.timelineMeta.History) > 0 {
-		historyEntry.StartOp = db.timelineMeta.History[len(db.timelineMeta.History)-1].EndOp
-	}
-	db.timelineMeta.History = append(db.timelineMeta.History, historyEntry)
-	db.timelineMeta.CurrentTimeline = newTL
-
-	if err := db.saveTimelineMeta(); err != nil {
-		return fmt.Errorf("save timeline meta: %w", err)
-	}
-	db.logger.Info("Promoted to new timeline", "old", currentTL, "new", newTL, "at_op", lastOp)
-	return nil
-}
-
-func (db *DB) SetTimeline(newTL uint64) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	currentTL := db.timelineMeta.CurrentTimeline
-	if newTL == currentTL {
-		return nil
-	}
-	if newTL < currentTL {
-		return fmt.Errorf("cannot rewind timeline from %d to %d", currentTL, newTL)
-	}
-
-	lastOp := atomic.LoadUint64(&db.operationID)
-	historyEntry := TimelineHistoryItem{TLI: currentTL, StartOp: 0, EndOp: lastOp}
-	if len(db.timelineMeta.History) > 0 {
-		historyEntry.StartOp = db.timelineMeta.History[len(db.timelineMeta.History)-1].EndOp
-	}
-	db.timelineMeta.History = append(db.timelineMeta.History, historyEntry)
-	db.timelineMeta.CurrentTimeline = newTL
-
-	if err := db.saveTimelineMeta(); err != nil {
-		return fmt.Errorf("save timeline meta: %w", err)
-	}
-	db.logger.Info("Switched timeline", "old", currentTL, "new", newTL, "at_op", lastOp)
-	return nil
-}
-
-func (db *DB) ForceSetClocks(txID, opID uint64) {
+func (db *DB) ForceSetXID(txID uint64) {
 	if txID > atomic.LoadUint64(&db.transactionID) {
 		atomic.StoreUint64(&db.transactionID, txID)
-	}
-	if opID > atomic.LoadUint64(&db.operationID) {
-		atomic.StoreUint64(&db.operationID, opID)
 	}
 }
 
 func (db *DB) startBackgroundTasks() {
-	db.lastCkptOpID = atomic.LoadUint64(&db.operationID)
+	atomic.StoreInt64(&db.lastCkptOffset, db.log.WriteOffset())
 	waitCount := 3
 	if db.checksumInterval > 0 {
 		waitCount++
@@ -346,22 +246,24 @@ func (db *DB) StorageStats() (logCount int, logicalSize int64, allocatedSize int
 	return
 }
 
-func (db *DB) LastOpID() uint64 {
-	return atomic.LoadUint64(&db.operationID)
+func (db *DB) LastLogOffset() int64 {
+	return db.log.WriteOffset()
 }
 
-func (db *DB) GetLastCheckpointOpID() uint64 {
-	return atomic.LoadUint64(&db.lastCkptOpID)
+func (db *DB) GetLastCheckpointOffset() int64 {
+	return atomic.LoadInt64(&db.lastCkptOffset)
+}
+
+func (db *DB) GetScanWALFloor() int64 {
+	return atomic.LoadInt64(&db.scanWALFloor)
+}
+
+func (db *DB) IsValidFrameOffset(offset int64) bool {
+	return db.log.IsFrameBoundary(offset)
 }
 
 func (db *DB) GetConflicts() uint64 {
 	return atomic.LoadUint64(&db.metricsConflicts)
-}
-
-func (db *DB) CurrentTimeline() uint64 {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-	return db.timelineMeta.CurrentTimeline
 }
 
 func (db *DB) ActiveTransactionCount() int {
@@ -455,7 +357,7 @@ func (db *DB) runAutoCheckpoint() {
 		case <-db.closeCh:
 			return
 		case <-ticker.C:
-			if atomic.LoadUint64(&db.operationID) > atomic.LoadUint64(&db.lastCkptOpID) {
+			if db.log.WriteOffset() > atomic.LoadInt64(&db.lastCkptOffset) {
 				if err := db.Checkpoint(); err != nil && !strings.Contains(err.Error(), "closed") {
 					db.logger.Error("Auto-checkpoint failed", "err", err)
 				}
@@ -491,7 +393,7 @@ func (db *DB) VerifyChecksums() error {
 		case <-ctx.Done():
 		}
 	}()
-	return db.log.Replay(ctx, false, db.timelineMeta.History, func(rec WALRecord, span recordSpan) {})
+	return db.log.Replay(ctx, false, func(rec WALRecord, span recordSpan) {})
 }
 
 func (db *DB) NewTransaction(update bool) *Transaction {
@@ -499,9 +401,8 @@ func (db *DB) NewTransaction(update bool) *Transaction {
 		db.activeTxnsMu.Lock()
 		db.txMu.Lock()
 		snap := db.buildSnapshotLocked()
-		snapOpID := atomic.LoadUint64(&db.operationID)
 		db.txMu.Unlock()
-		tx := &Transaction{db: db, update: false, snapshot: snap, snapOpID: snapOpID}
+		tx := &Transaction{db: db, update: false, snapshot: snap}
 		db.activeTxns[tx] = snap.Xmax
 		db.activeTxnsMu.Unlock()
 		return tx
@@ -524,67 +425,52 @@ func (db *DB) NewTransaction(update bool) *Transaction {
 	db.activeTxns[tx] = xid
 	db.activeTxnsMu.Unlock()
 
-	opID, err := db.appendRecord(WALRecordBegin, xid, nil, nil)
+	beginOff, err := db.appendRecord(WALRecordBegin, xid, nil, nil)
 	if err != nil {
 		tx.markAborted()
 		tx.beginErr = err
 	} else {
-		tx.beginOpID = opID
 		db.txMu.Lock()
-		db.beginOpIDs[xid] = opID
+		db.beginOffsets[xid] = beginOff
 		db.txMu.Unlock()
 	}
 	return tx
 }
 
-func (db *DB) appendRecord(recType WALRecordType, xid uint64, key, value []byte) (uint64, error) {
-	nextOpID := func() uint64 { return atomic.AddUint64(&db.operationID, 1) }
-	build := func(opID uint64) []byte {
-		return encodeWALRecord(WALRecord{Type: recType, XID: xid, OpID: opID, Key: key, Value: value})
+func (db *DB) appendRecord(recType WALRecordType, xid uint64, key, value []byte) (int64, error) {
+	build := func() []byte {
+		return encodeWALRecord(WALRecord{Type: recType, XID: xid, Key: key, Value: value})
 	}
-	opIDs, _, err := db.log.AppendRecordsWithOpIDs(nextOpID, []func(uint64) []byte{build}, false)
+	offsets, err := db.log.AppendRecords([]func() []byte{build}, false)
 	if err != nil {
 		return 0, err
 	}
-	return opIDs[0], nil
+	return offsets[0], nil
 }
 
-func (db *DB) appendRecordWithOffset(recType WALRecordType, xid uint64, key, value []byte) (uint64, int64, error) {
-	nextOpID := func() uint64 { return atomic.AddUint64(&db.operationID, 1) }
-	build := func(opID uint64) []byte {
-		return encodeWALRecord(WALRecord{Type: recType, XID: xid, OpID: opID, Key: key, Value: value})
-	}
-	opIDs, offsets, err := db.log.AppendRecordsWithOpIDs(nextOpID, []func(uint64) []byte{build}, false)
-	if err != nil {
-		return 0, 0, err
-	}
-	return opIDs[0], offsets[0], nil
-}
-
-func (db *DB) ScanWAL(startOpID uint64, fn func([]WALRecord) error) error {
-	if startOpID < atomic.LoadUint64(&db.scanWALFloor) {
+func (db *DB) ScanWAL(startOffset int64, fn func([]WALRecord) error) error {
+	if startOffset < atomic.LoadInt64(&db.scanWALFloor) {
 		return ErrLogUnavailable
 	}
-	return db.log.Scan(startOpID, fn)
+	return db.log.Scan(startOffset, fn)
 }
 
-func (db *DB) PurgeWAL(minOpID uint64) error {
+func (db *DB) PurgeWAL(minOffset int64) error {
 	db.txMu.Lock()
-	for _, op := range db.beginOpIDs {
-		if op < minOpID {
-			minOpID = op
+	for _, off := range db.beginOffsets {
+		if off < minOffset {
+			minOffset = off
 		}
 	}
 	db.txMu.Unlock()
-	atomic.StoreUint64(&db.scanWALFloor, minOpID)
-	db.log.TrimOpOffsetsBelow(minOpID)
+	atomic.StoreInt64(&db.scanWALFloor, minOffset)
 	return nil
 }
 
 // ApplyLogSegment appends a raw byte range of complete WAL frames and applies
 // each statement to the in-memory index. Segments must be statement-aligned
 // (whole frames only); partial frames are rejected.
-func (db *DB) ApplyLogSegment(data []byte) (uint64, error) {
+func (db *DB) ApplyLogSegment(data []byte) (int64, error) {
 	if atomic.LoadInt32(&db.isCorrupt) == 1 {
 		return 0, errors.New("database is corrupt")
 	}
@@ -593,7 +479,7 @@ func (db *DB) ApplyLogSegment(data []byte) (uint64, error) {
 		return 0, err
 	}
 	if len(frames) == 0 {
-		return 0, nil
+		return db.log.WriteOffset(), nil
 	}
 
 	fsync := frames[len(frames)-1].rec.Type == WALRecordCommit
@@ -602,7 +488,6 @@ func (db *DB) ApplyLogSegment(data []byte) (uint64, error) {
 		return 0, err
 	}
 
-	var lastOpID uint64
 	off := startOff
 	for _, fr := range frames {
 		rec := fr.rec
@@ -610,20 +495,20 @@ func (db *DB) ApplyLogSegment(data []byte) (uint64, error) {
 		case WALRecordBegin:
 			db.txMu.Lock()
 			db.activeXids[rec.XID] = nil
-			db.beginOpIDs[rec.XID] = rec.OpID
+			db.beginOffsets[rec.XID] = off
 			db.txMu.Unlock()
 		case WALRecordSet, WALRecordDelete:
 			isDelete := rec.Type == WALRecordDelete
 			db.index.Put(rec.Key, indexVersion{
 				offset: off, valueLen: uint32(len(rec.Value)),
-				xmin: rec.XID, opID: rec.OpID, tombstone: isDelete,
+				xmin: rec.XID, tombstone: isDelete,
 			})
 			db.accountReplicatedWrite(rec)
 		case WALRecordCommit:
 			db.forgetClog(rec.XID)
 			db.txMu.Lock()
 			delete(db.activeXids, rec.XID)
-			delete(db.beginOpIDs, rec.XID)
+			delete(db.beginOffsets, rec.XID)
 			impact := db.replImpact[rec.XID]
 			delete(db.replImpact, rec.XID)
 			db.txMu.Unlock()
@@ -633,26 +518,21 @@ func (db *DB) ApplyLogSegment(data []byte) (uint64, error) {
 			db.index.DropXid(rec.XID)
 			db.txMu.Lock()
 			delete(db.activeXids, rec.XID)
-			delete(db.beginOpIDs, rec.XID)
+			delete(db.beginOffsets, rec.XID)
 			delete(db.replImpact, rec.XID)
 			db.txMu.Unlock()
 			db.forgetClog(rec.XID)
 		default:
-			return lastOpID, fmt.Errorf("unknown WAL record type: %d", rec.Type)
+			return 0, fmt.Errorf("unknown WAL record type: %d", rec.Type)
 		}
-		db.ForceSetClocks(rec.XID, rec.OpID)
-		lastOpID = rec.OpID
+		db.ForceSetXID(rec.XID)
 		off += fr.length
 	}
-	return lastOpID, nil
+	return off, nil
 }
 
-func (db *DB) ReadLogSegment(startOffset int64, maxBytes int64) ([]byte, int64, uint64, error) {
+func (db *DB) ReadLogSegment(startOffset int64, maxBytes int64) ([]byte, int64, error) {
 	return db.log.ReadLogSegment(startOffset, maxBytes)
-}
-
-func (db *DB) ByteOffsetAfterOpID(opID uint64) (int64, bool) {
-	return db.log.ByteOffsetAfterOpID(opID)
 }
 
 func (db *DB) ApplyRecord(rec WALRecord) error {
@@ -663,14 +543,15 @@ func (db *DB) ApplyRecord(rec WALRecord) error {
 
 	switch rec.Type {
 	case WALRecordBegin:
-		if _, err := db.log.AppendReplicatedRecord(payload, false); err != nil {
+		off, err := db.log.AppendReplicatedRecord(payload, false)
+		if err != nil {
 			return err
 		}
 		db.txMu.Lock()
 		db.activeXids[rec.XID] = nil
-		db.beginOpIDs[rec.XID] = rec.OpID
+		db.beginOffsets[rec.XID] = off
 		db.txMu.Unlock()
-		db.ForceSetClocks(rec.XID, rec.OpID)
+		db.ForceSetXID(rec.XID)
 		return nil
 
 	case WALRecordSet, WALRecordDelete:
@@ -682,10 +563,10 @@ func (db *DB) ApplyRecord(rec WALRecord) error {
 		isDelete := rec.Type == WALRecordDelete
 		db.index.Put(rec.Key, indexVersion{
 			offset: off, valueLen: uint32(len(rec.Value)),
-			xmin: rec.XID, opID: rec.OpID, tombstone: isDelete,
+			xmin: rec.XID, tombstone: isDelete,
 		})
 		db.accountReplicatedWrite(rec)
-		db.ForceSetClocks(rec.XID, rec.OpID)
+		db.ForceSetXID(rec.XID)
 		return nil
 
 	case WALRecordCommit:
@@ -695,12 +576,12 @@ func (db *DB) ApplyRecord(rec WALRecord) error {
 		db.forgetClog(rec.XID)
 		db.txMu.Lock()
 		delete(db.activeXids, rec.XID)
-		delete(db.beginOpIDs, rec.XID)
+		delete(db.beginOffsets, rec.XID)
 		impact := db.replImpact[rec.XID]
 		delete(db.replImpact, rec.XID)
 		db.txMu.Unlock()
 		db.applyReplicatedImpact(impact)
-		db.ForceSetClocks(rec.XID, rec.OpID)
+		db.ForceSetXID(rec.XID)
 		return nil
 
 	case WALRecordAbort:
@@ -711,11 +592,11 @@ func (db *DB) ApplyRecord(rec WALRecord) error {
 		db.index.DropXid(rec.XID)
 		db.txMu.Lock()
 		delete(db.activeXids, rec.XID)
-		delete(db.beginOpIDs, rec.XID)
+		delete(db.beginOffsets, rec.XID)
 		delete(db.replImpact, rec.XID)
 		db.txMu.Unlock()
 		db.forgetClog(rec.XID)
-		db.ForceSetClocks(rec.XID, rec.OpID)
+		db.ForceSetXID(rec.XID)
 		return nil
 	}
 	return fmt.Errorf("unknown WAL record type: %d", rec.Type)
@@ -816,7 +697,7 @@ func (db *DB) Close() error {
 }
 
 func (db *DB) Checkpoint() error {
-	atomic.StoreUint64(&db.lastCkptOpID, atomic.LoadUint64(&db.operationID))
+	atomic.StoreInt64(&db.lastCkptOffset, db.log.WriteOffset())
 	return nil
 }
 

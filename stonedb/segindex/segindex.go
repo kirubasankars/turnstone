@@ -17,7 +17,7 @@ const (
 	maxLoadFactorNum = 3 // grow when keyCount*4 > slotCount*3
 	maxLoadFactorDen = 4
 	headerSize       = 4096
-	versionSize      = 29
+	versionSize      = 21
 	versionNodeSz    = versionSize + 8      // next pointer
 	magic            = uint64(0x5447534547) // "TGSEG"
 	formatVersion    = uint32(1)
@@ -28,7 +28,6 @@ type Version struct {
 	Offset    int64
 	ValueLen  uint32
 	Xmin      uint64
-	OpID      uint64
 	Tombstone bool
 }
 
@@ -524,31 +523,6 @@ func (s *segment) filterChain(recOff uint64, keep func(Version) bool) (uint64, b
 	return newHead, false
 }
 
-func (s *segment) forEachKeyLocked(fn func(key []byte, chain []Version)) {
-	data := s.data
-	slots := s.slotCount()
-	table := int(s.tableOff())
-	for slot := uint32(0); slot < slots; slot++ {
-		recOff := readU64(data, table+int(slot)*8)
-		if recOff == 0 {
-			continue
-		}
-		key := s.readKey(recOff)
-		var chain []Version
-		node := s.versionHead(recOff)
-		for node != 0 {
-			if int(node)+versionNodeSz > len(data) {
-				break
-			}
-			chain = append(chain, readVersion(data, int(node)))
-			node = readU64(data, int(node)+versionSize)
-		}
-		if len(chain) > 0 {
-			fn(key, chain)
-		}
-	}
-}
-
 func hashKey(key []byte) uint64 {
 	const (
 		offset64 = 14695981039346656037
@@ -566,11 +540,10 @@ func writeVersion(buf []byte, off int, v Version) {
 	binary.BigEndian.PutUint64(buf[off:], uint64(v.Offset))
 	binary.BigEndian.PutUint32(buf[off+8:], v.ValueLen)
 	binary.BigEndian.PutUint64(buf[off+12:], v.Xmin)
-	binary.BigEndian.PutUint64(buf[off+20:], v.OpID)
 	if v.Tombstone {
-		buf[off+28] = 1
+		buf[off+20] = 1
 	} else {
-		buf[off+28] = 0
+		buf[off+20] = 0
 	}
 }
 
@@ -579,8 +552,7 @@ func readVersion(buf []byte, off int) Version {
 		Offset:    int64(binary.BigEndian.Uint64(buf[off:])),
 		ValueLen:  binary.BigEndian.Uint32(buf[off+8:]),
 		Xmin:      binary.BigEndian.Uint64(buf[off+12:]),
-		OpID:      binary.BigEndian.Uint64(buf[off+20:]),
-		Tombstone: buf[off+28] == 1,
+		Tombstone: buf[off+20] == 1,
 	}
 }
 

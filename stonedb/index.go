@@ -6,15 +6,11 @@
 package stonedb
 
 import (
-	"encoding/binary"
-	"errors"
 	"os"
 	"path/filepath"
 
 	"turnstone/stonedb/segindex"
 )
-
-const indexVersionSize = 29 // offset(8)+valueLen(4)+xmin(8)+opID(8)+tombstone(1)
 
 // Index is an MVCC index backed by a segmented in-memory hash arena.
 // The index is ephemeral: rebuilt from data.log replay on open and dropped on close.
@@ -141,7 +137,6 @@ func toSegVersion(v indexVersion) segindex.Version {
 		Offset:    v.offset,
 		ValueLen:  v.valueLen,
 		Xmin:      v.xmin,
-		OpID:      v.opID,
 		Tombstone: v.tombstone,
 	}
 }
@@ -151,34 +146,8 @@ func fromSegVersion(v segindex.Version) indexVersion {
 		offset:    v.Offset,
 		valueLen:  v.ValueLen,
 		xmin:      v.Xmin,
-		opID:      v.OpID,
 		tombstone: v.Tombstone,
 	}
-}
-
-func encodeIndexVersion(v indexVersion) []byte {
-	buf := make([]byte, indexVersionSize)
-	binary.BigEndian.PutUint64(buf[0:], uint64(v.offset))
-	binary.BigEndian.PutUint32(buf[8:], v.valueLen)
-	binary.BigEndian.PutUint64(buf[12:], v.xmin)
-	binary.BigEndian.PutUint64(buf[20:], v.opID)
-	if v.tombstone {
-		buf[28] = 1
-	}
-	return buf
-}
-
-func decodeIndexVersion(data []byte) (indexVersion, error) {
-	if len(data) < indexVersionSize {
-		return indexVersion{}, errors.New("invalid index version length")
-	}
-	return indexVersion{
-		offset:    int64(binary.BigEndian.Uint64(data[0:])),
-		valueLen:  binary.BigEndian.Uint32(data[8:]),
-		xmin:      binary.BigEndian.Uint64(data[12:]),
-		opID:      binary.BigEndian.Uint64(data[20:]),
-		tombstone: data[28] == 1,
-	}, nil
 }
 
 // visibleVersionForKey returns the first visible version for key in snapshot.

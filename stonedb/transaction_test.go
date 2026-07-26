@@ -321,7 +321,7 @@ func TestTransaction_ReadOnlyCommitNoWAL(t *testing.T) {
 	if err := wtx.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	beforeOps := db.operationID
+	beforeOff := db.LastLogOffset()
 
 	rtx := db.NewTransaction(false)
 	if rtx.xid != 0 {
@@ -333,7 +333,7 @@ func TestTransaction_ReadOnlyCommitNoWAL(t *testing.T) {
 	if err := rtx.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	if after := db.operationID; after != beforeOps {
-		t.Fatalf("read-only commit must not append WAL records: opID %d -> %d", beforeOps, after)
+	if after := db.LastLogOffset(); after != beforeOff {
+		t.Fatalf("read-only commit must not append WAL records: offset %d -> %d", beforeOff, after)
 	}
 }

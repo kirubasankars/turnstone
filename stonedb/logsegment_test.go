@@ -22,7 +22,7 @@ func TestValidateLogSegment_RejectsPartialFrame(t *testing.T) {
 	tx.Put([]byte("k"), []byte("v"))
 	tx.Commit()
 
-	seg, _, _, err := db.ReadLogSegment(0, 1<<20)
+	seg, _, err := db.ReadLogSegment(0, 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +51,7 @@ func TestReadLogSegment_StatementBoundaries(t *testing.T) {
 
 	var offset int64
 	for {
-		seg, next, _, err := db.ReadLogSegment(offset, 64)
+		seg, next, err := db.ReadLogSegment(offset, 64)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -85,7 +85,7 @@ func TestApplyLogSegment_RoundTrip(t *testing.T) {
 		tx.Commit()
 	}
 
-	seg, _, lastOpID, err := leader.ReadLogSegment(0, 1<<20)
+	seg, endOffset, err := leader.ReadLogSegment(0, 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,8 +100,8 @@ func TestApplyLogSegment_RoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if applied != lastOpID {
-		t.Fatalf("expected last opID %d, got %d", lastOpID, applied)
+	if applied != endOffset {
+		t.Fatalf("expected end offset %d, got %d", endOffset, applied)
 	}
 
 	count, _ := follower.KeyCount()
@@ -122,7 +122,7 @@ func TestApplyLogSegment_RoundTrip(t *testing.T) {
 	}
 }
 
-func TestByteOffsetAfterOpID(t *testing.T) {
+func TestIsFrameBoundary(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(dir, Options{})
 	if err != nil {
@@ -133,22 +133,24 @@ func TestByteOffsetAfterOpID(t *testing.T) {
 	tx := db.NewTransaction(true)
 	tx.Put([]byte("k"), []byte("v"))
 	tx.Commit()
-	opID := db.LastOpID()
 
-	off, ok := db.ByteOffsetAfterOpID(opID)
-	if !ok {
-		t.Fatal("expected offset for opID")
+	head := db.LastLogOffset()
+	if !db.IsValidFrameOffset(0) {
+		t.Fatal("offset 0 should be valid")
 	}
-	if off <= 0 {
-		t.Fatalf("expected positive offset, got %d", off)
+	if !db.IsValidFrameOffset(head) {
+		t.Fatal("head offset should be valid")
+	}
+	if db.IsValidFrameOffset(1) {
+		t.Fatal("offset 1 should not be a frame boundary")
 	}
 
-	seg, next, _, err := db.ReadLogSegment(0, 1<<20)
+	seg, next, err := db.ReadLogSegment(0, 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if next != off {
-		t.Fatalf("expected next offset %d after full read, got %d", off, next)
+	if next != head {
+		t.Fatalf("expected next offset %d after full read, got %d", head, next)
 	}
 	if len(seg) == 0 {
 		t.Fatal("expected segment bytes")

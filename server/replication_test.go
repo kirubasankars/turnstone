@@ -536,9 +536,9 @@ func TestReplication_SlowConsumer_Dropped(t *testing.T) {
 	}
 }
 
-// TestReplication_FullSync_Integration verifies that a Replica server can correctly
-// ingest a full snapshot from a Primary when the WAL logs are missing, and then
-// seamlessly transition to receiving live updates.
+// TestReplication_FullSync_Integration verifies that an empty Replica can catch up
+// by streaming the full physical WAL from offset 0 (even after PurgeWAL raises the
+// scan floor), and then seamlessly transition to receiving live updates.
 func TestReplication_FullSync_Integration(t *testing.T) {
 	baseDir, clientTLS := setupSharedCertEnv(t)
 	adminTLS := getRoleTLS(t, baseDir, "admin")
@@ -548,14 +548,14 @@ func TestReplication_FullSync_Integration(t *testing.T) {
 	defer cancelPrimary()
 	promoteNode(t, baseDir, primaryAddr, "1")
 
-	// 2. Populate Primary with data that will be "snapshotted"
+	// 2. Populate Primary with data that will be streamed from offset 0
 	clientPrimary := connectClient(t, primaryAddr, clientTLS)
 	defer clientPrimary.Close()
 	selectDatabase(t, clientPrimary, "1")
 
 	writeKeyVal(t, clientPrimary, "snapKey", "snapVal")
 
-	// 3. Force WAL Purge on Primary to make logs unavailable using Promote (Forces rotation)
+	// 3. Force WAL Purge on Primary to make logs unavailable
 	st1 := primarySrv.stores["1"]
 	// StepDown first because Promote now requires it if already Primary
 	cAdmin := connectClient(t, primaryAddr, adminTLS)
@@ -574,9 +574,9 @@ func TestReplication_FullSync_Integration(t *testing.T) {
 	selectDatabase(t, clientPrimary, "1")
 
 	// Purge WAL.
-	// We purge up to currentOpID + 1 to ensure the old log file is eligible.
-	currentOpID := st1.DB.LastOpID()
-	if err := st1.DB.PurgeWAL(currentOpID + 1); err != nil {
+	// Purge through the current head so retained WAL is gone.
+	currentOffset := st1.DB.LastLogOffset()
+	if err := st1.DB.PurgeWAL(currentOffset); err != nil {
 		t.Fatalf("PurgeWAL failed: %v", err)
 	}
 
@@ -593,16 +593,16 @@ func TestReplication_FullSync_Integration(t *testing.T) {
 	selectDatabase(t, adminReplica, "1")
 
 	// 5. Configure Replication
-	// Primary should detect missing WAL and send Snapshot.
+	// Empty replica (cursor 0) streams the full physical WAL from the primary.
 	configureReplication(t, adminReplica, primaryAddr, "1")
 
-	// 6. Verify Snapshot Data Arrives
+	// 6. Verify catch-up data arrives via physical WAL stream
 	waitForConditionOrTimeout(t, 5*time.Second, func() bool {
 		val := readKey(t, clientReplica, "snapKey")
 		return string(val) == "snapVal"
-	}, "Replica failed to receive snapshot data (snapKey)")
+	}, "Replica failed to receive catch-up data (snapKey)")
 
-	// 7. Verify Transition to Live Streaming
+	// 7. Verify transition to live streaming
 	// Write new data to Primary
 	writeKeyVal(t, clientPrimary, "liveKey", "liveVal")
 
@@ -610,7 +610,7 @@ func TestReplication_FullSync_Integration(t *testing.T) {
 	waitForConditionOrTimeout(t, 5*time.Second, func() bool {
 		val := readKey(t, clientReplica, "liveKey")
 		return string(val) == "liveVal"
-	}, "Replica failed to receive live stream data (liveKey) after snapshot")
+	}, "Replica failed to receive live stream data (liveKey) after catch-up")
 }
 
 func TestReplication_KeyCount_Match(t *testing.T) {
@@ -658,17 +658,17 @@ func TestReplication_KeyCount_Match(t *testing.T) {
 	})
 }
 
-func TestReplication_TimelineFork_Recovery(t *testing.T) {
+func TestReplication_CatchUpAfterPromote(t *testing.T) {
 	baseDir, clientTLS := setupSharedCertEnv(t)
 	adminTLS := getRoleTLS(t, baseDir, "admin")
 
 	// 1. Start Primary
-	primarySrv, primaryAddr, cancelPrimary := startServerNode(t, baseDir, "primary_tl", clientTLS)
+	primarySrv, primaryAddr, cancelPrimary := startServerNode(t, baseDir, "primary_cu", clientTLS)
 	defer cancelPrimary()
 	promoteNode(t, baseDir, primaryAddr, "1")
 
 	// 2. Start Replica
-	_, replicaAddr, cancelReplica := startServerNode(t, baseDir, "replica_tl", clientTLS)
+	_, replicaAddr, cancelReplica := startServerNode(t, baseDir, "replica_cu", clientTLS)
 	defer cancelReplica()
 
 	// Clients
@@ -684,14 +684,11 @@ func TestReplication_TimelineFork_Recovery(t *testing.T) {
 	defer adminReplica.Close()
 	selectDatabase(t, adminReplica, "1")
 
-	// 3. Write on Timeline 1
 	writeKeyVal(t, clientPrimary, "t1_key", "val1")
 
-	// 4. Force Timeline Switch on Primary
-	// This simulates a promotion event or a history fork.
 	st1 := primarySrv.stores["1"]
 
-	// StepDown first because Promote now requires it if already Primary
+	// StepDown first because Promote requires UNDEFINED or REPLICA
 	cAdmin := connectClient(t, primaryAddr, adminTLS)
 	selectDatabase(t, cAdmin, "1")
 	cAdmin.AssertStatus(protocol.OpCodeStepDown, nil, protocol.ResStatusOK)
@@ -707,19 +704,15 @@ func TestReplication_TimelineFork_Recovery(t *testing.T) {
 	clientPrimary = connectClient(t, primaryAddr, clientTLS)
 	selectDatabase(t, clientPrimary, "1")
 
-	// 5. Write on Timeline 2
 	writeKeyVal(t, clientPrimary, "t2_key", "val2")
 
-	// 6. Configure Replication (Replica connects to Primary)
-	// The replica should pull T1 data, cross the timeline boundary, and pull T2 data.
 	configureReplication(t, adminReplica, primaryAddr, "1")
 
-	// 7. Verify Data
 	waitForConditionOrTimeout(t, 5*time.Second, func() bool {
 		v1 := readKey(t, clientReplica, "t1_key")
 		v2 := readKey(t, clientReplica, "t2_key")
 		return string(v1) == "val1" && string(v2) == "val2"
-	}, "Replica failed to sync across timeline fork")
+	}, "Replica failed to catch up after promote")
 }
 
 // startServerNodeWithReplicas starts a single TurnstoneDB server instance with specific minReplicas.
@@ -928,11 +921,11 @@ func TestReplication_Retention_LeaderProtectsSlowFollower(t *testing.T) {
 
 	// 9. Verify retention protects slow follower: logs at replica ack still scannable
 	if replicaMinSeq != math.MaxUint64 {
-		if err := st1.DB.ScanWAL(replicaMinSeq, func([]stonedb.WALRecord) error { return nil }); err != nil {
+		if err := st1.DB.ScanWAL(int64(replicaMinSeq), func([]stonedb.WALRecord) error { return nil }); err != nil {
 			t.Errorf("Leader should retain logs for slow follower at seq %d: %v", replicaMinSeq, err)
 		}
-		if replicaMinSeq > 1 {
-			if err := st1.DB.ScanWAL(replicaMinSeq-1, func([]stonedb.WALRecord) error { return nil }); err != stonedb.ErrLogUnavailable {
+		if replicaMinSeq > 0 {
+			if err := st1.DB.ScanWAL(int64(replicaMinSeq-1), func([]stonedb.WALRecord) error { return nil }); err != stonedb.ErrLogUnavailable {
 				t.Errorf("Expected ops below replica ack to be purged, got %v", err)
 			}
 		}
@@ -947,7 +940,7 @@ func TestReplication_Retention_LeaderProtectsSlowFollower(t *testing.T) {
 	st1.EnforceRetentionPolicy()
 
 	// 12. Verify old logs are no longer available for replication
-	if err := st1.DB.ScanWAL(replicaMinSeq, func([]stonedb.WALRecord) error { return nil }); err != stonedb.ErrLogUnavailable {
+	if err := st1.DB.ScanWAL(int64(replicaMinSeq), func([]stonedb.WALRecord) error { return nil }); err != stonedb.ErrLogUnavailable {
 		t.Errorf("Expected ErrLogUnavailable after slot deletion at seq %d, got %v", replicaMinSeq, err)
 	}
 }
@@ -1064,11 +1057,17 @@ func TestReplication_Retention_FollowerRespectsLeaderSafePoint(t *testing.T) {
 	// 9. Run Retention on F1
 	stF1.EnforceRetentionPolicy()
 
-	// 10. Verify F1 retains logs at/above Leader SafePoint (floor=300)
-	if err := stF1.DB.ScanWAL(301, func([]stonedb.WALRecord) error { return nil }); err != nil {
-		t.Errorf("Follower 1 should retain logs at leader safe point: %v", err)
+	// 10. Verify F1 retains logs at/above Leader SafePoint byte offset
+	leaderSafe := stF1.GetLeaderSafeSeq()
+	if leaderSafe == math.MaxUint64 {
+		t.Fatal("expected leader safe point constraint on follower")
 	}
-	if err := stF1.DB.ScanWAL(1, func([]stonedb.WALRecord) error { return nil }); err != stonedb.ErrLogUnavailable {
-		t.Errorf("Expected early ops purged below safe point, got %v", err)
+	if err := stF1.DB.ScanWAL(int64(leaderSafe), func([]stonedb.WALRecord) error { return nil }); err != nil {
+		t.Errorf("Follower 1 should retain logs at leader safe point %d: %v", leaderSafe, err)
+	}
+	if leaderSafe > 0 {
+		if err := stF1.DB.ScanWAL(int64(leaderSafe-1), func([]stonedb.WALRecord) error { return nil }); err != stonedb.ErrLogUnavailable {
+			t.Errorf("Expected ops below safe point %d to be purged, got %v", leaderSafe, err)
+		}
 	}
 }
