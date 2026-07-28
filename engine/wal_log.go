@@ -29,6 +29,7 @@ type walSegment struct {
 }
 
 // DataLog is a segmented append-only WAL addressed by a global byte LSN.
+// Segment rotation does not remap existing index or replication offsets.
 type DataLog struct {
 	dir          string
 	walDir       string
@@ -41,6 +42,7 @@ type DataLog struct {
 	writeOffset  int64
 }
 
+// OpenDataLog opens or creates wal/manifest.json and segment files under dir/wal/.
 func OpenDataLog(dir string, logger *slog.Logger, segmentSize int64) (*DataLog, error) {
 	if err := os.MkdirAll(dir, dirMode); err != nil {
 		return nil, err
@@ -63,19 +65,9 @@ func OpenDataLog(dir string, logger *slog.Logger, segmentSize int64) (*DataLog, 
 			return nil, fmt.Errorf("load wal manifest: %w", err)
 		}
 	} else if os.IsNotExist(err) {
-		legacyPath := filepath.Join(dir, logFileName)
-		if _, statErr := os.Stat(legacyPath); statErr == nil {
-			manifest, err = migrateLegacyDataLog(dir, walDir, segmentSize)
-			if err != nil {
-				return nil, fmt.Errorf("migrate legacy log: %w", err)
-			}
-		} else if os.IsNotExist(statErr) {
-			manifest, err = createFreshWalManifest(walDir, segmentSize)
-			if err != nil {
-				return nil, fmt.Errorf("create wal: %w", err)
-			}
-		} else {
-			return nil, statErr
+		manifest, err = createFreshWalManifest(walDir, segmentSize)
+		if err != nil {
+			return nil, fmt.Errorf("create wal: %w", err)
 		}
 	} else {
 		return nil, err

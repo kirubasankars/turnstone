@@ -10,7 +10,7 @@ import (
 )
 
 // Index is an MVCC index backed by a sharded in-memory hash arena.
-// The index is ephemeral: rebuilt from data.log replay on open and dropped on close.
+// The index is ephemeral: rebuilt from WAL replay on open and dropped on close.
 type Index struct {
 	hash *hashindex.Index
 }
