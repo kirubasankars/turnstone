@@ -19,9 +19,9 @@ import (
 
 	"turnstone/client"
 	"turnstone/config"
-	"turnstone/replication"
+	"turnstone/database"
+	"turnstone/repl"
 	"turnstone/server"
-	"turnstone/store"
 )
 
 // --- Test Setup Helper ---
@@ -51,11 +51,11 @@ func setupTestEnv(t *testing.T) (string, *server.Server, func()) {
 	}
 
 	// 2. Init Stores
-	stores := make(map[string]*store.Store)
+	stores := make(map[string]*database.Database)
 	for i := 0; i < 4; i++ {
 		dbName := strconv.Itoa(i)
 		// No special system database at 0 anymore
-		s, err := store.NewStore(context.Background(), filepath.Join(dir, "data", dbName), logger, 0, "time", 90)
+		s, err := database.Open(context.Background(), filepath.Join(dir, "data", dbName), logger, 0, "none", 90)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -72,7 +72,7 @@ func setupTestEnv(t *testing.T) (string, *server.Server, func()) {
 	pool := x509.NewCertPool()
 	pool.AppendCertsFromPEM(caCert)
 	replTLS := &tls.Config{Certificates: []tls.Certificate{clientCert}, RootCAs: pool, InsecureSkipVerify: true}
-	rm := replication.NewReplicationManager("test-server", stores, replTLS, logger)
+	rm := repl.NewManager("test-server", stores, replTLS, logger)
 
 	// 4. Server
 	srv, err := server.NewServer(

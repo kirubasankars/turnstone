@@ -3,7 +3,7 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root of this source tree.
 
-package stonedb
+package engine
 
 import (
 	"context"
@@ -38,10 +38,10 @@ type DB struct {
 	commitMu   sync.Mutex
 	shutdownMu sync.RWMutex
 
-	transactionID  uint64
-	keyCount       int64
-	scanWALFloor   int64
-	lastCkptOffset int64
+	transactionID   uint64
+	keyCount        int64
+	scanFloor       int64
+	retentionOffset int64
 
 	metricsConflicts uint64
 
@@ -66,11 +66,11 @@ type DB struct {
 	commitSiblings     int
 	unsafeDisableFsync bool
 
-	checksumInterval       time.Duration
-	autoCheckpointInterval time.Duration
-	maxDiskUsagePercent    int
-	isDiskFull             int32
-	isCorrupt              int32
+	checksumInterval    time.Duration
+	retentionInterval   time.Duration
+	maxDiskUsagePercent int
+	isDiskFull          int32
+	isCorrupt           int32
 }
 
 // Open opens a database, replaying data.log to rebuild the ephemeral index.
@@ -86,8 +86,8 @@ func OpenContext(ctx context.Context, dir string, opts Options) (*DB, error) {
 	if err := os.MkdirAll(dir, dirMode); err != nil {
 		return nil, err
 	}
-	if opts.AutoCheckpointInterval == 0 {
-		opts.AutoCheckpointInterval = 60 * time.Second
+	if opts.RetentionInterval == 0 {
+		opts.RetentionInterval = 60 * time.Second
 	}
 	if opts.TxTimeout == 0 {
 		opts.TxTimeout = protocol.MaxTxDuration
@@ -113,40 +113,40 @@ func OpenContext(ctx context.Context, dir string, opts Options) (*DB, error) {
 		return nil, fmt.Errorf("open log: %w", err)
 	}
 
-	index, err := OpenIndex(dir)
-	if err != nil {
+	if err := os.RemoveAll(filepath.Join(dir, "index")); err != nil {
 		_ = logFile.Close()
-		return nil, fmt.Errorf("open index: %w", err)
+		return nil, fmt.Errorf("remove leftover index dir: %w", err)
 	}
+	index := NewIndex()
 
 	db := &DB{
-		dir:                    dir,
-		log:                    logFile,
-		index:                  index,
-		clog:                   make(map[uint64]TxStatus),
-		activeTxns:             make(map[*Transaction]uint64),
-		activeXids:             make(map[uint64]*Transaction),
-		keyLocks:               make(map[string]uint64),
-		txStartTimes:           make(map[uint64]time.Time),
-		beginOffsets:           make(map[uint64]int64),
-		replImpact:             make(map[uint64]*replTxImpact),
-		txTimeout:              opts.TxTimeout,
-		closeCh:                make(chan struct{}),
-		commitCh:               make(chan commitRequest, 500),
-		commitDelay:            opts.CommitDelay,
-		commitSiblings:         opts.CommitSiblings,
-		unsafeDisableFsync:     opts.UnsafeDisableFsync,
-		checksumInterval:       opts.ChecksumInterval,
-		autoCheckpointInterval: opts.AutoCheckpointInterval,
-		maxDiskUsagePercent:    opts.MaxDiskUsagePercent,
-		logger:                 logger,
+		dir:                 dir,
+		log:                 logFile,
+		index:               index,
+		clog:                make(map[uint64]TxStatus),
+		activeTxns:          make(map[*Transaction]uint64),
+		activeXids:          make(map[uint64]*Transaction),
+		keyLocks:            make(map[string]uint64),
+		txStartTimes:        make(map[uint64]time.Time),
+		beginOffsets:        make(map[uint64]int64),
+		replImpact:          make(map[uint64]*replTxImpact),
+		txTimeout:           opts.TxTimeout,
+		closeCh:             make(chan struct{}),
+		commitCh:            make(chan commitRequest, 500),
+		commitDelay:         opts.CommitDelay,
+		commitSiblings:      opts.CommitSiblings,
+		unsafeDisableFsync:  opts.UnsafeDisableFsync,
+		checksumInterval:    opts.ChecksumInterval,
+		retentionInterval:   opts.RetentionInterval,
+		maxDiskUsagePercent: opts.MaxDiskUsagePercent,
+		logger:              logger,
 	}
 
 	if opts.UnsafeDisableFsync {
 		logger.Warn("UnsafeDisableFsync enabled")
 	}
 
-	if err := db.replayLog(ctx, opts.TruncateCorruptWAL); err != nil {
+	if err := db.replayLog(ctx, opts.TruncateCorruptTail); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("replay log: %w", err)
 	}
@@ -155,14 +155,14 @@ func OpenContext(ctx context.Context, dir string, opts Options) (*DB, error) {
 	return db, nil
 }
 
-func (db *DB) ForceSetXID(txID uint64) {
+func (db *DB) AdvanceXID(txID uint64) {
 	if txID > atomic.LoadUint64(&db.transactionID) {
 		atomic.StoreUint64(&db.transactionID, txID)
 	}
 }
 
 func (db *DB) startBackgroundTasks() {
-	atomic.StoreInt64(&db.lastCkptOffset, db.log.WriteOffset())
+	atomic.StoreInt64(&db.retentionOffset, db.log.WriteOffset())
 	waitCount := 3
 	if db.checksumInterval > 0 {
 		waitCount++
@@ -172,7 +172,7 @@ func (db *DB) startBackgroundTasks() {
 	}
 	db.wg.Add(waitCount)
 
-	go db.runAutoCheckpoint()
+	go db.runRetentionMarker()
 	go db.runGroupCommits()
 	go db.runLivenessReaper()
 	if db.checksumInterval > 0 {
@@ -239,23 +239,20 @@ func (db *DB) KeyCount() (int64, error) {
 	return atomic.LoadInt64(&db.keyCount), nil
 }
 
-func (db *DB) StorageStats() (logCount int, logicalSize int64, allocatedSize int64) {
-	logCount = 1
-	logicalSize = db.log.LogicalSize()
-	allocatedSize = db.log.AllocatedSize()
-	return
+func (db *DB) StorageStats() (logicalSize int64, allocatedSize int64) {
+	return db.log.LogicalSize(), db.log.AllocatedSize()
 }
 
 func (db *DB) LastLogOffset() int64 {
 	return db.log.WriteOffset()
 }
 
-func (db *DB) GetLastCheckpointOffset() int64 {
-	return atomic.LoadInt64(&db.lastCkptOffset)
+func (db *DB) RetentionOffset() int64 {
+	return atomic.LoadInt64(&db.retentionOffset)
 }
 
-func (db *DB) GetScanWALFloor() int64 {
-	return atomic.LoadInt64(&db.scanWALFloor)
+func (db *DB) ScanFloor() int64 {
+	return atomic.LoadInt64(&db.scanFloor)
 }
 
 func (db *DB) IsValidFrameOffset(offset int64) bool {
@@ -348,18 +345,18 @@ func (db *DB) runGroupCommits() {
 	}
 }
 
-func (db *DB) runAutoCheckpoint() {
+func (db *DB) runRetentionMarker() {
 	defer db.wg.Done()
-	ticker := time.NewTicker(db.autoCheckpointInterval)
+	ticker := time.NewTicker(db.retentionInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-db.closeCh:
 			return
 		case <-ticker.C:
-			if db.log.WriteOffset() > atomic.LoadInt64(&db.lastCkptOffset) {
-				if err := db.Checkpoint(); err != nil && !strings.Contains(err.Error(), "closed") {
-					db.logger.Error("Auto-checkpoint failed", "err", err)
+			if db.log.WriteOffset() > atomic.LoadInt64(&db.retentionOffset) {
+				if err := db.MarkRetention(); err != nil && !strings.Contains(err.Error(), "closed") {
+					db.logger.Error("retention mark failed", "err", err)
 				}
 			}
 		}
@@ -393,7 +390,7 @@ func (db *DB) VerifyChecksums() error {
 		case <-ctx.Done():
 		}
 	}()
-	return db.log.Replay(ctx, false, func(rec WALRecord, span recordSpan) {})
+	return db.log.Replay(ctx, false, func(rec Record, span recordSpan) {})
 }
 
 func (db *DB) NewTransaction(update bool) *Transaction {
@@ -425,7 +422,7 @@ func (db *DB) NewTransaction(update bool) *Transaction {
 	db.activeTxns[tx] = xid
 	db.activeTxnsMu.Unlock()
 
-	beginOff, err := db.appendRecord(WALRecordBegin, xid, nil, nil)
+	beginOff, err := db.appendRecord(RecordBegin, xid, nil, nil)
 	if err != nil {
 		tx.markAborted()
 		tx.beginErr = err
@@ -437,9 +434,9 @@ func (db *DB) NewTransaction(update bool) *Transaction {
 	return tx
 }
 
-func (db *DB) appendRecord(recType WALRecordType, xid uint64, key, value []byte) (int64, error) {
+func (db *DB) appendRecord(recType RecordType, xid uint64, key, value []byte) (int64, error) {
 	build := func() []byte {
-		return encodeWALRecord(WALRecord{Type: recType, XID: xid, Key: key, Value: value})
+		return encodeRecord(Record{Type: recType, XID: xid, Key: key, Value: value})
 	}
 	offsets, err := db.log.AppendRecords([]func() []byte{build}, false)
 	if err != nil {
@@ -448,14 +445,14 @@ func (db *DB) appendRecord(recType WALRecordType, xid uint64, key, value []byte)
 	return offsets[0], nil
 }
 
-func (db *DB) ScanWAL(startOffset int64, fn func([]WALRecord) error) error {
-	if startOffset < atomic.LoadInt64(&db.scanWALFloor) {
+func (db *DB) ScanLog(startOffset int64, fn func([]Record) error) error {
+	if startOffset < atomic.LoadInt64(&db.scanFloor) {
 		return ErrLogUnavailable
 	}
 	return db.log.Scan(startOffset, fn)
 }
 
-func (db *DB) PurgeWAL(minOffset int64) error {
+func (db *DB) SetScanFloor(minOffset int64) error {
 	db.txMu.Lock()
 	for _, off := range db.beginOffsets {
 		if off < minOffset {
@@ -463,18 +460,18 @@ func (db *DB) PurgeWAL(minOffset int64) error {
 		}
 	}
 	db.txMu.Unlock()
-	atomic.StoreInt64(&db.scanWALFloor, minOffset)
+	atomic.StoreInt64(&db.scanFloor, minOffset)
 	return nil
 }
 
-// ApplyLogSegment appends a raw byte range of complete WAL frames and applies
+// ApplyLogRange appends a raw byte range of complete log frames and applies
 // each statement to the in-memory index. Segments must be statement-aligned
 // (whole frames only); partial frames are rejected.
-func (db *DB) ApplyLogSegment(data []byte) (int64, error) {
+func (db *DB) ApplyLogRange(data []byte) (int64, error) {
 	if atomic.LoadInt32(&db.isCorrupt) == 1 {
 		return 0, errors.New("database is corrupt")
 	}
-	frames, err := validateLogSegment(data)
+	frames, err := validateFrames(data)
 	if err != nil {
 		return 0, err
 	}
@@ -482,8 +479,8 @@ func (db *DB) ApplyLogSegment(data []byte) (int64, error) {
 		return db.log.WriteOffset(), nil
 	}
 
-	fsync := frames[len(frames)-1].rec.Type == WALRecordCommit
-	startOff, err := db.log.AppendRawSegment(data, fsync)
+	fsync := frames[len(frames)-1].rec.Type == RecordCommit
+	startOff, err := db.log.AppendRawFrames(data, fsync)
 	if err != nil {
 		return 0, err
 	}
@@ -492,19 +489,19 @@ func (db *DB) ApplyLogSegment(data []byte) (int64, error) {
 	for _, fr := range frames {
 		rec := fr.rec
 		switch rec.Type {
-		case WALRecordBegin:
+		case RecordBegin:
 			db.txMu.Lock()
 			db.activeXids[rec.XID] = nil
 			db.beginOffsets[rec.XID] = off
 			db.txMu.Unlock()
-		case WALRecordSet, WALRecordDelete:
-			isDelete := rec.Type == WALRecordDelete
+		case RecordSet, RecordDelete:
+			isDelete := rec.Type == RecordDelete
 			db.index.Put(rec.Key, indexVersion{
 				offset: off, valueLen: uint32(len(rec.Value)),
 				xmin: rec.XID, tombstone: isDelete,
 			})
 			db.accountReplicatedWrite(rec)
-		case WALRecordCommit:
+		case RecordCommit:
 			db.forgetClog(rec.XID)
 			db.txMu.Lock()
 			delete(db.activeXids, rec.XID)
@@ -513,7 +510,7 @@ func (db *DB) ApplyLogSegment(data []byte) (int64, error) {
 			delete(db.replImpact, rec.XID)
 			db.txMu.Unlock()
 			db.applyReplicatedImpact(impact)
-		case WALRecordAbort:
+		case RecordAbort:
 			db.setClog(rec.XID, TxAborted)
 			db.index.DropXid(rec.XID)
 			db.txMu.Lock()
@@ -523,27 +520,27 @@ func (db *DB) ApplyLogSegment(data []byte) (int64, error) {
 			db.txMu.Unlock()
 			db.forgetClog(rec.XID)
 		default:
-			return 0, fmt.Errorf("unknown WAL record type: %d", rec.Type)
+			return 0, fmt.Errorf("unknown log record type: %d", rec.Type)
 		}
-		db.ForceSetXID(rec.XID)
+		db.AdvanceXID(rec.XID)
 		off += fr.length
 	}
 	return off, nil
 }
 
-func (db *DB) ReadLogSegment(startOffset int64, maxBytes int64) ([]byte, int64, error) {
-	return db.log.ReadLogSegment(startOffset, maxBytes)
+func (db *DB) ReadLogRange(startOffset int64, maxBytes int64) ([]byte, int64, error) {
+	return db.log.ReadLogRange(startOffset, maxBytes)
 }
 
-func (db *DB) ApplyRecord(rec WALRecord) error {
+func (db *DB) ApplyRecord(rec Record) error {
 	if atomic.LoadInt32(&db.isCorrupt) == 1 {
 		return errors.New("database is corrupt")
 	}
-	payload := encodeWALRecord(rec)
+	payload := encodeRecord(rec)
 
 	switch rec.Type {
-	case WALRecordBegin:
-		off, err := db.log.AppendReplicatedRecord(payload, false)
+	case RecordBegin:
+		off, err := db.log.AppendEncoded(payload, false)
 		if err != nil {
 			return err
 		}
@@ -551,26 +548,26 @@ func (db *DB) ApplyRecord(rec WALRecord) error {
 		db.activeXids[rec.XID] = nil
 		db.beginOffsets[rec.XID] = off
 		db.txMu.Unlock()
-		db.ForceSetXID(rec.XID)
+		db.AdvanceXID(rec.XID)
 		return nil
 
-	case WALRecordSet, WALRecordDelete:
-		off, err := db.log.AppendReplicatedRecord(payload, false)
+	case RecordSet, RecordDelete:
+		off, err := db.log.AppendEncoded(payload, false)
 		if err != nil {
 			atomic.StoreInt32(&db.isCorrupt, 1)
 			return err
 		}
-		isDelete := rec.Type == WALRecordDelete
+		isDelete := rec.Type == RecordDelete
 		db.index.Put(rec.Key, indexVersion{
 			offset: off, valueLen: uint32(len(rec.Value)),
 			xmin: rec.XID, tombstone: isDelete,
 		})
 		db.accountReplicatedWrite(rec)
-		db.ForceSetXID(rec.XID)
+		db.AdvanceXID(rec.XID)
 		return nil
 
-	case WALRecordCommit:
-		if _, err := db.log.AppendReplicatedRecord(payload, true); err != nil {
+	case RecordCommit:
+		if _, err := db.log.AppendEncoded(payload, true); err != nil {
 			return err
 		}
 		db.forgetClog(rec.XID)
@@ -581,11 +578,11 @@ func (db *DB) ApplyRecord(rec WALRecord) error {
 		delete(db.replImpact, rec.XID)
 		db.txMu.Unlock()
 		db.applyReplicatedImpact(impact)
-		db.ForceSetXID(rec.XID)
+		db.AdvanceXID(rec.XID)
 		return nil
 
-	case WALRecordAbort:
-		if _, err := db.log.AppendReplicatedRecord(payload, false); err != nil {
+	case RecordAbort:
+		if _, err := db.log.AppendEncoded(payload, false); err != nil {
 			return err
 		}
 		db.setClog(rec.XID, TxAborted)
@@ -596,10 +593,10 @@ func (db *DB) ApplyRecord(rec WALRecord) error {
 		delete(db.replImpact, rec.XID)
 		db.txMu.Unlock()
 		db.forgetClog(rec.XID)
-		db.ForceSetXID(rec.XID)
+		db.AdvanceXID(rec.XID)
 		return nil
 	}
-	return fmt.Errorf("unknown WAL record type: %d", rec.Type)
+	return fmt.Errorf("unknown log record type: %d", rec.Type)
 }
 
 type replTxImpact struct {
@@ -607,9 +604,9 @@ type replTxImpact struct {
 	dispositionSeen map[string]bool
 }
 
-func (db *DB) accountReplicatedWrite(rec WALRecord) {
+func (db *DB) accountReplicatedWrite(rec Record) {
 	keyStr := string(rec.Key)
-	isDelete := rec.Type == WALRecordDelete
+	isDelete := rec.Type == RecordDelete
 
 	db.txMu.Lock()
 	impact, ok := db.replImpact[rec.XID]
@@ -677,10 +674,10 @@ func (db *DB) Close() error {
 	}()
 	select {
 	case <-commitDone:
-		_ = db.Checkpoint()
+		_ = db.MarkRetention()
 		db.commitMu.Unlock()
 	case <-time.After(shutdownCommitWait):
-		db.logger.Warn("Shutdown: commit batch still active, skipping checkpoint", "wait_ms", shutdownCommitWait.Milliseconds())
+		db.logger.Warn("Shutdown: commit batch still active, skipping retention mark", "wait_ms", shutdownCommitWait.Milliseconds())
 	}
 
 	if db.index != nil {
@@ -696,8 +693,8 @@ func (db *DB) Close() error {
 	return nil
 }
 
-func (db *DB) Checkpoint() error {
-	atomic.StoreInt64(&db.lastCkptOffset, db.log.WriteOffset())
+func (db *DB) MarkRetention() error {
+	atomic.StoreInt64(&db.retentionOffset, db.log.WriteOffset())
 	return nil
 }
 

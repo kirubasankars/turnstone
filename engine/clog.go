@@ -3,7 +3,7 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root of this source tree.
 
-package stonedb
+package engine
 
 import (
 	"sync/atomic"
@@ -70,7 +70,7 @@ func (db *DB) abortTransaction(tx *Transaction) {
 			return
 		}
 
-		if _, err := db.appendRecord(WALRecordAbort, tx.xid, nil, nil); err != nil {
+		if _, err := db.appendRecord(RecordAbort, tx.xid, nil, nil); err != nil {
 			panic("CRITICAL: ABORT record append failed: " + err.Error())
 		}
 		db.setClog(tx.xid, TxAborted)

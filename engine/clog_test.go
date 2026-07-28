@@ -3,7 +3,7 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root of this source tree.
 
-package stonedb
+package engine
 
 import (
 	"testing"
@@ -110,10 +110,10 @@ func TestClog_EmptyAfterApplyRecordAbort(t *testing.T) {
 	defer db.Close()
 
 	const xid = uint64(42)
-	recs := []WALRecord{
-		{Type: WALRecordBegin, XID: xid},
-		{Type: WALRecordSet, XID: xid, Key: []byte("k"), Value: []byte("v")},
-		{Type: WALRecordAbort, XID: xid},
+	recs := []Record{
+		{Type: RecordBegin, XID: xid},
+		{Type: RecordSet, XID: xid, Key: []byte("k"), Value: []byte("v")},
+		{Type: RecordAbort, XID: xid},
 	}
 	for _, r := range recs {
 		if err := db.ApplyRecord(r); err != nil {

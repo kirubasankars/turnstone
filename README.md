@@ -29,7 +29,7 @@ LICENSE file in the root of this source tree.
 
 | Area | Detail |
 | --- | --- |
-| Storage | Single append-only `data.log` + in-memory segmented hash index arena |
+| Storage | Single append-only `data.log` + in-memory sharded hash index arena |
 | Durability | Eager append on `SET`/`DEL`; group fsync on `COMMIT` |
 | Security | mTLS on all connections; RBAC via X.509 certificate Organization |
 | Replication | Async or sync (quorum ack) |
@@ -128,7 +128,7 @@ There is no automatic leader election. An operator must invoke failover.
 | `port` | `:6379` | Listen address |
 | `max_conns` | `1000` | Max concurrent connections |
 | `number_of_databases` | `4` | Logical databases (`0` … `N`) |
-| `wal_retention_strategy` | `replication` | Purge policy: `replication` or `time` |
+| `log_retention` | `replication` | Purge policy: `replication` or `none` |
 | `max_disk_usage_percent` | `90` | Reject writes above this disk usage |
 | `metrics_addr` | `:9090` | Prometheus scrape address |
 | `tls_cert_file` | `certs/server.crt` | Server certificate |
@@ -139,7 +139,7 @@ There is no automatic leader election. An operator must invoke failover.
 ## Storage engine
 
 ```
-Client SET/DEL  →  append data.log  →  update segmented hash index
+Client SET/DEL  →  append data.log  →  update sharded hash index
 Client COMMIT   →  append + fsync COMMIT  →  clog[xid] = committed
 Client GET      →  index lookup  →  ReadAt(offset) from data.log
 Open            →  replay data.log  →  rebuild index + clog
@@ -148,7 +148,7 @@ Open            →  replay data.log  →  rebuild index + clog
 ### Components
 
 1. **`data.log`** — one unbounded append-only file. Records: `BEGIN`, `SET`, `DEL`, `COMMIT`, `ABORT` (keys and values inline). This is the only durable database state.
-2. **In-memory index** — 256-segment hash arena (ephemeral runtime cache). Rebuilt from `data.log` replay on open and dropped on close. Only `data.log` is durable.
+2. **In-memory index** — 256-shard hash arena (ephemeral runtime cache). Rebuilt from `data.log` replay on open and dropped on close. Only `data.log` is durable.
 3. **In-memory clog** — transaction commit status, rebuilt during replay.
 
 ### Transaction model (eager logging)
@@ -175,7 +175,8 @@ sequenceDiagram
 
 Notable semantics:
 
-- **`xid` at `BEGIN`** — replication uses the leader `data.log` byte offset (exclusive end) as the LSN for handshake, acks, and retention.
+- **Replication cursor** — handshake, acks, and retention use the exclusive-end **byte offset** of `data.log`, not the transaction `xid`.
+- **`xid` at `BEGIN`** — a monotonic transaction id stored inside log records.
 - **First-writer-wins** — `SET`/`DEL` takes a NOWAIT key lock; conflicts return immediately, no deadlock.
 - **Read-set validation at `COMMIT`** — detects stale reads / write skew under snapshot isolation.
 - **Read-your-own-writes** — uncommitted versions with `xmin == my xid` are visible inside the transaction.
@@ -190,7 +191,7 @@ Replication streams raw physical `data.log` byte ranges to follower replicas.
 1. **Single node** — one process, local disk. Scale-out requires application-level sharding.
 2. **Manual failover** — no Raft/Paxos; an operator runs `stepdown` / `promote`.
 3. **No lock waiting** — hot-key contention surfaces as immediate `TxConflict`; clients must retry.
-4. **Breaking on-disk format** — the current `data.log` + segmented hash index layout is not compatible with older WAL/VLog/LevelDB directories.
+4. **Breaking on-disk format** — the current `data.log` + sharded hash index layout is not compatible with older WAL/VLog/LevelDB directories.
 
 ---
 

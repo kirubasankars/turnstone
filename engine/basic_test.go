@@ -3,7 +3,7 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root of this source tree.
 
-package stonedb
+package engine
 
 import (
 	"fmt"
@@ -156,7 +156,7 @@ func TestPersistence(t *testing.T) {
 	}
 }
 
-func TestWALScan(t *testing.T) {
+func TestLogScan(t *testing.T) {
 	dir := t.TempDir()
 	opts := Options{}
 
@@ -181,11 +181,11 @@ func TestWALScan(t *testing.T) {
 	}
 
 	head := db.LastLogOffset()
-	seg, _, err := db.ReadLogSegment(0, head/2)
+	seg, _, err := db.ReadLogRange(0, head/2)
 	if err != nil {
-		t.Fatalf("ReadLogSegment failed: %v", err)
+		t.Fatalf("ReadLogRange failed: %v", err)
 	}
-	frames, err := validateLogSegment(seg)
+	frames, err := validateFrames(seg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,14 +195,14 @@ func TestWALScan(t *testing.T) {
 	}
 
 	foundCount := 0
-	err = db.ScanWAL(startOffset, func(recs []WALRecord) error {
+	err = db.ScanLog(startOffset, func(recs []Record) error {
 		foundCount += len(recs)
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("ScanWAL failed: %v", err)
+		t.Fatalf("ScanLog failed: %v", err)
 	}
 	if foundCount == 0 {
-		t.Error("ScanWAL returned no records from mid offset")
+		t.Error("ScanLog returned no records from mid offset")
 	}
 }

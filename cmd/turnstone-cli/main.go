@@ -153,24 +153,13 @@ func handleCommand(cl *client.Client, cmd string, parts []string) error {
 		}
 
 	case "replicaof":
-		// Handle "replicaof no one" as stop replication
-		if len(parts) >= 3 && parts[1] == "no" && parts[2] == "one" {
-			err = cl.ReplicaOf("", "")
-			if err == nil {
-				fmt.Println("Replication stopped (NO ONE)")
-			}
-		} else if len(parts) < 3 {
-			// Also allow empty args to stop
-			err = cl.ReplicaOf("", "")
-			if err == nil {
-				fmt.Println("Replication stopped (Empty args)")
-			}
-		} else {
-			// Normal case: replicaof <host> <db>
-			err = cl.ReplicaOf(parts[1], parts[2])
-			if err == nil {
-				fmt.Printf("Replication started from %s/%s\n", parts[1], parts[2])
-			}
+		if len(parts) < 3 {
+			fmt.Println("Usage: replicaof <host:port> <remote_db>  (use stepdown to stop following)")
+			return errors.New("usage error")
+		}
+		err = cl.ReplicaOf(parts[1], parts[2])
+		if err == nil {
+			fmt.Printf("Replication started from %s/%s\n", parts[1], parts[2])
 		}
 
 	case "promote":

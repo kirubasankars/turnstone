@@ -23,19 +23,19 @@ import (
 
 // Config represents the server configuration.
 type Config struct {
-	ID                   string `json:"id"` // Unique identifier for this instance
-	Port                 string `json:"port"`
-	Debug                bool   `json:"debug"`
-	MaxConns             int    `json:"max_conns"`
-	TLSCertFile          string `json:"tls_cert_file"`
-	TLSKeyFile           string `json:"tls_key_file"`
-	TLSCAFile            string `json:"tls_ca_file"`
-	TLSClientCertFile    string `json:"tls_client_cert_file"`
-	TLSClientKeyFile     string `json:"tls_client_key_file"`
-	MetricsAddr          string `json:"metrics_addr"`
-	NumberOfDatabases    int    `json:"number_of_databases"`
-	WALRetentionStrategy string `json:"wal_retention_strategy"` // "replication" or "checkpoint"
-	MaxDiskUsagePercent  int    `json:"max_disk_usage_percent"`
+	ID                  string `json:"id"` // Unique identifier for this instance
+	Port                string `json:"port"`
+	Debug               bool   `json:"debug"`
+	MaxConns            int    `json:"max_conns"`
+	TLSCertFile         string `json:"tls_cert_file"`
+	TLSKeyFile          string `json:"tls_key_file"`
+	TLSCAFile           string `json:"tls_ca_file"`
+	TLSClientCertFile   string `json:"tls_client_cert_file"`
+	TLSClientKeyFile    string `json:"tls_client_key_file"`
+	MetricsAddr         string `json:"metrics_addr"`
+	NumberOfDatabases   int    `json:"number_of_databases"`
+	LogRetention        string `json:"log_retention"` // "replication" or "none"
+	MaxDiskUsagePercent int    `json:"max_disk_usage_percent"`
 }
 
 // ResolvePath returns an absolute path relative to the home directory if strictly necessary.
@@ -52,7 +52,7 @@ func ResolvePath(homeDir, path string) string {
 // ValidateConfig sanity-checks user-supplied config values that would
 // otherwise be accepted silently and then misbehave downstream. In
 // particular, MaxDiskUsagePercent is compared directly against a 0-100
-// disk-usage percentage (stonedb.DB.runDiskMonitor); only 0 is special
+// disk-usage percentage (engine.DB.runDiskMonitor); only 0 is special
 // (disables the monitor entirely) -- anything negative silently disables
 // the monitor too (since the "is it positive" gate never passes), and
 // anything above 100 makes the "usage > limit" comparison permanently
@@ -98,8 +98,8 @@ func GenerateConfigArtifacts(homeDir string, defaultCfg Config, configPath strin
 	defaultCfg.TLSClientCertFile = "certs/server.crt"
 	defaultCfg.TLSClientKeyFile = "certs/server.key"
 
-	if defaultCfg.WALRetentionStrategy == "" {
-		defaultCfg.WALRetentionStrategy = "replication"
+	if defaultCfg.LogRetention == "" {
+		defaultCfg.LogRetention = "replication"
 	}
 	// Default to 90% if not set (0 is treated as disabled, so we set explicit default here if needed)
 	if defaultCfg.MaxDiskUsagePercent == 0 {

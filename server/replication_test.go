@@ -21,10 +21,10 @@ import (
 	"time"
 
 	"turnstone/config"
+	"turnstone/database"
+	"turnstone/engine"
 	"turnstone/protocol"
-	"turnstone/replication"
-	"turnstone/stonedb"
-	"turnstone/store"
+	"turnstone/repl"
 )
 
 // --- Replication Helpers ---
@@ -66,11 +66,11 @@ func startServerNode(t *testing.T, baseDir, name string, sharedTLS *tls.Config) 
 	logger := slog.New(slog.NewTextHandler(io.MultiWriter(os.Stdout, logFile), &slog.HandlerOptions{Level: slog.LevelDebug})).With("node", name)
 
 	nodeDir := filepath.Join(baseDir, name)
-	stores := make(map[string]*store.Store)
+	stores := make(map[string]*database.Database)
 	for _, dbName := range []string{"0", "1", "2", "3"} {
 		partPath := filepath.Join(nodeDir, "data", dbName)
 		// Removed isSystem (4th arg), using default 0 minReplicas
-		st, err := store.NewStore(context.Background(), partPath, logger, 0, "time", 90)
+		st, err := database.Open(context.Background(), partPath, logger, 0, "none", 90)
 		if err != nil {
 			t.Fatalf("Failed to init store %s: %v", dbName, err)
 		}
@@ -85,7 +85,7 @@ func startServerNode(t *testing.T, baseDir, name string, sharedTLS *tls.Config) 
 	pool.AppendCertsFromPEM(caCert)
 	replTLS := &tls.Config{Certificates: []tls.Certificate{serverCert}, RootCAs: pool, InsecureSkipVerify: true}
 
-	rm := replication.NewReplicationManager(name, stores, replTLS, logger)
+	rm := repl.NewManager(name, stores, replTLS, logger)
 
 	srv, err := NewServer(
 		name, // Use node name as Server ID
@@ -348,7 +348,7 @@ func TestReplication_Cascading_Rejected(t *testing.T) {
 	configureReplication(t, adminB, addrA, "1")
 
 	// Configure C -> B (Database 1)
-	// This should send the config command, but since AddReplica now performs
+	// This should send the config command, but since Follow now performs
 	// a synchronous handshake check, and B detects it is a replica, B will reject
 	// the handshake. Thus, `REPLICAOF` should return an ERROR.
 	//
@@ -445,7 +445,7 @@ func TestReplication_SlowConsumer_Dropped(t *testing.T) {
 	binary.Write(buf, binary.BigEndian, uint32(1)) // NumDatabases
 	binary.Write(buf, binary.BigEndian, uint32(len(dbName)))
 	buf.WriteString(dbName)
-	binary.Write(buf, binary.BigEndian, uint64(0)) // Start from LogSeq 0
+	binary.Write(buf, binary.BigEndian, uint64(0)) // Start from Offset 0
 
 	header := make([]byte, 5)
 	header[0] = protocol.OpCodeReplHello
@@ -537,7 +537,7 @@ func TestReplication_SlowConsumer_Dropped(t *testing.T) {
 }
 
 // TestReplication_FullSync_Integration verifies that an empty Replica can catch up
-// by streaming the full physical WAL from offset 0 (even after PurgeWAL raises the
+// by streaming the full physical log from offset 0 (even after SetScanFloor raises the
 // scan floor), and then seamlessly transition to receiving live updates.
 func TestReplication_FullSync_Integration(t *testing.T) {
 	baseDir, clientTLS := setupSharedCertEnv(t)
@@ -555,7 +555,7 @@ func TestReplication_FullSync_Integration(t *testing.T) {
 
 	writeKeyVal(t, clientPrimary, "snapKey", "snapVal")
 
-	// 3. Force WAL Purge on Primary to make logs unavailable
+	// 3. Force log Purge on Primary to make logs unavailable
 	st1 := primarySrv.stores["1"]
 	// StepDown first because Promote now requires it if already Primary
 	cAdmin := connectClient(t, primaryAddr, adminTLS)
@@ -573,11 +573,11 @@ func TestReplication_FullSync_Integration(t *testing.T) {
 	clientPrimary = connectClient(t, primaryAddr, clientTLS)
 	selectDatabase(t, clientPrimary, "1")
 
-	// Purge WAL.
-	// Purge through the current head so retained WAL is gone.
+	// Purge log prefix.
+	// Purge through the current head so retained log is gone.
 	currentOffset := st1.DB.LastLogOffset()
-	if err := st1.DB.PurgeWAL(currentOffset); err != nil {
-		t.Fatalf("PurgeWAL failed: %v", err)
+	if err := st1.DB.SetScanFloor(currentOffset); err != nil {
+		t.Fatalf("SetScanFloor failed: %v", err)
 	}
 
 	// 4. Start Replica (Empty)
@@ -593,10 +593,10 @@ func TestReplication_FullSync_Integration(t *testing.T) {
 	selectDatabase(t, adminReplica, "1")
 
 	// 5. Configure Replication
-	// Empty replica (cursor 0) streams the full physical WAL from the primary.
+	// Empty replica (cursor 0) streams the full physical log from the primary.
 	configureReplication(t, adminReplica, primaryAddr, "1")
 
-	// 6. Verify catch-up data arrives via physical WAL stream
+	// 6. Verify catch-up data arrives via physical log stream
 	waitForConditionOrTimeout(t, 5*time.Second, func() bool {
 		val := readKey(t, clientReplica, "snapKey")
 		return string(val) == "snapVal"
@@ -727,11 +727,11 @@ func startServerNodeWithReplicas(t *testing.T, baseDir, name string, sharedTLS *
 	logger := slog.New(slog.NewTextHandler(io.MultiWriter(os.Stdout, logFile), &slog.HandlerOptions{Level: slog.LevelDebug})).With("node", name)
 
 	nodeDir := filepath.Join(baseDir, name)
-	stores := make(map[string]*store.Store)
+	stores := make(map[string]*database.Database)
 	for _, dbName := range []string{"0", "1", "2", "3"} {
 		partPath := filepath.Join(nodeDir, "data", dbName)
 		// Use minReplicas here
-		st, err := store.NewStore(context.Background(), partPath, logger, minReplicas, "time", 90)
+		st, err := database.Open(context.Background(), partPath, logger, minReplicas, "none", 90)
 		if err != nil {
 			t.Fatalf("Failed to init store %s: %v", dbName, err)
 		}
@@ -745,7 +745,7 @@ func startServerNodeWithReplicas(t *testing.T, baseDir, name string, sharedTLS *
 	pool.AppendCertsFromPEM(caCert)
 	replTLS := &tls.Config{Certificates: []tls.Certificate{serverCert}, RootCAs: pool, InsecureSkipVerify: true}
 
-	rm := replication.NewReplicationManager(name, stores, replTLS, logger)
+	rm := repl.NewManager(name, stores, replTLS, logger)
 
 	srv, err := NewServer(
 		name,
@@ -835,9 +835,9 @@ func TestReplication_KeyCount_SyncAndAsync(t *testing.T) {
 }
 
 func TestReplication_Retention_LeaderProtectsSlowFollower(t *testing.T) {
-	// WAL rotation is checkpoint-driven (no more size-based auto-rotation),
-	// so multiple WAL files are generated below via periodic explicit
-	// Checkpoint() calls interleaved with writes, rather than a tiny
+	// retention marking is checkpoint-driven (no more size-based auto-rotation),
+	// so multiple log prefix are generated below via periodic explicit
+	// MarkRetention() calls interleaved with writes, rather than a tiny
 	// size threshold.
 	baseDir, clientTLS := setupSharedCertEnv(t)
 	adminTLS := getRoleTLS(t, baseDir, "admin")
@@ -861,8 +861,8 @@ func TestReplication_Retention_LeaderProtectsSlowFollower(t *testing.T) {
 	selectDatabase(t, adminReplica, "1")
 	configureReplication(t, adminReplica, leaderAddr, "1")
 
-	// 3. Write data to generate multiple WAL files
-	// Entry ~50 bytes. 100 entries = 5KB -> ~5 WAL files.
+	// 3. Write data to generate multiple log prefix
+	// Entry ~50 bytes. 100 entries = 5KB -> ~5 log prefix.
 	clientLeader := connectClient(t, leaderAddr, clientTLS)
 	defer clientLeader.Close()
 	selectDatabase(t, clientLeader, "1")
@@ -870,10 +870,10 @@ func TestReplication_Retention_LeaderProtectsSlowFollower(t *testing.T) {
 	leaderStore1 := leaderSrv.stores["1"]
 	for i := 0; i < 100; i++ {
 		writeKeyVal(t, clientLeader, fmt.Sprintf("k%d", i), "val")
-		// Rotation is checkpoint-driven; force a new WAL file every few
+		// Rotation is checkpoint-driven; force a new log file every few
 		// writes so this test actually exercises multi-file retention.
 		if i%10 == 9 {
-			if err := leaderStore1.DB.Checkpoint(); err != nil {
+			if err := leaderStore1.DB.MarkRetention(); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -899,33 +899,33 @@ func TestReplication_Retention_LeaderProtectsSlowFollower(t *testing.T) {
 
 	cancelReplica()
 
-	// 6. Write MORE data to Leader (Another 100 entries -> ~5 more WAL files)
+	// 6. Write MORE data to Leader (Another 100 entries -> ~5 more log prefix)
 	for i := 100; i < 200; i++ {
 		writeKeyVal(t, clientLeader, fmt.Sprintf("k%d", i), "val")
 		if i%10 == 9 {
-			if err := leaderStore1.DB.Checkpoint(); err != nil {
+			if err := leaderStore1.DB.MarkRetention(); err != nil {
 				t.Fatal(err)
 			}
 		}
 	}
 
-	// 7. Force Checkpoint on Leader (Enables purging of old WALs if no replicas needed them)
+	// 7. Force MarkRetention on Leader (Enables purging of old log prefix if no replicas needed them)
 	st1 := leaderStore1
-	if err := st1.DB.Checkpoint(); err != nil {
+	if err := st1.DB.MarkRetention(); err != nil {
 		t.Fatal(err)
 	}
 
 	// 8. Run Retention Check Manually
-	replicaMinSeq := st1.GetMinSlotLogSeq()
+	replicaMinOffset := st1.MinReplicaOffset()
 	st1.EnforceRetentionPolicy()
 
 	// 9. Verify retention protects slow follower: logs at replica ack still scannable
-	if replicaMinSeq != math.MaxUint64 {
-		if err := st1.DB.ScanWAL(int64(replicaMinSeq), func([]stonedb.WALRecord) error { return nil }); err != nil {
-			t.Errorf("Leader should retain logs for slow follower at seq %d: %v", replicaMinSeq, err)
+	if replicaMinOffset != math.MaxUint64 {
+		if err := st1.DB.ScanLog(int64(replicaMinOffset), func([]engine.Record) error { return nil }); err != nil {
+			t.Errorf("Leader should retain logs for slow follower at seq %d: %v", replicaMinOffset, err)
 		}
-		if replicaMinSeq > 0 {
-			if err := st1.DB.ScanWAL(int64(replicaMinSeq-1), func([]stonedb.WALRecord) error { return nil }); err != stonedb.ErrLogUnavailable {
+		if replicaMinOffset > 0 {
+			if err := st1.DB.ScanLog(int64(replicaMinOffset-1), func([]engine.Record) error { return nil }); err != engine.ErrLogUnavailable {
 				t.Errorf("Expected ops below replica ack to be purged, got %v", err)
 			}
 		}
@@ -940,15 +940,15 @@ func TestReplication_Retention_LeaderProtectsSlowFollower(t *testing.T) {
 	st1.EnforceRetentionPolicy()
 
 	// 12. Verify old logs are no longer available for replication
-	if err := st1.DB.ScanWAL(int64(replicaMinSeq), func([]stonedb.WALRecord) error { return nil }); err != stonedb.ErrLogUnavailable {
-		t.Errorf("Expected ErrLogUnavailable after slot deletion at seq %d, got %v", replicaMinSeq, err)
+	if err := st1.DB.ScanLog(int64(replicaMinOffset), func([]engine.Record) error { return nil }); err != engine.ErrLogUnavailable {
+		t.Errorf("Expected ErrLogUnavailable after slot deletion at seq %d, got %v", replicaMinOffset, err)
 	}
 }
 
 func TestReplication_Retention_FollowerRespectsLeaderSafePoint(t *testing.T) {
-	// WAL rotation is checkpoint-driven (no more size-based auto-rotation);
-	// multiple WAL files are generated below via periodic explicit
-	// Checkpoint() calls on the follower as data streams in.
+	// retention marking is checkpoint-driven (no more size-based auto-rotation);
+	// multiple log prefix are generated below via periodic explicit
+	// MarkRetention() calls on the follower as data streams in.
 	baseDir, clientTLS := setupSharedCertEnv(t)
 	adminTLS := getRoleTLS(t, baseDir, "admin")
 
@@ -991,8 +991,8 @@ func TestReplication_Retention_FollowerRespectsLeaderSafePoint(t *testing.T) {
 	stF1 := follower1Srv.stores["1"]
 
 	// 4. Write Batch 1 (0..100) -> Both Followers sync.
-	// Checkpoint F1 periodically as data streams in so it actually
-	// accumulates multiple WAL files (rotation is checkpoint-driven).
+	// MarkRetention F1 periodically as data streams in so it actually
+	// accumulates multiple log prefix (rotation is checkpoint-driven).
 	for block := 0; block < 100; block += 10 {
 		for i := block; i < block+10; i++ {
 			writeKeyVal(t, clientLeader, fmt.Sprintf("k%d", i), "val")
@@ -1002,7 +1002,7 @@ func TestReplication_Retention_FollowerRespectsLeaderSafePoint(t *testing.T) {
 			val := readKey(t, clientF1, lastKey)
 			return string(val) == "val"
 		}, "F1 sync failed")
-		if err := stF1.DB.Checkpoint(); err != nil {
+		if err := stF1.DB.MarkRetention(); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1028,7 +1028,7 @@ func TestReplication_Retention_FollowerRespectsLeaderSafePoint(t *testing.T) {
 
 	// 6. Write Batch 2 (100..200) -> F1 syncs, F2 is dead.
 	// Keep checkpointing F1 periodically so batch 2 also spans multiple
-	// WAL files.
+	// log prefix.
 	for block := 100; block < 200; block += 10 {
 		for i := block; i < block+10; i++ {
 			writeKeyVal(t, clientLeader, fmt.Sprintf("k%d", i), "val")
@@ -1038,19 +1038,19 @@ func TestReplication_Retention_FollowerRespectsLeaderSafePoint(t *testing.T) {
 			val := readKey(t, clientF1, lastKey)
 			return string(val) == "val"
 		}, "F1 batch 2 sync failed")
-		if err := stF1.DB.Checkpoint(); err != nil {
+		if err := stF1.DB.MarkRetention(); err != nil {
 			t.Fatal(err)
 		}
 	}
 
 	// 7. Trigger Leader to broadcast SafePoint
 	// Leader sees F2 at ~100. Leader sends SafePoint(~100) to F1.
-	// We wait a bit for the periodic broadcast (1s interval in replication.go).
+	// We wait a bit for the periodic broadcast (1s interval in repl.go).
 	time.Sleep(2 * time.Second)
 
-	// 8. Force Checkpoint on F1
+	// 8. Force MarkRetention on F1
 	// This would normally allow F1 to delete logs 0..100 IF it had no constraints.
-	if err := stF1.DB.Checkpoint(); err != nil {
+	if err := stF1.DB.MarkRetention(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1058,15 +1058,15 @@ func TestReplication_Retention_FollowerRespectsLeaderSafePoint(t *testing.T) {
 	stF1.EnforceRetentionPolicy()
 
 	// 10. Verify F1 retains logs at/above Leader SafePoint byte offset
-	leaderSafe := stF1.GetLeaderSafeSeq()
+	leaderSafe := stF1.GetLeaderRetainOffset()
 	if leaderSafe == math.MaxUint64 {
 		t.Fatal("expected leader safe point constraint on follower")
 	}
-	if err := stF1.DB.ScanWAL(int64(leaderSafe), func([]stonedb.WALRecord) error { return nil }); err != nil {
+	if err := stF1.DB.ScanLog(int64(leaderSafe), func([]engine.Record) error { return nil }); err != nil {
 		t.Errorf("Follower 1 should retain logs at leader safe point %d: %v", leaderSafe, err)
 	}
 	if leaderSafe > 0 {
-		if err := stF1.DB.ScanWAL(int64(leaderSafe-1), func([]stonedb.WALRecord) error { return nil }); err != stonedb.ErrLogUnavailable {
+		if err := stF1.DB.ScanLog(int64(leaderSafe-1), func([]engine.Record) error { return nil }); err != engine.ErrLogUnavailable {
 			t.Errorf("Expected ops below safe point %d to be purged, got %v", leaderSafe, err)
 		}
 	}
