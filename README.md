@@ -161,8 +161,6 @@ Each database directory contains:
   repl.slots         # replication follower ack positions (when used)
 ```
 
-Legacy single-file `data.log` directories are migrated automatically on first open into `wal/seg-000001.wal`.
-
 ### Components
 
 1. **Segmented WAL** — append-only log split into rotating segments (default **64 MiB** per segment). Each frame has a CRC32 header. A **global byte LSN** spans all segments, so index offsets and replication cursors stay stable across rotation.
@@ -225,7 +223,7 @@ Replication streams raw physical WAL byte ranges (possibly spanning segment boun
 1. **Single node** — one process, local disk. Scale-out requires application-level sharding.
 2. **Manual failover** — no Raft/Paxos; an operator runs `stepdown` / `promote`.
 3. **No lock waiting** — hot-key contention surfaces as immediate `TxConflict`; clients must retry.
-4. **On-disk format** — uses segmented WAL under `wal/` with a global byte LSN. Legacy `data.log` is migrated on open. Not compatible with older WAL/VLog/LevelDB directory layouts.
+4. **On-disk format** — segmented WAL under `wal/` with a global byte LSN. Not compatible with older monolithic-log or LevelDB directory layouts.
 
 ---
 

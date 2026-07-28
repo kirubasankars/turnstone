@@ -87,6 +87,9 @@ func (ctx IndexGCContext) keepMaskForWalRetain(chain []indexVersion) []bool {
 	return ctx.keepMaskInternal(chain, false)
 }
 
+// keepMaskInternal applies reader/snapshot visibility and optional LogFloor pruning.
+// applyLogFloor=false for WAL retain paths so snapshot-pinned bytes below scan floor
+// remain reachable until copy-forward or segment delete runs.
 func (ctx IndexGCContext) keepMaskInternal(chain []indexVersion, applyLogFloor bool) []bool {
 	n := len(chain)
 	keep := make([]bool, n)
@@ -124,7 +127,8 @@ func (ctx IndexGCContext) keepMaskInternal(chain []indexVersion, applyLogFloor b
 }
 
 // FilterVersionsForWalRetain returns MVCC-visible versions without log-floor pruning.
-// Used to find the minimum WAL offset that must remain reachable for reads.
+// Used for WAL retain/copy-forward/delete floors. Index compaction uses FilterVersions
+// instead, which applies LogFloor to drop versions already below scan floor.
 func (ctx IndexGCContext) FilterVersionsForWalRetain(_ []byte, chain []indexVersion) []indexVersion {
 	if len(chain) == 0 {
 		return nil

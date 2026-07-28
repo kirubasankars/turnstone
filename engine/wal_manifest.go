@@ -27,9 +27,10 @@ type walManifestSegment struct {
 }
 
 type walManifest struct {
+	// Version is the on-disk manifest schema (currently 1).
 	Version     int                  `json:"version"`
 	SegmentSize int64                `json:"segment_size"`
-	ScanFloor   int64                `json:"scan_floor"`
+	ScanFloor   int64                `json:"scan_floor"` // reserved; scan floor lives in engine memory today
 	ActiveID    uint32               `json:"active_id"`
 	Segments    []walManifestSegment `json:"segments"`
 }
@@ -66,32 +67,6 @@ func saveWalManifest(path string, m *walManifest) error {
 		return err
 	}
 	return os.Rename(tmp, path)
-}
-
-func migrateLegacyDataLog(dbDir, walDir string, segmentSize int64) (*walManifest, error) {
-	legacyPath := filepath.Join(dbDir, logFileName)
-	if _, err := os.Stat(legacyPath); err != nil {
-		return nil, err
-	}
-	if err := os.MkdirAll(walDir, dirMode); err != nil {
-		return nil, err
-	}
-	segName := walSegmentFileName(1)
-	segPath := filepath.Join(walDir, segName)
-	if err := os.Rename(legacyPath, segPath); err != nil {
-		return nil, fmt.Errorf("migrate legacy log: %w", err)
-	}
-	m := &walManifest{
-		Version:     walManifestVersion,
-		SegmentSize: segmentSize,
-		ActiveID:    1,
-		Segments: []walManifestSegment{{
-			ID:      1,
-			File:    segName,
-			BaseLSN: 0,
-		}},
-	}
-	return m, saveWalManifest(filepath.Join(walDir, walManifestName), m)
 }
 
 func createFreshWalManifest(walDir string, segmentSize int64) (*walManifest, error) {

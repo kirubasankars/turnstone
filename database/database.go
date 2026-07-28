@@ -29,8 +29,8 @@ type Stats struct {
 	Offset       int64
 	Conflicts    uint64
 	ReplicaLag   uint64
-	LogSize      int64 // logical size of data.log
-	LogAllocated int64 // allocated on-disk bytes (sparse)
+	LogSize      int64 // logical WAL size (global write head)
+	LogAllocated int64 // allocated on-disk WAL bytes (all segments)
 	KeyCount     int64
 }
 
@@ -330,6 +330,10 @@ func (s *Database) evictZombieReplicas() {
 
 // EnforceRetentionPolicy raises the log scan floor from replica acks, the
 // leader retain offset, and the local retention mark, then runs index/WAL maintenance.
+//
+// safeID is the minimum of replication constraints and MarkRetention; that byte
+// offset becomes ScanFloor before RunWalMaintenance compacts, copy-forwards, and
+// deletes sealed WAL segments.
 func (s *Database) EnforceRetentionPolicy() {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()

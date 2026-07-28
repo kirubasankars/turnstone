@@ -25,6 +25,9 @@ type WalRetentionResult struct {
 
 // RunWalMaintenance compacts the index (when enabled), copy-forwards live WAL
 // frames when fragmented, then deletes sealed segments at or below scan floor.
+//
+// Order matters: index compact drops stale versions first; copy-forward rewrites
+// live frames and remaps offsets before physical segment delete runs.
 func (db *DB) RunWalMaintenance() error {
 	if db.indexCompactOnRetention {
 		if _, err := db.MaybeCompactIndex(); err != nil {
@@ -63,8 +66,13 @@ func (db *DB) DeleteWalSegments(minDeletableLSN int64) (WalRetentionResult, erro
 	}, nil
 }
 
-// MaybeCopyForwardWal copies live index-referenced frames into a fresh segment
-// and remaps index offsets when on-disk WAL bytes exceed live bytes by ratio.
+// MaybeCopyForwardWal copies MVCC-visible index frames into a fresh segment when
+// on-disk WAL bytes exceed live bytes by WalCopyForwardFragmentation (default 3×).
+//
+// Under commitMu: skips while write transactions are active (read-only snapshots
+// may still pin older frames). Pipeline is append → remap index → purge segments.
+// Segment purge respects scan floor for replication; unconstrained DBs purge through
+// the pre-copy write head for maximum reclaim.
 func (db *DB) MaybeCopyForwardWal(minDeletableLSN int64) (WalRetentionResult, error) {
 	if db.log == nil || db.index == nil || db.index.hash == nil {
 		return WalRetentionResult{}, nil
@@ -139,6 +147,10 @@ func (db *DB) MinDeletableLSN() int64 {
 	return db.effectiveWalDeleteThrough(db.ScanFloor())
 }
 
+// effectiveWalDeleteThrough is the exclusive-end LSN through which sealed segments
+// may be deleted: min(scan/replication floor, MVCC-visible min index offset).
+// MVCC tightening allows deleting stale chain entries that index compact has not
+// yet rewritten while still honoring snapshot and replication byte retain points.
 func (db *DB) effectiveWalDeleteThrough(minDeletableLSN int64) int64 {
 	scanFloor := db.ScanFloor()
 	if minDeletableLSN > 0 {
@@ -180,6 +192,9 @@ func (db *DB) indexMinMVCCReferencedOffset(ctx IndexGCContext) (int64, bool) {
 	return minOff, true
 }
 
+// collectLiveFrameOffsets gathers deduplicated frame offsets for copy-forward.
+// Uses FilterVersionsForWalRetain (not FilterVersions) so snapshot-pinned frames
+// below scan floor are still copied.
 func (db *DB) collectLiveFrameOffsets(ctx IndexGCContext) ([]int64, int64, error) {
 	seen := make(map[int64]struct{})
 	var offsets []int64

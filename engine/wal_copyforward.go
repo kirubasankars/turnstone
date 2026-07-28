@@ -72,7 +72,7 @@ type walCopyForwardOutcome struct {
 
 // appendCopyForwardFrames appends frame copies to a fresh active segment and
 // returns the old→new offset map. Segment purge is deferred until after the
-// index is remapped.
+// index is remapped (see MaybeCopyForwardWal).
 func (l *DataLog) appendCopyForwardFrames(oldOffsets []int64, frames [][]byte) (walCopyForwardOutcome, error) {
 	if len(oldOffsets) != len(frames) {
 		return walCopyForwardOutcome{}, fmt.Errorf("wal copy-forward: offset/frame count mismatch")
@@ -119,6 +119,9 @@ func (l *DataLog) appendCopyForwardFrames(oldOffsets []int64, frames [][]byte) (
 	return out, nil
 }
 
+// copyForwardSegmentDeleteThrough computes how far sealed segments may be purged
+// after a copy-forward pass. Replication scan floor caps deletion; standalone DBs
+// with no floor delete through headBefore.
 func copyForwardSegmentDeleteThrough(minDeletableLSN, headBefore int64, scanFloor int64) int64 {
 	deleteThrough := minDeletableLSN
 	if deleteThrough <= 0 {
@@ -134,7 +137,8 @@ func copyForwardSegmentDeleteThrough(minDeletableLSN, headBefore int64, scanFloo
 	return deleteThrough
 }
 
-// deleteSegmentsThroughLocked is deleteSegmentsThrough with mu already held.
+// deleteSegmentsThroughLocked removes sealed segments whose exclusive end LSN is
+// at or below maxEndLSN. The active segment is never deleted. Caller must hold l.mu.
 func (l *DataLog) deleteSegmentsThroughLocked(maxEndLSN int64) (int, int64, error) {
 	if maxEndLSN <= 0 {
 		return 0, 0, nil
