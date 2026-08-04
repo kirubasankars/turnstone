@@ -5,10 +5,7 @@
 
 build:
 	mkdir -p ./bin
-	go build -o bin/turnstone cmd/turnstone/main.go
-	go build -o bin/turnstone-cli cmd/turnstone-cli/main.go
-	go build -o bin/turnstone-generate-config cmd/turnstone-generate-config/main.go
-	go build -o bin/turnstone-bench cmd/turnstone-bench/main.go
+	go build -o bin/turnstone ./cmd/turnstone
 
 clean:
 	rm -rf ./bin
