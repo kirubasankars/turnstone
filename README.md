@@ -57,13 +57,19 @@ make build
 Generate a home directory with TLS certificates and default config:
 
 ```bash
-./bin/turnstone-generate-config -home tsdata -ip 192.168.1.10,myserver.local
+./bin/turnstone init --home tsdata --ip 192.168.1.10,myserver.local
 ```
 
 ### Run
 
 ```bash
-./bin/turnstone -home tsdata
+./bin/turnstone server --home tsdata
+```
+
+For local development (auto-promote all databases, no transaction timeouts):
+
+```bash
+./bin/turnstone server --home tsdata --dev
 ```
 
 The server listens on `:6379` by default. Databases `0`–`N` are independent keyspaces (`number_of_databases` in config).
@@ -72,10 +78,10 @@ The server listens on `:6379` by default. Databases `0`–`N` are independent ke
 
 ## CLI usage
 
-The CLI reads certificates from `--home`. Admin commands require the `-admin` flag.
+The interactive client reads certificates from `--home`. Admin commands require the `--admin` flag.
 
 ```bash
-./bin/turnstone-cli -home tsdata
+./bin/turnstone cli --home tsdata
 ```
 
 All reads and writes run inside a transaction:
@@ -95,6 +101,23 @@ OK
 
 Batch operations (`mset`, `mget`, `mdel`) also require an active transaction.
 
+### Commands
+
+| Command | Purpose |
+| --- | --- |
+| `turnstone init` | Create home directory, TLS certs, and `turnstone.json` |
+| `turnstone server` | Run the database server |
+| `turnstone cli` | Interactive client REPL |
+| `turnstone bench` | Load and throughput benchmark |
+
+Global flag: `--home` (default `tsdata`) applies to all subcommands.
+
+Benchmark example:
+
+```bash
+./bin/turnstone bench --home tsdata --addr localhost:6379 --ops 10000 --concurrency 50
+```
+
 ---
 
 ## Replication and failover
@@ -103,7 +126,7 @@ Replication is **per database**, not whole-server. Each database follows a small
 
 `UNDEFINED` → `REPLICA` → `PRIMARY`
 
-Admin commands (via `turnstone-cli -admin`):
+Admin commands (via `turnstone cli --admin`):
 
 | Command | Effect |
 | --- | --- |

@@ -9,7 +9,6 @@ import (
 	"bufio"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"log/slog"
@@ -18,52 +17,58 @@ import (
 	"strings"
 	"time"
 
+	"github.com/spf13/cobra"
+
 	"turnstone/client"
 )
 
-func main() {
-	host := flag.String("host", "localhost:6379", "Server address")
-	home := flag.String("home", ".", "Path to home directory containing certs/")
-	debug := flag.Bool("debug", false, "Enable debug logging")
+func newCLICmd() *cobra.Command {
+	var host string
+	var debug bool
+	var asAdmin bool
 
-	// Identity selection
-	asAdmin := flag.Bool("admin", false, "Connect using admin certificate (certs/admin.crt)")
-	// -client is implicit default, but adding for completeness if user wants to be explicit
-	_ = flag.Bool("client", true, "Connect using client certificate (default)")
+	cmd := &cobra.Command{
+		Use:   "cli",
+		Short: "Open an interactive client session",
+		Run: func(cmd *cobra.Command, args []string) {
+			runCLI(host, debug, asAdmin)
+		},
+	}
 
-	flag.Parse()
+	cmd.Flags().StringVar(&host, "host", "localhost:6379", "Server address")
+	cmd.Flags().BoolVar(&debug, "debug", false, "Enable debug logging")
+	cmd.Flags().BoolVar(&asAdmin, "admin", false, "Connect using the admin certificate")
 
-	// Setup Logger
+	return cmd
+}
+
+func runCLI(host string, debug bool, asAdmin bool) {
 	var logger *slog.Logger
-	if *debug {
+	if debug {
 		logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	} else {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 
-	var cl *client.Client
-	var err error
-
-	// 1. Connection Setup
-	// Resolve certificate paths relative to home directory
 	certRole := "client"
-	if *asAdmin {
+	if asAdmin {
 		certRole = "admin"
 	}
 
-	caPath := filepath.Join(*home, "certs", "ca.crt")
-	certPath := filepath.Join(*home, "certs", certRole+".crt")
-	keyPath := filepath.Join(*home, "certs", certRole+".key")
+	caPath := filepath.Join(homeDir, "certs", "ca.crt")
+	certPath := filepath.Join(homeDir, "certs", certRole+".crt")
+	keyPath := filepath.Join(homeDir, "certs", certRole+".key")
 
-	// Check if certificates exist to determine connection mode
+	var cl *client.Client
+	var err error
+
 	if _, statErr := os.Stat(caPath); statErr == nil {
-		fmt.Printf("Connecting to %s via mTLS as %s (Home: %s)...\n", *host, strings.ToUpper(certRole), *home)
-		cl, err = client.NewMTLSClientHelper(*host, caPath, certPath, keyPath, logger)
+		fmt.Printf("Connecting to %s via mTLS as %s (Home: %s)...\n", host, strings.ToUpper(certRole), homeDir)
+		cl, err = client.NewMTLSClientHelper(host, caPath, certPath, keyPath, logger)
 	} else {
-		// Fallback to insecure if certs are missing in the expected location
-		fmt.Printf("Certificates not found at %s/certs. Connecting to %s via insecure TCP...\n", *home, *host)
+		fmt.Printf("Certificates not found at %s/certs. Connecting to %s via insecure TCP...\n", homeDir, host)
 		cl, err = client.NewClient(client.Config{
-			Address:        *host,
+			Address:        host,
 			ConnectTimeout: 5 * time.Second,
 			Logger:         logger,
 		})
@@ -75,7 +80,6 @@ func main() {
 	}
 	defer cl.Close()
 
-	// Verify connection with a Ping
 	if err := cl.Ping(); err != nil {
 		fmt.Printf("Failed to ping server: %v\n", err)
 		os.Exit(1)
@@ -84,11 +88,9 @@ func main() {
 	fmt.Println("Connected.")
 	fmt.Println("Commands: select <db>, replicaof <host:port> <remote_db>, promote [min_replicas], stepdown, flushdb, get <k>, set <k> <v>, del <k>, mget <k>..., mset <k> <v>..., mdel <k>..., begin [read], commit, abort, stat, clear, quit")
 
-	// Track current database for the prompt (default server DB is 0)
 	currentDB := "0"
 	fmt.Printf("%s> ", currentDB)
 
-	// 2. Interactive Loop
 	scanner := bufio.NewScanner(os.Stdin)
 	hasError := false
 	for scanner.Scan() {
@@ -101,7 +103,6 @@ func main() {
 		parts := strings.SplitN(line, " ", 3)
 		cmd := strings.ToLower(parts[0])
 
-		// Handle local commands
 		if cmd == "clear" || cmd == "cls" {
 			fmt.Print("\033[H\033[2J")
 			fmt.Printf("%s> ", currentDB)
@@ -115,12 +116,10 @@ func main() {
 		}
 
 		if err := handleCommand(cl, cmd, parts); err != nil {
-			// Don't flag "key not found" (nil) as a failure condition for exit code
 			if !errors.Is(err, client.ErrNotFound) {
 				hasError = true
 			}
 		} else if cmd == "select" && len(parts) >= 2 {
-			// Update the tracked DB name on successful SELECT
 			currentDB = parts[1]
 		}
 		fmt.Printf("%s> ", currentDB)
@@ -165,7 +164,6 @@ func handleCommand(cl *client.Client, cmd string, parts []string) error {
 	case "promote":
 		minReplicas := 0
 		if len(parts) > 1 {
-			// Parse optional argument
 			var val int
 			if _, errScan := fmt.Sscanf(parts[1], "%d", &val); errScan == nil {
 				minReplicas = val
@@ -253,7 +251,6 @@ func handleCommand(cl *client.Client, cmd string, parts []string) error {
 		}
 
 	case "mget":
-		// Reconstruct args list from parts (handles > 2 keys)
 		var args []string
 		if len(parts) > 1 {
 			args = append(args, parts[1])
@@ -327,12 +324,12 @@ func handleCommand(cl *client.Client, cmd string, parts []string) error {
 	}
 
 	if err != nil {
-		printError(err)
+		printCLIError(err)
 	}
 	return err
 }
 
-func printError(err error) {
+func printCLIError(err error) {
 	switch {
 	case errors.Is(err, client.ErrConnection):
 		fmt.Println("ERR: Connection closed by server")
