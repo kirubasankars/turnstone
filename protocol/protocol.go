@@ -76,6 +76,10 @@ const (
 	ResTxInProgress         = 0x06
 	ResStatusServerBusy     = 0x07
 	ResStatusEntityTooLarge = 0x08
+	ResStatusMemoryLimit    = 0x09
+
+	// ResStatusTxInProgress is an alias for ResTxInProgress.
+	ResStatusTxInProgress = ResTxInProgress
 )
 
 // Errors

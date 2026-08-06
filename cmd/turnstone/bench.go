@@ -9,7 +9,6 @@ import (
 	"bufio"
 	"crypto/rand"
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -17,8 +16,6 @@ import (
 	"log"
 	"math/big"
 	mrand "math/rand"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,6 +24,8 @@ import (
 	"github.com/spf13/cobra"
 
 	"turnstone/client"
+	"turnstone/internal/tlsutil"
+	"turnstone/protocol"
 )
 
 func newBenchCmd() *cobra.Command {
@@ -72,7 +71,7 @@ func newBenchCmd() *cobra.Command {
 			fmt.Printf("Mode:         %s\n", mode)
 			fmt.Println("--------------------------------------------------")
 
-			tlsConfig, err := loadBenchTLSConfig()
+			tlsConfig, err := tlsutil.LoadFromHome(homeDir, tlsutil.RoleClient)
 			if err != nil {
 				log.Fatal(err)
 			}
@@ -104,33 +103,8 @@ func newBenchCmd() *cobra.Command {
 	return cmd
 }
 
-func loadBenchTLSConfig() (*tls.Config, error) {
-	caPath := filepath.Join(homeDir, "certs", "ca.crt")
-	certPath := filepath.Join(homeDir, "certs", "client.crt")
-	keyPath := filepath.Join(homeDir, "certs", "client.key")
-
-	caCert, err := os.ReadFile(caPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read CA at %s: %w", caPath, err)
-	}
-	pool := x509.NewCertPool()
-	pool.AppendCertsFromPEM(caCert)
-
-	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load certs at %s/%s: %w", certPath, keyPath, err)
-	}
-
-	return &tls.Config{
-		RootCAs:      pool,
-		Certificates: []tls.Certificate{cert},
-	}, nil
-}
-
 func benchPreflight(addr string, dbNum int) error {
-	caPath := filepath.Join(homeDir, "certs", "ca.crt")
-	certPath := filepath.Join(homeDir, "certs", "client.crt")
-	keyPath := filepath.Join(homeDir, "certs", "client.key")
+	caPath, certPath, keyPath := tlsutil.CertPaths(homeDir, tlsutil.RoleClient)
 
 	cl, err := client.NewMTLSClientHelper(addr, caPath, certPath, keyPath, nil)
 	if err != nil {
@@ -166,33 +140,6 @@ Or start the server with --dev to auto-promote every database`,
 			dbName, st.State, homeDir, dbName, dbName, dbName)
 	}
 	return nil
-}
-
-func statusName(status byte) string {
-	switch status {
-	case client.ResStatusOK:
-		return "OK"
-	case client.ResStatusErr:
-		return "ERR"
-	case client.ResStatusNotFound:
-		return "NOT_FOUND"
-	case client.ResStatusTxRequired:
-		return "TX_REQUIRED"
-	case client.ResStatusTxTimeout:
-		return "TX_TIMEOUT"
-	case client.ResStatusTxConflict:
-		return "TX_CONFLICT"
-	case client.ResStatusTxInProgress:
-		return "TX_IN_PROGRESS"
-	case client.ResStatusServerBusy:
-		return "SERVER_BUSY"
-	case client.ResStatusEntityTooLarge:
-		return "ENTITY_TOO_LARGE"
-	case client.ResStatusMemoryLimit:
-		return "MEMORY_LIMIT"
-	default:
-		return "UNKNOWN"
-	}
 }
 
 func generateKey(keyPrefix string, keySize int, clientID, index int) string {
@@ -270,7 +217,7 @@ func runWorkload(
 			reader := bufio.NewReader(conn)
 
 			dbName := []byte(fmt.Sprintf("%d", dbNum))
-			selBuf := appendHeader(make([]byte, 0, 5+len(dbName)), client.OpCodeSelect, len(dbName))
+			selBuf := protocol.AppendHeader(make([]byte, 0, 5+len(dbName)), protocol.OpCodeSelect, len(dbName))
 			selBuf = append(selBuf, dbName...)
 			if _, err := conn.Write(selBuf); err != nil {
 				log.Printf("[Client %d] Select write failed: %v", clientID, err)
@@ -284,7 +231,7 @@ func runWorkload(
 				atomic.AddInt64(&failedOps, int64(numOps))
 				return
 			}
-			if selHead[0] != client.ResStatusOK {
+			if selHead[0] != protocol.ResStatusOK {
 				log.Printf("[Client %d] Select failed status: 0x%x", clientID, selHead[0])
 				atomic.AddInt64(&failedOps, int64(numOps))
 				return
@@ -325,10 +272,10 @@ func runWorkload(
 					}
 
 					if allRead {
-						writeBuf = appendHeader(writeBuf, client.OpCodeBegin, 1)
-						writeBuf = append(writeBuf, client.BeginReadOnly)
+						writeBuf = protocol.AppendHeader(writeBuf, protocol.OpCodeBegin, 1)
+						writeBuf = append(writeBuf, protocol.BeginReadOnly)
 					} else {
-						writeBuf = appendHeader(writeBuf, client.OpCodeBegin, 0)
+						writeBuf = protocol.AppendHeader(writeBuf, protocol.OpCodeBegin, 0)
 					}
 
 					for k := 0; k < batchSize; k++ {
@@ -341,12 +288,12 @@ func runWorkload(
 						key := generateKey(keyPrefix, keySize, clientID, keyIndex)
 
 						if isRead {
-							writeBuf = appendHeader(writeBuf, client.OpCodeGet, len(key))
+							writeBuf = protocol.AppendHeader(writeBuf, protocol.OpCodeGet, len(key))
 							writeBuf = append(writeBuf, key...)
 						} else {
 							kLen := len(key)
 							totalLen := 4 + kLen + len(payload)
-							writeBuf = appendHeader(writeBuf, client.OpCodeSet, totalLen)
+							writeBuf = protocol.AppendHeader(writeBuf, protocol.OpCodeSet, totalLen)
 							var lenBytes [4]byte
 							binary.BigEndian.PutUint32(lenBytes[:], uint32(kLen))
 							writeBuf = append(writeBuf, lenBytes[:]...)
@@ -355,7 +302,7 @@ func runWorkload(
 						}
 					}
 
-					writeBuf = appendHeader(writeBuf, client.OpCodeCommit, 0)
+					writeBuf = protocol.AppendHeader(writeBuf, protocol.OpCodeCommit, 0)
 					txCount++
 				}
 
@@ -374,7 +321,7 @@ func runWorkload(
 					}
 					status := headerBuf[0]
 					length := binary.BigEndian.Uint32(headerBuf[1:])
-					failedStatus := status != client.ResStatusOK && status != client.ResStatusNotFound
+					failedStatus := status != protocol.ResStatusOK && status != protocol.ResStatusNotFound
 
 					var errBody string
 					if length > 0 {
@@ -394,10 +341,10 @@ func runWorkload(
 					if failedStatus {
 						batchFailed = true
 						logFail.Do(func() {
-							log.Printf("%s first failure: status=0x%02x (%s) body=%q", phase, status, statusName(status), errBody)
+							log.Printf("%s first failure: status=0x%02x (%s) body=%q", phase, status, protocol.StatusName(status), errBody)
 						})
 					}
-					if status == client.ResStatusNotFound {
+					if status == protocol.ResStatusNotFound {
 						atomic.AddInt64(&notFoundOps, 1)
 					}
 				}
@@ -418,13 +365,6 @@ func runWorkload(
 	wg.Wait()
 	elapsed := time.Since(startTotal)
 	printBenchStats(phase, elapsed, completedOps, failedOps, notFoundOps, totalDuration)
-}
-
-func appendHeader(buf []byte, op byte, length int) []byte {
-	var header [5]byte
-	header[0] = op
-	binary.BigEndian.PutUint32(header[1:], uint32(length))
-	return append(buf, header[:]...)
 }
 
 func printBenchStats(phase string, elapsed time.Duration, success, failed, notFound int64, totalLatencyNs int64) {

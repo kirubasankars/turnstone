@@ -7,8 +7,6 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,6 +25,7 @@ import (
 
 	"turnstone/config"
 	"turnstone/database"
+	"turnstone/internal/tlsutil"
 	"turnstone/metrics"
 	"turnstone/repl"
 	"turnstone/server"
@@ -148,7 +147,7 @@ func runServer(logger *slog.Logger, devMode bool) {
 		os.Exit(1)
 	}
 
-	replTLS, err := loadClientTLS(clientCertFile, clientKeyFile, caFile)
+	replTLS, err := tlsutil.LoadMTLS(caFile, clientCertFile, clientKeyFile)
 	if err != nil {
 		logger.Error("Failed to load replication TLS config", "err", err)
 		os.Exit(1)
@@ -211,20 +210,3 @@ func runServer(logger *slog.Logger, devMode bool) {
 	}
 }
 
-func loadClientTLS(certFile, keyFile, caFile string) (*tls.Config, error) {
-	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-	if err != nil {
-		return nil, err
-	}
-	caCert, err := os.ReadFile(caFile)
-	if err != nil {
-		return nil, err
-	}
-	pool := x509.NewCertPool()
-	pool.AppendCertsFromPEM(caCert)
-
-	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		RootCAs:      pool,
-	}, nil
-}

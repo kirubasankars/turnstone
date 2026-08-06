@@ -84,6 +84,13 @@ The interactive client reads certificates from `--home`. Admin commands require 
 ./bin/turnstone cli --home tsdata
 ```
 
+Run a single command without entering the REPL:
+
+```bash
+./bin/turnstone cli exec get mykey
+./bin/turnstone cli --admin exec promote
+```
+
 All reads and writes run inside a transaction:
 
 ```bash
@@ -108,6 +115,7 @@ Batch operations (`mset`, `mget`, `mdel`) also require an active transaction.
 | `turnstone init` | Create home directory, TLS certs, and `turnstone.json` |
 | `turnstone server` | Run the database server |
 | `turnstone cli` | Interactive client REPL |
+| `turnstone cli exec` | Run one client command and exit |
 | `turnstone bench` | Load and throughput benchmark |
 
 Global flag: `--home` (default `tsdata`) applies to all subcommands.
