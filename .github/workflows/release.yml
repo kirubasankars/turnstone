@@ -1,0 +1,154 @@
+# Copyright (c) 2026 Kiruba Sankar Swaminathan
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root of this source tree.
+
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Semantic version tag to release (e.g. v0.1.0)"
+        required: true
+        type: string
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GIT_AUTHOR_NAME: Kiruba Sankar Swaminathan
+  GIT_AUTHOR_EMAIL: kiruba.sankars@gmail.com
+  GIT_COMMITTER_NAME: Kiruba Sankar Swaminathan
+  GIT_COMMITTER_EMAIL: kiruba.sankars@gmail.com
+  EXPECTED_AUTHOR: Kiruba Sankar Swaminathan <kiruba.sankars@gmail.com>
+
+jobs:
+  release-commit:
+    name: Release commit and tag
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+          # PAT owned by the repo owner so pushed commits keep the right author/committer.
+          token: ${{ secrets.RELEASE_PUSH_TOKEN }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Test
+        run: go test -race -count=1 ./...
+
+      - name: Configure Git identity
+        run: |
+          git config user.name "$GIT_AUTHOR_NAME"
+          git config user.email "$GIT_AUTHOR_EMAIL"
+
+      - name: Validate version tag
+        run: |
+          version="${{ inputs.version }}"
+          if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+            echo "Version must look like v1.2.3 or v1.2.3-rc1"
+            exit 1
+          fi
+          if git rev-parse "$version" >/dev/null 2>&1; then
+            echo "Tag $version already exists"
+            exit 1
+          fi
+
+      - name: Write VERSION and create release commit
+        run: |
+          version="${{ inputs.version }}"
+          printf '%s\n' "${version#v}" > VERSION
+          git add VERSION
+          if git diff --staged --quiet; then
+            echo "VERSION already matches ${version#v}"
+          else
+            git commit -m "Release ${version}"
+          fi
+
+      - name: Verify commit author
+        run: |
+          author="$(git log -1 --format='%an <%ae>')"
+          if [ "$author" != "$EXPECTED_AUTHOR" ]; then
+            echo "Unexpected author: $author (expected $EXPECTED_AUTHOR)"
+            exit 1
+          fi
+
+      - name: Tag and push
+        run: |
+          version="${{ inputs.version }}"
+          git tag -a "$version" -m "Release $version"
+          git push origin main
+          git push origin "$version"
+
+  build-release:
+    name: Build and publish release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Test
+        run: go test -race -count=1 ./...
+
+      - name: Resolve version
+        id: meta
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          version="${tag#v}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build binaries
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          mkdir -p dist
+          for target in \
+            "linux amd64" \
+            "linux arm64" \
+            "darwin amd64" \
+            "darwin arm64" \
+            "windows amd64"; do
+            set -- $target
+            goos=$1
+            goarch=$2
+            ext=""
+            if [ "$goos" = windows ]; then
+              ext=".exe"
+            fi
+            out="dist/turnstone-${goos}-${goarch}${ext}"
+            echo "Building $out"
+            GOOS=$goos GOARCH=$goarch CGO_ENABLED=0 go build \
+              -trimpath \
+              -ldflags "-s -w -X main.version=${VERSION}" \
+              -o "$out" ./cmd/turnstone
+          done
+          (cd dist && sha256sum turnstone-* > SHA256SUMS)
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

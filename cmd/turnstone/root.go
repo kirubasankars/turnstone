@@ -13,8 +13,9 @@ var homeDir string
 
 func newRootCmd() *cobra.Command {
 	root := &cobra.Command{
-		Use:   "turnstone",
-		Short: "TurnstoneDB — persistent transactional key-value store",
+		Use:     "turnstone",
+		Version: version,
+		Short:   "TurnstoneDB — persistent transactional key-value store",
 		Long: `TurnstoneDB is a persistent, transactional key-value store with optional replication.
 
 Use the subcommands to initialize a data home, run the server, open an interactive
