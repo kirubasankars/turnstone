@@ -258,6 +258,29 @@ Replication streams raw physical WAL byte ranges (possibly spanning segment boun
 
 ---
 
+## Codebase documentation
+
+Per-package guides for learning and code review live next to the source:
+
+| Package | Guide |
+| --- | --- |
+| Overview & reading order | [docs/README.md](docs/README.md) |
+| CLI (`cmd/`) | [cmd/README.md](cmd/README.md) |
+| Binary subcommands | [cmd/turnstone/README.md](cmd/turnstone/README.md) |
+| Wire protocol | [protocol/README.md](protocol/README.md) |
+| Go client | [client/README.md](client/README.md) |
+| Configuration & PKI | [config/README.md](config/README.md) |
+| TCP/mTLS server | [server/README.md](server/README.md) |
+| Database + replication | [database/README.md](database/README.md) |
+| Outbound replication | [repl/README.md](repl/README.md) |
+| Storage engine | [engine/README.md](engine/README.md) |
+| Hash index | [engine/hashindex/README.md](engine/hashindex/README.md) |
+| Internal utilities | [internal/README.md](internal/README.md) |
+| Prometheus metrics | [metrics/README.md](metrics/README.md) |
+| CI | [.github/README.md](.github/README.md) |
+
+---
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
