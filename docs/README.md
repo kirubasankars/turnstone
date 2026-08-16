@@ -1,6 +1,6 @@
 # TurnstoneDB documentation index
 
-This index links **per-package README files** intended for education and code review. Start with the [root README](../README.md) for operator-facing usage; use this map to navigate the codebase by layer.
+This index links operator guides and **per-package README files** for education and code review. Start with the [root README](../README.md) for a project overview and [cli.md](cli.md) for day-to-day CLI usage; use this map to navigate the codebase by layer.
 
 ## Suggested reading order (new contributors)
 
@@ -16,6 +16,12 @@ Then branch by interest:
 - **Security / ops:** [config](../config/README.md), [internal/tlsutil](../internal/tlsutil/README.md), [metrics](../metrics/README.md)
 - **Replication:** [repl](../repl/README.md), [server/replication tests](../server/replication_test.go)
 - **Client embedding:** [client](../client/README.md)
+
+## Operator documentation
+
+| Topic | Path |
+| --- | --- |
+| CLI reference (`init`, `server`, `cli`, `bench`) | [cli.md](cli.md) |
 
 ## Package documentation
 
