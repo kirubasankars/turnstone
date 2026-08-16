@@ -78,53 +78,30 @@ The server listens on `:6379` by default. Databases `0`–`N` are independent ke
 
 ## CLI usage
 
-The interactive client reads certificates from `--home`. Admin commands require the `--admin` flag.
+Full command reference: **[docs/cli.md](docs/cli.md)**
 
-```bash
-./bin/turnstone cli --home tsdata
-```
-
-Run a single command without entering the REPL:
-
-```bash
-./bin/turnstone cli exec get mykey
-./bin/turnstone cli --admin exec promote
-```
-
-All reads and writes run inside a transaction:
-
-```bash
-> select 1
-OK
-> begin
-OK
-> set mykey "hello"
-OK
-> get mykey
-OK: hello
-> commit
-OK
-```
-
-Batch operations (`mset`, `mget`, `mdel`) also require an active transaction.
-
-### Commands
+The `turnstone` binary has four subcommands. All share `--home` (default `tsdata`).
 
 | Command | Purpose |
 | --- | --- |
 | `turnstone init` | Create home directory, TLS certs, and `turnstone.json` |
-| `turnstone server` | Run the database server |
-| `turnstone cli` | Interactive client REPL |
-| `turnstone cli exec` | Run one client command and exit |
+| `turnstone server` | Run the database server (`--dev` for local use) |
+| `turnstone cli` | Interactive REPL or `cli exec <command>` one-shot |
 | `turnstone bench` | Load and throughput benchmark |
 
-Global flag: `--home` (default `tsdata`) applies to all subcommands.
-
-Benchmark example:
-
 ```bash
-./bin/turnstone bench --home tsdata --addr localhost:6379 --ops 10000 --concurrency 50
+# Interactive client (certs loaded from --home)
+./bin/turnstone cli --home tsdata
+
+# One-shot command
+./bin/turnstone cli exec get mykey
+./bin/turnstone cli --admin exec promote
+
+# Benchmark
+./bin/turnstone bench --home tsdata --ops 10000 --concurrency 50
 ```
+
+All writes require a transaction (`begin` → `set`/`del` → `commit`). Admin commands (`promote`, `stepdown`, `replicaof`, `flushdb`) need `--admin`.
 
 ---
 
@@ -264,6 +241,7 @@ Per-package guides for learning and code review live next to the source:
 
 | Package | Guide |
 | --- | --- |
+| CLI usage guide | [docs/cli.md](docs/cli.md) |
 | Overview & reading order | [docs/README.md](docs/README.md) |
 | CLI (`cmd/`) | [cmd/README.md](cmd/README.md) |
 | Binary subcommands | [cmd/turnstone/README.md](cmd/turnstone/README.md) |
