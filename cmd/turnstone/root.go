@@ -29,6 +29,8 @@ client, or run benchmarks.`,
 		newServerCmd(),
 		newCLICmd(),
 		newBenchCmd(),
+		newBackupCmd(),
+		newRestoreCmd(),
 	)
 
 	return root

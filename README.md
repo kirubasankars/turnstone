@@ -80,7 +80,7 @@ The server listens on `:6379` by default. Databases `0`–`N` are independent ke
 
 Full command reference: **[docs/cli.md](docs/cli.md)**
 
-The `turnstone` binary has four subcommands. All share `--home` (default `tsdata`).
+The `turnstone` binary has six subcommands. All share `--home` (default `tsdata`).
 
 | Command | Purpose |
 | --- | --- |
@@ -88,6 +88,8 @@ The `turnstone` binary has four subcommands. All share `--home` (default `tsdata
 | `turnstone server` | Run the database server (`--dev` for local use) |
 | `turnstone cli` | Interactive REPL or `cli exec <command>` one-shot |
 | `turnstone bench` | Load and throughput benchmark |
+| `turnstone backup` | Stream a physical WAL backup from a primary |
+| `turnstone restore` | Restore WAL backups into a new home directory |
 
 ```bash
 # Interactive client (certs loaded from --home)
