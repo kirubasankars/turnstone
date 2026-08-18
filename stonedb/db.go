@@ -105,7 +105,9 @@ type DB struct {
 	closed       int32
 
 	// Group Commit Pipeline
-	commitCh chan commitRequest
+	commitCh       chan commitRequest
+	commitDelay    time.Duration
+	commitSiblings int
 
 	// Config
 	minGarbageThreshold    int64
@@ -147,6 +149,15 @@ func Open(dir string, opts Options) (*DB, error) {
 	if opts.TxTimeout == 0 {
 		opts.TxTimeout = protocol.MaxTxDuration
 	}
+	switch {
+	case opts.CommitDelay < 0:
+		opts.CommitDelay = 0 // explicitly disabled
+	case opts.CommitDelay == 0:
+		opts.CommitDelay = 2 * time.Millisecond
+	}
+	if opts.CommitSiblings <= 0 {
+		opts.CommitSiblings = 2
+	}
 
 	logger := opts.Logger
 	if logger == nil {
@@ -186,6 +197,8 @@ func Open(dir string, opts Options) (*DB, error) {
 		txTimeout:              opts.TxTimeout,
 		closeCh:                make(chan struct{}),
 		commitCh:               make(chan commitRequest, 500),
+		commitDelay:            opts.CommitDelay,
+		commitSiblings:         opts.CommitSiblings,
 		minGarbageThreshold:    opts.CompactionMinGarbage,
 		checksumInterval:       opts.ChecksumInterval,
 		autoCheckpointInterval: opts.AutoCheckpointInterval,
@@ -576,6 +589,10 @@ func (db *DB) ActiveTransactionCount() int {
 	return len(db.activeTxns)
 }
 
+// maxCommitBatchSize bounds how many commits a single group-commit round can
+// coalesce into one WAL fsync.
+const maxCommitBatchSize = 128
+
 func (db *DB) runGroupCommits() {
 	defer db.wg.Done()
 	var batch []commitRequest
@@ -588,8 +605,37 @@ func (db *DB) runGroupCommits() {
 			batch = append(batch, req)
 		}
 
+		// Give other concurrently-committing transactions a brief window to
+		// join this batch before we pay its fsync cost. Without this, the
+		// drain loop below (which only grabs what's *already* queued) tends
+		// to fire off a fsync as soon as 1-2 requests have arrived, even
+		// under heavy concurrent load, because a single fsync is often
+		// faster than the time it takes many concurrent writers to reach
+		// commit -- defeating the point of group commit.
+		//
+		// db.ActiveTransactionCount() counts the transaction we just
+		// dequeued too (it isn't removed from activeTxns until its commit
+		// response comes back), so "count >= commitSiblings" with the
+		// default of 2 really means "at least one OTHER transaction is
+		// also active right now". That keeps a single, unbatched client at
+		// its normal one-fsync-per-commit latency, and only pays the delay
+		// when there's real concurrency to amortize it against.
+		if db.commitDelay > 0 && db.ActiveTransactionCount() >= db.commitSiblings {
+			timer := time.NewTimer(db.commitDelay)
+		DelayLoop:
+			for len(batch) < maxCommitBatchSize {
+				select {
+				case req := <-db.commitCh:
+					batch = append(batch, req)
+				case <-timer.C:
+					break DelayLoop
+				}
+			}
+			timer.Stop()
+		}
+
 	Loop:
-		for len(batch) < 128 {
+		for len(batch) < maxCommitBatchSize {
 			select {
 			case req := <-db.commitCh:
 				batch = append(batch, req)
