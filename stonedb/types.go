@@ -156,6 +156,13 @@ type Options struct {
 	// CommitDelay is applied (mirrors PostgreSQL's commit_siblings).
 	// If 0, defaults to 2.
 	CommitSiblings int
+
+	// UnsafeDisableFsync skips the WAL fsync on COMMIT entirely (mirrors
+	// PostgreSQL's fsync=off). A crash or power loss can then silently lose
+	// or corrupt recently "committed" data that the OS never actually
+	// flushed to disk. Benchmarking/debugging only -- never enable in
+	// production.
+	UnsafeDisableFsync bool
 }
 
 // WALLocation points to a specific batch in the WAL files

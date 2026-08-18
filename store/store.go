@@ -117,6 +117,7 @@ func NewStore(dir string, logger *slog.Logger, minReplicas int, walStrategy stri
 		MaxDiskUsagePercent:  maxDiskUsage,
 		BlockCacheSize:       blockCacheSize,
 		Logger:               logger, // Ensure logger is passed down
+		UnsafeDisableFsync:   os.Getenv("TS_UNSAFE_DISABLE_FSYNC") == "true",
 	}
 
 	s := &Store{
