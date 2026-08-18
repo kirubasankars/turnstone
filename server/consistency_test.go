@@ -242,10 +242,7 @@ func TestFailover_NoDataLoss(t *testing.T) {
 	waitForConditionOrTimeout(t, 10*time.Second, func() bool {
 		// Sample check
 		val := readKey(t, clientA2, "nk49")
-		if val == nil {
-			return false
-		}
-		return true
+		return val != nil
 	}, "Node A failed to catch up after becoming replica")
 
 	verifyKeys(t, 100, clientA2, "mk")

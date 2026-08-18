@@ -51,6 +51,22 @@ type DB struct {
 	mu       sync.RWMutex
 	commitMu sync.Mutex
 
+	// writeSeqMu serializes opID-allocation + WAL-append + VLog-append for
+	// every eager SET/DELETE write (see Transaction.write and ApplyRecord).
+	// WAL and VLog otherwise use independent locks, so without this a
+	// preempted goroutine could let a later opID's VLog write land before
+	// an earlier opID's; a crash in that window would make the ValueLog's
+	// recovered high-water mark ("maxOp") look like it already covers an
+	// opID that was, in fact, never written, permanently and silently
+	// losing that committed write on replay.
+	writeSeqMu sync.Mutex
+
+	// shutdownMu is a shutdown barrier between Close() and Commit(): Close()
+	// takes the write lock (blocking until every in-flight Commit's RLock is
+	// released) before closing closeCh, guaranteeing no commit request can
+	// be stranded in commitCh after runGroupCommits stops draining it.
+	shutdownMu sync.RWMutex
+
 	// Clocks
 	transactionID uint64
 	operationID   uint64
@@ -100,6 +116,7 @@ type DB struct {
 	blockCacheSize         int   // Configured cache size
 	isDiskFull             int32 // Atomic boolean (1=Full, 0=OK)
 	isCorrupt              int32 // Atomic boolean (1=Corrupt, 0=OK) - Prevents writes after critical failure
+	compacting             int32 // Atomic boolean (1=RunCompaction in progress) - prevents overlapping compaction passes
 
 	// Timeline Meta
 	timelineMeta TimelineMeta
@@ -433,6 +450,38 @@ func (db *DB) reapExpiredTransactions() {
 	}
 }
 
+// AbortAllActiveWriteTransactions force-aborts every currently in-progress,
+// locally-owned RW transaction. It uses the same claimDecision-guarded
+// abortTransaction path as the liveness reaper, so it's safe to race against
+// a concurrent Commit() on the same transaction: whichever side wins the
+// claim decides the outcome, and the loser backs off without producing a
+// conflicting durable record.
+//
+// This exists for planned failover (STEPDOWN): after draining active
+// transactions times out, the caller must not simply proceed as if they'd
+// all finished -- a straggler could otherwise still commit locally *after*
+// the final safe-point/replica-reset has already been broadcast, which
+// would silently drop that write on failover since no replica (and no
+// future primary) would ever see it. Force-aborting any stragglers here
+// closes that window.
+func (db *DB) AbortAllActiveWriteTransactions() {
+	var active []*Transaction
+
+	db.txMu.Lock()
+	for _, tx := range db.activeXids {
+		if tx != nil {
+			active = append(active, tx)
+		}
+	}
+	db.txMu.Unlock()
+
+	for _, tx := range active {
+		tx.markAborted()
+		db.logger.Warn("Force-aborting active transaction for planned failover", "xid", tx.xid)
+		db.abortTransaction(tx)
+	}
+}
+
 func (db *DB) KeyCount() (int64, error) {
 	return atomic.LoadInt64(&db.keyCount), nil
 }
@@ -671,8 +720,16 @@ func (db *DB) NewTransaction(update bool) *Transaction {
 		db.activeTxnsMu.Lock()
 		db.txMu.Lock()
 		snap := db.buildSnapshotLocked()
+		// Captured under the same txMu critical section as the snapshot
+		// boundary itself, so StreamSnapshot's returned watermark is
+		// guaranteed consistent with (never ahead of) the data it actually
+		// streamed -- reading db.operationID separately afterward could
+		// observe writes that committed after the snapshot was fixed,
+		// letting a replication/CDC consumer resuming from that watermark
+		// silently skip records.
+		snapOpID := atomic.LoadUint64(&db.operationID)
 		db.txMu.Unlock()
-		tx := &Transaction{db: db, update: false, snapshot: snap}
+		tx := &Transaction{db: db, update: false, snapshot: snap, snapOpID: snapOpID}
 		db.activeTxns[tx] = snap.Xmax
 		db.activeTxnsMu.Unlock()
 		return tx
@@ -713,7 +770,7 @@ func (db *DB) NewTransaction(update bool) *Transaction {
 	opID, err := db.appendRecord(WALRecordBegin, xid, nil, nil)
 	if err != nil {
 		// Best-effort: mark the transaction unusable; Put/Commit will surface the failure.
-		tx.aborted = true
+		tx.markAborted()
 		tx.beginErr = err
 	} else {
 		tx.beginOpID = opID
@@ -802,12 +859,21 @@ func (db *DB) ApplyRecord(rec WALRecord) error {
 		return nil
 
 	case WALRecordSet, WALRecordDelete:
-		if err := db.writeAheadLog.AppendReplicatedRecord(payload, false); err != nil {
+		// See Transaction.write: the WAL append and VLog append for a given
+		// opID must be serialized as one unit against every other writer
+		// (including the local eager-write path) so recovery's VLog
+		// high-water mark never covers an opID whose entry wasn't actually
+		// written.
+		db.writeSeqMu.Lock()
+		err := db.writeAheadLog.AppendReplicatedRecord(payload, false)
+		if err != nil {
+			db.writeSeqMu.Unlock()
 			return err
 		}
 		fileID, offset, err := db.valueLog.AppendEntries([]ValueLogEntry{{
 			Key: rec.Key, Value: rec.Value, TransactionID: rec.XID, OperationID: rec.OpID, IsDelete: rec.Type == WALRecordDelete,
 		}})
+		db.writeSeqMu.Unlock()
 		if err != nil {
 			atomic.StoreInt32(&db.isCorrupt, 1)
 			return err
@@ -978,6 +1044,16 @@ func (db *DB) Close() error {
 	}
 	// CHANGED: Reduced from INFO to DEBUG
 	db.logger.Debug("Closing database instance", "dir", db.dir)
+
+	// Block until every Commit() that observed closed==0 has fully enqueued
+	// its request and received a response, so nothing can be left stranded
+	// in commitCh once runGroupCommits exits below (see Transaction.Commit).
+	// This is a deliberate empty critical section used purely as a
+	// barrier against Commit()'s shutdownMu.RLock() holders, not dead code.
+	db.shutdownMu.Lock()
+	//lint:ignore SA2001 intentional lock/unlock barrier, no data protected
+	db.shutdownMu.Unlock()
+
 	close(db.closeCh)
 	db.wg.Wait()
 

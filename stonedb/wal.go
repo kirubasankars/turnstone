@@ -74,16 +74,37 @@ func OpenWriteAheadLog(dir string, maxSize uint32, requestedTL uint64, logger *s
 			return nil, fmt.Errorf("failed to parse latest wal file %s: %w", latest, err)
 		}
 
-		// Consistency Check:
-		// If the latest file on disk is from a HIGHER timeline than requested,
-		// it means the metadata file is stale or we are recovering on a node
-		// that was already promoted. We respect the disk state.
-		if tl > currentTL {
+		switch {
+		case tl > currentTL:
+			// Consistency Check: the latest file on disk is from a HIGHER
+			// timeline than requested. This means the metadata file is
+			// stale or we are recovering on a node that was already
+			// promoted. We respect the disk state.
 			currentTL = tl
+			activePath = latest
+			currentStartOffset = off
+		case tl < currentTL:
+			// timeline.meta says we should already be on a newer timeline
+			// than any file that actually exists on disk -- e.g. we
+			// crashed after saveTimelineMeta() persisted the new timeline
+			// but before ForceNewTimeline() created its first file.
+			// Reusing the stale timeline's file here would silently label
+			// every new record we append with the wrong (old) timeline,
+			// which recovery's history-based orphan filtering (see
+			// replayFile's cutoffOp check) depends on being accurate.
+			// Start a fresh file for the requested timeline instead,
+			// continuing the virtual offset sequence from where the old
+			// file leaves off.
+			latestStat, statErr := os.Stat(latest)
+			if statErr != nil {
+				return nil, fmt.Errorf("failed to stat latest wal file %s: %w", latest, statErr)
+			}
+			currentStartOffset = off + uint64(latestStat.Size())
+			activePath = filepath.Join(dir, fmt.Sprintf("wal_%d_%020d.wal", currentTL, currentStartOffset))
+		default:
+			activePath = latest
+			currentStartOffset = off
 		}
-
-		activePath = latest
-		currentStartOffset = off
 	} else {
 		// No files, start fresh on requested timeline
 		currentStartOffset = 0
@@ -266,13 +287,17 @@ func (wal *WriteAheadLog) FindInMemory(opID uint64) (WALLocation, bool) {
 }
 
 // strictSync enforces durability. If the disk fails, the process dies.
-// This prevents "The False Success" where the OS marks dirty pages as clean after an error.
-func (wal *WriteAheadLog) strictSync() error {
+// This prevents "The False Success" where the OS marks dirty pages as clean
+// after an error. It has no error return: every path either succeeds (nil
+// Sync) or panics, and a previous `error` return type was pure dead code
+// that misled every call site into unreachable "if err != nil" branches.
+func (wal *WriteAheadLog) strictSync() {
 	err := wal.currentFile.Sync()
 	if err != nil {
 		// 1. Transient errors (interrupted system call) can be retried.
 		if errors.Is(err, syscall.EINTR) {
-			return wal.strictSync()
+			wal.strictSync()
+			return
 		}
 
 		// 2. CRITICAL HARDWARE FAILURE (EIO, EROFS, ENOSPC).
@@ -280,7 +305,6 @@ func (wal *WriteAheadLog) strictSync() error {
 		wal.logger.Error("CRITICAL: fsync failed. Storage integrity compromised. Panicking.", "err", err)
 		panic(fmt.Sprintf("CRITICAL STORAGE FAILURE: %v", err))
 	}
-	return nil
 }
 
 // AppendRecordsWithOpIDs assigns an opID (via nextOpID) to each builder in order,
@@ -310,14 +334,22 @@ func (wal *WriteAheadLog) AppendRecordsWithOpIDs(nextOpID func() uint64, builder
 		payload := build(opID)
 		if err := wal.writeFrame(payload); err != nil {
 			_ = wal.truncateTailLocked(int64(wal.writeOffset - startOffset))
+			// writeFrame records a batchIndex entry for every record it
+			// successfully writes *before* this failing one. Those bytes
+			// were just truncated away above, so their batchIndex entries
+			// are now stale: if left in place, a later rotation could
+			// flush them into the durable WAL index, pointing a future
+			// ScanWAL/replication reader at an offset that may since have
+			// been overwritten by unrelated data.
+			for j := 0; j < i; j++ {
+				delete(wal.batchIndex, opIDs[j])
+			}
 			return nil, err
 		}
 	}
 
 	if sync {
-		if err := wal.strictSync(); err != nil {
-			return nil, err
-		}
+		wal.strictSync()
 	}
 	return opIDs, nil
 }
@@ -338,7 +370,7 @@ func (wal *WriteAheadLog) AppendReplicatedRecord(payload []byte, sync bool) erro
 		return err
 	}
 	if sync {
-		return wal.strictSync()
+		wal.strictSync()
 	}
 	return nil
 }
@@ -384,14 +416,6 @@ func peekOpID(payload []byte) (uint64, bool) {
 	return binary.BigEndian.Uint64(payload[9:17]), true
 }
 
-// TruncateTail removes the last N bytes from the active WAL file.
-// Used by the DB to rollback if the VLog write fails.
-func (wal *WriteAheadLog) TruncateTail(bytesToRemove int64) error {
-	wal.mu.Lock()
-	defer wal.mu.Unlock()
-	return wal.truncateTailLocked(bytesToRemove)
-}
-
 func (wal *WriteAheadLog) truncateTailLocked(bytesToRemove int64) error {
 	currentSize := int64(wal.writeOffset)
 	if currentSize < bytesToRemove {
@@ -407,9 +431,7 @@ func (wal *WriteAheadLog) truncateTailLocked(bytesToRemove int64) error {
 	}
 	wal.writeOffset = uint32(newOffset)
 	// Rollback also requires sync to be durable
-	if err := wal.strictSync(); err != nil {
-		return fmt.Errorf("sync failed: %w", err)
-	}
+	wal.strictSync()
 	return nil
 }
 
@@ -425,6 +447,14 @@ func (wal *WriteAheadLog) rotate() error {
 		return nil
 	}
 
+	// Fsync before handing batchIndex to onRotate: onRotate persists these
+	// offsets into LevelDB's durable WAL index (used by ScanWAL/replication
+	// to locate records by opID), so a reader could be pointed at an offset
+	// whose bytes were never actually flushed to disk if a crash happened
+	// between an unsynced write and the (already-persisted) index entry for
+	// it. Syncing first guarantees every offset onRotate is about to record
+	// is already durable.
+	wal.strictSync()
 	if wal.onRotate != nil && len(wal.batchIndex) > 0 {
 		if err := wal.onRotate(wal.batchIndex); err != nil {
 			return fmt.Errorf("wal rotate hook failed: %w", err)
@@ -432,9 +462,6 @@ func (wal *WriteAheadLog) rotate() error {
 	}
 	wal.batchIndex = make(map[uint64]WALLocation)
 
-	if err := wal.strictSync(); err != nil {
-		return err
-	}
 	if err := wal.currentFile.Close(); err != nil {
 		return err
 	}
@@ -463,9 +490,7 @@ func (wal *WriteAheadLog) ForceNewTimeline(newTimelineID uint64) error {
 		return fmt.Errorf("new timeline %d must be greater than current %d", newTimelineID, wal.timelineID)
 	}
 
-	if err := wal.strictSync(); err != nil {
-		return err
-	}
+	wal.strictSync()
 	if err := wal.currentFile.Close(); err != nil {
 		return err
 	}
@@ -812,7 +837,7 @@ func (wal *WriteAheadLog) replayFile(f *os.File, path string, vl *ValueLog, minO
 				"file", filepath.Base(path),
 				"offset", validOffset,
 				"err", err)
-			return fmt.Errorf("FATAL: WAL corruption at offset %d in %s: %w. Manual intervention required.", validOffset, path, err)
+			return fmt.Errorf("FATAL: WAL corruption at offset %d in %s: %w. Manual intervention required", validOffset, path, err)
 		} else if err != io.EOF {
 			return err
 		}
