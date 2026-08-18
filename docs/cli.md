@@ -267,6 +267,86 @@ See the [root README](../README.md#replication-and-failover) for replication sta
 
 ---
 
+## `turnstone backup`
+
+Stream raw WAL frames from a running **primary** database using the replication protocol. Backups are physical byte ranges keyed by **opid** (the global byte LSN used as the replication cursor).
+
+### Usage
+
+```bash
+# Full backup (starts at opid 0)
+turnstone backup --home tsdata --host localhost:6379 --db 1 --out backup_full
+
+# Differential backup (resume from a previous backup.meta end_opid)
+turnstone backup --home tsdata --db 1 --type differential \
+  --base-meta backup_full/backup.meta --out backup_diff1
+
+# Differential backup with explicit start LSN
+turnstone backup --home tsdata --db 1 --type differential --from-opid 1048576 --out backup_diff2
+```
+
+### Flags
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--host` | `localhost:6379` | Primary server address |
+| `--db` | `1` | Database name to backup |
+| `--out` | `backup_data` | Output directory |
+| `--file` | `wal.bin` | Backup filename (`.gz` appended when compressed) |
+| `--type` | `full` | `full` or `differential` |
+| `--from-opid` | `0` | Start LSN for differential backup |
+| `--base-meta` | — | Previous `backup.meta` to resume from |
+| `--compress` | on | GZIP the WAL artifact |
+| `--wait` | `2s` | Idle time before finishing once caught up |
+
+Each backup writes:
+
+```
+<out>/
+  wal.bin[.gz]     # raw concatenated WAL frames
+  backup.meta      # metadata (type, base_opid, end_opid, sha256, ...)
+```
+
+Differential backups record `parent_sha256` linking to the prior artifact. The server must still retain WAL bytes back to the differential `base_opid`; otherwise the handshake fails with an invalid cursor error.
+
+Uses the admin certificate from `<home>/certs/`.
+
+---
+
+## `turnstone restore`
+
+Rebuild a database offline by applying one or more backup artifacts into a **new** home directory. The target `--out` path must not already exist.
+
+### Usage
+
+```bash
+# Restore a full backup
+turnstone restore --in backup_full --out restored_home
+
+# Restore a full backup plus differential chain
+turnstone restore --chain backup_full,backup_diff1,backup_diff2 --out restored_home
+```
+
+### Flags
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--in` | `backup_data` | Single backup directory (ignored when `--chain` is set) |
+| `--out` | `restored_data` | Target home directory to create |
+| `--file` | `wal.bin` | Backup filename inside each directory |
+| `--verify` | on | Verify SHA256 before applying |
+| `--chain` | — | Comma-separated backup directories in apply order |
+
+Restore validates that:
+
+1. The first backup is `type=full` with `base_opid=0`.
+2. Each differential starts at the previous backup's `end_opid`.
+3. Optional `parent_sha256` matches the prior artifact.
+
+The restored database is placed at `<out>/data/<db>/`. Start a server with `turnstone server --home <out>` after restore (promote the database if not using `--dev`).
+
+---
+
 ## Shell completion
 
 Generate autocompletion scripts for bash, zsh, fish, or PowerShell:
