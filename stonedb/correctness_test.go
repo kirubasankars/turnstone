@@ -16,7 +16,6 @@ func TestCorrectness_ModelBased(t *testing.T) {
 	dir := t.TempDir()
 	opts := Options{
 		// Force frequent internal churn to stress flushing/compaction
-		MaxWALSize:           1024 * 10,
 		CompactionMinGarbage: 1024,
 		CompactionInterval:   10 * time.Millisecond,
 	}
@@ -100,7 +99,7 @@ func TestCorrectness_ModelBased(t *testing.T) {
 // This tests Atomicity (money isn't lost/created) and Isolation (locks work).
 func TestCorrectness_BankTransfers(t *testing.T) {
 	dir := t.TempDir()
-	db, err := Open(dir, Options{MaxWALSize: 1024 * 1024})
+	db, err := Open(dir, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +223,6 @@ func TestCorrectness_BankTransfers_HeavyStress(t *testing.T) {
 	opts := Options{
 		// Very aggressive settings to force frequent rotation and compaction
 		// while transactions are in flight.
-		MaxWALSize:           4096,                 // 4KB WAL (Force frequent rotation)
 		CompactionMinGarbage: 1024,                 // 1KB Garbage (Force frequent compaction candidates)
 		CompactionInterval:   5 * time.Millisecond, // Check for compaction very frequently
 	}

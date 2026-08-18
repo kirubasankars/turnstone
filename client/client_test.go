@@ -76,6 +76,7 @@ func setupTestEnv(t *testing.T) (string, *server.Server, func()) {
 		filepath.Join(certsDir, "server.key"),
 		filepath.Join(certsDir, "ca.crt"),
 		rm,
+		false,
 	)
 	if err != nil {
 		t.Fatalf("Failed to create server: %v", err)

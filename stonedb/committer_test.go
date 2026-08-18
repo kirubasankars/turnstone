@@ -2,16 +2,13 @@ package stonedb
 
 import (
 	"errors"
-	"os"
-	"path/filepath"
-	"strings"
 	"testing"
 )
 
-// TestProcessCommitBatch_MixedValidity verifies that the commit pipeline correctly
-// separates valid transactions from conflicting ones within the same batch.
-// It ensures that a single bad transaction does not fail the entire batch.
-func TestProcessCommitBatch_MixedValidity(t *testing.T) {
+// TestProcessCommitBatch_MultipleValid verifies that several disjoint-key
+// transactions in the same group-commit cycle all succeed together with a
+// single WAL fsync.
+func TestProcessCommitBatch_MultipleValid(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(dir, Options{})
 	if err != nil {
@@ -19,84 +16,37 @@ func TestProcessCommitBatch_MixedValidity(t *testing.T) {
 	}
 	defer db.Close()
 
-	// 1. Setup: Create a key "k_conflict" at version 1 (TxID 1)
-	{
-		tx := db.NewTransaction(true)
-		tx.Put([]byte("k_conflict"), []byte("v1"))
-		if err := tx.Commit(); err != nil {
-			t.Fatal(err)
-		}
+	txA := db.NewTransaction(true)
+	if err := txA.Put([]byte("k_A"), []byte("val_A")); err != nil {
+		t.Fatal(err)
+	}
+	txD := db.NewTransaction(true)
+	if err := txD.Put([]byte("k_D"), []byte("val_D")); err != nil {
+		t.Fatal(err)
 	}
 
-	// 2. Prepare Transactions for the batch
-
-	// TxA: Valid write to a new key
-	txA := db.NewTransaction(true)
-	txA.Put([]byte("k_A"), []byte("val_A"))
-
-	// TxB: Invalid (Stale Read on "k_conflict")
-	// We force a conflict by manually setting the read snapshot to 0 (older than v1)
-	txB := db.NewTransaction(true)
-	txB.readTxID = 0
-	txB.readSet["k_conflict"] = struct{}{}
-	txB.Put([]byte("k_B"), []byte("val_B"))
-
-	// TxC: Invalid (Intra-batch conflict with TxA)
-	// TxA writes "k_A". TxC writes "k_A" too. Since TxA comes first in our list,
-	// TxC should detect the conflict against the pending batch.
-	txC := db.NewTransaction(true)
-	txC.Put([]byte("k_A"), []byte("val_C_conflict"))
-
-	// TxD: Valid (Disjoint write)
-	txD := db.NewTransaction(true)
-	txD.Put([]byte("k_D"), []byte("val_D"))
-
-	// 3. Construct the Batch Request manually
 	reqs := []commitRequest{
 		{tx: txA, resp: make(chan error, 1)},
-		{tx: txB, resp: make(chan error, 1)},
-		{tx: txC, resp: make(chan error, 1)},
 		{tx: txD, resp: make(chan error, 1)},
 	}
-
-	// 4. Execute internal pipeline directly
-	// Note: We bypass the commitCh and call the processor directly to ensure deterministic execution.
 	db.processCommitBatch(reqs)
 
-	// 5. Verify Responses
-
-	// TxA should succeed
 	if err := <-reqs[0].resp; err != nil {
 		t.Errorf("TxA expected success, got %v", err)
 	}
-
-	// TxB should fail with conflict
-	if err := <-reqs[1].resp; err != ErrWriteConflict {
-		t.Errorf("TxB expected ErrWriteConflict (Stale Read), got %v", err)
-	}
-
-	// TxC should fail with conflict (Intra-batch)
-	if err := <-reqs[2].resp; err != ErrWriteConflict {
-		t.Errorf("TxC expected ErrWriteConflict (Intra-batch), got %v", err)
-	}
-
-	// TxD should succeed
-	if err := <-reqs[3].resp; err != nil {
+	if err := <-reqs[1].resp; err != nil {
 		t.Errorf("TxD expected success, got %v", err)
 	}
 
-	// 6. Verify DB State (Persistence)
 	checkKey(t, db, "k_A", "val_A")
 	checkKey(t, db, "k_D", "val_D")
-	checkKeyMissing(t, db, "k_B")
-
-	// Verify "k_A" was NOT overwritten by TxC
-	checkKey(t, db, "k_A", "val_A")
 }
 
-// TestProcessCommitBatch_IndexFailure simulates a failure during the index update phase (Stage 3).
-// This is a critical scenario where data is persisted but not indexed. we tried hard to rollback
-func TestProcessCommitBatch_IndexFailure(t *testing.T) {
+// TestProcessCommitBatch_ReadSetConflict verifies that a transaction whose
+// read set is stale relative to its (forced) snapshot fails commit-time SI
+// validation, even though under first-writer-wins its own writes never
+// conflicted with anyone at Put time.
+func TestProcessCommitBatch_ReadSetConflict(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(dir, Options{})
 	if err != nil {
@@ -104,138 +54,49 @@ func TestProcessCommitBatch_IndexFailure(t *testing.T) {
 	}
 	defer db.Close()
 
-	// 1. Establish baseline: Write k1 successfully
-	tx := db.NewTransaction(true)
-	tx.Put([]byte("k1"), []byte("v1"))
-
-	reqs := []commitRequest{
-		{tx: tx, resp: make(chan error, 1)},
+	// Establish a committed version of "k_conflict".
+	tx0 := db.NewTransaction(true)
+	if err := tx0.Put([]byte("k_conflict"), []byte("v1")); err != nil {
+		t.Fatal(err)
 	}
-	db.processCommitBatch(reqs)
-
-	// Ensure baseline success
-	if err := <-reqs[0].resp; err != nil {
-		t.Fatalf("Baseline write failed: %v", err)
-	}
-	checkKey(t, db, "k1", "v1")
-
-	// 2. Inject Index Failure
-	// Define a distinct error so we can verify wrapping works
-	simulatedErr := errors.New("simulated index failure")
-	testingApplyBatchIndexErr = simulatedErr
-	defer func() { testingApplyBatchIndexErr = nil }()
-
-	// 3. Attempt a write that will fail at the Index stage
-	tx = db.NewTransaction(true)
-	tx.Put([]byte("k"), []byte("v"))
-
-	reqs = []commitRequest{
-		{tx: tx, resp: make(chan error, 1)},
-	}
-
-	db.processCommitBatch(reqs)
-
-	// 4. Verify the Error Response
-	err = <-reqs[0].resp
-	if err == nil {
-		t.Fatal("Expected error, got nil")
-	}
-
-	// Check that we got the wrapper message indicating rollback happened
-	if !strings.Contains(err.Error(), "safe rollback performed") {
-		t.Errorf("Expected rollback message, got: %v", err)
-	}
-
-	// Check that it wraps the underlying cause
-	if !errors.Is(err, simulatedErr) {
-		t.Errorf("Expected error to wrap '%v', got '%v'", simulatedErr, err)
-	}
-
-	// 5. Verify Rollback (In-Memory)
-	// The key should NOT be visible because index update failed
-	checkKeyMissing(t, db, "k")
-
-	// Delete VLog and Index. This forces a full rebuild from the WAL.
-	// If the WAL wasn't truncated correctly during the rollback,
-	// the replay will resurrect the phantom key "k".
-	if err := os.RemoveAll(filepath.Join(dir, "vlog")); err != nil {
+	if err := tx0.Commit(); err != nil {
 		t.Fatal(err)
 	}
 
-	// 6. Verify Rollback (Persistence)
-	// Close and Reopen to ensure WAL/VLog were actually truncated.
-	// If rollback failed, "k" would reappear here (Phantom Write).
-	db.Close()
-	db2, err := Open(dir, Options{})
-	if err != nil {
+	// txB read "k_conflict" under a snapshot older than tx0's commit, then
+	// wrote a disjoint key. At commit time, the read set must be revalidated
+	// against the clog and found stale.
+	txB := db.NewTransaction(true)
+	txB.readSet["k_conflict"] = struct{}{}
+	txB.snapshot = Snapshot{Xmax: 1, Xip: map[uint64]bool{}}
+	if err := txB.Put([]byte("k_B"), []byte("val_B")); err != nil {
 		t.Fatal(err)
 	}
-	defer db2.Close()
 
-	// "k" should be gone forever
-	checkKeyMissing(t, db2, "k")
-
-	// "k1" should still be there
-	checkKey(t, db2, "k1", "v1")
-
-	if db.transactionID != db2.transactionID {
-		t.Fatal("transactionID should be advanced")
-	}
-}
-
-// TestProcessCommitBatch_AllFail verifies the behavior when prepareBatch rejects
-// every transaction in the list. The pipeline should abort early (before persistence).
-func TestProcessCommitBatch_AllFail(t *testing.T) {
-	dir := t.TempDir()
-	db, err := Open(dir, Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	// Setup conflict
-	txInit := db.NewTransaction(true)
-	_ = txInit.Put([]byte("exists"), []byte("v1"))
-	_ = txInit.Commit() // TxID becomes 1
-
-	// Tx1: Conflict
-	tx1 := db.NewTransaction(true)
-	tx1.readTxID = 0
-	tx1.readSet["exists"] = struct{}{}
-	_ = tx1.Put([]byte("new1"), []byte("val1"))
-
-	// Tx2: Conflict
-	tx2 := db.NewTransaction(true)
-	tx2.readTxID = 0
-	tx2.readSet["exists"] = struct{}{}
-	_ = tx2.Put([]byte("new2"), []byte("val2"))
-
-	reqs := []commitRequest{
-		{tx: tx1, resp: make(chan error, 1)},
-		{tx: tx2, resp: make(chan error, 1)},
-	}
-
-	// Execute
+	reqs := []commitRequest{{tx: txB, resp: make(chan error, 1)}}
 	db.processCommitBatch(reqs)
 
-	// Verify Failures
 	if err := <-reqs[0].resp; err != ErrWriteConflict {
-		t.Errorf("Tx1 expected ErrWriteConflict, got %v", err)
-	}
-	if err := <-reqs[1].resp; err != ErrWriteConflict {
-		t.Errorf("Tx2 expected ErrWriteConflict, got %v", err)
+		t.Errorf("txB expected ErrWriteConflict (stale read), got %v", err)
 	}
 
-	// Verify Optimization: Global clocks should NOT have advanced if batch was empty
-	// Initial Commit was TxID 1. Since valid batch was empty, it should stay 1.
-	if db.transactionID != 1 {
-		t.Errorf("Expected TransactionID to remain 1, got %d", db.transactionID)
+	// The key locks/xid bookkeeping must be released so a later writer isn't
+	// blocked by the aborted transaction.
+	checkKeyMissing(t, db, "k_B")
+	txRetry := db.NewTransaction(true)
+	if err := txRetry.Put([]byte("k_B"), []byte("val_B_retry")); err != nil {
+		t.Fatalf("expected k_B to be writable after txB aborted, got %v", err)
 	}
+	if err := txRetry.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	checkKey(t, db, "k_B", "val_B_retry")
 }
 
-// TestProcessCommitBatch_PreparationFailure exercises the system-level error path in prepareBatch.
-// It forces a failure via the testingPrepareBatchErr hook.
-func TestProcessCommitBatch_PreparationFailure(t *testing.T) {
+// TestProcessCommitBatch_SystemErrorHook verifies that the
+// testingProcessCommitBatchErr hook fails every request in the batch before
+// any WAL/clog work happens.
+func TestProcessCommitBatch_SystemErrorHook(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(dir, Options{})
 	if err != nil {
@@ -243,86 +104,65 @@ func TestProcessCommitBatch_PreparationFailure(t *testing.T) {
 	}
 	defer db.Close()
 
-	// Inject the failure hook
-	forcedErr := errors.New("simulated critical system failure")
-	testingPrepareBatchErr = forcedErr
-	defer func() { testingPrepareBatchErr = nil }()
+	forcedErr := errTestSystemFailure
+	testingProcessCommitBatchErr = forcedErr
+	defer func() { testingProcessCommitBatchErr = nil }()
 
-	// Create a transaction that would otherwise be valid
 	tx := db.NewTransaction(true)
-	tx.Put([]byte("key"), []byte("val"))
-
-	reqs := []commitRequest{
-		{tx: tx, resp: make(chan error, 1)},
-	}
-
-	// Execute pipeline
-	db.processCommitBatch(reqs)
-
-	// Verify the error propagated to the request
-	select {
-	case err := <-reqs[0].resp:
-		if err != forcedErr {
-			t.Errorf("Expected forced error %v, got %v", forcedErr, err)
-		}
-	default:
-		t.Error("Expected error response, got nothing")
-	}
-}
-
-// TestProcessCommitBatch_CorruptionState verifies that the system handles
-// critical rollback failures by marking the DB as corrupt instead of panicking.
-func TestProcessCommitBatch_CorruptionState(t *testing.T) {
-	dir := t.TempDir()
-	db, err := Open(dir, Options{})
-	if err != nil {
+	if err := tx.Put([]byte("key"), []byte("val")); err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close() // Ensure cleanup even if corrupt
-
-	// Inject Hook: Trigger critical failure conditions
-	testingPersistBatchHook = func() {
-		// 1. Sabotage VLog to force write failure (closes the active file handle)
-		db.valueLog.Close()
-		// 2. Sabotage WAL to trigger the bounds check failure in rollbackWAL
-		// Setting writeOffset to 0 ensures (currentSize < bytesToRemove) becomes true
-		db.writeAheadLog.writeOffset = 0
-	}
-
-	tx := db.NewTransaction(true)
-	tx.Put([]byte("k"), []byte("v"))
 
 	reqs := []commitRequest{{tx: tx, resp: make(chan error, 1)}}
-
-	// Execution should NOT panic now
 	db.processCommitBatch(reqs)
 
-	// Verify Error Response
-	err = <-reqs[0].resp
-	if err == nil {
-		t.Fatal("Expected error response, got nil")
-	}
-	if !strings.Contains(err.Error(), "CRITICAL") && !strings.Contains(err.Error(), "Consistency violation") {
-		t.Errorf("Expected CRITICAL error, got: %v", err)
-	}
-
-	// Verify Corruption State
-	if db.isCorrupt != 1 {
-		t.Error("Expected DB to be marked as corrupt (isCorrupt=1)")
-	}
-
-	// Verify Subsequent Writes Rejected
-	tx2 := db.NewTransaction(true)
-	tx2.Put([]byte("should_fail"), []byte("val"))
-	// Even if tx creation succeeds (it shouldn't if we check there), Commit MUST fail
-	if err := tx2.Commit(); err == nil {
-		t.Error("Subsequent commit should fail due to corruption")
-	} else if err.Error() != "database is corrupt" {
-		t.Errorf("Expected 'database is corrupt' error, got: %v", err)
+	if err := <-reqs[0].resp; err != forcedErr {
+		t.Errorf("expected forced error %v, got %v", forcedErr, err)
 	}
 }
 
+// TestProcessCommitBatch_WALFsyncFailure verifies that a failure while
+// group-fsyncing COMMIT records marks the database corrupt (there is no
+// rollback of an already-eager-written transaction; the WAL append for the
+// COMMIT record itself is what failed here, before it was durable).
+func TestProcessCommitBatch_WALFsyncFailure(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// NOTE: deliberately not deferring db.Close() here. We sabotage the WAL's
+	// underlying file below, and a subsequent Close()/Checkpoint() would force
+	// a WAL rotation that calls strictSync directly on the closed file,
+	// which panics by design (fail-fast on real storage failure). That crash
+	// path is exercised/covered elsewhere; this test only cares about the
+	// commit-time error and corruption flag.
+
+	tx := db.NewTransaction(true)
+	if err := tx.Put([]byte("k"), []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Sabotage the WAL's underlying file so the COMMIT record's fsync fails.
+	db.writeAheadLog.currentFile.Close()
+
+	reqs := []commitRequest{{tx: tx, resp: make(chan error, 1)}}
+	db.processCommitBatch(reqs)
+
+	if err := <-reqs[0].resp; err == nil {
+		t.Fatal("expected error from sabotaged WAL fsync, got nil")
+	}
+
+	if db.isCorrupt != 1 {
+		t.Error("expected DB to be marked corrupt after WAL commit-fsync failure")
+	}
+}
+
+// errTestSystemFailure is a distinct sentinel used by the testing hook tests.
+var errTestSystemFailure = errors.New("simulated critical system failure")
+
 // Helpers for test conciseness
+
 func checkKey(t *testing.T, db *DB, key, expected string) {
 	t.Helper()
 	tx := db.NewTransaction(false)
