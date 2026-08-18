@@ -43,10 +43,10 @@ const (
 
 // WALRecord is a single decoded WAL entry.
 type WALRecord struct {
-	Type WALRecordType
-	XID  uint64 // Transaction ID (assigned at BEGIN)
-	OpID uint64 // Monotonic log sequence number, assigned per record
-	Key  []byte
+	Type  WALRecordType
+	XID   uint64 // Transaction ID (assigned at BEGIN)
+	OpID  uint64 // Monotonic log sequence number, assigned per record
+	Key   []byte
 	Value []byte
 }
 
@@ -85,16 +85,16 @@ var (
 )
 
 var (
-	ErrTxnFinished         = errors.New("transaction is already finished")
-	ErrWriteConflict       = errors.New("write conflict detected")
-	ErrTxAborted           = errors.New("current transaction is aborted, commands ignored until end of transaction block")
-	ErrKeyNotFound         = errors.New("key not found")
-	ErrChecksum            = errors.New("checksum mismatch")
-	ErrCorruptData         = errors.New("data corruption detected")
-	ErrTruncated           = errors.New("wal truncated due to corruption")
-	ErrLogUnavailable      = errors.New("wal log unavailable for requested operation id")
-	ErrDiskFull            = errors.New("disk usage exceeds threshold")
-	ErrDatabaseClosed      = errors.New("database is closed")
+	ErrTxnFinished    = errors.New("transaction is already finished")
+	ErrWriteConflict  = errors.New("write conflict detected")
+	ErrTxAborted      = errors.New("current transaction is aborted, commands ignored until end of transaction block")
+	ErrKeyNotFound    = errors.New("key not found")
+	ErrChecksum       = errors.New("checksum mismatch")
+	ErrCorruptData    = errors.New("data corruption detected")
+	ErrTruncated      = errors.New("wal truncated due to corruption")
+	ErrLogUnavailable = errors.New("wal log unavailable for requested operation id")
+	ErrDiskFull       = errors.New("disk usage exceeds threshold")
+	ErrDatabaseClosed = errors.New("database is closed")
 )
 
 // Options allows configuring the store behavior on Open
