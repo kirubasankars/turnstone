@@ -7,7 +7,7 @@
 ## 🚀 Key Features
 
 * **⚡ WiscKey-style Storage Engine**: Uses a LevelDB LSM-tree for the index (Keys) and an append-only Value Log (VLog) for values. This minimizes write amplification and drastically improves throughput for large payloads.
-* **📝 Postgres-style Eager Logging**: `SET`/`DEL` write to the WAL, VLog, and index immediately (not buffered until `COMMIT`). `COMMIT` only group-fsyncs a small commit record and flips visibility, matching PostgreSQL's write path. See "Transaction Model: Postgres-style Eager Logging" below — **this is a breaking on-disk WAL format change**.
+* **📝 Eager Logging**: `SET`/`DEL` write to the WAL, VLog, and index immediately (not buffered until `COMMIT`). `COMMIT` only group-fsyncs a small commit record and flips visibility. See "Transaction Model: Eager Logging" below — **this is a breaking on-disk WAL format change**.
 * **🔒 ACID Transactions**: Full support for multi-key transactions with **Snapshot Isolation**. Write-write conflicts are detected eagerly at `SET`/`DEL` time via **first-writer-wins** key locking (no waiting, no deadlocks); read-set validation still runs at `COMMIT` to catch stale-read/write-skew.
 * **🛡️ Secure by Default**: All connections (Client-Server and Inter-Node) are secured via **mTLS** (Mutual TLS). Role-Based Access Control (RBAC) is enforced via X.509 Certificate Organization fields.
 * **📡 Replication & Timelines**: Database-level Leader-Follower replication. Supports **Timelines** to handle split-brain scenarios and allow safe history divergence during promotion.
@@ -275,11 +275,11 @@ TurnstoneDB separates the storage of keys and values to optimize for modern SSDs
 2. **Value Log (VLog)**: Stores the actual values on disk in append-only files. Garbage collection is performed only when a file exceeds a configurable staleness threshold.
 3. **Write-Ahead Log (WAL)**: Ensures durability. Supports retention strategies based on time or replication acknowledgment. WAL rotation is checkpoint-driven (not size-triggered); checkpoints run on a timer (default 60s) or can be forced via the `checkpoint` admin command.
 
-### Transaction Model: Postgres-style Eager Logging
+### Transaction Model: Eager Logging
 
 > ⚠️ **Breaking change.** This is a new on-disk WAL format. Data directories created by older versions of TurnstoneDB cannot be opened by this version and must be rebuilt (e.g. from a backup or by resyncing from a peer). Client wire protocol opcodes (`BEGIN`/`SET`/`DEL`/`COMMIT`/`ABORT`) are unchanged — only the internal WAL framing, status semantics, and replication journal changed.
 
-Earlier versions of TurnstoneDB buffered all writes in memory between `BEGIN` and `COMMIT`, and only touched the WAL/VLog/index once, atomically, at commit time. TurnstoneDB now follows PostgreSQL's write path instead:
+Earlier versions of TurnstoneDB buffered all writes in memory between `BEGIN` and `COMMIT`, and only touched the WAL/VLog/index once, atomically, at commit time. TurnstoneDB now writes eagerly instead:
 
 ```mermaid
 sequenceDiagram
@@ -305,7 +305,7 @@ sequenceDiagram
 Key semantics:
 
 * **`xid` is assigned at `BEGIN`**, not at commit time. Every WAL record (`BEGIN`/`SET`/`DEL`/`COMMIT`/`ABORT`) also gets its own monotonically increasing `opID`, which remains the replication cursor.
-* **`SET`/`DEL` write immediately.** Values land in the VLog and an index version is inserted (`xmin = xid`, initially "in progress") as soon as the client calls `SET`/`DEL` — not buffered until `COMMIT`. This data is **not fsynced** at write time; it is recovered from the WAL on crash, the same way Postgres relies on WAL replay rather than fsyncing every row.
+* **`SET`/`DEL` write immediately.** Values land in the VLog and an index version is inserted (`xmin = xid`, initially "in progress") as soon as the client calls `SET`/`DEL` — not buffered until `COMMIT`. This data is **not fsynced** at write time; it is recovered from the WAL on crash via WAL replay rather than fsyncing every row.
 * **`COMMIT` group-fsyncs a tiny record.** Because `SET`/`DEL` already did the heavy I/O, `COMMIT` only has to append and fsync a `COMMIT` WAL record (batched with other concurrent commits), then flip the transaction's status to `committed` in the commit log (`clog`). This is cheaper and more predictable than fsyncing an entire write-set at commit time.
 * **Read-your-own-writes** works without a separate write-cache: `Get` inside a transaction simply treats `xmin == my xid` as visible regardless of `clog` state.
 * **Isolation is now first-writer-wins, not first-committer-wins.** `SET`/`DEL` takes an exclusive, **NOWAIT** lock on the key: if another in-progress transaction already owns it, the call fails immediately with a write conflict — there is no waiting and therefore no deadlock. The write-set/blind-write half of the old commit-time conflict check is gone since it's now structurally impossible (whoever holds the key's lock is the only writer). Read-set validation (stale-read / write-skew detection) still happens at `COMMIT` for true snapshot-isolation correctness.
@@ -314,7 +314,7 @@ Key semantics:
 #### What this means for clients
 
 * `SET`/`DEL` (and `MSET`/`MDEL`) can now fail with **`ResStatusTxConflict` (0x05)** directly — previously this only happened at `COMMIT`. The Go client already maps this to `ErrTxConflict`.
-* Once a transaction hits a conflict, it is marked aborted server-side (Postgres's "current transaction is aborted" behavior): every subsequent `GET`/`SET`/`COMMIT` on that connection returns `ResStatusTxConflict` until you send `ABORT` (or a fresh `BEGIN`).
+* Once a transaction hits a conflict, it is marked aborted server-side ("current transaction is aborted" behavior): every subsequent `GET`/`SET`/`COMMIT` on that connection returns `ResStatusTxConflict` until you send `ABORT` (or a fresh `BEGIN`).
 * Values are visible to other transactions only after `COMMIT` — the eager writes described above are strictly an internal engine detail; external readers never see uncommitted data (`Get`/`StreamSnapshot`/CDC/replica reads all filter by `clog` + snapshot visibility, identical to before).
 * Replication is role-filtered: `server`-role streams (used for replica apply, promotion, and `turnstone-backup`) see the full physical WAL including `BEGIN`/`ABORT`; `cdc`-role streams remain logical — they only ever emit committed `SET`/`DEL` plus a commit marker, exactly like before.
 
@@ -325,7 +325,7 @@ Key semantics:
 1. **Consensus**: Replication uses async/sync streaming. There is no automated Raft/Paxos failover; promotion must be triggered manually via API/CLI (though `Timelines` make this safe).
 2. **Sharding**: The server is single-node (multi-db). Sharding must be handled client-side (see `cmd/turnstone-load2` for a reference implementation).
 3. **Memory**: The index (LevelDB) relies heavily on OS Page Cache. Large datasets require sufficient RAM for optimal performance.
-4. **No lock waiting**: Key-level write locks are NOWAIT (see "Transaction Model: Postgres-style Eager Logging" above). Under hot-key contention this shows up as `TxConflict` abort storms rather than the queuing/blocking behavior Postgres row locks provide — the client is expected to retry, not wait.
+4. **No lock waiting**: Key-level write locks are NOWAIT (see "Transaction Model: Eager Logging" above). Under hot-key contention this shows up as `TxConflict` abort storms rather than a queuing/blocking row-lock behavior — the client is expected to retry, not wait.
 5. **No WAL migration**: The eager-logging WAL format is a breaking change from prior releases; existing data directories must be rebuilt or resynced, they cannot be opened in-place.
 
 ---
