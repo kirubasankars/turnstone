@@ -31,20 +31,54 @@ type Transaction struct {
 	keyDelta        int64                 // net live-key count delta contributed by this tx
 	readSet         map[string]struct{}   // keys read, validated against clog at commit
 
-	snapshot  Snapshot
-	aborted   bool
+	snapshot Snapshot
+	// snapOpID is the operationID watermark captured atomically alongside
+	// snapshot.Xmax (under db.txMu) at transaction start, for read-only
+	// transactions. It always reflects the exact same instant as the
+	// snapshot boundary, unlike a separately-timed re-read of db.operationID.
+	snapOpID uint64
+	// aborted is read/written from multiple goroutines (the owning
+	// goroutine via write()/Get()/Commit(), and the background liveness
+	// reaper via markAborted()), so it must be accessed atomically.
+	aborted   int32
 	finished  bool
 	abortOnce sync.Once // guards db.abortTransaction's one-time WAL/clog/lock-release work
+
+	// decided is the single arbitration point between the commit path
+	// (processCommitBatch) and the abort path (abortTransaction, invoked by
+	// Discard or the liveness reaper) for this xid's durable outcome.
+	// Whichever side wins the CompareAndSwap(0, 1) is the sole writer of
+	// the COMMIT/ABORT WAL record and clog entry; the loser must not touch
+	// WAL/clog/locks for this xid at all. Without this, the reaper and the
+	// committer could independently decide the same xid, producing both a
+	// COMMIT and an ABORT record for it.
+	decided int32
 
 	iter        iterator.Iterator // cached iterator for reads
 	currentSize int64             // accumulated size of keys/values + overhead, for MaxTxSize
 }
 
+// isAborted reports whether the transaction has been flagged aborted, safe
+// to call concurrently from any goroutine.
+func (tx *Transaction) isAborted() bool {
+	return atomic.LoadInt32(&tx.aborted) == 1
+}
+
 // markAborted flags the transaction as unusable for further operations. The
 // actual ABORT WAL record / clog write happens in db.abortTransaction, called
-// either here inline (on conflict) or from Discard/the liveness reaper.
+// either here inline (on conflict) or from Discard/the liveness reaper. Safe
+// to call concurrently from any goroutine.
 func (tx *Transaction) markAborted() {
-	tx.aborted = true
+	atomic.StoreInt32(&tx.aborted, 1)
+}
+
+// claimDecision atomically claims the right to durably decide (commit or
+// abort) this transaction's xid. Only the first caller (across both the
+// commit path and the abort path) gets true; every other caller must back
+// off without writing any WAL/clog record or touching key locks for this
+// xid, since the winner is now the sole source of truth for its outcome.
+func (tx *Transaction) claimDecision() bool {
+	return atomic.CompareAndSwapInt32(&tx.decided, 0, 1)
 }
 
 // Discard aborts (if RW and not already finished) and releases resources.
@@ -88,11 +122,11 @@ func (tx *Transaction) write(key, value []byte, isDelete bool) error {
 	if tx.beginErr != nil {
 		return tx.beginErr
 	}
-	if tx.aborted {
+	if tx.isAborted() {
 		return ErrWriteConflict
 	}
 	db := tx.db
-	if db.isDiskFull == 1 {
+	if atomic.LoadInt32(&db.isDiskFull) == 1 {
 		return ErrDiskFull
 	}
 	if len(key) == 0 {
@@ -122,6 +156,17 @@ func (tx *Transaction) write(key, value []byte, isDelete bool) error {
 	}
 	db.txMu.Unlock()
 
+	// Snapshot the accounting state for this key so a failed WAL/VLog/index
+	// write below can be rolled back instead of permanently skewing
+	// tx.keyDelta/tx.dispositionSeen/tx.staleBytes relative to what was
+	// actually durably written (a retried Put/Delete on the same key would
+	// otherwise compute its own delta against corrupted baseline state).
+	prevDelta := tx.keyDelta
+	prevDispositionSeen, hadDisposition := tx.dispositionSeen[keyStr]
+	var staleFid uint32
+	var hadStaleFid bool
+	var prevStaleVal int64
+
 	if firstWriteToKey {
 		// Blind-write hazard: someone else may have committed a newer version
 		// of this key after our snapshot was taken (they must have finished,
@@ -130,37 +175,71 @@ func (tx *Transaction) write(key, value []byte, isDelete bool) error {
 		meta, xmin, found := db.latestResolvedMeta(iter, key, tx.xid)
 		iter.Release()
 		if found && (xmin >= tx.snapshot.Xmax || tx.snapshot.contains(xmin)) {
-			db.releaseKeyLockLocked(keyStr, tx.xid)
-			delete(tx.keyLocks, keyStr)
+			db.releaseKeyLockAndForget(tx, keyStr)
 			atomic.AddUint64(&db.metricsConflicts, 1)
 			tx.markAborted()
 			return ErrWriteConflict
 		}
+		if meta != nil {
+			staleFid, hadStaleFid = meta.FileID, true
+			prevStaleVal = tx.staleBytes[staleFid]
+		}
 		tx.recordBaselineImpact(keyStr, key, meta, isDelete)
 	} else {
+		if pm, ok := tx.ownPriorMeta[keyStr]; ok && pm != nil {
+			staleFid, hadStaleFid = pm.FileID, true
+			prevStaleVal = tx.staleBytes[staleFid]
+		}
 		tx.recordOwnImpact(keyStr, key, isDelete)
+	}
+
+	rollbackImpact := func() {
+		tx.keyDelta = prevDelta
+		if hadDisposition {
+			tx.dispositionSeen[keyStr] = prevDispositionSeen
+		} else {
+			delete(tx.dispositionSeen, keyStr)
+		}
+		if hadStaleFid {
+			tx.staleBytes[staleFid] = prevStaleVal
+		}
 	}
 
 	recType := WALRecordSet
 	if isDelete {
 		recType = WALRecordDelete
 	}
+
+	// The opID allocation, WAL append, and VLog append for this write must
+	// happen as one atomic unit under writeSeqMu: WAL and VLog otherwise use
+	// independent locks, so a preempted goroutine could let a later opID's
+	// VLog write land before an earlier opID's. A crash in that window would
+	// make the ValueLog's recovered high-water mark ("maxOp") look like it
+	// already covers an opID whose entry was, in fact, never written --
+	// permanently and silently losing that committed write on replay
+	// (syncWALToValueLog only redoes records with OpID > maxOp).
+	db.writeSeqMu.Lock()
 	opID, err := db.appendRecord(recType, tx.xid, key, value)
 	if err != nil {
+		db.writeSeqMu.Unlock()
+		rollbackImpact()
 		return err
 	}
 
 	fileID, offset, err := db.valueLog.AppendEntries([]ValueLogEntry{{
 		Key: key, Value: value, TransactionID: tx.xid, OperationID: opID, IsDelete: isDelete,
 	}})
+	db.writeSeqMu.Unlock()
 	if err != nil {
 		db.markCorrupt(err)
+		rollbackImpact()
 		return err
 	}
 
 	meta := &EntryMeta{FileID: fileID, ValueOffset: offset, ValueLen: uint32(len(value)), TransactionID: tx.xid, OperationID: opID, IsTombstone: isDelete}
 	if err := db.ldb.Put(encodeIndexKey(key, tx.xid), meta.Encode(), nil); err != nil {
 		db.markCorrupt(err)
+		rollbackImpact()
 		return err
 	}
 
@@ -178,11 +257,19 @@ func (tx *Transaction) write(key, value []byte, isDelete bool) error {
 	return nil
 }
 
-func (db *DB) releaseKeyLockLocked(key string, xid uint64) {
+// releaseKeyLockAndForget releases key's first-writer-wins lock (if owned by
+// tx) and removes it from tx.keyLocks, all under a single db.txMu critical
+// section. tx.keyLocks is also iterated by abortTransaction/
+// releaseCommittedLocks under db.txMu from a different goroutine (the
+// liveness reaper), so every mutation of it must go through db.txMu too --
+// otherwise a plain unlocked delete() here can race with that iteration and
+// crash the process with "concurrent map iteration and map write".
+func (db *DB) releaseKeyLockAndForget(tx *Transaction, key string) {
 	db.txMu.Lock()
-	if owner, ok := db.keyLocks[key]; ok && owner == xid {
+	if owner, ok := db.keyLocks[key]; ok && owner == tx.xid {
 		delete(db.keyLocks, key)
 	}
+	delete(tx.keyLocks, key)
 	db.txMu.Unlock()
 }
 
@@ -272,7 +359,7 @@ func (tx *Transaction) Get(key []byte) ([]byte, error) {
 	if tx.finished {
 		return nil, ErrTxnFinished
 	}
-	if tx.aborted {
+	if tx.isAborted() {
 		return nil, ErrWriteConflict
 	}
 
@@ -328,7 +415,7 @@ func (tx *Transaction) Commit() error {
 	if tx.finished {
 		return ErrTxnFinished
 	}
-	if tx.aborted || tx.beginErr != nil {
+	if tx.isAborted() || tx.beginErr != nil {
 		tx.finished = true
 		tx.db.activeTxnsMu.Lock()
 		delete(tx.db.activeTxns, tx)
@@ -343,7 +430,7 @@ func (tx *Transaction) Commit() error {
 		}
 		return ErrWriteConflict
 	}
-	if tx.db.isDiskFull == 1 {
+	if atomic.LoadInt32(&tx.db.isDiskFull) == 1 {
 		tx.finished = true
 		tx.db.activeTxnsMu.Lock()
 		delete(tx.db.activeTxns, tx)
@@ -352,13 +439,32 @@ func (tx *Transaction) Commit() error {
 		return ErrDiskFull
 	}
 
-	req := commitRequest{tx: tx, resp: make(chan error, 1)}
-	select {
-	case tx.db.commitCh <- req:
-	default:
-		tx.db.commitCh <- req
+	// shutdownMu is a shutdown barrier: Close() takes the write lock (which
+	// blocks until every RLock below has been released) before it closes
+	// db.closeCh and lets runGroupCommits exit. That guarantees any request
+	// we're about to enqueue into commitCh is guaranteed to still be
+	// serviced -- without this barrier, Close() could stop draining
+	// commitCh while our request sits in it, permanently stranding us on
+	// <-req.resp (see runGroupCommits).
+	tx.db.shutdownMu.RLock()
+	if atomic.LoadInt32(&tx.db.closed) == 1 {
+		tx.db.shutdownMu.RUnlock()
+		tx.finished = true
+		tx.db.activeTxnsMu.Lock()
+		delete(tx.db.activeTxns, tx)
+		tx.db.activeTxnsMu.Unlock()
+		tx.db.abortTransaction(tx)
+		if tx.iter != nil {
+			tx.iter.Release()
+			tx.iter = nil
+		}
+		return ErrDatabaseClosed
 	}
+
+	req := commitRequest{tx: tx, resp: make(chan error, 1)}
+	tx.db.commitCh <- req
 	err := <-req.resp
+	tx.db.shutdownMu.RUnlock()
 
 	tx.finished = true
 	tx.db.activeTxnsMu.Lock()
