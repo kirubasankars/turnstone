@@ -19,11 +19,19 @@ func (db *DB) StreamSnapshot(fn func(batch []SnapshotEntry) error) (uint64, uint
 	tx := db.NewTransaction(false)
 	defer tx.Discard()
 
-	// 2. Lock to capture the high-water marks (TxID and OpID)
-	db.mu.RLock()
-	snapOpID := db.operationID
-	snapTxID := db.transactionID
-	db.mu.RUnlock()
+	// 2. Derive the high-water marks (TxID and OpID) from the transaction's
+	// own snapshot boundary, captured atomically under db.txMu at the exact
+	// instant the snapshot was fixed (see NewTransaction). Re-reading
+	// db.transactionID/db.operationID here separately -- as plain fields,
+	// which is itself a data race since every writer uses sync/atomic --
+	// could also observe commits that landed after the snapshot boundary,
+	// making the returned watermark inconsistent with the data actually
+	// streamed below.
+	snapOpID := tx.snapOpID
+	var snapTxID uint64
+	if tx.snapshot.Xmax > 0 {
+		snapTxID = tx.snapshot.Xmax - 1
+	}
 
 	db.logger.Info("Starting snapshot stream", "snap_tx_id", snapTxID, "snap_op_id", snapOpID)
 

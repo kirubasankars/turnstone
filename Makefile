@@ -17,4 +17,12 @@ clean:
 test:
 	go test -v ./... | tee test.log
 
+# test-race runs the full suite across ALL packages in one process, with the
+# race detector enabled. This must be run as a single `./...` invocation
+# (not per-package) so that races between goroutines in different packages
+# (e.g. server <-> store <-> stonedb) are still observed by one race
+# detector instance.
+test-race:
+	go test -race -count=1 ./... | tee test-race.log
+
 

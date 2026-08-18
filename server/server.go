@@ -39,11 +39,17 @@ const (
 type Server struct {
 	stores           map[string]*store.Store
 	defaultDB        string
-	id               string // Unique Server ID
-	addr             string
-	logger           *slog.Logger
-	listener         net.Listener
-	maxConns         int
+	id     string // Unique Server ID
+	addr   string
+	logger *slog.Logger
+
+	// listener is written once by Run() and read by Addr()/CloseAll(), which
+	// can legitimately be called concurrently with Run() still starting up
+	// (e.g. a caller polling Addr() right after launching Run() in a
+	// goroutine), so it needs its own lock rather than being a bare field.
+	listenerMu sync.Mutex
+	listener   net.Listener
+	maxConns   int
 	sem              chan struct{}
 	wg               sync.WaitGroup
 	totalConns       uint64
@@ -151,6 +157,8 @@ func (s *Server) ReloadTLS() error {
 
 // Addr returns the listener's network address.
 func (s *Server) Addr() net.Addr {
+	s.listenerMu.Lock()
+	defer s.listenerMu.Unlock()
 	if s.listener != nil {
 		return s.listener.Addr()
 	}
@@ -162,7 +170,9 @@ func (s *Server) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	s.listenerMu.Lock()
 	s.listener = ln
+	s.listenerMu.Unlock()
 
 	// INFO: Startup configuration
 	s.logger.Info("TurnstoneDB Server Started",
@@ -251,19 +261,6 @@ func (s *Server) unregisterConn(db string, conn net.Conn) {
 		if len(m) == 0 {
 			delete(s.activeClients, db)
 		}
-	}
-}
-
-func (s *Server) killDBConnections(db string) {
-	s.activeClientsMu.Lock()
-	defer s.activeClientsMu.Unlock()
-	if m, ok := s.activeClients[db]; ok {
-		// We copy keys to avoid issues while iterating (though Close() is safe)
-		// and we deleted the map entry anyway.
-		for conn := range m {
-			_ = conn.Close()
-		}
-		delete(s.activeClients, db)
 	}
 }
 
@@ -628,7 +625,7 @@ func (s *Server) handleBegin(w io.Writer, st *connState) {
 	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
 }
 
-func (s *Server) handleCommit(w io.Writer, st *connState) {
+func (s *Server) handleCommit(w net.Conn, st *connState) {
 	if st.tx == nil {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusTxRequired, nil)
 		return
@@ -664,10 +661,46 @@ func (s *Server) handleCommit(w io.Writer, st *connState) {
 	if st.db.MinReplicas() > 0 {
 		// Wait for the latest OpID (which includes the tx we just committed)
 		lastOpID := st.db.LastOpID()
-		st.db.WaitForQuorum(lastOpID)
+		if err := s.waitForQuorumOrDisconnect(w, st.db, lastOpID); err != nil {
+			s.logger.Warn("Commit succeeded locally but quorum wait failed", "err", err)
+			_ = s.writeBinaryResponse(w, protocol.ResStatusServerBusy, []byte(err.Error()))
+			return
+		}
 	}
 
 	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
+}
+
+// waitForQuorumOrDisconnect wraps Store.WaitForQuorum with a lightweight
+// background watcher that periodically checks whether the requesting client
+// has already disconnected. Without this, a client that gives up (or
+// crashes) during a replica outage would still leave this goroutine -- and
+// the connection-semaphore slot it holds -- blocked for the full quorum
+// timeout; a burst of such abandoned commits during an outage can exhaust
+// maxConns even though none of those clients are still waiting on a
+// response.
+func (s *Server) waitForQuorumOrDisconnect(conn net.Conn, st *store.Store, lastOpID uint64) error {
+	cancel := make(chan struct{})
+	stop := make(chan struct{})
+	defer close(stop)
+
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				if connAppearsClosed(conn) {
+					close(cancel)
+					return
+				}
+			}
+		}
+	}()
+
+	return st.WaitForQuorum(lastOpID, 0, cancel)
 }
 
 func (s *Server) handleAbort(w io.Writer, st *connState) {
@@ -1040,6 +1073,13 @@ func (s *Server) handleReplicaOf(w io.Writer, payload []byte, st *connState) {
 		return
 	}
 
+	// Serialize against concurrent PROMOTE/REPLICAOF/STEPDOWN on this same
+	// database: without this, two concurrent admin connections could both
+	// observe StateUndefined below and both proceed into conflicting
+	// transitions.
+	st.db.LockAdmin()
+	defer st.db.UnlockAdmin()
+
 	// VALID ONLY IF UNDEFINED
 	if st.db.GetState() != store.StateUndefined {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte("Must be in UNDEFINED state to call REPLICAOF"))
@@ -1084,6 +1124,11 @@ func (s *Server) handleReplicaOf(w io.Writer, payload []byte, st *connState) {
 }
 
 func (s *Server) handlePromote(w io.Writer, payload []byte, st *connState) {
+	// Serialize against concurrent PROMOTE/REPLICAOF/STEPDOWN on this same
+	// database (see handleReplicaOf for the full rationale).
+	st.db.LockAdmin()
+	defer st.db.UnlockAdmin()
+
 	currentState := st.db.GetState()
 
 	// Consolidated check for consistency with REPLICAOF message style
@@ -1118,6 +1163,11 @@ func (s *Server) handlePromote(w io.Writer, payload []byte, st *connState) {
 }
 
 func (s *Server) handleStepDown(w io.Writer, st *connState) {
+	// Serialize against concurrent PROMOTE/REPLICAOF/STEPDOWN on this same
+	// database (see handleReplicaOf for the full rationale).
+	st.db.LockAdmin()
+	defer st.db.UnlockAdmin()
+
 	// Only allow StepDown if actively running as Primary or Replica
 	currentState := st.db.GetState()
 	if currentState != store.StatePrimary && currentState != store.StateReplica {
@@ -1142,7 +1192,15 @@ func (s *Server) handleStepDown(w io.Writer, st *connState) {
 		// State 2: Drain ACTIVE transactions
 		st.logger.Info("Waiting for active transactions to drain...", "db", st.dbName)
 		if err := st.db.WaitForActiveTransactions(5 * time.Second); err != nil {
-			st.logger.Warn("Timeout waiting for active transactions", "err", err)
+			// A straggler that's still active at this point must not be
+			// allowed to commit locally after we go on to broadcast the
+			// final safe-point and reset replicas below -- that write
+			// would never reach any replica (or a future primary) and
+			// would silently vanish on failover. Force-abort it instead
+			// of just warning and proceeding as if the drain had
+			// succeeded.
+			st.logger.Warn("Timeout waiting for active transactions, force-aborting stragglers", "err", err)
+			st.db.AbortAllActiveWriteTransactions()
 		}
 
 		// State 3: Propagate changes to Replicas
@@ -1288,8 +1346,11 @@ func (s *Server) handleStat(w io.Writer, st *connState) {
 }
 
 func (s *Server) CloseAll() {
-	if s.listener != nil {
-		_ = s.listener.Close()
+	s.listenerMu.Lock()
+	l := s.listener
+	s.listenerMu.Unlock()
+	if l != nil {
+		_ = l.Close()
 	}
 	for _, store := range s.stores {
 		_ = store.Close()

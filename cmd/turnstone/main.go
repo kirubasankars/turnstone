@@ -91,6 +91,10 @@ func runServer(logger *slog.Logger, devMode bool) {
 		logger.Error("Failed to parse config file", "err", err)
 		os.Exit(1)
 	}
+	if err := config.ValidateConfig(cfg); err != nil {
+		logger.Error("Invalid configuration", "err", err)
+		os.Exit(1)
+	}
 
 	if cfg.Debug {
 		logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))

@@ -53,6 +53,22 @@ func ValidateSecurityConfig(cfg Config) error {
 	return nil
 }
 
+// ValidateConfig sanity-checks user-supplied config values that would
+// otherwise be accepted silently and then misbehave downstream. In
+// particular, MaxDiskUsagePercent is compared directly against a 0-100
+// disk-usage percentage (stonedb.DB.runDiskMonitor); only 0 is special
+// (disables the monitor entirely) -- anything negative silently disables
+// the monitor too (since the "is it positive" gate never passes), and
+// anything above 100 makes the "usage > limit" comparison permanently
+// false, silently turning off the disk-full write guard instead of the
+// hard startup failure an obviously-wrong value should produce.
+func ValidateConfig(cfg Config) error {
+	if cfg.MaxDiskUsagePercent < 0 || cfg.MaxDiskUsagePercent > 100 {
+		return fmt.Errorf("max_disk_usage_percent must be between 0 and 100 (0 disables the check), got %d", cfg.MaxDiskUsagePercent)
+	}
+	return nil
+}
+
 // GenerateConfigArtifacts creates a sample directory structure and certificates.
 func GenerateConfigArtifacts(homeDir string, defaultCfg Config, configPath string, extraHosts ...string) error {
 	if err := os.MkdirAll(homeDir, 0o755); err != nil {
@@ -119,9 +135,14 @@ func GenerateConfigArtifacts(homeDir string, defaultCfg Config, configPath strin
 }
 
 func generateCerts(outDir string, extraHosts []string) error {
-	writePEM := func(filename, typeStr string, bytes []byte) error {
+	// perm is explicit per-file: certificates are public and stay at the
+	// usual 0644, but private keys must not be group/world-readable.
+	// os.Create() always opens at 0666 (masked by umask), which on a
+	// typical 022 umask yields 0644 for keys too -- letting any other
+	// local user/process read the mTLS private keys these files hold.
+	writePEM := func(filename, typeStr string, bytes []byte, perm os.FileMode) error {
 		path := filepath.Join(outDir, filename)
-		f, err := os.Create(path)
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, perm)
 		if err != nil {
 			return err
 		}
@@ -147,7 +168,7 @@ func generateCerts(outDir string, extraHosts []string) error {
 	if err != nil {
 		return err
 	}
-	if err := writePEM("ca.crt", "CERTIFICATE", caBytes); err != nil {
+	if err := writePEM("ca.crt", "CERTIFICATE", caBytes, 0o644); err != nil {
 		return err
 	}
 
@@ -181,10 +202,10 @@ func generateCerts(outDir string, extraHosts []string) error {
 		if err != nil {
 			return err
 		}
-		if err := writePEM(role+".crt", "CERTIFICATE", b); err != nil {
+		if err := writePEM(role+".crt", "CERTIFICATE", b, 0o644); err != nil {
 			return err
 		}
-		return writePEM(role+".key", "RSA PRIVATE KEY", x509.MarshalPKCS1PrivateKey(priv))
+		return writePEM(role+".key", "RSA PRIVATE KEY", x509.MarshalPKCS1PrivateKey(priv), 0o600)
 	}
 
 	// Always include localhost + any extra hosts provided via CLI

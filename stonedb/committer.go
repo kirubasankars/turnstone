@@ -24,8 +24,9 @@ func (db *DB) processCommitBatch(requests []commitRequest) {
 	}
 
 	type outcome struct {
-		tx  *Transaction
-		err error
+		tx      *Transaction
+		err     error
+		claimed bool // true if this tx won tx.claimDecision() in this batch
 	}
 	var outcomes []outcome
 
@@ -35,19 +36,19 @@ func (db *DB) processCommitBatch(requests []commitRequest) {
 
 		if testingProcessCommitBatchErr != nil {
 			for _, req := range requests {
-				outcomes = append(outcomes, outcome{req.tx, testingProcessCommitBatchErr})
+				outcomes = append(outcomes, outcome{req.tx, testingProcessCommitBatchErr, false})
 			}
 			return
 		}
-		if db.isDiskFull == 1 {
+		if atomic.LoadInt32(&db.isDiskFull) == 1 {
 			for _, req := range requests {
-				outcomes = append(outcomes, outcome{req.tx, ErrDiskFull})
+				outcomes = append(outcomes, outcome{req.tx, ErrDiskFull, false})
 			}
 			return
 		}
 		if atomic.LoadInt32(&db.isCorrupt) == 1 {
 			for _, req := range requests {
-				outcomes = append(outcomes, outcome{req.tx, errors.New("database is corrupt")})
+				outcomes = append(outcomes, outcome{req.tx, errors.New("database is corrupt"), false})
 			}
 			return
 		}
@@ -60,7 +61,18 @@ func (db *DB) processCommitBatch(requests []commitRequest) {
 			tx := req.tx
 			if err := tx.checkReadSetConflicts(); err != nil {
 				atomic.AddUint64(&db.metricsConflicts, 1)
-				outcomes = append(outcomes, outcome{tx, err})
+				outcomes = append(outcomes, outcome{tx, err, false})
+				continue
+			}
+			// Claim the sole right to decide this xid's outcome before
+			// committing it. If this fails, the liveness reaper already
+			// claimed and durably aborted this xid (e.g. it timed out
+			// while queued here) -- we must not also commit it, which
+			// would produce both an ABORT and a COMMIT record for the same
+			// xid. Report the same error the client would have seen had it
+			// discarded the transaction itself.
+			if !tx.claimDecision() {
+				outcomes = append(outcomes, outcome{tx, ErrWriteConflict, false})
 				continue
 			}
 			valid = append(valid, tx)
@@ -79,8 +91,15 @@ func (db *DB) processCommitBatch(requests []commitRequest) {
 		if err != nil {
 			atomic.StoreInt32(&db.isCorrupt, 1)
 			db.logger.Error("CRITICAL: WAL commit-group fsync failed. Database entering CORRUPT state.", "err", err)
+			// Nothing was made durable, so it's safe to just release these
+			// transactions' in-memory bookkeeping. We deliberately do not
+			// route them through abortTransaction: they already won
+			// claimDecision above (so a second attempt to claim it there
+			// would just no-op and leak their locks), and WAL writes are
+			// already known to be failing here, so trying to append an
+			// ABORT record would only fail again.
 			for _, tx := range valid {
-				outcomes = append(outcomes, outcome{tx, err})
+				outcomes = append(outcomes, outcome{tx, err, true})
 			}
 			return
 		}
@@ -117,7 +136,7 @@ func (db *DB) processCommitBatch(requests []commitRequest) {
 		}
 
 		for _, tx := range valid {
-			outcomes = append(outcomes, outcome{tx, nil})
+			outcomes = append(outcomes, outcome{tx, nil, true})
 		}
 
 		duration := time.Since(start)
@@ -129,11 +148,17 @@ func (db *DB) processCommitBatch(requests []commitRequest) {
 	// Release locks / write ABORT records for failed transactions, and
 	// release locks for committed ones, outside commitMu.
 	for _, o := range outcomes {
-		if o.err != nil {
+		switch {
+		case o.err == nil:
+			db.releaseCommittedLocks(o.tx)
+		case o.claimed:
+			// Already durably resolved (or a WAL failure already left
+			// nothing durable to protect) as part of this batch; just drop
+			// the in-memory bookkeeping without another WAL/clog attempt.
+			db.forceReleaseLocks(o.tx)
+		default:
 			o.tx.markAborted()
 			db.abortTransaction(o.tx)
-		} else {
-			db.releaseCommittedLocks(o.tx)
 		}
 	}
 
@@ -149,6 +174,24 @@ func (db *DB) processCommitBatch(requests []commitRequest) {
 // releaseCommittedLocks drops a committed transaction's key locks and
 // bookkeeping (mirrors abortTransaction's cleanup, minus the ABORT record).
 func (db *DB) releaseCommittedLocks(tx *Transaction) {
+	db.txMu.Lock()
+	delete(db.activeXids, tx.xid)
+	delete(db.beginOpIDs, tx.xid)
+	delete(db.txStartTimes, tx.xid)
+	for k := range tx.keyLocks {
+		if owner, ok := db.keyLocks[k]; ok && owner == tx.xid {
+			delete(db.keyLocks, k)
+		}
+	}
+	db.txMu.Unlock()
+}
+
+// forceReleaseLocks drops tx's key locks and bookkeeping without attempting
+// any further WAL/clog write. Used only for transactions that already won
+// tx.claimDecision() as part of a commit batch that then failed at the WAL
+// level (nothing was made durable, and the WAL is already known to be
+// failing, so a follow-up ABORT append would only fail again).
+func (db *DB) forceReleaseLocks(tx *Transaction) {
 	db.txMu.Lock()
 	delete(db.activeXids, tx.xid)
 	delete(db.beginOpIDs, tx.xid)
