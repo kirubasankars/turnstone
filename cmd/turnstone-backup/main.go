@@ -159,6 +159,26 @@ func runBackup(ctx context.Context) error {
 	count := 0
 	start := time.Now()
 
+	// The backup connection sees the physical WAL stream (BEGIN/SET/DEL/COMMIT/ABORT
+	// as written, uncommitted included). Buffer SET/DEL per xid and only flush them
+	// to the backup file once we observe that xid's COMMIT record; drop them on ABORT.
+	// This keeps the flat backup file format (used by turnstone-restore) containing
+	// only ever-committed data, matching the pre-eager-write backup contract.
+	type pendingEntry struct {
+		key, val []byte
+		isDelete bool
+	}
+	pending := make(map[uint64][]pendingEntry)
+	// pendingBeginOpID tracks the BEGIN opID of every xid that is still open
+	// (buffered, not yet committed/aborted). It bounds how far we can safely
+	// claim to have captured: any transaction opened before we stopped but
+	// not yet resolved means its SET/DEL records were never written to the
+	// backup, so a future replica resuming from our reported resume point
+	// must still see them again -- resuming any later would silently lose
+	// that transaction's writes if it eventually commits.
+	pendingBeginOpID := make(map[uint64]uint64)
+	var maxXidSeen, maxOpIDSeen uint64
+
 	// TIMEOUT STRATEGY:
 	// We only extend the deadline when we receive actual DATA (Snapshot or Batch).
 	// Metadata (Timeline, SafePoint) does not extend the deadline.
@@ -192,9 +212,9 @@ func runBackup(ctx context.Context) error {
 		}
 
 		// Verify CRC for data-heavy packets
-		if opCode == protocol.OpCodeReplSnapshot || opCode == protocol.OpCodeReplSnapshotDone || 
-		   opCode == protocol.OpCodeReplTimeline || opCode == protocol.OpCodeReplBatch || 
-		   opCode == protocol.OpCodeReplSafePoint {
+		if opCode == protocol.OpCodeReplSnapshot || opCode == protocol.OpCodeReplSnapshotDone ||
+			opCode == protocol.OpCodeReplTimeline || opCode == protocol.OpCodeReplBatch ||
+			opCode == protocol.OpCodeReplSafePoint {
 			if len(payload) < 4 {
 				return fmt.Errorf("payload too short for CRC")
 			}
@@ -227,7 +247,7 @@ func runBackup(ctx context.Context) error {
 			cursor := 0
 			nLen := int(binary.BigEndian.Uint32(payload[cursor : cursor+4]))
 			cursor += 4 + nLen + 4
-			
+
 			snapshotData := bytes.NewReader(payload[cursor:])
 			for snapshotData.Len() > 0 {
 				if err := writeEntry(snapshotData, outputWriter, 0); err != nil {
@@ -247,6 +267,7 @@ func runBackup(ctx context.Context) error {
 			if cursor+16 <= len(payload) {
 				meta.SnapshotTxID = binary.BigEndian.Uint64(payload[cursor:])
 				meta.SnapshotOpID = binary.BigEndian.Uint64(payload[cursor+8:])
+				maxXidSeen, maxOpIDSeen = meta.SnapshotTxID, meta.SnapshotOpID
 			}
 			log.Printf("\nSnapshot Complete. TxID: %d, OpID: %d", meta.SnapshotTxID, meta.SnapshotOpID)
 
@@ -255,58 +276,87 @@ func runBackup(ctx context.Context) error {
 			cursor := 0
 			nLen := int(binary.BigEndian.Uint32(payload[cursor : cursor+4]))
 			cursor += 4 + nLen
-			
-			if cursor+4 > len(payload) { return fmt.Errorf("bad batch count") }
+
+			if cursor+4 > len(payload) {
+				return fmt.Errorf("bad batch count")
+			}
 			entryCount := binary.BigEndian.Uint32(payload[cursor : cursor+4])
 			cursor += 4
-			
+
 			for i := 0; i < int(entryCount); i++ {
-				if cursor+17 > len(payload) { return fmt.Errorf("bad entry header") }
+				if cursor+17 > len(payload) {
+					return fmt.Errorf("bad entry header")
+				}
 				opID := binary.BigEndian.Uint64(payload[cursor:])
 				txID := binary.BigEndian.Uint64(payload[cursor+8:])
 				opType := payload[cursor+16]
 				cursor += 17
-				
-				meta.SnapshotTxID = txID 
-				meta.SnapshotOpID = opID 
 
 				// Key
-				if cursor+4 > len(payload) { return fmt.Errorf("bad entry klen") }
+				if cursor+4 > len(payload) {
+					return fmt.Errorf("bad entry klen")
+				}
 				kLen := binary.BigEndian.Uint32(payload[cursor:])
 				cursor += 4
-				if cursor+int(kLen) > len(payload) { return fmt.Errorf("bad entry key") }
-				key := payload[cursor:cursor+int(kLen)]
+				if cursor+int(kLen) > len(payload) {
+					return fmt.Errorf("bad entry key")
+				}
+				key := payload[cursor : cursor+int(kLen)]
 				cursor += int(kLen)
-				
+
 				// Value
-				if cursor+4 > len(payload) { return fmt.Errorf("bad entry vlen") }
+				if cursor+4 > len(payload) {
+					return fmt.Errorf("bad entry vlen")
+				}
 				vLen := binary.BigEndian.Uint32(payload[cursor:])
 				cursor += 4
-				if cursor+int(vLen) > len(payload) { return fmt.Errorf("bad entry val") }
-				val := payload[cursor:cursor+int(vLen)]
+				if cursor+int(vLen) > len(payload) {
+					return fmt.Errorf("bad entry val")
+				}
+				val := payload[cursor : cursor+int(vLen)]
 				cursor += int(vLen)
-				
-				if opType == protocol.OpJournalCommit {
-					continue
+
+				if opID > maxOpIDSeen {
+					maxOpIDSeen = opID
+				}
+				if txID > maxXidSeen {
+					maxXidSeen = txID
 				}
 
-				storageType := byte(0)
-				if opType == protocol.OpJournalDelete {
-					storageType = 1
+				switch opType {
+				case protocol.OpJournalBegin:
+					pendingBeginOpID[txID] = opID
+				case protocol.OpJournalSet, protocol.OpJournalDelete:
+					entry := pendingEntry{
+						key:      append([]byte(nil), key...),
+						val:      append([]byte(nil), val...),
+						isDelete: opType == protocol.OpJournalDelete,
+					}
+					pending[txID] = append(pending[txID], entry)
+				case protocol.OpJournalAbort:
+					delete(pending, txID)
+					delete(pendingBeginOpID, txID)
+				case protocol.OpJournalCommit:
+					for _, e := range pending[txID] {
+						storageType := byte(0)
+						if e.isDelete {
+							storageType = 1
+						}
+						kLenBuf := make([]byte, 4)
+						binary.BigEndian.PutUint32(kLenBuf, uint32(len(e.key)))
+						vLenBuf := make([]byte, 4)
+						binary.BigEndian.PutUint32(vLenBuf, uint32(len(e.val)))
+
+						outputWriter.Write(kLenBuf)
+						outputWriter.Write(e.key)
+						outputWriter.Write(vLenBuf)
+						outputWriter.Write(e.val)
+						outputWriter.Write([]byte{storageType})
+						count++
+					}
+					delete(pending, txID)
+					delete(pendingBeginOpID, txID)
 				}
-				
-				kLenBuf := make([]byte, 4)
-				binary.BigEndian.PutUint32(kLenBuf, kLen)
-				vLenBuf := make([]byte, 4)
-				binary.BigEndian.PutUint32(vLenBuf, vLen)
-				
-				outputWriter.Write(kLenBuf)
-				outputWriter.Write(key)
-				outputWriter.Write(vLenBuf)
-				outputWriter.Write(val)
-				outputWriter.Write([]byte{storageType})
-				
-				count++
 			}
 			if count%1000 == 0 {
 				fmt.Printf("\rProcessed items: %d", count)
@@ -322,7 +372,31 @@ func runBackup(ctx context.Context) error {
 			return fmt.Errorf("gzip close: %w", err)
 		}
 	}
-	
+
+	// Compute the safe resume point: if any transaction is still open
+	// (BEGIN seen, no COMMIT/ABORT yet), we must report a resume position
+	// strictly before its BEGIN, since its writes are not in this backup.
+	// Otherwise everything through the latest record we saw is captured.
+	safeResumeOpID := maxOpIDSeen
+	if len(pendingBeginOpID) > 0 {
+		var minBegin uint64
+		first := true
+		for _, op := range pendingBeginOpID {
+			if first || op < minBegin {
+				minBegin = op
+				first = false
+			}
+		}
+		if minBegin > 0 {
+			safeResumeOpID = minBegin - 1
+		} else {
+			safeResumeOpID = 0
+		}
+		log.Printf("Warning: %d transaction(s) still open at end of backup; resume point capped before their BEGIN (opID %d)", len(pendingBeginOpID), minBegin)
+	}
+	meta.SnapshotOpID = safeResumeOpID
+	meta.SnapshotTxID = maxXidSeen
+
 	meta.SHA256 = hex.EncodeToString(fileHasher.Sum(nil))
 
 	metaBytes, _ := json.MarshalIndent(meta, "", "  ")
@@ -333,7 +407,7 @@ func runBackup(ctx context.Context) error {
 	log.Printf("\nBackup successful in %v!", time.Since(start))
 	log.Printf("Location: %s", fPath)
 	log.Printf("Checksum: %s", meta.SHA256)
-	
+
 	sendQuit(conn)
 	return nil
 }
@@ -341,17 +415,25 @@ func runBackup(ctx context.Context) error {
 // Helper to read fields from snapshot stream and write to disk
 func writeEntry(r io.Reader, w io.Writer, typeByte byte) error {
 	lenBuf := make([]byte, 4)
-	if _, err := io.ReadFull(r, lenBuf); err != nil { return err }
+	if _, err := io.ReadFull(r, lenBuf); err != nil {
+		return err
+	}
 	kLen := binary.BigEndian.Uint32(lenBuf)
-	
-	key := make([]byte, kLen)
-	if _, err := io.ReadFull(r, key); err != nil { return err }
 
-	if _, err := io.ReadFull(r, lenBuf); err != nil { return err }
+	key := make([]byte, kLen)
+	if _, err := io.ReadFull(r, key); err != nil {
+		return err
+	}
+
+	if _, err := io.ReadFull(r, lenBuf); err != nil {
+		return err
+	}
 	vLen := binary.BigEndian.Uint32(lenBuf)
 
 	val := make([]byte, vLen)
-	if _, err := io.ReadFull(r, val); err != nil { return err }
+	if _, err := io.ReadFull(r, val); err != nil {
+		return err
+	}
 
 	w.Write(makeKLen(kLen))
 	w.Write(key)

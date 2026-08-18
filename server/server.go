@@ -267,6 +267,24 @@ func (s *Server) killDBConnections(db string) {
 	}
 }
 
+// snapshotDBConnections returns the connections currently registered for db,
+// without removing them from tracking. Used to capture "who to disconnect"
+// at call time for a delayed kill, so a later-joining connection for the
+// same dbName isn't caught by a stale scheduled cleanup.
+func (s *Server) snapshotDBConnections(db string) []net.Conn {
+	s.activeClientsMu.Lock()
+	defer s.activeClientsMu.Unlock()
+	m, ok := s.activeClients[db]
+	if !ok {
+		return nil
+	}
+	conns := make([]net.Conn, 0, len(m))
+	for conn := range m {
+		conns = append(conns, conn)
+	}
+	return conns
+}
+
 // connState is shared with replication.go
 type connState struct {
 	dbName      string
@@ -422,8 +440,6 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 			return
 		}
 
-		_ = conn.SetWriteDeadline(time.Now().Add(protocol.DefaultWriteTimeout))
-
 		if s.dispatchCommand(conn, r, opCode, payload, state) {
 			return
 		}
@@ -541,6 +557,12 @@ func (s *Server) isOpAllowed(role string, opCode uint8) bool {
 }
 
 func (s *Server) writeBinaryResponse(w io.Writer, status byte, body []byte) error {
+	// Set the write deadline immediately before writing (not before the handler
+	// runs) so slow-but-legitimate handlers (e.g. REPLICAOF's network handshake)
+	// don't have their response silently dropped by an expired deadline.
+	if conn, ok := w.(net.Conn); ok {
+		_ = conn.SetWriteDeadline(time.Now().Add(protocol.DefaultWriteTimeout))
+	}
 	header := make([]byte, protocol.ProtoHeaderSize)
 	header[0] = status
 	binary.BigEndian.PutUint32(header[1:], uint32(len(body)))
@@ -596,8 +618,12 @@ func (s *Server) handleBegin(w io.Writer, st *connState) {
 		return
 	}
 
-	// Start a read-write transaction and record start time
-	st.tx = st.db.NewTransaction(true)
+	// Only a Primary connection actually needs a writable (xid-bearing)
+	// transaction that logs a BEGIN record; a Replica's transaction is
+	// read-only (it can never SET/DEL, enforced separately below) and must
+	// not consume an xid or write to the WAL.
+	update := state == store.StatePrimary
+	st.tx = st.db.NewTransaction(update)
 	st.txStartTime = time.Now()
 	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
 }
@@ -674,13 +700,16 @@ func (s *Server) handleGet(w io.Writer, payload []byte, st *connState) {
 	}
 
 	val, err := st.tx.Get([]byte(key))
-	if err == stonedb.ErrKeyNotFound {
+	switch err {
+	case nil:
+		_ = s.writeBinaryResponse(w, protocol.ResStatusOK, val)
+	case stonedb.ErrKeyNotFound:
 		_ = s.writeBinaryResponse(w, protocol.ResStatusNotFound, nil)
-	} else if err != nil {
+	case stonedb.ErrWriteConflict:
+		_ = s.writeBinaryResponse(w, protocol.ResStatusTxConflict, []byte(err.Error()))
+	default:
 		st.logger.Error("Get operation failed", "key", key, "err", err)
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte(err.Error()))
-	} else {
-		_ = s.writeBinaryResponse(w, protocol.ResStatusOK, val)
 	}
 }
 
@@ -730,10 +759,27 @@ func (s *Server) handleSet(w io.Writer, payload []byte, st *connState) {
 	}
 
 	if err := st.tx.Put(key, val); err != nil {
-		st.logger.Error("Set operation failed", "key", keyStr, "err", err)
-		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte(err.Error()))
+		s.writeWriteError(w, st, "Set", keyStr, err)
 	} else {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
+	}
+}
+
+// writeWriteError maps a Put/Delete error to the appropriate wire status.
+// stonedb.ErrWriteConflict now surfaces directly from SET/DEL (first-writer-wins
+// happens eagerly, not just at COMMIT), matching Postgres's "current transaction
+// is aborted" behavior for subsequent ops on the same connection.
+func (s *Server) writeWriteError(w io.Writer, st *connState, op, key string, err error) {
+	switch err {
+	case stonedb.ErrWriteConflict:
+		st.logger.Debug(op+" operation conflict", "key", key)
+		_ = s.writeBinaryResponse(w, protocol.ResStatusTxConflict, []byte(err.Error()))
+	case stonedb.ErrDiskFull:
+		st.logger.Error(op + " failed: Disk Full")
+		_ = s.writeBinaryResponse(w, protocol.ResStatusServerBusy, []byte("ERR disk is full"))
+	default:
+		st.logger.Error(op+" operation failed", "key", key, "err", err)
+		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte(err.Error()))
 	}
 }
 
@@ -765,14 +811,12 @@ func (s *Server) handleDel(w io.Writer, payload []byte, st *connState) {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusNotFound, nil)
 		return
 	} else if err != nil {
-		st.logger.Error("Del existence check failed", "key", key, "err", err)
-		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte(err.Error()))
+		s.writeWriteError(w, st, "Del existence check", key, err)
 		return
 	}
 
 	if err := st.tx.Delete([]byte(key)); err != nil {
-		st.logger.Error("Del operation failed", "key", key, "err", err)
-		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte(err.Error()))
+		s.writeWriteError(w, st, "Del", key, err)
 	} else {
 		_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
 	}
@@ -835,6 +879,9 @@ func (s *Server) handleMGet(w io.Writer, payload []byte, st *connState) {
 		val, err := st.tx.Get(key)
 		if err == stonedb.ErrKeyNotFound {
 			binary.Write(respBuf, binary.BigEndian, uint32(0xFFFFFFFF))
+		} else if err == stonedb.ErrWriteConflict {
+			_ = s.writeBinaryResponse(w, protocol.ResStatusTxConflict, []byte(err.Error()))
+			return
 		} else if err != nil {
 			st.logger.Error("MGet operation failed", "key", keyStr, "err", err)
 			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte(err.Error()))
@@ -914,8 +961,7 @@ func (s *Server) handleMSet(w io.Writer, payload []byte, st *connState) {
 		}
 
 		if err := st.tx.Put(key, val); err != nil {
-			st.logger.Error("MSet operation failed", "key", keyStr, "err", err)
-			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte(err.Error()))
+			s.writeWriteError(w, st, "MSet", keyStr, err)
 			return
 		}
 	}
@@ -967,11 +1013,14 @@ func (s *Server) handleMDel(w io.Writer, payload []byte, st *connState) {
 		}
 
 		_, err := st.tx.Get(key)
+		if err == stonedb.ErrWriteConflict {
+			_ = s.writeBinaryResponse(w, protocol.ResStatusTxConflict, []byte(err.Error()))
+			return
+		}
 		exists := err == nil
 
 		if err := st.tx.Delete(key); err != nil {
-			st.logger.Error("MDel operation failed", "key", keyStr, "err", err)
-			_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte(err.Error()))
+			s.writeWriteError(w, st, "MDel", keyStr, err)
 			return
 		}
 
@@ -1116,11 +1165,19 @@ func (s *Server) handleStepDown(w io.Writer, st *connState) {
 		st.db.SetState(store.StateUndefined)
 	}
 
-	// Disconnect ALL clients (including self/current connection)
-	go func(dbName string) {
+	// Disconnect ALL clients (including self/current connection). Snapshot the
+	// connection set now rather than re-querying it after the delay below: a
+	// new admin/client connection may join this dbName in the intervening
+	// window (e.g. a subsequent StepDown/Promote cycle), and a stale delayed
+	// kill must not reach forward in time and sever a connection that had
+	// nothing to do with this StepDown call.
+	connsToKill := s.snapshotDBConnections(st.dbName)
+	go func(conns []net.Conn) {
 		time.Sleep(20 * time.Millisecond) // Attempt to flush OK response
-		s.killDBConnections(dbName)
-	}(st.dbName)
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	}(connsToKill)
 
 	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, nil)
 }

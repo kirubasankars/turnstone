@@ -87,6 +87,7 @@ func startServerNode(t *testing.T, baseDir, name string, sharedTLS *tls.Config) 
 		filepath.Join(certsDir, "server.key"),
 		filepath.Join(certsDir, "ca.crt"),
 		rm,
+		false,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -356,6 +357,12 @@ func TestReplication_Cascading_Rejected(t *testing.T) {
 
 	adminC.AssertStatus(protocol.OpCodeReplicaOf, payload, protocol.ResStatusErr)
 
+	// C's DB stayed UNDEFINED (the rejected REPLICAOF call reverts state),
+	// which does not accept transactions. Promote it standalone so we can
+	// read from it to confirm no data cascaded in; this doesn't affect the
+	// cascading-rejection assertion above, which already ran against B.
+	promoteNode(t, baseDir, addrC, "1")
+
 	// Write to A (Database 1)
 	writeKeyVal(t, clientA, "cascadeKey", "cascadeVal")
 
@@ -553,6 +560,12 @@ func TestReplication_FullSync_Integration(t *testing.T) {
 		t.Fatalf("Promote failed: %v", err)
 	}
 
+	// StepDown disconnects all connections on this db (including
+	// clientPrimary); reconnect before issuing further commands.
+	clientPrimary.Close()
+	clientPrimary = connectClient(t, primaryAddr, clientTLS)
+	selectDatabase(t, clientPrimary, "1")
+
 	// Purge WAL.
 	// We purge up to currentOpID + 1 to ensure the old log file is eligible.
 	currentOpID := st1.DB.LastOpID()
@@ -681,6 +694,12 @@ func TestReplication_TimelineFork_Recovery(t *testing.T) {
 		t.Fatalf("Primary promote failed: %v", err)
 	}
 
+	// StepDown disconnects all connections on this db (including
+	// clientPrimary); reconnect before issuing further commands.
+	clientPrimary.Close()
+	clientPrimary = connectClient(t, primaryAddr, clientTLS)
+	selectDatabase(t, clientPrimary, "1")
+
 	// 5. Write on Timeline 2
 	writeKeyVal(t, clientPrimary, "t2_key", "val2")
 
@@ -735,6 +754,7 @@ func startServerNodeWithReplicas(t *testing.T, baseDir, name string, sharedTLS *
 		filepath.Join(certsDir, "server.key"),
 		filepath.Join(certsDir, "ca.crt"),
 		rm,
+		false,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -815,10 +835,10 @@ func TestReplication_KeyCount_SyncAndAsync(t *testing.T) {
 }
 
 func TestReplication_Retention_LeaderProtectsSlowFollower(t *testing.T) {
-	// Force tiny WAL files (1KB) so we generate multiple files quickly
-	os.Setenv("TS_TEST_WAL_SIZE", "1024")
-	defer os.Unsetenv("TS_TEST_WAL_SIZE")
-
+	// WAL rotation is checkpoint-driven (no more size-based auto-rotation),
+	// so multiple WAL files are generated below via periodic explicit
+	// Checkpoint() calls interleaved with writes, rather than a tiny
+	// size threshold.
 	baseDir, clientTLS := setupSharedCertEnv(t)
 	adminTLS := getRoleTLS(t, baseDir, "admin")
 
@@ -847,8 +867,16 @@ func TestReplication_Retention_LeaderProtectsSlowFollower(t *testing.T) {
 	defer clientLeader.Close()
 	selectDatabase(t, clientLeader, "1")
 
+	leaderStore1 := leaderSrv.stores["1"]
 	for i := 0; i < 100; i++ {
 		writeKeyVal(t, clientLeader, fmt.Sprintf("k%d", i), "val")
+		// Rotation is checkpoint-driven; force a new WAL file every few
+		// writes so this test actually exercises multi-file retention.
+		if i%10 == 9 {
+			if err := leaderStore1.DB.Checkpoint(); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 
 	// 4. Wait for sync
@@ -874,10 +902,15 @@ func TestReplication_Retention_LeaderProtectsSlowFollower(t *testing.T) {
 	// 6. Write MORE data to Leader (Another 100 entries -> ~5 more WAL files)
 	for i := 100; i < 200; i++ {
 		writeKeyVal(t, clientLeader, fmt.Sprintf("k%d", i), "val")
+		if i%10 == 9 {
+			if err := leaderStore1.DB.Checkpoint(); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 
 	// 7. Force Checkpoint on Leader (Enables purging of old WALs if no replicas needed them)
-	st1 := leaderSrv.stores["1"]
+	st1 := leaderStore1
 	if err := st1.DB.Checkpoint(); err != nil {
 		t.Fatal(err)
 	}
@@ -915,10 +948,9 @@ func TestReplication_Retention_LeaderProtectsSlowFollower(t *testing.T) {
 }
 
 func TestReplication_Retention_FollowerRespectsLeaderSafePoint(t *testing.T) {
-	// Force tiny WAL files
-	os.Setenv("TS_TEST_WAL_SIZE", "1024")
-	defer os.Unsetenv("TS_TEST_WAL_SIZE")
-
+	// WAL rotation is checkpoint-driven (no more size-based auto-rotation);
+	// multiple WAL files are generated below via periodic explicit
+	// Checkpoint() calls on the follower as data streams in.
 	baseDir, clientTLS := setupSharedCertEnv(t)
 	adminTLS := getRoleTLS(t, baseDir, "admin")
 
@@ -954,19 +986,28 @@ func TestReplication_Retention_FollowerRespectsLeaderSafePoint(t *testing.T) {
 	defer clientLeader.Close()
 	selectDatabase(t, clientLeader, "1")
 
-	// 4. Write Batch 1 (0..100) -> Both Followers sync
-	for i := 0; i < 100; i++ {
-		writeKeyVal(t, clientLeader, fmt.Sprintf("k%d", i), "val")
-	}
-
-	// Wait for F1 to sync
 	clientF1 := connectClient(t, follower1Addr, clientTLS)
 	defer clientF1.Close()
 	selectDatabase(t, clientF1, "1")
-	waitForConditionOrTimeout(t, 5*time.Second, func() bool {
-		val := readKey(t, clientF1, "k99")
-		return string(val) == "val"
-	}, "F1 sync failed")
+
+	stF1 := follower1Srv.stores["1"]
+
+	// 4. Write Batch 1 (0..100) -> Both Followers sync.
+	// Checkpoint F1 periodically as data streams in so it actually
+	// accumulates multiple WAL files (rotation is checkpoint-driven).
+	for block := 0; block < 100; block += 10 {
+		for i := block; i < block+10; i++ {
+			writeKeyVal(t, clientLeader, fmt.Sprintf("k%d", i), "val")
+		}
+		lastKey := fmt.Sprintf("k%d", block+9)
+		waitForConditionOrTimeout(t, 5*time.Second, func() bool {
+			val := readKey(t, clientF1, lastKey)
+			return string(val) == "val"
+		}, "F1 sync failed")
+		if err := stF1.DB.Checkpoint(); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	// Wait for F2 to sync
 	clientF2 := connectClient(t, follower2Addr, clientTLS)
@@ -987,16 +1028,22 @@ func TestReplication_Retention_FollowerRespectsLeaderSafePoint(t *testing.T) {
 
 	cancelFollower2()
 
-	// 6. Write Batch 2 (100..200) -> F1 syncs, F2 is dead
-	for i := 100; i < 200; i++ {
-		writeKeyVal(t, clientLeader, fmt.Sprintf("k%d", i), "val")
+	// 6. Write Batch 2 (100..200) -> F1 syncs, F2 is dead.
+	// Keep checkpointing F1 periodically so batch 2 also spans multiple
+	// WAL files.
+	for block := 100; block < 200; block += 10 {
+		for i := block; i < block+10; i++ {
+			writeKeyVal(t, clientLeader, fmt.Sprintf("k%d", i), "val")
+		}
+		lastKey := fmt.Sprintf("k%d", block+9)
+		waitForConditionOrTimeout(t, 5*time.Second, func() bool {
+			val := readKey(t, clientF1, lastKey)
+			return string(val) == "val"
+		}, "F1 batch 2 sync failed")
+		if err := stF1.DB.Checkpoint(); err != nil {
+			t.Fatal(err)
+		}
 	}
-
-	// Verify F1 sync
-	waitForConditionOrTimeout(t, 5*time.Second, func() bool {
-		val := readKey(t, clientF1, "k199")
-		return string(val) == "val"
-	}, "F1 batch 2 sync failed")
 
 	// 7. Trigger Leader to broadcast SafePoint
 	// Leader sees F2 at ~100. Leader sends SafePoint(~100) to F1.
@@ -1005,7 +1052,6 @@ func TestReplication_Retention_FollowerRespectsLeaderSafePoint(t *testing.T) {
 
 	// 8. Force Checkpoint on F1
 	// This would normally allow F1 to delete logs 0..100 IF it had no constraints.
-	stF1 := follower1Srv.stores["1"]
 	if err := stF1.DB.Checkpoint(); err != nil {
 		t.Fatal(err)
 	}
