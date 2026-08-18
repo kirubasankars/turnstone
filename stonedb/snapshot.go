@@ -36,9 +36,12 @@ func (db *DB) StreamSnapshot(fn func(batch []SnapshotEntry) error) (uint64, uint
 	const maxBatchBytes = 1 * 1024 * 1024 // 1MB Batches
 
 	var lastLogicalKey []byte
+	resolvedForKey := false
 	itemCount := 0
 
-	// 4. Iterate keyspace
+	// 4. Iterate keyspace. Versions of a given key appear consecutively,
+	// newest-xid-first (see encodeIndexKey). Skip in-progress/aborted
+	// versions and take the first committed-and-visible one per key.
 	for iter.Next() {
 		idxKey := iter.Key()
 
@@ -48,16 +51,23 @@ func (db *DB) StreamSnapshot(fn func(batch []SnapshotEntry) error) (uint64, uint
 		}
 
 		// Decode Index Key
-		uKey, _, err := decodeIndexKey(idxKey)
+		uKey, xmin, err := decodeIndexKey(idxKey)
 		if err != nil {
 			continue
 		}
 
-		// Dedup
-		if bytes.Equal(uKey, lastLogicalKey) {
+		if !bytes.Equal(uKey, lastLogicalKey) {
+			lastLogicalKey = append([]byte(nil), uKey...)
+			resolvedForKey = false
+		}
+		if resolvedForKey {
 			continue
 		}
-		lastLogicalKey = append([]byte(nil), uKey...)
+
+		if !tx.db.isVisible(xmin, tx.snapshot) {
+			continue
+		}
+		resolvedForKey = true
 
 		// Decode Metadata
 		meta, err := decodeEntryMeta(iter.Value())

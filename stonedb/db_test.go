@@ -2,7 +2,6 @@ package stonedb
 
 import (
 	"bytes"
-	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -61,7 +60,7 @@ func TestDB_BasicCRUD(t *testing.T) {
 
 func TestDB_Promote_Integration(t *testing.T) {
 	dir := t.TempDir()
-	db, err := Open(dir, Options{MaxWALSize: 1024 * 1024})
+	db, err := Open(dir, Options{})
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -197,11 +196,14 @@ func TestDB_WriteConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// TxA tries to commit -> Should fail because it read old data
-	txA.Put(key, []byte("overwrite"))
-	err = txA.Commit()
-	if err != ErrWriteConflict {
-		t.Errorf("Expected ErrWriteConflict, got %v", err)
+	// TxA's write is a blind-write hazard now detected at Put time (first-writer-wins):
+	// txB already committed a newer version that txA's snapshot never saw.
+	if err := txA.Put(key, []byte("overwrite")); err != ErrWriteConflict {
+		t.Errorf("Expected ErrWriteConflict at Put, got %v", err)
+	}
+	// The transaction is now aborted; Commit must reflect that, not succeed.
+	if err := txA.Commit(); err != ErrWriteConflict {
+		t.Errorf("Expected ErrWriteConflict on Commit of aborted tx, got %v", err)
 	}
 }
 
@@ -289,9 +291,10 @@ func TestDB_Checkpoint_Empty(t *testing.T) {
 	}
 }
 
-// TestDB_ApplyBatch verifies that ApplyBatch correctly writes data to all subsystems
-// and advances the internal clocks without generating new IDs.
-func TestDB_ApplyBatch(t *testing.T) {
+// TestDB_ApplyRecord verifies that ApplyRecord correctly replays a
+// BEGIN/SET/SET/DELETE/COMMIT sequence, writing to all subsystems and
+// advancing the internal clocks, without reassigning xid/opID.
+func TestDB_ApplyRecord(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(dir, Options{})
 	if err != nil {
@@ -299,43 +302,27 @@ func TestDB_ApplyBatch(t *testing.T) {
 	}
 	defer db.Close()
 
-	// Simulate a batch from a leader or external source
-	// TxID: 100, StartOpID: 500
-	entries := []ValueLogEntry{
-		{
-			Key:           []byte("replica_k1"),
-			Value:         []byte("val1"),
-			TransactionID: 100,
-			OperationID:   500,
-			IsDelete:      false,
-		},
-		{
-			Key:           []byte("replica_k2"),
-			Value:         []byte("val2"),
-			TransactionID: 100,
-			OperationID:   501,
-			IsDelete:      false,
-		},
-		{
-			Key:           []byte("replica_k3"),
-			Value:         nil,
-			TransactionID: 100,
-			OperationID:   502,
-			IsDelete:      true, // Tombstone
-		},
+	// Simulate a physical replication stream from a leader.
+	const xid = uint64(100)
+	recs := []WALRecord{
+		{Type: WALRecordBegin, XID: xid, OpID: 500},
+		{Type: WALRecordSet, XID: xid, OpID: 501, Key: []byte("replica_k1"), Value: []byte("val1")},
+		{Type: WALRecordSet, XID: xid, OpID: 502, Key: []byte("replica_k2"), Value: []byte("val2")},
+		{Type: WALRecordDelete, XID: xid, OpID: 503, Key: []byte("replica_k3")},
+		{Type: WALRecordCommit, XID: xid, OpID: 504},
 	}
-
-	// Apply the batch
-	if err := db.ApplyBatch(entries); err != nil {
-		t.Fatalf("ApplyBatch failed: %v", err)
+	for _, r := range recs {
+		if err := db.ApplyRecord(r); err != nil {
+			t.Fatalf("ApplyRecord(type=%d) failed: %v", r.Type, err)
+		}
 	}
 
 	// 1. Verify Clocks advanced
-	if db.transactionID < 100 {
-		t.Errorf("TransactionID not advanced. Got %d, want >= 100", db.transactionID)
+	if db.transactionID < xid {
+		t.Errorf("TransactionID not advanced. Got %d, want >= %d", db.transactionID, xid)
 	}
-	if db.operationID < 502 {
-		t.Errorf("OperationID not advanced. Got %d, want >= 502", db.operationID)
+	if db.operationID < 504 {
+		t.Errorf("OperationID not advanced. Got %d, want >= 504", db.operationID)
 	}
 
 	// 2. Verify Data Visibility via Standard Get
@@ -360,9 +347,9 @@ func TestDB_ApplyBatch(t *testing.T) {
 	// 3. Verify WAL Persistence
 	// Scan from the beginning. We expect to find these entries.
 	foundWAL := false
-	err = db.ScanWAL(500, func(scanned []ValueLogEntry) error {
-		for _, e := range scanned {
-			if string(e.Key) == "replica_k1" && e.TransactionID == 100 {
+	err = db.ScanWAL(500, func(scanned []WALRecord) error {
+		for _, r := range scanned {
+			if r.Type == WALRecordSet && string(r.Key) == "replica_k1" && r.XID == xid {
 				foundWAL = true
 			}
 		}
@@ -372,14 +359,24 @@ func TestDB_ApplyBatch(t *testing.T) {
 		t.Errorf("ScanWAL failed: %v", err)
 	}
 	if !foundWAL {
-		t.Error("ApplyBatch data not found in WAL")
+		t.Error("Replicated record not found in WAL")
+	}
+
+	// 4. Verify key-count impact was accounted (2 new keys - k1, k2; k3 never
+	// existed so its delete contributes 0).
+	count, err := db.KeyCount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Errorf("Expected KeyCount 2 after replicated commit, got %d", count)
 	}
 }
 
 // TestVLog_AppendEntries verifies low-level VLog appending and reading.
 func TestVLog_AppendEntries(t *testing.T) {
 	dir := t.TempDir()
-	vl, err := OpenValueLog(dir, nil)
+	vl, err := OpenValueLog(dir, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -415,8 +412,8 @@ func TestVLog_AppendEntries(t *testing.T) {
 	}
 }
 
-// TestWAL_AppendBatch_Direct verifies low-level WAL appending.
-func TestWAL_AppendBatch_Direct(t *testing.T) {
+// TestWAL_AppendRecord_Direct verifies low-level WAL record appending.
+func TestWAL_AppendRecord_Direct(t *testing.T) {
 	dir := t.TempDir()
 	// Use OpenWriteAheadLog to get the default timeline 1
 	wal, err := OpenWriteAheadLog(dir, 1024*1024, 1, nil)
@@ -425,32 +422,20 @@ func TestWAL_AppendBatch_Direct(t *testing.T) {
 	}
 	defer wal.Close()
 
-	// Manually construct a batch payload
-	var walBuf bytes.Buffer
-	// Header: TxID(8) + StartOpID(8) + Count(4)
-	binary.Write(&walBuf, binary.BigEndian, uint64(999)) // TxID
-	binary.Write(&walBuf, binary.BigEndian, uint64(10))  // StartOpID
-	binary.Write(&walBuf, binary.BigEndian, uint32(1))   // Count
-
-	// Entry: KeyLen(4) + Key + ValLen(4) + Val + Type(1)
 	key := []byte("wal_test")
 	val := []byte("wal_val")
-	binary.Write(&walBuf, binary.BigEndian, uint32(len(key)))
-	walBuf.Write(key)
-	binary.Write(&walBuf, binary.BigEndian, uint32(len(val)))
-	walBuf.Write(val)
-	walBuf.WriteByte(0) // Not delete
+	payload := encodeWALRecord(WALRecord{Type: WALRecordSet, XID: 999, OpID: 10, Key: key, Value: val})
 
-	// Append directly
-	if err := wal.AppendBatch(walBuf.Bytes()); err != nil {
-		t.Fatalf("AppendBatch failed: %v", err)
+	// Append directly, as a replicated record would be.
+	if err := wal.AppendReplicatedRecord(payload, true); err != nil {
+		t.Fatalf("AppendReplicatedRecord failed: %v", err)
 	}
 
 	// Verify via Scan
 	found := false
-	err = wal.Scan(WALLocation{FileStartOffset: 0, RelativeOffset: 0}, func(entries []ValueLogEntry) error {
-		for _, e := range entries {
-			if e.TransactionID == 999 && string(e.Key) == "wal_test" {
+	err = wal.Scan(WALLocation{FileStartOffset: 0, RelativeOffset: 0}, func(recs []WALRecord) error {
+		for _, r := range recs {
+			if r.XID == 999 && string(r.Key) == "wal_test" {
 				found = true
 			}
 		}
@@ -460,7 +445,7 @@ func TestWAL_AppendBatch_Direct(t *testing.T) {
 		t.Errorf("WAL Scan failed: %v", err)
 	}
 	if !found {
-		t.Error("Did not find appended batch in WAL")
+		t.Error("Did not find appended record in WAL")
 	}
 }
 
@@ -585,7 +570,7 @@ func TestBackgroundChecksum_Coverage(t *testing.T) {
 func TestLocateWALStart_LevelDBFallback(t *testing.T) {
 	dir := t.TempDir()
 	// Small WAL size to force rotations
-	opts := Options{MaxWALSize: 1024}
+	opts := Options{}
 	db, err := Open(dir, opts)
 	if err != nil {
 		t.Fatal(err)
@@ -636,9 +621,9 @@ func TestLocateWALStart_LevelDBFallback(t *testing.T) {
 	}
 }
 
-// TestApplyBatch_StaleBytes_Miss covers the branch where keys in ApplyBatch
-// do not exist in the DB (staleBytes calculation yields nothing).
-func TestApplyBatch_StaleBytes_Miss(t *testing.T) {
+// TestApplyRecord_StaleBytes_Miss covers the branch where a replicated key
+// does not already exist in the DB (staleBytes calculation yields nothing).
+func TestApplyRecord_StaleBytes_Miss(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(dir, Options{})
 	if err != nil {
@@ -646,19 +631,17 @@ func TestApplyBatch_StaleBytes_Miss(t *testing.T) {
 	}
 	defer db.Close()
 
-	// ApplyBatch with a key that is NOT in the DB.
-	// This hits the `if iter.Seek(...)` but fails `bytes.Equal` or simply doesn't find it.
-	entries := []ValueLogEntry{
-		{
-			Key:           []byte("new_key"),
-			Value:         []byte("val"),
-			TransactionID: 1,
-			OperationID:   1,
-		},
+	// Replicate a BEGIN/SET/COMMIT for a key that is NOT in the DB.
+	// This shouldn't crash and shouldn't add to stale bytes.
+	recs := []WALRecord{
+		{Type: WALRecordBegin, XID: 1, OpID: 1},
+		{Type: WALRecordSet, XID: 1, OpID: 2, Key: []byte("new_key"), Value: []byte("val")},
+		{Type: WALRecordCommit, XID: 1, OpID: 3},
 	}
-	// This shouldn't crash and shouldn't add to stale bytes
-	if err := db.ApplyBatch(entries); err != nil {
-		t.Fatal(err)
+	for _, r := range recs {
+		if err := db.ApplyRecord(r); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -731,10 +714,10 @@ func TestDB_RunAutoCheckpoint(t *testing.T) {
 	}
 }
 
-// TestApplyBatch_CalculateStaleBytes verifies that applying a batch correctly detects
-// existing keys and counts them as garbage (stale bytes).
-// This exercises the `calculateStaleBytesSimple` logic.
-func TestApplyBatch_CalculateStaleBytes(t *testing.T) {
+// TestApplyRecord_CalculateStaleBytes verifies that applying a replicated
+// write correctly detects an existing key and counts its prior version as
+// garbage (stale bytes) once the transaction commits.
+func TestApplyRecord_CalculateStaleBytes(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(dir, Options{})
 	if err != nil {
@@ -764,20 +747,19 @@ func TestApplyBatch_CalculateStaleBytes(t *testing.T) {
 		t.Fatalf("Expected 0 garbage initially, got %d", totalGarbage)
 	}
 
-	// 3. Apply a batch that overwrites "key1"
-	// This should trigger the logic to find "old_value" in the index and mark it stale.
+	// 3. Replicate a BEGIN/SET/COMMIT that overwrites "key1".
+	// This should trigger the logic to find "old_value" in the index and
+	// mark it stale once the replicated transaction commits.
 	newVal := []byte("new_value")
-	batch := []ValueLogEntry{
-		{
-			Key:           initialKey,
-			Value:         newVal,
-			TransactionID: 100,
-			OperationID:   200,
-		},
+	recs := []WALRecord{
+		{Type: WALRecordBegin, XID: 100, OpID: 199},
+		{Type: WALRecordSet, XID: 100, OpID: 200, Key: initialKey, Value: newVal},
+		{Type: WALRecordCommit, XID: 100, OpID: 201},
 	}
-
-	if err := db.ApplyBatch(batch); err != nil {
-		t.Fatalf("ApplyBatch failed: %v", err)
+	for _, r := range recs {
+		if err := db.ApplyRecord(r); err != nil {
+			t.Fatalf("ApplyRecord failed: %v", err)
+		}
 	}
 
 	// 4. Verify garbage stats increased
@@ -802,7 +784,6 @@ func TestDB_RunAutoCompaction(t *testing.T) {
 	opts := Options{
 		CompactionInterval:   50 * time.Millisecond,
 		CompactionMinGarbage: 1, // Trigger compaction on any garbage
-		MaxWALSize:           1024 * 1024,
 	}
 	db, err := Open(dir, opts)
 	if err != nil {

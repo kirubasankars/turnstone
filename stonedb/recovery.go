@@ -23,8 +23,13 @@ func (db *DB) recoverValueLog() error {
 	return nil
 }
 
-// syncWALToValueLog replays WAL entries that are newer than the VLog state.
-// It uses history to skip orphaned writes from stale timelines.
+// syncWALToValueLog replays WAL records newer than the VLog's recovered
+// high-water mark, redoing any SET/DEL that didn't make it into the VLog
+// before a crash, and reconstructing the commit log (BEGIN/COMMIT/ABORT) so
+// it can be persisted into LevelDB once it is reopened (see
+// persistClogRebuild). Any transaction that never reached COMMIT or ABORT by
+// the end of the WAL is a crash victim and is resolved as aborted. It uses
+// history to skip orphaned writes from stale timelines.
 func (db *DB) syncWALToValueLog(truncateCorrupt bool, history []TimelineHistoryItem) error {
 	onTruncate := func() error {
 		indexPath := filepath.Join(db.dir, "index")
@@ -32,22 +37,35 @@ func (db *DB) syncWALToValueLog(truncateCorrupt bool, history []TimelineHistoryI
 		return os.RemoveAll(indexPath)
 	}
 
-	return db.writeAheadLog.ReplaySinceTx(db.valueLog, db.transactionID, history, truncateCorrupt, func(entries []ValueLogEntry) {
-		replayCount := 0
-		for _, e := range entries {
-			if e.TransactionID > db.transactionID {
-				db.transactionID = e.TransactionID
-			}
-			if e.OperationID > db.operationID {
-				db.operationID = e.OperationID
-			}
-			replayCount++
+	clogRebuild := make(map[uint64]TxStatus)
+	replayCount := 0
+
+	err := db.writeAheadLog.ReplaySinceTx(db.valueLog, db.operationID, history, truncateCorrupt, func(rec WALRecord) {
+		if rec.XID > db.transactionID {
+			db.transactionID = rec.XID
 		}
-		// Log batch replays minimally unless debug
-		if replayCount > 0 {
-			db.logger.Debug("Replayed WAL entries", "count", replayCount, "new_head_tx", db.transactionID)
+		if rec.OpID > db.operationID {
+			db.operationID = rec.OpID
 		}
+		switch rec.Type {
+		case WALRecordBegin:
+			clogRebuild[rec.XID] = TxInProgress
+		case WALRecordCommit:
+			clogRebuild[rec.XID] = TxCommitted
+		case WALRecordAbort:
+			clogRebuild[rec.XID] = TxAborted
+		}
+		replayCount++
 	}, onTruncate)
+	if err != nil {
+		return err
+	}
+
+	if replayCount > 0 {
+		db.logger.Debug("Replayed WAL records", "count", replayCount, "new_head_tx", db.transactionID, "new_head_op", db.operationID)
+	}
+	db.pendingClogRebuild = clogRebuild
+	return nil
 }
 
 func (db *DB) isIndexConsistent() bool {

@@ -200,7 +200,7 @@ func (s *Store) IsSnapshotRequired(reqLogID uint64) (bool, error) {
 	}
 
 	// We are behind. Check if we can stream from WAL.
-	err := s.DB.ScanWAL(reqLogID+1, func([]stonedb.ValueLogEntry) error { return nil })
+	err := s.DB.ScanWAL(reqLogID+1, func([]stonedb.WALRecord) error { return nil })
 
 	if err == stonedb.ErrLogUnavailable {
 		return true, nil
@@ -389,38 +389,13 @@ func (s *Store) ApplyBatch(entries []protocol.LogEntry) error {
 	return nil
 }
 
-// ReplicateBatch applies a batch from a leader (no quorum wait).
-func (s *Store) ReplicateBatch(entries []protocol.LogEntry) error {
-	return s.ReplicateBatches([][]protocol.LogEntry{entries})
-}
-
-// ReplicateBatches applies multiple batches from a leader using group commit.
-func (s *Store) ReplicateBatches(batches [][]protocol.LogEntry) error {
+// ApplyRecord applies a single replicated WAL record (Begin/Set/Delete/Commit/Abort)
+// directly to the engine, preserving the leader's xid/opID and eager
+// visibility semantics.
+func (s *Store) ApplyRecord(rec stonedb.WALRecord) error {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
-
-	var vlogBatches [][]stonedb.ValueLogEntry
-
-	for _, entries := range batches {
-		var vlogEntries []stonedb.ValueLogEntry
-		for _, e := range entries {
-			vEntry := stonedb.ValueLogEntry{
-				Key:           e.Key,
-				Value:         e.Value,
-				OperationID:   e.LogSeq,
-				TransactionID: e.LogSeq,
-			}
-
-			if e.OpCode == protocol.OpJournalDelete {
-				vEntry.IsDelete = true
-				vEntry.Value = nil
-			}
-			vlogEntries = append(vlogEntries, vEntry)
-		}
-		vlogBatches = append(vlogBatches, vlogEntries)
-	}
-
-	return s.DB.ApplyBatches(vlogBatches)
+	return s.DB.ApplyRecord(rec)
 }
 
 // Get retrieves a value by key.
@@ -452,7 +427,7 @@ func (s *Store) Close() error {
 }
 
 // ScanWAL wrapper for thread safety
-func (s *Store) ScanWAL(startOpID uint64, fn func([]stonedb.ValueLogEntry) error) error {
+func (s *Store) ScanWAL(startOpID uint64, fn func([]stonedb.WALRecord) error) error {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 	return s.DB.ScanWAL(startOpID, fn)
