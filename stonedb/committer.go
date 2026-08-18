@@ -87,7 +87,7 @@ func (db *DB) processCommitBatch(requests []commitRequest) {
 		}
 
 		nextOpID := func() uint64 { return atomic.AddUint64(&db.operationID, 1) }
-		_, err := db.writeAheadLog.AppendRecordsWithOpIDs(nextOpID, builders, true)
+		_, err := db.writeAheadLog.AppendRecordsWithOpIDs(nextOpID, builders, !db.unsafeDisableFsync)
 		if err != nil {
 			atomic.StoreInt32(&db.isCorrupt, 1)
 			db.logger.Error("CRITICAL: WAL commit-group fsync failed. Database entering CORRUPT state.", "err", err)
