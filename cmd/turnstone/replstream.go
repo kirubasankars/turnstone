@@ -24,14 +24,14 @@ import (
 type replStreamOptions struct {
 	Host      string
 	DBName    string
-	StartOpID uint64
+	StartLSN uint64
 	WaitIdle  time.Duration
 	ClientID  string
 }
 
 type replStreamResult struct {
-	BaseOpID uint64
-	EndOpID  uint64
+	BaseLSN uint64
+	EndLSN  uint64
 	Bytes    int64
 }
 
@@ -67,7 +67,7 @@ func streamReplLogRange(ctx context.Context, home string, opts replStreamOptions
 	}()
 	defer conn.Close()
 
-	if err := sendReplHello(conn, opts.ClientID, opts.DBName, opts.StartOpID); err != nil {
+	if err := sendReplHello(conn, opts.ClientID, opts.DBName, opts.StartLSN); err != nil {
 		return replStreamResult{}, fmt.Errorf("handshake: %w", err)
 	}
 
@@ -89,7 +89,7 @@ func streamReplLogRange(ctx context.Context, home string, opts replStreamOptions
 		}
 	}
 
-	result := replStreamResult{BaseOpID: opts.StartOpID, EndOpID: opts.StartOpID}
+	result := replStreamResult{BaseLSN: opts.StartLSN, EndLSN: opts.StartLSN}
 	lastDataTime := time.Now()
 
 	for {
@@ -146,7 +146,7 @@ func streamReplLogRange(ctx context.Context, home string, opts replStreamOptions
 				return result, fmt.Errorf("write backup data: %w", err)
 			}
 			result.Bytes += int64(len(segData))
-			result.EndOpID = endOff
+			result.EndLSN = endOff
 			lastDataTime = time.Now()
 		}
 	}
@@ -180,7 +180,7 @@ func parseReplLogRangePayload(rawBody []byte, wantDB string) (endOff uint64, seg
 	return endOff, segData, nil
 }
 
-func sendReplHello(conn net.Conn, clientID, dbName string, startOpID uint64) error {
+func sendReplHello(conn net.Conn, clientID, dbName string, startLSN uint64) error {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.BigEndian, uint32(1))
 	binary.Write(buf, binary.BigEndian, uint32(len(clientID)))
@@ -188,7 +188,7 @@ func sendReplHello(conn net.Conn, clientID, dbName string, startOpID uint64) err
 	binary.Write(buf, binary.BigEndian, uint32(1))
 	binary.Write(buf, binary.BigEndian, uint32(len(dbName)))
 	buf.WriteString(dbName)
-	binary.Write(buf, binary.BigEndian, startOpID)
+	binary.Write(buf, binary.BigEndian, startLSN)
 
 	header := make([]byte, 5)
 	header[0] = protocol.OpCodeReplHello

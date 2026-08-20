@@ -269,20 +269,20 @@ See the [root README](../README.md#replication-and-failover) for replication sta
 
 ## `turnstone backup`
 
-Stream raw WAL frames from a running **primary** database using the replication protocol. Backups are physical byte ranges keyed by **opid** (the global byte LSN used as the replication cursor).
+Stream raw WAL frames from a running **primary** database using the replication protocol. Backups are physical byte ranges keyed by **WAL LSN** (global byte offset in the segmented WAL).
 
 ### Usage
 
 ```bash
-# Full backup (starts at opid 0)
+# Full backup (starts at LSN 0)
 turnstone backup --home tsdata --host localhost:6379 --db 1 --out backup_full
 
-# Differential backup (resume from a previous backup.meta end_opid)
+# Differential backup (resume from a previous backup.meta end_lsn)
 turnstone backup --home tsdata --db 1 --type differential \
   --base-meta backup_full/backup.meta --out backup_diff1
 
 # Differential backup with explicit start LSN
-turnstone backup --home tsdata --db 1 --type differential --from-opid 1048576 --out backup_diff2
+turnstone backup --home tsdata --db 1 --type differential --from-lsn 1048576 --out backup_diff2
 ```
 
 ### Flags
@@ -294,7 +294,7 @@ turnstone backup --home tsdata --db 1 --type differential --from-opid 1048576 --
 | `--out` | `backup_data` | Output directory |
 | `--file` | `wal.bin` | Backup filename (`.gz` appended when compressed) |
 | `--type` | `full` | `full` or `differential` |
-| `--from-opid` | `0` | Start LSN for differential backup |
+| `--from-lsn` | `0` | Start WAL LSN for differential backup |
 | `--base-meta` | — | Previous `backup.meta` to resume from |
 | `--compress` | on | GZIP the WAL artifact |
 | `--wait` | `2s` | Idle time before finishing once caught up |
@@ -304,10 +304,10 @@ Each backup writes:
 ```
 <out>/
   wal.bin[.gz]     # raw concatenated WAL frames
-  backup.meta      # metadata (type, base_opid, end_opid, sha256, ...)
+  backup.meta      # metadata (type, base_lsn, end_lsn, sha256, ...)
 ```
 
-Differential backups record `parent_sha256` linking to the prior artifact. The server must still retain WAL bytes back to the differential `base_opid`; otherwise the handshake fails with an invalid cursor error.
+Differential backups record `parent_sha256` linking to the prior artifact. The server must still retain WAL bytes back to the differential `base_lsn`; otherwise the handshake fails with an invalid cursor error.
 
 Uses the admin certificate from `<home>/certs/`.
 
@@ -339,8 +339,8 @@ turnstone restore --chain backup_full,backup_diff1,backup_diff2 --out restored_h
 
 Restore validates that:
 
-1. The first backup is `type=full` with `base_opid=0`.
-2. Each differential starts at the previous backup's `end_opid`.
+1. The first backup is `type=full` with `base_lsn=0`.
+2. Each differential starts at the previous backup's `end_lsn`.
 3. Optional `parent_sha256` matches the prior artifact.
 
 The restored database is placed at `<out>/data/<db>/`. Start a server with `turnstone server --home <out>` after restore (promote the database if not using `--dev`).

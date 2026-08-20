@@ -27,7 +27,7 @@ func newBackupCmd() *cobra.Command {
 	var outDir string
 	var backupFile string
 	var backupType string
-	var fromOpID uint64
+	var fromLSN uint64
 	var baseMetaPath string
 	var compress bool
 	var waitIdle time.Duration
@@ -36,11 +36,8 @@ func newBackupCmd() *cobra.Command {
 		Use:   "backup",
 		Short: "Stream a physical WAL backup from a primary database",
 		Long: `Connect to a running primary and stream raw WAL frames using the replication
-protocol. Full backups start at opid 0; differential backups resume from a
-previous backup's end_opid (stored in backup.meta).
-
-The opid fields in backup metadata are the global byte LSN used as the
-replication cursor.`,
+protocol. Full backups start at WAL LSN 0; differential backups resume from a
+previous backup's end_lsn (stored in backup.meta).`,
 		Run: func(cmd *cobra.Command, args []string) {
 			ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 			defer cancel()
@@ -52,7 +49,7 @@ replication cursor.`,
 				OutDir:         outDir,
 				File:         backupFile,
 				Type:         backupType,
-				FromOpID:     fromOpID,
+				FromLSN:      fromLSN,
 				BaseMetaPath: baseMetaPath,
 				Compress:     compress,
 				WaitIdle:     waitIdle,
@@ -71,7 +68,7 @@ replication cursor.`,
 	cmd.Flags().StringVar(&outDir, "out", "backup_data", "Output directory for backup artifacts")
 	cmd.Flags().StringVar(&backupFile, "file", defaultBackupFile, "Backup filename (appends .gz when --compress is set)")
 	cmd.Flags().StringVar(&backupType, "type", backupTypeFull, "Backup type: full or differential")
-	cmd.Flags().Uint64Var(&fromOpID, "from-opid", 0, "Start LSN for differential backup (overrides --base-meta)")
+	cmd.Flags().Uint64Var(&fromLSN, "from-lsn", 0, "Start WAL LSN for differential backup (overrides --base-meta)")
 	cmd.Flags().StringVar(&baseMetaPath, "base-meta", "", "Previous backup.meta to resume from for differential backup")
 	cmd.Flags().BoolVar(&compress, "compress", true, "Enable GZIP compression")
 	cmd.Flags().DurationVar(&waitIdle, "wait", 2*time.Second, "Idle time before finishing once caught up")
@@ -86,7 +83,7 @@ type backupOptions struct {
 	OutDir       string
 	File         string
 	Type         string
-	FromOpID     uint64
+	FromLSN      uint64
 	BaseMetaPath string
 	Compress     bool
 	WaitIdle     time.Duration
@@ -97,11 +94,11 @@ func runBackup(ctx context.Context, opts backupOptions) error {
 		return fmt.Errorf("invalid --type %q (want full or differential)", opts.Type)
 	}
 
-	startOpID := uint64(0)
+	startLSN := uint64(0)
 	parentSHA := ""
 	if opts.Type == backupTypeDifferential {
-		if opts.FromOpID > 0 {
-			startOpID = opts.FromOpID
+		if opts.FromLSN > 0 {
+			startLSN = opts.FromLSN
 		} else if opts.BaseMetaPath != "" {
 			baseMeta, err := loadBackupMeta(opts.BaseMetaPath)
 			if err != nil {
@@ -110,14 +107,14 @@ func runBackup(ctx context.Context, opts backupOptions) error {
 			if baseMeta.Database != opts.DBName {
 				return fmt.Errorf("base meta database %q does not match --db %q", baseMeta.Database, opts.DBName)
 			}
-			startOpID = baseMeta.EndOpID
+			startLSN = baseMeta.EndLSN
 			parentSHA = baseMeta.SHA256
 		} else {
-			return fmt.Errorf("differential backup requires --from-opid or --base-meta")
+			return fmt.Errorf("differential backup requires --from-lsn or --base-meta")
 		}
 	}
 
-	log.Printf("Starting %s backup from %s [db=%s, base_opid=%d]...", opts.Type, opts.Host, opts.DBName, startOpID)
+	log.Printf("Starting %s backup from %s [db=%s, base_lsn=%d]...", opts.Type, opts.Host, opts.DBName, startLSN)
 
 	if err := os.MkdirAll(opts.OutDir, 0755); err != nil {
 		return fmt.Errorf("create output dir: %w", err)
@@ -145,7 +142,7 @@ func runBackup(ctx context.Context, opts backupOptions) error {
 	streamRes, err := streamReplLogRange(ctx, opts.Home, replStreamOptions{
 		Host:      opts.Host,
 		DBName:    opts.DBName,
-		StartOpID: startOpID,
+		StartLSN: startLSN,
 		WaitIdle:  opts.WaitIdle,
 	}, outputWriter)
 	if err != nil {
@@ -166,8 +163,8 @@ func runBackup(ctx context.Context, opts backupOptions) error {
 		Timestamp:    time.Now(),
 		Database:     opts.DBName,
 		Type:         opts.Type,
-		BaseOpID:     startOpID,
-		EndOpID:      streamRes.EndOpID,
+		BaseLSN:      startLSN,
+		EndLSN:       streamRes.EndLSN,
 		ParentSHA256: parentSHA,
 		Compressed:   opts.Compress,
 		SHA256:       hex.EncodeToString(hasher.Sum(nil)),
@@ -179,7 +176,7 @@ func runBackup(ctx context.Context, opts backupOptions) error {
 	log.Printf("Backup successful in %v", time.Since(start))
 	log.Printf("Location: %s", outPath)
 	log.Printf("Bytes: %d", streamRes.Bytes)
-	log.Printf("OpID range: [%d, %d)", meta.BaseOpID, meta.EndOpID)
+	log.Printf("LSN range: [%d, %d)", meta.BaseLSN, meta.EndLSN)
 	log.Printf("Checksum: %s", meta.SHA256)
 	return nil
 }
