@@ -6,20 +6,22 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 )
 
 func TestValidateRestoreChain(t *testing.T) {
 	full := BackupMeta{
-		Type:     backupTypeFull,
-		BaseOpID: 0,
-		EndOpID:  100,
-		SHA256:   "aaa",
+		Type:    backupTypeFull,
+		BaseLSN: 0,
+		EndLSN:  100,
+		SHA256:  "aaa",
 	}
 	diff := BackupMeta{
 		Type:         backupTypeDifferential,
-		BaseOpID:     100,
-		EndOpID:      250,
+		BaseLSN:      100,
+		EndLSN:       250,
 		ParentSHA256: "aaa",
 		SHA256:       "bbb",
 	}
@@ -32,9 +34,9 @@ func TestValidateRestoreChain(t *testing.T) {
 	}
 
 	badBase := diff
-	badBase.BaseOpID = 99
+	badBase.BaseLSN = 99
 	if err := validateRestoreChain([]BackupMeta{full, badBase}); err == nil {
-		t.Fatal("expected base_opid mismatch error")
+		t.Fatal("expected base_lsn mismatch error")
 	}
 
 	badParent := diff
@@ -47,6 +49,29 @@ func TestValidateRestoreChain(t *testing.T) {
 	badFirst.Type = backupTypeDifferential
 	if err := validateRestoreChain([]BackupMeta{badFirst}); err == nil {
 		t.Fatal("expected first backup type error")
+	}
+}
+
+func TestLoadBackupMetaLegacyOpID(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, defaultBackupMeta)
+	legacy := `{
+  "timestamp": "2026-09-12T00:00:00Z",
+  "database": "1",
+  "type": "full",
+  "base_opid": 0,
+  "end_opid": 42,
+  "sha256": "deadbeef"
+}`
+	if err := os.WriteFile(path, []byte(legacy), 0644); err != nil {
+		t.Fatal(err)
+	}
+	meta, err := loadBackupMeta(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.EndLSN != 42 {
+		t.Fatalf("expected end_lsn 42, got %d", meta.EndLSN)
 	}
 }
 
