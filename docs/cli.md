@@ -1,6 +1,6 @@
 # TurnstoneDB CLI guide
 
-TurnstoneDB ships a single binary, `turnstone`, with subcommands for setup, serving, client access, and benchmarking. All subcommands share a global `--home` flag (default `tsdata`) that points at the data directory containing TLS certificates, `turnstone.json`, and per-database storage.
+TurnstoneDB ships a single binary, `turnstone`, with subcommands for setup, serving, client access, benchmarking, and WAL backup/restore. All subcommands share a global `--home` flag (default `tsdata`) that points at the data directory containing TLS certificates, `turnstone.json`, and per-database storage.
 
 ## Build
 
@@ -15,6 +15,17 @@ make build
 | --- | --- | --- |
 | `--home` | `tsdata` | Home directory for certs, config, and data |
 | `-v`, `--version` | — | Print version and exit |
+
+## Subcommands
+
+| Command | Purpose |
+| --- | --- |
+| `turnstone init` | Create home directory, TLS certs, and `turnstone.json` |
+| `turnstone server` | Run the database server |
+| `turnstone cli` | Interactive REPL or `cli exec <command>` one-shot |
+| `turnstone bench` | Load and throughput benchmark |
+| `turnstone backup` | Stream a physical WAL backup from a primary |
+| `turnstone restore` | Restore WAL backups into a new home directory |
 
 ---
 
@@ -265,11 +276,43 @@ replicaof <B-host>:6379 1
 
 See the [root README](../README.md#replication-and-failover) for replication state machine details.
 
+### Backup and restore
+
+Back up a primary database, then restore offline into a new home directory:
+
+```bash
+# Full WAL backup from a running primary
+turnstone backup --home tsdata --host localhost:6379 --db 1 --out backup_full
+
+# Incremental differential backup (resumes at previous end_lsn)
+turnstone backup --home tsdata --db 1 --type differential \
+  --base-meta backup_full/backup.meta --out backup_diff
+
+# Restore full + differential chain into a new home
+turnstone restore --chain backup_full,backup_diff --out restored_home
+turnstone server --home restored_home --dev
+```
+
+Requirements:
+
+- The source database must be `PRIMARY`.
+- Backup uses the admin certificate from `<home>/certs/`.
+- Differential backups require the primary to retain WAL back to the differential `base_lsn`.
+
 ---
 
 ## `turnstone backup`
 
-Stream raw WAL frames from a running **primary** database using the replication protocol. Backups are physical byte ranges keyed by **WAL LSN** (global byte offset in the segmented WAL).
+Stream raw WAL frames from a running **primary** database using the replication protocol (`ReplHello` + `ReplLogRange`). Backups are physical byte ranges keyed by **WAL LSN** (global byte offset in the segmented WAL).
+
+### Full vs differential
+
+| Type | Start LSN | Output | Use case |
+| --- | --- | --- | --- |
+| `full` | `0` | Complete WAL from the beginning | Base backup, disaster recovery baseline |
+| `differential` | previous `end_lsn` | WAL delta since last backup | Smaller incremental captures between full backups |
+
+Differential backups require either `--base-meta` (reads `end_lsn` from a prior `backup.meta`) or an explicit `--from-lsn`.
 
 ### Usage
 
@@ -291,41 +334,82 @@ turnstone backup --home tsdata --db 1 --type differential --from-lsn 1048576 --o
 | --- | --- | --- |
 | `--host` | `localhost:6379` | Primary server address |
 | `--db` | `1` | Database name to backup |
-| `--out` | `backup_data` | Output directory |
-| `--file` | `wal.bin` | Backup filename (`.gz` appended when compressed) |
+| `--out` | `backup_data` | Output directory for backup artifacts |
+| `--file` | `wal.bin` | Backup filename (`.gz` appended when `--compress` is set) |
 | `--type` | `full` | `full` or `differential` |
-| `--from-lsn` | `0` | Start WAL LSN for differential backup |
-| `--base-meta` | — | Previous `backup.meta` to resume from |
+| `--from-lsn` | `0` | Start WAL LSN for differential backup (overrides `--base-meta` when set) |
+| `--base-meta` | — | Path to previous `backup.meta` to resume from |
 | `--compress` | on | GZIP the WAL artifact |
 | `--wait` | `2s` | Idle time before finishing once caught up |
+
+### Artifacts
 
 Each backup writes:
 
 ```
 <out>/
   wal.bin[.gz]     # raw concatenated WAL frames
-  backup.meta      # metadata (type, base_lsn, end_lsn, sha256, ...)
+  backup.meta      # JSON metadata (see below)
 ```
 
-Differential backups record `parent_sha256` linking to the prior artifact. The server must still retain WAL bytes back to the differential `base_lsn`; otherwise the handshake fails with an invalid cursor error.
+### `backup.meta` schema
 
-Uses the admin certificate from `<home>/certs/`.
+| Field | Description |
+| --- | --- |
+| `timestamp` | Backup creation time |
+| `database` | Logical database name |
+| `type` | `full` or `differential` |
+| `base_lsn` | Exclusive-start WAL LSN for this artifact |
+| `end_lsn` | Exclusive-end WAL LSN after streaming completes |
+| `parent_sha256` | SHA256 of parent artifact (differential only) |
+| `compressed` | Whether `wal.bin` is gzip-compressed |
+| `sha256` | SHA256 of the WAL artifact file |
+
+Example:
+
+```json
+{
+  "timestamp": "2026-09-12T22:00:00Z",
+  "database": "1",
+  "type": "differential",
+  "base_lsn": 1048576,
+  "end_lsn": 2097152,
+  "parent_sha256": "abc123...",
+  "compressed": true,
+  "sha256": "def456..."
+}
+```
+
+Legacy `backup.meta` files using `base_opid` / `end_opid` are still accepted on restore.
+
+### Notes
+
+- Uses the admin certificate from `<home>/certs/`.
+- Streaming stops after `--wait` with no new WAL data (caught up).
+- If WAL has been purged below the differential start LSN, the handshake fails with an invalid cursor error.
 
 ---
 
 ## `turnstone restore`
 
-Rebuild a database offline by applying one or more backup artifacts into a **new** home directory. The target `--out` path must not already exist.
+Rebuild a database offline by applying one or more physical WAL backups through `engine.ApplyLogRange`. The target `--out` home directory must **not** already exist.
+
+Restore opens a fresh database under `<out>/data/<db>/`, replays each artifact in order, and leaves a runnable WAL on disk.
 
 ### Usage
 
 ```bash
-# Restore a full backup
+# Restore a single full backup
 turnstone restore --in backup_full --out restored_home
 
 # Restore a full backup plus differential chain
 turnstone restore --chain backup_full,backup_diff1,backup_diff2 --out restored_home
+
+# Start the restored database
+turnstone server --home restored_home --dev
 ```
+
+When `--chain` is set, `--in` is ignored. Directories are applied left-to-right.
 
 ### Flags
 
@@ -333,17 +417,34 @@ turnstone restore --chain backup_full,backup_diff1,backup_diff2 --out restored_h
 | --- | --- | --- |
 | `--in` | `backup_data` | Single backup directory (ignored when `--chain` is set) |
 | `--out` | `restored_data` | Target home directory to create |
-| `--file` | `wal.bin` | Backup filename inside each directory |
-| `--verify` | on | Verify SHA256 before applying |
+| `--file` | `wal.bin` | Backup filename inside each directory (auto-detects `.gz`) |
+| `--verify` | on | Verify SHA256 checksum before applying each artifact |
 | `--chain` | — | Comma-separated backup directories in apply order |
+
+### Chain validation
 
 Restore validates that:
 
 1. The first backup is `type=full` with `base_lsn=0`.
-2. Each differential starts at the previous backup's `end_lsn`.
-3. Optional `parent_sha256` matches the prior artifact.
+2. Each subsequent backup is `type=differential`.
+3. Each differential's `base_lsn` equals the previous backup's `end_lsn`.
+4. When present, `parent_sha256` matches the prior artifact's `sha256`.
 
-The restored database is placed at `<out>/data/<db>/`. Start a server with `turnstone server --home <out>` after restore (promote the database if not using `--dev`).
+All backups in a chain must target the same `database` field.
+
+### After restore
+
+The restored database is placed at `<out>/data/<db>/`. To serve it:
+
+```bash
+turnstone server --home restored_home
+```
+
+Promote the database if not using `--dev`:
+
+```bash
+turnstone cli --home restored_home --admin exec promote
+```
 
 ---
 
