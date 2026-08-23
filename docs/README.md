@@ -21,7 +21,7 @@ Then branch by interest:
 
 | Topic | Path |
 | --- | --- |
-| CLI reference (`init`, `server`, `cli`, `bench`) | [cli.md](cli.md) |
+| CLI reference (`init`, `server`, `cli`, `bench`, `backup`, `restore`) | [cli.md](cli.md) |
 
 ## Package documentation
 
