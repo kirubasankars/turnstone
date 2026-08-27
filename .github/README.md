@@ -17,7 +17,7 @@ Runs on `ubuntu-latest` with Go **1.25** (see workflow; `go.mod` may specify new
 | Build | `go build ./...` | Compile all packages |
 | Vet | `go vet ./...` | Static analysis |
 | Gofmt | `gofmt -l .` | Enforce formatting (fail if any file differs) |
-| Test | `go test -race -count=1 ./...` | Full suite with race detector |
+| Test | `go test -race -count=1 ./...` | Full suite with race detector (includes backup/restore integration tests in `server/`) |
 
 ### Why one `./...` race run?
 
@@ -32,6 +32,8 @@ make test-race
 ## Educational focus
 
 TurnstoneDB relies heavily on goroutines (committer, retention, replication streams, per-connection handlers). The race detector is not optional polish — it is part of the correctness story.
+
+Backup/restore integration tests (`server/backup_restore_integration_test.go`) exercise full and differential WAL backup chains end-to-end: write on a primary, backup via replication stream, restore offline, and verify keys on a new server node. They run as part of the standard `./...` CI test step.
 
 ## Review checklist
 
