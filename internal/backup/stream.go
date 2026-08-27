@@ -3,7 +3,7 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root of this source tree.
 
-package main
+package backup
 
 import (
 	"bufio"
@@ -17,25 +17,28 @@ import (
 	"net"
 	"time"
 
-	"turnstone/internal/tlsutil"
 	"turnstone/protocol"
 )
 
-type replStreamOptions struct {
-	Host      string
-	DBName    string
+type StreamOptions struct {
+	Host     string
+	DBName   string
 	StartLSN uint64
-	WaitIdle  time.Duration
-	ClientID  string
+	WaitIdle time.Duration
+	ClientID string
+	TLS      *tls.Config
 }
 
-type replStreamResult struct {
+type StreamResult struct {
 	BaseLSN uint64
 	EndLSN  uint64
-	Bytes    int64
+	Bytes   int64
 }
 
-func streamReplLogRange(ctx context.Context, home string, opts replStreamOptions, writer io.Writer) (replStreamResult, error) {
+func StreamLogRange(ctx context.Context, opts StreamOptions, writer io.Writer) (StreamResult, error) {
+	if opts.TLS == nil {
+		return StreamResult{}, fmt.Errorf("TLS config is required")
+	}
 	if opts.ClientID == "" {
 		opts.ClientID = "turnstone-backup"
 	}
@@ -43,15 +46,10 @@ func streamReplLogRange(ctx context.Context, home string, opts replStreamOptions
 		opts.WaitIdle = 2 * time.Second
 	}
 
-	tlsConf, err := tlsutil.LoadFromHome(home, tlsutil.RoleAdmin)
-	if err != nil {
-		return replStreamResult{}, fmt.Errorf("load TLS: %w", err)
-	}
-
 	dialer := net.Dialer{Timeout: 10 * time.Second}
-	conn, err := tls.DialWithDialer(&dialer, "tcp", opts.Host, tlsConf)
+	conn, err := tls.DialWithDialer(&dialer, "tcp", opts.Host, opts.TLS)
 	if err != nil {
-		return replStreamResult{}, fmt.Errorf("connect: %w", err)
+		return StreamResult{}, fmt.Errorf("connect: %w", err)
 	}
 
 	done := make(chan struct{})
@@ -60,36 +58,36 @@ func streamReplLogRange(ctx context.Context, home string, opts replStreamOptions
 		select {
 		case <-ctx.Done():
 			_ = conn.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
-			sendReplQuit(conn)
+			sendQuit(conn)
 			conn.Close()
 		case <-done:
 		}
 	}()
 	defer conn.Close()
 
-	if err := sendReplHello(conn, opts.ClientID, opts.DBName, opts.StartLSN); err != nil {
-		return replStreamResult{}, fmt.Errorf("handshake: %w", err)
+	if err := sendHello(conn, opts.ClientID, opts.DBName, opts.StartLSN); err != nil {
+		return StreamResult{}, fmt.Errorf("handshake: %w", err)
 	}
 
 	reader := bufio.NewReader(conn)
 	respHeader := make([]byte, 5)
 	if _, err := io.ReadFull(reader, respHeader); err != nil {
-		return replStreamResult{}, fmt.Errorf("read handshake response: %w", err)
+		return StreamResult{}, fmt.Errorf("read handshake response: %w", err)
 	}
 	if respHeader[0] != protocol.ResStatusOK {
 		body := make([]byte, binary.BigEndian.Uint32(respHeader[1:]))
 		if _, err := io.ReadFull(reader, body); err != nil {
-			return replStreamResult{}, fmt.Errorf("handshake rejected")
+			return StreamResult{}, fmt.Errorf("handshake rejected")
 		}
-		return replStreamResult{}, fmt.Errorf("handshake rejected: %s", string(body))
+		return StreamResult{}, fmt.Errorf("handshake rejected: %s", string(body))
 	}
 	if ln := binary.BigEndian.Uint32(respHeader[1:]); ln > 0 {
 		if _, err := io.ReadFull(reader, make([]byte, ln)); err != nil {
-			return replStreamResult{}, fmt.Errorf("read handshake body: %w", err)
+			return StreamResult{}, fmt.Errorf("read handshake body: %w", err)
 		}
 	}
 
-	result := replStreamResult{BaseLSN: opts.StartLSN, EndLSN: opts.StartLSN}
+	result := StreamResult{BaseLSN: opts.StartLSN, EndLSN: opts.StartLSN}
 	lastDataTime := time.Now()
 
 	for {
@@ -123,19 +121,18 @@ func streamReplLogRange(ctx context.Context, home string, opts replStreamOptions
 			continue
 		}
 		if len(payload) < 4 {
-			return result, fmt.Errorf("payload too short for CRC")
+			return StreamResult{}, fmt.Errorf("payload too short for CRC")
 		}
 		crcReceived := binary.BigEndian.Uint32(payload[:4])
 		rawBody := payload[4:]
 		if crc32.Checksum(rawBody, protocol.Crc32Table) != crcReceived {
-			return result, fmt.Errorf("CRC mismatch on replication stream")
+			return StreamResult{}, fmt.Errorf("CRC mismatch on replication stream")
 		}
 
 		switch opCode {
 		case protocol.OpCodeReplSafePoint:
-			// Heartbeat only; does not extend idle timeout.
 		case protocol.OpCodeReplLogRange:
-			endOff, segData, err := parseReplLogRangePayload(rawBody, opts.DBName)
+			endOff, segData, err := parseLogRangePayload(rawBody, opts.DBName)
 			if err != nil {
 				return result, err
 			}
@@ -151,11 +148,11 @@ func streamReplLogRange(ctx context.Context, home string, opts replStreamOptions
 		}
 	}
 
-	sendReplQuit(conn)
+	sendQuit(conn)
 	return result, nil
 }
 
-func parseReplLogRangePayload(rawBody []byte, wantDB string) (endOff uint64, segData []byte, err error) {
+func parseLogRangePayload(rawBody []byte, wantDB string) (endOff uint64, segData []byte, err error) {
 	cursor := 0
 	if cursor+4 > len(rawBody) {
 		return 0, nil, fmt.Errorf("malformed log range packet")
@@ -180,7 +177,7 @@ func parseReplLogRangePayload(rawBody []byte, wantDB string) (endOff uint64, seg
 	return endOff, segData, nil
 }
 
-func sendReplHello(conn net.Conn, clientID, dbName string, startLSN uint64) error {
+func sendHello(conn net.Conn, clientID, dbName string, startLSN uint64) error {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.BigEndian, uint32(1))
 	binary.Write(buf, binary.BigEndian, uint32(len(clientID)))
@@ -200,7 +197,7 @@ func sendReplHello(conn net.Conn, clientID, dbName string, startLSN uint64) erro
 	return err
 }
 
-func sendReplQuit(conn net.Conn) {
+func sendQuit(conn net.Conn) {
 	header := make([]byte, 5)
 	header[0] = protocol.OpCodeQuit
 	binary.BigEndian.PutUint32(header[1:], 0)

@@ -10,8 +10,8 @@ The `turnstone` executable is the only shipped program. It uses [Cobra](https://
 | `turnstone server` | `server.go` | Load config, open databases, start mTLS listener, Prometheus metrics, replication manager |
 | `turnstone cli` | `cli.go`, `clicommand.go`, `cliconn.go` | Interactive REPL or `cli exec <one-liner>` against a running server |
 | `turnstone bench` | `bench.go` | Concurrent load generator for throughput experiments |
-| `turnstone backup` | `backup.go`, `replstream.go`, `backupmeta.go` | Stream physical WAL backup from a primary (full or differential by WAL LSN) |
-| `turnstone restore` | `restore.go`, `backupmeta.go` | Offline restore of WAL backup chains into a new home directory |
+| `turnstone backup` | `backup.go` | Stream physical WAL backup from a primary (uses `internal/backup`) |
+| `turnstone restore` | `restore.go` | Offline restore of WAL backup chains (uses `internal/backup`) |
 
 ## File reference
 
@@ -25,10 +25,8 @@ The `turnstone` executable is the only shipped program. It uses [Cobra](https://
 | `clicommand.go` | Parses REPL tokens into protocol operations |
 | `cliconn.go` | mTLS dial + framed read/write for CLI |
 | `bench.go` | Benchmark driver using `client` package |
-| `backup.go` | `backup` — replication stream to WAL artifact + `backup.meta` |
-| `restore.go` | `restore` — apply WAL artifacts via `engine.ApplyLogRange` |
-| `replstream.go` | Shared replication streaming client for backup |
-| `backupmeta.go` | Backup metadata types and helpers |
+| `backup.go` | `backup` — thin wrapper around `internal/backup` |
+| `restore.go` | `restore` — thin wrapper around `internal/backup` |
 
 ## Server startup flow (`server.go`)
 
