@@ -162,7 +162,7 @@ Require `--admin` and an admin certificate from init.
 
 | Command | Description |
 | --- | --- |
-| `promote [min_replicas]` | Promote database to `PRIMARY`; optional sync quorum |
+| `promote [min_replicas]` | Promote database to `PRIMARY`; optional sync quorum (see below) |
 | `stepdown` | Drain writes and return to `UNDEFINED` |
 | `replicaof <host:port> <remote_db>` | Follow a remote primary |
 | `flushdb` | Delete all keys in the current database |
@@ -176,9 +176,15 @@ Require `--admin` and an admin certificate from init.
 | `ERR: Transaction Required` | Mutating command called without `begin` |
 | `ERR: Conflict Detected (Retry)` | Write conflict; retry the transaction |
 | `ERR: Transaction Timeout` | Transaction exceeded `MaxTxDuration` (30s) |
-| `ERR: Server Busy` | Connection limit reached |
+| `ERR: Server Busy` | Connection limit reached, or sync-replication quorum not met after local commit |
 | `ERR: Entity Too Large` | Value exceeds size limit |
 | `ERR: Server Memory Limit Exceeded` | Disk usage above configured threshold |
+
+### Sync replication (`promote N`)
+
+When a database is promoted with `min_replicas = N` (N > 0), every successful `commit` on the primary is **written to local WAL first**, then the server waits until at least **N connected server-role replicas** have ACKed the commit's end byte offset before returning `OK` to the client. If replicas are slow or disconnected, the client may receive `ERR: Server Busy` even though the write is already durable on the primary.
+
+Backup streams (`turnstone-backup`) and admin replication connections do **not** count toward quorum and do **not** pin WAL retention on the leader.
 
 ---
 

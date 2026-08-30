@@ -7,6 +7,8 @@ package engine
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -155,4 +157,27 @@ func TestIsFrameBoundary(t *testing.T) {
 	if len(seg) == 0 {
 		t.Fatal("expected segment bytes")
 	}
+}
+
+func TestReadLogRange_MissingSegment(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tx := db.NewTransaction(true)
+	tx.Put([]byte("k"), []byte("v"))
+	tx.Commit()
+
+	logPath := filepath.Join(dir, "wal", "seg-000001.wal")
+	if err := os.Remove(logPath); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err = db.ReadLogRange(0, 1<<20)
+	if err != ErrLogUnavailable {
+		t.Fatalf("expected ErrLogUnavailable after segment delete, got %v", err)
+	}
+	db.Close()
 }

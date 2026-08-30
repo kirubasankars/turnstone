@@ -108,24 +108,27 @@ func startServerNode(t *testing.T, baseDir, name string, sharedTLS *tls.Config) 
 	return srv, srv.Addr().String(), cancel
 }
 
-func promoteNode(t *testing.T, baseDir, addr string, databases ...string) {
+func promoteNodeWithMinReplicas(t *testing.T, baseDir, addr string, minReplicas uint32, databases ...string) {
 	t.Helper()
 	adminTLS := getRoleTLS(t, baseDir, "admin")
 	c := connectClient(t, addr, adminTLS)
 	defer c.Close()
 
 	if len(databases) == 0 {
-		// Default to all if none specified? Or no-op?
-		// Retain compatibility with my previous "Promote All" intent?
-		// No, explicit is better.
 		databases = []string{"0", "1", "2", "3"}
 	}
 
+	payload := make([]byte, 4)
+	binary.BigEndian.PutUint32(payload, minReplicas)
 	for _, dbName := range databases {
 		selectDatabase(t, c, dbName)
-		// Promote Payload: [MinReplicas(4)] = 0
-		c.AssertStatus(protocol.OpCodePromote, make([]byte, 4), protocol.ResStatusOK)
+		c.AssertStatus(protocol.OpCodePromote, payload, protocol.ResStatusOK)
 	}
+}
+
+func promoteNode(t *testing.T, baseDir, addr string, databases ...string) {
+	t.Helper()
+	promoteNodeWithMinReplicas(t, baseDir, addr, 0, databases...)
 }
 
 // Helper wrappers using functions from server_test.go

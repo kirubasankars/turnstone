@@ -39,6 +39,10 @@ const (
 	StatePrimary      = "PRIMARY"
 	StateReplica      = "REPLICA"
 	StateSteppingDown = "STEPPING_DOWN"
+
+	ReplicaRoleServer = "server"
+	ReplicaRoleAdmin  = "admin"
+	ReplicaRoleBackup = "backup"
 )
 
 // ReplicaSlot tracks the state of a connected replication consumer.
@@ -74,6 +78,7 @@ type Database struct {
 	retentionStrategy string
 	state             string // Current Database State (UNDEFINED, PRIMARY, REPLICA)
 	replicaTimeout    time.Duration
+	quorumTimeout     time.Duration
 
 	// Coordination for StepDown
 	safePointCh chan struct{} // Signal to force broadcast of SafePoint
@@ -135,9 +140,21 @@ func Open(ctx context.Context, dir string, logger *slog.Logger, minReplicas int,
 		state:              StateUndefined,
 		safePointCh:        make(chan struct{}),
 		replicaTimeout:     1 * time.Minute, // Default strict timeout for lagging replicas
+		quorumTimeout:      defaultQuorumTimeout,
 		closeCh:            make(chan struct{}),
 	}
 	s.cond = sync.NewCond(&s.mu)
+
+	if v := os.Getenv("TS_TEST_REPLICA_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			s.replicaTimeout = d
+		}
+	}
+	if v := os.Getenv("TS_TEST_QUORUM_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			s.quorumTimeout = d
+		}
+	}
 
 	// Load existing persistence state (if any)
 	s.loadSlots()
@@ -239,7 +256,8 @@ func (s *Database) GetLeaderRetainOffset() uint64 {
 	return atomic.LoadUint64(&s.leaderRetainOffset)
 }
 
-// MinReplicaOffset calculates the minimum Offset required by ANY registered client.
+// MinReplicaOffset calculates the minimum offset required by replication
+// consumers that pin WAL retention (server-role replicas only).
 func (s *Database) MinReplicaOffset() uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -248,6 +266,9 @@ func (s *Database) MinReplicaOffset() uint64 {
 	hasSlots := false
 
 	for _, slot := range s.replicas {
+		if slot.Role != ReplicaRoleServer {
+			continue
+		}
 		hasSlots = true
 		if slot.Offset < minOffset {
 			minOffset = slot.Offset
@@ -534,6 +555,31 @@ func (s *Database) RegisterReplica(id string, offset uint64, role string) {
 	s.cond.Broadcast()
 }
 
+// ReplicaRole returns the role recorded for a replica slot, if present.
+func (s *Database) ReplicaRole(id string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	slot, ok := s.replicas[id]
+	if !ok {
+		return "", false
+	}
+	return slot.Role, true
+}
+
+// EvictZombieReplicasNow runs one zombie-replica eviction pass (used in tests).
+func (s *Database) EvictZombieReplicasNow() {
+	s.evictZombieReplicas()
+}
+
+// SetReplicaLastSeenForTest adjusts LastSeen on a slot (used in tests).
+func (s *Database) SetReplicaLastSeenForTest(id string, lastSeen time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if slot, ok := s.replicas[id]; ok {
+		slot.LastSeen = lastSeen
+	}
+}
+
 // UnregisterReplica marks the replica as disconnected but keeps the slot.
 func (s *Database) UnregisterReplica(id string) {
 	s.mu.Lock()
@@ -620,12 +666,11 @@ const defaultQuorumTimeout = 30 * time.Second
 // the caller holds, such as a connection-semaphore slot) for the full
 // timeout.
 func (s *Database) WaitForQuorum(offset uint64, timeout time.Duration, cancel <-chan struct{}) error {
+	s.mu.Lock()
 	if timeout <= 0 {
-		timeout = defaultQuorumTimeout
+		timeout = s.quorumTimeout
 	}
 	deadline := time.Now().Add(timeout)
-
-	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	startWait := time.Now()
@@ -640,7 +685,7 @@ func (s *Database) WaitForQuorum(offset uint64, timeout time.Duration, cancel <-
 			// that replica has actually reconnected) must not be able to
 			// satisfy quorum for a replica that isn't actually there right
 			// now to receive/ack future writes.
-			if slot.Connected && slot.Role == "server" && slot.Offset >= offset {
+			if slot.Connected && slot.Role == ReplicaRoleServer && slot.Offset >= offset {
 				acks++
 			}
 		}

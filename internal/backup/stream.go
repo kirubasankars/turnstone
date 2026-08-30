@@ -148,6 +148,9 @@ func StreamLogRange(ctx context.Context, opts StreamOptions, writer io.Writer) (
 		}
 	}
 
+	if result.EndLSN > opts.StartLSN {
+		_ = sendReplAck(conn, opts.DBName, result.EndLSN)
+	}
 	sendQuit(conn)
 	return result, nil
 }
@@ -189,6 +192,22 @@ func sendHello(conn net.Conn, clientID, dbName string, startLSN uint64) error {
 
 	header := make([]byte, 5)
 	header[0] = protocol.OpCodeReplHello
+	binary.BigEndian.PutUint32(header[1:], uint32(buf.Len()))
+	if _, err := conn.Write(header); err != nil {
+		return err
+	}
+	_, err := conn.Write(buf.Bytes())
+	return err
+}
+
+func sendReplAck(conn net.Conn, dbName string, offset uint64) error {
+	buf := new(bytes.Buffer)
+	binary.Write(buf, binary.BigEndian, uint32(len(dbName)))
+	buf.WriteString(dbName)
+	binary.Write(buf, binary.BigEndian, offset)
+
+	header := make([]byte, 5)
+	header[0] = protocol.OpCodeReplAck
 	binary.BigEndian.PutUint32(header[1:], uint32(buf.Len()))
 	if _, err := conn.Write(header); err != nil {
 		return err
