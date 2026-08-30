@@ -340,7 +340,7 @@ func TestOpen_ErrorPaths(t *testing.T) {
 	}
 	_, err := Open(dir2, Options{})
 	if err == nil {
-		t.Error("Expected error when data.log path conflicts")
+		t.Error("Expected error when wal manifest is invalid")
 	}
 }
 
