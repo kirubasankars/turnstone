@@ -50,6 +50,59 @@ func TestValidateRestoreChain(t *testing.T) {
 	if err := ValidateRestoreChain([]Meta{badFirst}); err == nil {
 		t.Fatal("expected first backup type error")
 	}
+
+	if err := ValidateRestoreChain(nil); err == nil {
+		t.Fatal("expected empty chain error")
+	}
+
+	badFullBase := full
+	badFullBase.BaseLSN = 10
+	if err := ValidateRestoreChain([]Meta{badFullBase}); err == nil {
+		t.Fatal("expected full non-zero base_lsn error")
+	}
+
+	badSecondType := full
+	badSecond := Meta{Type: TypeFull, BaseLSN: 100, EndLSN: 200, SHA256: "bbb"}
+	if err := ValidateRestoreChain([]Meta{badSecondType, badSecond}); err == nil {
+		t.Fatal("expected second backup must be differential error")
+	}
+}
+
+func TestLoadMetaErrors(t *testing.T) {
+	if _, err := LoadMeta(filepath.Join(t.TempDir(), "missing.meta")); err == nil {
+		t.Fatal("expected missing file error")
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, DefaultMetaFile)
+	if err := os.WriteFile(path, []byte("{"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadMeta(path); err == nil {
+		t.Fatal("expected invalid json error")
+	}
+
+	writeRawMeta(t, dir, `{"type":"full","base_lsn":0,"end_lsn":1,"sha256":"x"}`)
+	if _, err := LoadMeta(path); err == nil {
+		t.Fatal("expected missing database error")
+	}
+
+	writeRawMeta(t, dir, `{"database":"1","type":"snapshot","base_lsn":0,"end_lsn":1,"sha256":"x"}`)
+	if _, err := LoadMeta(path); err == nil {
+		t.Fatal("expected unknown type error")
+	}
+}
+
+func TestResolveRestoreChain_EmptyChain(t *testing.T) {
+	if _, err := ResolveRestoreChain("", " , "); err == nil {
+		t.Fatal("expected empty chain error")
+	}
+}
+
+func TestResolveWALFile(t *testing.T) {
+	if got := ResolveWALFile("dir", "wal.bin", true); got != filepath.Join("dir", "wal.bin.gz") {
+		t.Fatalf("unexpected compressed path: %s", got)
+	}
 }
 
 func TestLoadMetaLegacyOpID(t *testing.T) {
