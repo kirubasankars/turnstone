@@ -25,6 +25,7 @@ import (
 
 	"turnstone/config"
 	"turnstone/database"
+	"turnstone/devtool"
 	"turnstone/internal/tlsutil"
 	"turnstone/metrics"
 	"turnstone/repl"
@@ -33,6 +34,7 @@ import (
 
 func newServerCmd() *cobra.Command {
 	var devMode bool
+	var devtoolAddr string
 
 	cmd := &cobra.Command{
 		Use:   "server",
@@ -46,18 +48,22 @@ func newServerCmd() *cobra.Command {
 				os.Exit(1)
 			}
 
-			runServer(logger, devMode)
+			runServer(logger, devMode, devtoolAddr)
 		},
 	}
 
 	cmd.Flags().BoolVar(&devMode, "dev", false, "Disable transaction timeouts and auto-promote all databases to PRIMARY")
+	cmd.Flags().StringVar(&devtoolAddr, "devtool-addr", "", "Address for the devtool web UI (default 127.0.0.1:8080 when --dev is set)")
 
 	return cmd
 }
 
-func runServer(logger *slog.Logger, devMode bool) {
+func runServer(logger *slog.Logger, devMode bool, devtoolAddr string) {
 	if devMode {
 		logger.Info("Starting in DEV mode: Transaction timeouts disabled, all DBs auto-promoted")
+		if devtoolAddr == "" {
+			devtoolAddr = "127.0.0.1:8080"
+		}
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -174,6 +180,16 @@ func runServer(logger *slog.Logger, devMode bool) {
 
 	if cfg.MetricsAddr != "" {
 		metrics.StartMetricsServer(cfg.MetricsAddr, stores, srv, logger)
+	}
+
+	if devtoolAddr != "" {
+		devtool.Start(devtool.Config{
+			Addr:        devtoolAddr,
+			MetricsAddr: cfg.MetricsAddr,
+			Stores:      stores,
+			ServerStats: srv,
+			Logger:      logger,
+		})
 	}
 
 	go func() {
