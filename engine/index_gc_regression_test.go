@@ -49,10 +49,10 @@ func TestIndexGC_keepMask_RegressionTable(t *testing.T) {
 	}
 
 	tests := []struct {
-		name    string
-		chain   []indexVersion
-		ctx     IndexGCContext
-		want    []uint64
+		name  string
+		chain []indexVersion
+		ctx   IndexGCContext
+		want  []uint64
 	}{
 		{
 			name:  "single reader sees head only",
