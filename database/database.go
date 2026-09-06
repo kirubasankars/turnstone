@@ -13,6 +13,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,10 +29,21 @@ type Stats struct {
 	Uptime       string
 	Offset       int64
 	Conflicts    uint64
-	ReplicaLag   uint64
-	LogSize      int64 // logical WAL size (global write head)
-	LogAllocated int64 // allocated on-disk WAL bytes (all segments)
+	ReplicaLag   uint64 // lag of the slowest connected consumer in bytes
+	LogSize      int64  // logical WAL size (global write head)
+	LogAllocated int64  // allocated on-disk WAL bytes (all segments)
 	KeyCount     int64
+	Replicas     []ReplicaInfo
+}
+
+// ReplicaInfo is a point-in-time view of one replication slot.
+type ReplicaInfo struct {
+	ID        string `json:"id"`
+	Role      string `json:"role"`
+	Connected bool   `json:"connected"`
+	Offset    uint64 `json:"offset"`
+	Lag       uint64 `json:"lag"`
+	LastSeen  string `json:"last_seen"`
 }
 
 const (
@@ -485,35 +497,43 @@ func (s *Database) Stats() Stats {
 	keyCount, _ := s.DB.KeyCount()
 	head := s.LastLogOffset()
 
-	minLag := uint64(0)
-	first := true
+	maxLag := uint64(0)
+	replicas := make([]ReplicaInfo, 0, len(s.replicas))
 
 	s.mu.Lock()
-	for _, r := range s.replicas {
+	for id, r := range s.replicas {
 		lag := uint64(0)
 		if head > r.Offset {
 			lag = head - r.Offset
 		}
-		if first || lag < minLag {
-			minLag = lag
-			first = false
+		if lag > maxLag {
+			maxLag = lag
 		}
+		replicas = append(replicas, ReplicaInfo{
+			ID:        id,
+			Role:      r.Role,
+			Connected: r.Connected,
+			Offset:    r.Offset,
+			Lag:       lag,
+			LastSeen:  r.LastSeen.UTC().Format(time.RFC3339),
+		})
 	}
 	s.mu.Unlock()
 
-	if first {
-		minLag = 0
-	}
+	sort.Slice(replicas, func(i, j int) bool {
+		return replicas[i].ID < replicas[j].ID
+	})
 
 	return Stats{
 		ActiveTxs:    s.DB.ActiveTransactionCount(),
 		Uptime:       time.Since(s.startTime).Round(time.Second).String(),
 		Offset:       int64(head),
 		Conflicts:    s.DB.GetConflicts(),
-		ReplicaLag:   minLag,
+		ReplicaLag:   maxLag,
 		LogSize:      logical,
 		LogAllocated: allocated,
 		KeyCount:     keyCount,
+		Replicas:     replicas,
 	}
 }
 

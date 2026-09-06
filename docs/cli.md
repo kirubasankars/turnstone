@@ -166,7 +166,31 @@ Require `--admin` and an admin certificate from init.
 | `stepdown` | Drain writes and return to `UNDEFINED` |
 | `replicaof <host:port> <remote_db>` | Follow a remote primary |
 | `flushdb` | Delete all keys in the current database |
-| `stat` | Print JSON status (replication state, offsets, etc.) |
+| `stat` | Print JSON status (replication state, log offset, replica slots and lag, etc.) |
+
+Example `stat` response on a primary with one connected follower:
+
+```json
+{
+  "state": "PRIMARY",
+  "key_count": 42,
+  "log_offset": 8192,
+  "replica_lag": 0,
+  "min_replicas": 0,
+  "replicas": [
+    {
+      "id": "stat_replica",
+      "role": "server",
+      "connected": true,
+      "offset": 8192,
+      "lag": 0,
+      "last_seen": "2026-09-12T23:45:00Z"
+    }
+  ]
+}
+```
+
+`replica_lag` is the lag in bytes of the **slowest** registered consumer. Each entry in `replicas` includes that consumer's ack offset and individual lag behind `log_offset`.
 
 ### Common errors
 
