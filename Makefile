@@ -28,3 +28,6 @@ bench:
 # bench-all runs microbenchmarks in every package.
 bench-all:
 	go test -run='^$$' -bench=. -benchmem -count=1 ./... | tee bench-all.log
+
+ui-test:
+	cd devtool/e2e && npm ci && npx playwright install chromium --with-deps && npm test

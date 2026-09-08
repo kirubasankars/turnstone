@@ -6,3 +6,12 @@
 bin
 *.log
 
+# Devtool UI e2e
+devtool/e2e/node_modules/
+devtool/e2e/.testdata/
+devtool/e2e/.server-pid
+devtool/e2e/server.log
+devtool/e2e/test-results/
+devtool/e2e/playwright-report/
+devtool/e2e/blob-report/
+

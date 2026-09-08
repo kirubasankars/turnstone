@@ -47,6 +47,7 @@ func Start(cfg Config) {
 	}
 
 	mux := http.NewServeMux()
+	mux.Handle("/static/", staticHandler())
 	mux.HandleFunc("/", srv.handleIndex)
 	mux.HandleFunc("/api/databases", srv.handleDatabases)
 	mux.HandleFunc("/api/databases/", srv.handleDatabase)
@@ -83,8 +84,13 @@ func (s *httpServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	data, err := staticFiles.ReadFile("static/index.html")
+	if err != nil {
+		http.Error(w, "index not found", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = w.Write(indexHTML)
+	_, _ = w.Write(data)
 }
 
 func (s *httpServer) handleDatabases(w http.ResponseWriter, r *http.Request) {
