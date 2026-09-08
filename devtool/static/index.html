@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <title>Turnstone Devtool</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="app-header" data-testid="app-header">
+    <div class="brand">
+      <h1><span>Turnstone</span> Devtool</h1>
+      <p class="tagline">Local database inspector</p>
+    </div>
+    <div class="header-actions">
+      <label class="field-inline" for="db-select">
+        <span class="field-label">Database</span>
+        <select id="db-select" data-testid="db-select" aria-label="Select database"></select>
+      </label>
+      <button type="button" class="btn secondary" id="btn-refresh" data-testid="btn-refresh">Refresh</button>
+    </div>
+  </header>
+
+  <main class="app-main" data-testid="app-main">
+    <section class="panel" data-testid="panel-stats">
+      <div class="panel-head">
+        <h2>Overview</h2>
+        <span id="db-state" data-testid="db-state"></span>
+      </div>
+      <div class="panel-body" id="db-stats" data-testid="db-stats">
+        <p class="placeholder">Loading stats…</p>
+      </div>
+    </section>
+
+    <section class="panel" data-testid="panel-server-metrics">
+      <div class="panel-head">
+        <h2>Server</h2>
+        <span class="live-indicator" data-testid="metrics-indicator">
+          <span class="dot" id="metrics-dot"></span>Prometheus
+        </span>
+      </div>
+      <div class="panel-body" id="server-metrics" data-testid="server-metrics">
+        <p class="placeholder">Loading metrics…</p>
+      </div>
+    </section>
+
+    <section class="panel panel-keys" data-testid="panel-keys">
+      <div class="panel-head"><h2>Keys</h2></div>
+      <div class="panel-body">
+        <div class="toolbar" data-testid="key-toolbar">
+          <input id="prefix-filter" data-testid="prefix-filter" type="search" placeholder="Filter by prefix" autocomplete="off" aria-label="Key prefix filter">
+          <button type="button" class="btn secondary" id="btn-search-keys" data-testid="btn-search-keys">Search</button>
+          <button type="button" class="btn secondary" id="btn-more-keys" data-testid="btn-more-keys">More</button>
+        </div>
+        <div class="key-list" id="key-list" data-testid="key-list" role="listbox" aria-label="Keys">
+          <p class="placeholder">No keys loaded</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel panel-editor" data-testid="panel-editor">
+      <div class="panel-head"><h2>Editor</h2></div>
+      <div class="panel-body editor">
+        <label class="field" for="edit-key">
+          <span class="field-label">Key</span>
+          <input id="edit-key" data-testid="edit-key" type="text" placeholder="Enter key name" autocomplete="off">
+        </label>
+        <label class="field" for="edit-value">
+          <span class="field-label">Value</span>
+          <textarea id="edit-value" data-testid="edit-value" placeholder="Enter value" rows="6"></textarea>
+        </label>
+        <div class="actions" data-testid="editor-actions">
+          <button type="button" class="btn" id="btn-get" data-testid="btn-get">Get</button>
+          <button type="button" class="btn" id="btn-set" data-testid="btn-set">Set</button>
+          <button type="button" class="btn danger" id="btn-delete" data-testid="btn-delete">Delete</button>
+        </div>
+        <p class="status" id="editor-status" data-testid="editor-status" role="status" aria-live="polite"></p>
+      </div>
+    </section>
+
+    <section class="panel panel-wide" data-testid="panel-db-metrics">
+      <div class="panel-head"><h2>Database metrics</h2></div>
+      <div class="panel-body" id="db-metrics" data-testid="db-metrics">
+        <p class="placeholder">Loading metrics…</p>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="confirm-dialog" data-testid="confirm-dialog">
+    <div class="dialog-form">
+      <p id="confirm-message" data-testid="confirm-message"></p>
+      <div class="dialog-actions">
+        <button type="button" class="btn secondary" id="confirm-cancel" data-testid="confirm-cancel">Cancel</button>
+        <button type="button" class="btn danger" id="confirm-ok" data-testid="confirm-ok">Delete</button>
+      </div>
+    </div>
+  </dialog>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
