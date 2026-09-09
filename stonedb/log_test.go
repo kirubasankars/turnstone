@@ -139,7 +139,7 @@ func TestDataLog_ScanAtFloorAfterPurge(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := db.ScanWAL(floor - 1, func([]WALRecord) error { return nil }); err != ErrLogUnavailable {
+	if err := db.ScanWAL(floor-1, func([]WALRecord) error { return nil }); err != ErrLogUnavailable {
 		t.Fatalf("ScanWAL below floor: expected ErrLogUnavailable, got %v", err)
 	}
 
