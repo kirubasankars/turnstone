@@ -1,3 +1,8 @@
+# Copyright (c) 2026 Kiruba Sankar Swaminathan
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root of this source tree.
+
 build:
 	mkdir -p ./bin
 	go build -o bin/turnstone cmd/turnstone/main.go
