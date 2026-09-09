@@ -4,7 +4,7 @@ import (
 	"math"
 	"sync/atomic"
 
-	"github.com/syndtr/goleveldb/leveldb"
+	"turnstone/stonedb/index"
 )
 
 // buildSnapshotLocked captures a Postgres-style snapshot. Callers must hold
@@ -22,11 +22,31 @@ func (db *DB) buildSnapshotLocked() Snapshot {
 
 // clogStatus resolves the commit-log state of xid: in-progress transactions
 // are tracked in memory (local or replicated); resolved ones are looked up
-// from the durable per-xid clog key in LevelDB. A missing durable entry is
+// from the durable per-xid clog key in the index. A missing durable entry is
 // only possible after an emergency index rebuild from the ValueLog (which
 // has no independent notion of "aborted"); in that case we default to
 // Committed, matching the ValueLog's role as ground truth for that recovery
 // path.
+// clogStatusUnlocked resolves clog state when the index read lock is already
+// held (e.g. during iterator walks). Do not call without holding the lock.
+func (db *DB) clogStatusUnlocked(xid uint64) TxStatus {
+	db.txMu.Lock()
+	_, inProgress := db.activeXids[xid]
+	db.txMu.Unlock()
+	if inProgress {
+		return TxInProgress
+	}
+
+	if db.ldb == nil {
+		return TxCommitted
+	}
+	val, err := db.ldb.GetLocked(encodeClogKey(xid))
+	if err != nil || len(val) == 0 {
+		return TxCommitted
+	}
+	return TxStatus(val[0])
+}
+
 func (db *DB) clogStatus(xid uint64) TxStatus {
 	db.txMu.Lock()
 	_, inProgress := db.activeXids[xid]
@@ -43,6 +63,13 @@ func (db *DB) clogStatus(xid uint64) TxStatus {
 		return TxCommitted
 	}
 	return TxStatus(val[0])
+}
+
+func (db *DB) isVisibleUnlocked(xmin uint64, snap Snapshot) bool {
+	if xmin >= snap.Xmax || snap.contains(xmin) {
+		return false
+	}
+	return db.clogStatusUnlocked(xmin) == TxCommitted
 }
 
 func (db *DB) isVisible(xmin uint64, snap Snapshot) bool {
@@ -145,13 +172,13 @@ func (db *DB) abortTransaction(tx *Transaction) {
 }
 
 // persistClogRebuild flushes the clog decisions reconstructed from the WAL
-// during recovery (syncWALToValueLog) into the now-open LevelDB index.
+// during recovery (syncWALToValueLog) into the now-open index.
 func (db *DB) persistClogRebuild() error {
 	if len(db.pendingClogRebuild) == 0 || db.ldb == nil {
 		db.pendingClogRebuild = nil
 		return nil
 	}
-	batch := new(leveldb.Batch)
+	batch := new(index.Batch)
 	for xid, status := range db.pendingClogRebuild {
 		final := status
 		if final == TxInProgress {

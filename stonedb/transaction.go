@@ -10,7 +10,7 @@ import (
 
 	"turnstone/protocol"
 
-	"github.com/syndtr/goleveldb/leveldb/iterator"
+	"turnstone/stonedb/index"
 )
 
 // Transaction represents a running transaction. Writes are applied eagerly
@@ -54,8 +54,7 @@ type Transaction struct {
 	// COMMIT and an ABORT record for it.
 	decided int32
 
-	iter        iterator.Iterator // cached iterator for reads
-	currentSize int64             // accumulated size of keys/values + overhead, for MaxTxSize
+	currentSize int64 // accumulated size of keys/values + overhead, for MaxTxSize
 }
 
 // isAborted reports whether the transaction has been flagged aborted, safe
@@ -89,11 +88,6 @@ func (tx *Transaction) Discard() {
 		return
 	}
 	tx.finished = true
-
-	if tx.iter != nil {
-		tx.iter.Release()
-		tx.iter = nil
-	}
 
 	tx.db.activeTxnsMu.Lock()
 	delete(tx.db.activeTxns, tx)
@@ -237,6 +231,7 @@ func (tx *Transaction) write(key, value []byte, isDelete bool) error {
 	}
 
 	meta := &EntryMeta{FileID: fileID, ValueOffset: offset, ValueLen: uint32(len(value)), TransactionID: tx.xid, OperationID: opID, IsTombstone: isDelete}
+
 	if err := db.ldb.Put(encodeIndexKey(key, tx.xid), meta.Encode(), nil); err != nil {
 		db.markCorrupt(err)
 		rollbackImpact()
@@ -245,15 +240,6 @@ func (tx *Transaction) write(key, value []byte, isDelete bool) error {
 
 	tx.ownPriorMeta[keyStr] = meta
 	tx.currentSize += entrySize
-
-	// Invalidate the cached read iterator: goleveldb's iterator reflects a
-	// point-in-time snapshot taken when it was created, so a cached iterator
-	// from an earlier Get would be blind to the index entry we just wrote,
-	// breaking read-your-own-writes for any key touched after the first Get.
-	if tx.iter != nil {
-		tx.iter.Release()
-		tx.iter = nil
-	}
 	return nil
 }
 
@@ -323,7 +309,7 @@ func (tx *Transaction) recordOwnImpact(keyStr string, key []byte, isDelete bool)
 // still in-progress (in-progress can only happen for Get()'s use of this
 // helper's sibling walk; for the write path lock exclusivity guarantees no
 // other in-progress owner exists).
-func (db *DB) latestResolvedMeta(iter iterator.Iterator, key []byte, excludeXid uint64) (*EntryMeta, uint64, bool) {
+func (db *DB) latestResolvedMeta(iter index.Iterator, key []byte, excludeXid uint64) (*EntryMeta, uint64, bool) {
 	seekKey := encodeIndexKey(key, math.MaxUint64)
 	if !iter.Seek(seekKey) {
 		return nil, 0, false
@@ -338,7 +324,7 @@ func (db *DB) latestResolvedMeta(iter iterator.Iterator, key []byte, excludeXid 
 			iter.Next()
 			continue
 		}
-		status := db.clogStatus(xmin)
+		status := db.clogStatusUnlocked(xmin)
 		if status == TxAborted {
 			iter.Next()
 			continue
@@ -368,22 +354,21 @@ func (tx *Transaction) Get(key []byte) ([]byte, error) {
 	}
 
 	db := tx.db
-	if tx.iter == nil {
-		tx.iter = db.ldb.NewIterator(nil, nil)
-	}
+	iter := db.ldb.NewIterator(nil, nil)
+	defer iter.Release()
 
 	seekKey := encodeIndexKey(key, math.MaxUint64)
-	if tx.iter.Seek(seekKey) {
-		for tx.iter.Valid() {
-			foundKey := tx.iter.Key()
+	if iter.Seek(seekKey) {
+		for iter.Valid() {
+			foundKey := iter.Key()
 			uKey, xmin, err := decodeIndexKey(foundKey)
 			if err != nil || !bytes.Equal(uKey, key) {
 				break
 			}
 
-			visible := (tx.update && xmin == tx.xid) || db.isVisible(xmin, tx.snapshot)
+			visible := (tx.update && xmin == tx.xid) || db.isVisibleUnlocked(xmin, tx.snapshot)
 			if visible {
-				meta, err := decodeEntryMeta(tx.iter.Value())
+				meta, err := decodeEntryMeta(iter.Value())
 				if err != nil {
 					db.logger.Error("Index meta corruption", "key", string(key), "err", err)
 					return nil, fmt.Errorf("meta corrupt: %w", err)
@@ -397,7 +382,7 @@ func (tx *Transaction) Get(key []byte) ([]byte, error) {
 				}
 				return val, err
 			}
-			tx.iter.Next()
+			iter.Next()
 		}
 	}
 	return nil, ErrKeyNotFound
@@ -421,10 +406,6 @@ func (tx *Transaction) Commit() error {
 		delete(tx.db.activeTxns, tx)
 		tx.db.activeTxnsMu.Unlock()
 		tx.db.abortTransaction(tx)
-		if tx.iter != nil {
-			tx.iter.Release()
-			tx.iter = nil
-		}
 		if tx.beginErr != nil {
 			return tx.beginErr
 		}
@@ -454,10 +435,6 @@ func (tx *Transaction) Commit() error {
 		delete(tx.db.activeTxns, tx)
 		tx.db.activeTxnsMu.Unlock()
 		tx.db.abortTransaction(tx)
-		if tx.iter != nil {
-			tx.iter.Release()
-			tx.iter = nil
-		}
 		return ErrDatabaseClosed
 	}
 
@@ -470,10 +447,6 @@ func (tx *Transaction) Commit() error {
 	tx.db.activeTxnsMu.Lock()
 	delete(tx.db.activeTxns, tx)
 	tx.db.activeTxnsMu.Unlock()
-	if tx.iter != nil {
-		tx.iter.Release()
-		tx.iter = nil
-	}
 	if err != nil && err != ErrWriteConflict {
 		tx.db.logger.Error("Transaction commit failed", "err", err)
 	}

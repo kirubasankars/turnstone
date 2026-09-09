@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"math"
 
-	"github.com/syndtr/goleveldb/leveldb/iterator"
+	"turnstone/stonedb/index"
 )
 
 // checkReadSetConflicts implements the read half of Snapshot Isolation
@@ -45,7 +45,7 @@ func (tx *Transaction) checkReadSetConflicts() error {
 // committing reader for a write that never lands would be a real deviation
 // from Snapshot Isolation (only a *committed* write can violate it). We skip
 // past in-progress/aborted versions and keep looking at older ones instead.
-func (db *DB) hasNewerCommittedVersion(iter iterator.Iterator, key []byte, excludeXid uint64, snap Snapshot) bool {
+func (db *DB) hasNewerCommittedVersion(iter index.Iterator, key []byte, excludeXid uint64, snap Snapshot) bool {
 	seekKey := encodeIndexKey(key, math.MaxUint64)
 	if !iter.Seek(seekKey) {
 		return false
@@ -60,7 +60,7 @@ func (db *DB) hasNewerCommittedVersion(iter iterator.Iterator, key []byte, exclu
 			iter.Next()
 			continue
 		}
-		if db.clogStatus(xmin) != TxCommitted {
+		if db.clogStatusUnlocked(xmin) != TxCommitted {
 			// Aborted, or still undecided: neither can be a genuine
 			// snapshot-isolation conflict. Keep walking toward older
 			// versions -- if the writer eventually commits, it will be
