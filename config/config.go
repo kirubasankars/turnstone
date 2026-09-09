@@ -49,14 +49,6 @@ func ResolvePath(homeDir, path string) string {
 	return filepath.Join(homeDir, path)
 }
 
-// ValidateSecurityConfig ensures that critical security parameters are present.
-func ValidateSecurityConfig(cfg Config) error {
-	if cfg.TLSCertFile == "" || cfg.TLSKeyFile == "" || cfg.TLSCAFile == "" {
-		return fmt.Errorf("security critical: 'tls_cert_file', 'tls_key_file', and 'tls_ca_file' must be set")
-	}
-	return nil
-}
-
 // ValidateConfig sanity-checks user-supplied config values that would
 // otherwise be accepted silently and then misbehave downstream. In
 // particular, MaxDiskUsagePercent is compared directly against a 0-100

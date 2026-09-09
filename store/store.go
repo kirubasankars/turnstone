@@ -579,29 +579,6 @@ func (s *Store) UnregisterReplica(id string) {
 	}
 }
 
-// DeleteReplica explicitly removes a replication slot.
-func (s *Store) DeleteReplica(id string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	slot, ok := s.replicas[id]
-	if !ok {
-		return protocol.ErrKeyNotFound
-	}
-
-	if slot.quitCh != nil {
-		select {
-		case <-slot.quitCh:
-		default:
-			close(slot.quitCh)
-		}
-	}
-
-	delete(s.replicas, id)
-	s.dirty = true
-	s.logger.Info("Replica slot deleted", "id", id)
-	return nil
-}
-
 // RemoveAllReplicas drops all connected replicas and CDC clients.
 func (s *Store) RemoveAllReplicas() {
 	s.mu.Lock()

@@ -30,4 +30,10 @@ test:
 test-race:
 	go test -race -count=1 ./... | tee test-race.log
 
+# bench runs Go microbenchmarks in stonedb. -run=^$ skips unit tests.
+bench:
+	go test -run=^$ -bench=. -benchmem -count=1 ./stonedb/ | tee bench.log
 
+# bench-all runs microbenchmarks in every package.
+bench-all:
+	go test -run=^$ -bench=. -benchmem -count=1 ./... | tee bench-all.log
