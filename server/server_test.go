@@ -212,14 +212,6 @@ func (c *testClient) AssertStatus(opCode byte, payload []byte, expectedStatus by
 	return body
 }
 
-// ReadStatus is like AssertStatus but returns the status instead of failing, useful for polling
-func (c *testClient) ReadStatus(opCode byte, payload []byte) ([]byte, byte) {
-	c.t.Helper()
-	c.Send(opCode, payload)
-	status, body := c.Read()
-	return body, status
-}
-
 // Helper to gather metrics from the server
 func gatherMetrics(t *testing.T, srv *Server) map[string]float64 {
 	t.Helper()
