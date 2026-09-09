@@ -297,7 +297,10 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 			binary.Write(bodyBuf, binary.BigEndian, uint32(len(p.dbName)))
 			bodyBuf.WriteString(p.dbName)
 			binary.Write(bodyBuf, binary.BigEndian, p.count)
-			bodyBuf.Write(p.data)
+			if len(p.data) > 0 {
+				// Copy: streamDB may reuse backing arrays (e.g. tlBuf) after enqueue.
+				bodyBuf.Write(append([]byte(nil), p.data...))
+			}
 
 			rawBody := bodyBuf.Bytes()
 			crc := crc32.Checksum(rawBody, protocol.Crc32Table)
@@ -431,13 +434,13 @@ func (s *Server) streamDB(name string, st *store.Store, minLogID uint64, outCh c
 			currentLogID = snapOpID
 
 			// Resend Timeline after Snapshot
-			currentTL = st.DB.CurrentTimeline()
-			binary.BigEndian.PutUint64(tlBuf, currentTL)
+			postSnapTL := make([]byte, 8)
+			binary.BigEndian.PutUint64(postSnapTL, st.DB.CurrentTimeline())
 			select {
 			case outCh <- replPacket{
 				dbName: name,
 				opCode: protocol.OpCodeReplTimeline,
-				data:   tlBuf,
+				data:   postSnapTL,
 				count:  0,
 			}:
 			case <-done:
