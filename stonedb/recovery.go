@@ -3,12 +3,10 @@ package stonedb
 import (
 	"encoding/binary"
 	"fmt"
-	"os"
 	"path/filepath"
 	"sync/atomic"
 
-	"github.com/syndtr/goleveldb/leveldb"
-	"github.com/syndtr/goleveldb/leveldb/opt"
+	"turnstone/stonedb/index"
 )
 
 func (db *DB) recoverValueLog() error {
@@ -26,15 +24,15 @@ func (db *DB) recoverValueLog() error {
 // syncWALToValueLog replays WAL records newer than the VLog's recovered
 // high-water mark, redoing any SET/DEL that didn't make it into the VLog
 // before a crash, and reconstructing the commit log (BEGIN/COMMIT/ABORT) so
-// it can be persisted into LevelDB once it is reopened (see
+// it can be persisted into the index once it is reopened (see
 // persistClogRebuild). Any transaction that never reached COMMIT or ABORT by
 // the end of the WAL is a crash victim and is resolved as aborted. It uses
 // history to skip orphaned writes from stale timelines.
 func (db *DB) syncWALToValueLog(truncateCorrupt bool, history []TimelineHistoryItem) error {
 	onTruncate := func() error {
 		indexPath := filepath.Join(db.dir, "index")
-		db.logger.Warn("WAL truncated due to corruption. Deleting LevelDB index to ensure consistency", "path", indexPath)
-		return os.RemoveAll(indexPath)
+		db.logger.Warn("WAL truncated due to corruption. Deleting index to ensure consistency", "path", indexPath)
+		return index.RemoveAll(indexPath)
 	}
 
 	clogRebuild := make(map[uint64]TxStatus)
@@ -73,7 +71,7 @@ func (db *DB) isIndexConsistent() bool {
 		return false
 	}
 	val, err := db.ldb.Get(sysTransactionIDKey, nil)
-	if err == leveldb.ErrNotFound {
+	if err == index.ErrNotFound {
 		return db.transactionID == 0
 	}
 	if err != nil || len(val) != 8 {
@@ -89,21 +87,17 @@ func (db *DB) RebuildIndexFromVLog() error {
 		db.ldb = nil
 	}
 	indexPath := filepath.Join(db.dir, "index")
-	os.RemoveAll(indexPath)
+	index.RemoveAll(indexPath)
 
-	ldbOpts := &opt.Options{
-		BlockCacheCapacity: db.blockCacheSize,
-		Compression:        opt.SnappyCompression,
-	}
 	var err error
-	db.ldb, err = leveldb.OpenFile(indexPath, ldbOpts)
+	db.ldb, err = index.Open(indexPath, db.blockCacheSize)
 	if err != nil {
 		return err
 	}
 
 	db.deletedBytesByFile = make(map[uint32]int64)
 
-	batch := new(leveldb.Batch)
+	batch := new(index.Batch)
 	batchCount := 0
 	totalCount := 0
 

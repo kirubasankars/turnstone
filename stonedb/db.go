@@ -18,9 +18,7 @@ import (
 
 	"turnstone/protocol"
 
-	"github.com/syndtr/goleveldb/leveldb"
-	"github.com/syndtr/goleveldb/leveldb/opt"
-	"github.com/syndtr/goleveldb/leveldb/util"
+	"turnstone/stonedb/index"
 )
 
 type commitRequest struct {
@@ -42,7 +40,7 @@ type TimelineMeta struct {
 // DB is the main database struct.
 type DB struct {
 	dir                string
-	ldb                *leveldb.DB
+	ldb                *index.DB
 	writeAheadLog      *WriteAheadLog
 	valueLog           *ValueLog
 	deletedBytesByFile map[uint32]int64
@@ -89,7 +87,7 @@ type DB struct {
 	txTimeout    time.Duration           // MaxTxDuration override for the liveness reaper
 
 	// pendingClogRebuild holds clog decisions reconstructed from the WAL during
-	// recovery, before LevelDB is open. Flushed by persistClogRebuild.
+	// recovery, before the index is open. Flushed by persistClogRebuild.
 	pendingClogRebuild map[uint64]TxStatus
 
 	// replImpact accumulates per-xid key-count/garbage impact for replicated
@@ -227,12 +225,12 @@ func Open(dir string, opts Options) (*DB, error) {
 		return nil, fmt.Errorf("sync wal: %w", err)
 	}
 
-	if err := db.openLevelDB(dir); err != nil {
+	if err := db.openIndex(dir); err != nil {
 		db.Close()
 		return nil, err
 	}
 
-	// The clog can only be persisted once LevelDB is open; apply whatever was
+	// The clog can only be persisted once the index is open; apply whatever was
 	// reconstructed from the WAL replay above now.
 	if err := db.persistClogRebuild(); err != nil {
 		db.Close()
@@ -365,24 +363,20 @@ func (db *DB) ForceSetClocks(txID, opID uint64) {
 	}
 }
 
-func (db *DB) openLevelDB(dir string) error {
+func (db *DB) openIndex(dir string) error {
 	indexPath := filepath.Join(dir, "index")
-	ldbOpts := &opt.Options{
-		BlockCacheCapacity: db.blockCacheSize,
-		Compression:        opt.SnappyCompression,
-	}
 
 	var err error
-	db.ldb, err = leveldb.OpenFile(indexPath, ldbOpts)
+	db.ldb, err = index.Open(indexPath, db.blockCacheSize)
 
 	needsRebuild := false
 	if err != nil {
-		db.logger.Error("LevelDB open failed, attempting rebuild", "err", err)
+		db.logger.Error("Index open failed, attempting rebuild", "err", err)
 		needsRebuild = true
-		os.RemoveAll(indexPath)
-		db.ldb, err = leveldb.OpenFile(indexPath, ldbOpts)
+		index.RemoveAll(indexPath)
+		db.ldb, err = index.Open(indexPath, db.blockCacheSize)
 		if err != nil {
-			return fmt.Errorf("open fresh leveldb: %w", err)
+			return fmt.Errorf("open fresh index: %w", err)
 		}
 	} else if !db.isIndexConsistent() {
 		db.logger.Warn("Index state inconsistent with WAL, rebuilding")
@@ -1068,7 +1062,7 @@ func (db *DB) locateWALStart(targetOpID uint64) (WALLocation, bool, error) {
 	if db.ldb == nil {
 		return WALLocation{}, false, nil
 	}
-	iter := db.ldb.NewIterator(util.BytesPrefix(sysWALIndexPrefix), nil)
+	iter := db.ldb.NewIterator(index.BytesPrefix(sysWALIndexPrefix), nil)
 	defer iter.Release()
 	seekKey := encodeWALIndexKey(targetOpID)
 	if iter.Seek(seekKey) {
@@ -1151,8 +1145,8 @@ func (db *DB) Checkpoint() error {
 	}
 
 	// FIX: Clean up ALL existing garbage stats first to prevent resurrection of deleted files
-	iter := db.ldb.NewIterator(util.BytesPrefix(sysStaleBytesPrefix), nil)
-	cleanupBatch := new(leveldb.Batch)
+	iter := db.ldb.NewIterator(index.BytesPrefix(sysStaleBytesPrefix), nil)
+	cleanupBatch := new(index.Batch)
 	for iter.Next() {
 		cleanupBatch.Delete(iter.Key())
 	}
@@ -1163,7 +1157,7 @@ func (db *DB) Checkpoint() error {
 		}
 	}
 
-	batch := new(leveldb.Batch)
+	batch := new(index.Batch)
 	for fileID, size := range db.deletedBytesByFile {
 		k := make([]byte, len(sysStaleBytesPrefix)+4)
 		copy(k, sysStaleBytesPrefix)
@@ -1191,22 +1185,22 @@ func (db *DB) Checkpoint() error {
 	if batch.Len() == 0 {
 		return nil
 	}
-	return db.ldb.Write(batch, &opt.WriteOptions{Sync: true})
+	return db.ldb.Write(batch, &index.WriteOptions{Sync: true})
 }
 
-func (db *DB) onWALRotate(index map[uint64]WALLocation) error {
-	if len(index) == 0 || db.ldb == nil {
+func (db *DB) onWALRotate(walIndex map[uint64]WALLocation) error {
+	if len(walIndex) == 0 || db.ldb == nil {
 		return nil
 	}
-	batch := new(leveldb.Batch)
+	batch := new(index.Batch)
 	var keys []uint64
-	for k := range index {
+	for k := range walIndex {
 		keys = append(keys, k)
 	}
 	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
 
 	for _, opID := range keys {
-		locBytes, _ := json.Marshal(index[opID])
+		locBytes, _ := json.Marshal(walIndex[opID])
 		batch.Put(encodeWALIndexKey(opID), locBytes)
 	}
 	return db.ldb.Write(batch, nil)
@@ -1255,7 +1249,7 @@ func (db *DB) loadKeyCount() error {
 		db.keyCount = int64(binary.BigEndian.Uint64(val))
 		return nil
 	}
-	if err == leveldb.ErrNotFound {
+	if err == index.ErrNotFound {
 		// CHANGED: Reduced from INFO to DEBUG
 		db.logger.Debug("Key count not found, scanning index for initial count", "action", "full_scan")
 		count, err := db.scanKeyCount()
@@ -1272,7 +1266,7 @@ func (db *DB) loadDeletedBytesStats() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	iter := db.ldb.NewIterator(util.BytesPrefix(sysStaleBytesPrefix), nil)
+	iter := db.ldb.NewIterator(index.BytesPrefix(sysStaleBytesPrefix), nil)
 	defer iter.Release()
 
 	for iter.Next() {
@@ -1297,7 +1291,7 @@ func (db *DB) persistSequences() error {
 		return nil
 	}
 
-	batch := new(leveldb.Batch)
+	batch := new(index.Batch)
 
 	buf := make([]byte, 8)
 	binary.BigEndian.PutUint64(buf, atomic.LoadUint64(&db.transactionID))
@@ -1311,5 +1305,5 @@ func (db *DB) persistSequences() error {
 	binary.BigEndian.PutUint64(buf3, uint64(atomic.LoadInt64(&db.keyCount)))
 	batch.Put(sysKeyCountKey, buf3)
 
-	return db.ldb.Write(batch, &opt.WriteOptions{Sync: true})
+	return db.ldb.Write(batch, &index.WriteOptions{Sync: true})
 }
