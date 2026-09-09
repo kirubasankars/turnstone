@@ -416,9 +416,9 @@ func TestReplication_SameServer_Loopback(t *testing.T) {
 
 func TestReplication_SlowConsumer_Dropped(t *testing.T) {
 	// 1. Lower timeout to speed up test
-	originalTimeout := ReplicaWriteTimeout
-	ReplicaWriteTimeout = 200 * time.Millisecond
-	defer func() { ReplicaWriteTimeout = originalTimeout }()
+	originalTimeout := replicaWriteTimeout()
+	setReplicaWriteTimeout(200 * time.Millisecond)
+	t.Cleanup(func() { setReplicaWriteTimeout(originalTimeout) })
 
 	// 2. Setup Single Node Environment
 	baseDir, clientTLS := setupSharedCertEnv(t)
