@@ -41,8 +41,8 @@ type DB struct {
 	clogMu sync.RWMutex
 	logger *slog.Logger
 
-	mu       sync.RWMutex
-	commitMu sync.Mutex
+	mu         sync.RWMutex
+	commitMu   sync.Mutex
 	shutdownMu sync.RWMutex
 
 	transactionID uint64
