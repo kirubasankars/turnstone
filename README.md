@@ -1,3 +1,11 @@
+<!--
+Copyright (c) 2026 Kiruba Sankar Swaminathan
+
+This source code is licensed under the MIT license found in the
+LICENSE file in the root of this source tree.
+-->
+
+
 # TurnstoneDB
 
 **TurnstoneDB** is a high-performance, persistent, distributed Key-Value store written in Go. It features a custom storage engine with a single append-only log and in-memory MVCC index, full ACID transactions via Snapshot Isolation, and robust asynchronous replication with **Timeline** support for safe failovers.
