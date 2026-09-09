@@ -6,6 +6,7 @@
 package stonedb
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -35,6 +36,9 @@ func TestRecovery_CrashConsistency(t *testing.T) {
 	_, err = rtx.Get([]byte("crash_key"))
 	if err != ErrKeyNotFound {
 		t.Errorf("Uncommitted write should not survive crash, got %v", err)
+	}
+	if len(db2.clog) != 0 {
+		t.Errorf("expected empty clog after crash recovery, got %d entries", len(db2.clog))
 	}
 }
 
@@ -143,6 +147,44 @@ func TestRecovery_KeyCountAfterPromote(t *testing.T) {
 	tx.Discard()
 	if err != nil || string(val) != "data" {
 		t.Fatalf("GET after promote+reopen: err=%v val=%q", err, val)
+	}
+}
+
+func TestRecovery_LargeReplay(t *testing.T) {
+	dir := t.TempDir()
+	opts := Options{}
+	const n = 5000
+
+	{
+		db, err := Open(dir, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Promote(); err != nil {
+			t.Fatal(err)
+		}
+		tx := db.NewTransaction(true)
+		for i := 0; i < n; i++ {
+			key := []byte(fmt.Sprintf("large-replay-%d", i))
+			if err := tx.Put(key, []byte("v")); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		db.Close()
+	}
+
+	db2, err := Open(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+
+	count, err := db2.KeyCount()
+	if err != nil || count != n {
+		t.Fatalf("KeyCount after large replay: want %d, got %d err=%v", n, count, err)
 	}
 }
 

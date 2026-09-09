@@ -13,13 +13,22 @@ type holeSpan struct{ off, len int64 }
 
 // RunVacuum drops dead index versions and punches holes in stale log ranges.
 func (db *DB) RunVacuum() (bool, error) {
+	if atomic.LoadInt32(&db.closed) == 1 {
+		return false, nil
+	}
 	if !atomic.CompareAndSwapInt32(&db.vacuuming, 0, 1) {
 		return false, nil
 	}
 	defer atomic.StoreInt32(&db.vacuuming, 0)
 
+	if atomic.LoadInt32(&db.closed) == 1 {
+		return false, nil
+	}
 	horizon := db.minActiveSnapshotXmax()
 	dead := db.index.collectDeadVersions(horizon, db.clogStatus)
+	if atomic.LoadInt32(&db.closed) == 1 {
+		return false, nil
+	}
 	if len(dead) == 0 {
 		return false, nil
 	}
