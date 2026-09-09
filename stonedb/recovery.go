@@ -6,13 +6,14 @@
 package stonedb
 
 import (
+	"context"
 	"sync/atomic"
 )
 
-func (db *DB) replayLog(truncateCorrupt bool) error {
+func (db *DB) replayLog(ctx context.Context, truncateCorrupt bool) error {
 	inProgress := make(map[uint64]struct{})
 
-	err := db.log.Replay(truncateCorrupt, db.timelineMeta.History, func(rec WALRecord, span recordSpan) {
+	err := db.log.Replay(ctx, truncateCorrupt, db.timelineMeta.History, func(rec WALRecord, span recordSpan) {
 		if rec.XID > atomic.LoadUint64(&db.transactionID) {
 			atomic.StoreUint64(&db.transactionID, rec.XID)
 		}
@@ -23,7 +24,6 @@ func (db *DB) replayLog(truncateCorrupt bool) error {
 		switch rec.Type {
 		case WALRecordBegin:
 			inProgress[rec.XID] = struct{}{}
-			db.clog[rec.XID] = TxInProgress
 		case WALRecordSet:
 			db.index.Put(rec.Key, indexVersion{
 				offset: span.offset, valueLen: uint32(len(rec.Value)),
@@ -35,12 +35,12 @@ func (db *DB) replayLog(truncateCorrupt bool) error {
 				xmin: rec.XID, opID: rec.OpID, tombstone: true,
 			})
 		case WALRecordCommit:
-			db.clog[rec.XID] = TxCommitted
 			delete(inProgress, rec.XID)
+			db.forgetClog(rec.XID)
 		case WALRecordAbort:
-			db.clog[rec.XID] = TxAborted
 			delete(inProgress, rec.XID)
 			db.index.DropXid(rec.XID)
+			db.forgetClog(rec.XID)
 		}
 	})
 	if err != nil && err != ErrTruncated {
@@ -48,8 +48,8 @@ func (db *DB) replayLog(truncateCorrupt bool) error {
 	}
 
 	for xid := range inProgress {
-		db.clog[xid] = TxAborted
 		db.index.DropXid(xid)
+		db.forgetClog(xid)
 	}
 
 	atomic.StoreInt64(&db.keyCount, db.index.LiveKeyCount(db.clogStatus))

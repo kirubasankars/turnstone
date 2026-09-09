@@ -66,6 +66,7 @@ type Server struct {
 	currentTLSConfig atomic.Value
 	replManager      *replication.ReplicationManager
 	devMode          bool
+	closing          int32
 
 	// Metrics per database
 	connsMu sync.Mutex
@@ -387,7 +388,7 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
 	header := make([]byte, protocol.ProtoHeaderSize)
 
 	for {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || atomic.LoadInt32(&s.closing) == 1 {
 			return
 		}
 		_ = conn.SetReadDeadline(time.Now().Add(protocol.IdleTimeout))
@@ -1355,16 +1356,70 @@ func (s *Server) handleStat(w io.Writer, st *connState) {
 	_ = s.writeBinaryResponse(w, protocol.ResStatusOK, data)
 }
 
+func (s *Server) closeAllConnections() {
+	s.activeClientsMu.Lock()
+	var conns []net.Conn
+	for _, m := range s.activeClients {
+		for conn := range m {
+			conns = append(conns, conn)
+		}
+	}
+	s.activeClientsMu.Unlock()
+	now := time.Now()
+	for _, conn := range conns {
+		_ = conn.SetReadDeadline(now)
+		_ = conn.SetWriteDeadline(now)
+		_ = conn.Close()
+	}
+}
+
 func (s *Server) CloseAll() {
+	start := time.Now()
+	atomic.StoreInt32(&s.closing, 1)
+
 	s.listenerMu.Lock()
 	l := s.listener
 	s.listenerMu.Unlock()
 	if l != nil {
 		_ = l.Close()
 	}
-	for _, store := range s.stores {
-		_ = store.Close()
+	s.logger.Info("Shutdown phase", "phase", "listener_closed", "elapsed_ms", time.Since(start).Milliseconds())
+
+	if s.replManager != nil {
+		s.replManager.StopAll()
 	}
+	s.closeAllConnections()
+	s.logger.Info("Shutdown phase", "phase", "connections_closed", "elapsed_ms", time.Since(start).Milliseconds())
+
+	handlerDone := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(handlerDone)
+	}()
+	const handlerWait = 2 * time.Second
+	select {
+	case <-handlerDone:
+	case <-time.After(handlerWait):
+		s.logger.Warn("Shutdown: handlers did not exit in time, proceeding", "wait_ms", handlerWait.Milliseconds())
+		s.closeAllConnections()
+	}
+	s.logger.Info("Shutdown phase", "phase", "handlers_done", "elapsed_ms", time.Since(start).Milliseconds())
+
+	var wg sync.WaitGroup
+	for _, st := range s.stores {
+		wg.Add(1)
+		go func(store *store.Store) {
+			defer wg.Done()
+			_ = store.Close()
+		}(st)
+	}
+	wg.Wait()
+	s.logger.Info("Shutdown phase", "phase", "stores_closed", "elapsed_ms", time.Since(start).Milliseconds())
+}
+
+// Wait blocks until all connection handlers started by Run have exited.
+func (s *Server) Wait() {
+	s.wg.Wait()
 }
 
 // ActiveConns returns number of activeConns
