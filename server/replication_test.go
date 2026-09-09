@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -17,6 +18,7 @@ import (
 	"turnstone/config"
 	"turnstone/protocol"
 	"turnstone/replication"
+	"turnstone/stonedb"
 	"turnstone/store"
 )
 
@@ -63,7 +65,7 @@ func startServerNode(t *testing.T, baseDir, name string, sharedTLS *tls.Config) 
 	for _, dbName := range []string{"0", "1", "2", "3"} {
 		partPath := filepath.Join(nodeDir, "data", dbName)
 		// Removed isSystem (4th arg), using default 0 minReplicas
-		st, err := store.NewStore(partPath, logger, 0, "time", 90, 0)
+		st, err := store.NewStore(partPath, logger, 0, "time", 90)
 		if err != nil {
 			t.Fatalf("Failed to init store %s: %v", dbName, err)
 		}
@@ -731,7 +733,7 @@ func startServerNodeWithReplicas(t *testing.T, baseDir, name string, sharedTLS *
 	for _, dbName := range []string{"0", "1", "2", "3"} {
 		partPath := filepath.Join(nodeDir, "data", dbName)
 		// Use minReplicas here
-		st, err := store.NewStore(partPath, logger, minReplicas, "time", 90, 0)
+		st, err := store.NewStore(partPath, logger, minReplicas, "time", 90)
 		if err != nil {
 			t.Fatalf("Failed to init store %s: %v", dbName, err)
 		}
@@ -916,19 +918,21 @@ func TestReplication_Retention_LeaderProtectsSlowFollower(t *testing.T) {
 	}
 
 	// 8. Run Retention Check Manually
+	replicaMinSeq := st1.GetMinSlotLogSeq()
 	st1.EnforceRetentionPolicy()
 
-	// 9. Verify WAL files are RETAINED
-	// The follower disconnected around OpID ~100.
-	// We wrote up to ~200.
-	// If retention works, files containing 100..200 must exist.
-	// If it failed, older files would be deleted because Leader checkpointed.
-	walDir := filepath.Join(baseDir, "leader_ret", "data", "1", "wal")
-	files, _ := filepath.Glob(filepath.Join(walDir, "*.wal"))
-
-	// With 1KB limit and 200 writes, we expect roughly 10 files.
-	if len(files) < 5 {
-		t.Errorf("Leader deleted WAL files too aggressively! Found %d files", len(files))
+	// 9. Verify retention protects slow follower: logs at replica ack still scannable
+	if replicaMinSeq != math.MaxUint64 {
+		if err := st1.DB.ScanWAL(replicaMinSeq, func([]stonedb.WALRecord) error { return nil }); err != nil {
+			t.Errorf("Leader should retain logs for slow follower at seq %d: %v", replicaMinSeq, err)
+		}
+		if replicaMinSeq > 1 {
+			if err := st1.DB.ScanWAL(replicaMinSeq-1, func([]stonedb.WALRecord) error { return nil }); err != stonedb.ErrLogUnavailable {
+				t.Errorf("Expected ops below replica ack to be purged, got %v", err)
+			}
+		}
+	} else {
+		t.Fatal("Expected replica slot to constrain retention")
 	}
 
 	// 10. Delete the Replica Slot manually on Leader
@@ -939,11 +943,9 @@ func TestReplication_Retention_LeaderProtectsSlowFollower(t *testing.T) {
 	// 11. Run Retention again
 	st1.EnforceRetentionPolicy()
 
-	// 12. Verify WAL files are PURGED
-	// Now that the slot is gone, Leader should only keep files needed for its own crash recovery (latest ones)
-	filesAfter, _ := filepath.Glob(filepath.Join(walDir, "*.wal"))
-	if len(filesAfter) >= len(files) {
-		t.Errorf("Leader failed to purge WAL files after slot deletion. Before: %d, After: %d", len(files), len(filesAfter))
+	// 12. Verify old logs are no longer available for replication
+	if err := st1.DB.ScanWAL(replicaMinSeq, func([]stonedb.WALRecord) error { return nil }); err != stonedb.ErrLogUnavailable {
+		t.Errorf("Expected ErrLogUnavailable after slot deletion at seq %d, got %v", replicaMinSeq, err)
 	}
 }
 
@@ -1059,17 +1061,11 @@ func TestReplication_Retention_FollowerRespectsLeaderSafePoint(t *testing.T) {
 	// 9. Run Retention on F1
 	stF1.EnforceRetentionPolicy()
 
-	// 10. Verify F1 RETAINS logs
-	// F1 has no downstream replicas (minReplicaSeq=Max).
-	// But it has Upstream SafePoint = ~100.
-	// It should NOT delete files containing OpID 100.
-	f1WalDir := filepath.Join(baseDir, "follower1", "data", "1", "wal")
-	files, _ := filepath.Glob(filepath.Join(f1WalDir, "*.wal"))
-
-	// 200 writes @ 1KB limit = ~10 files.
-	// If it deleted everything older than checkpoint (200), we'd have 1-2 files.
-	// If it respected SafePoint(100), we should have ~5 files.
-	if len(files) < 4 {
-		t.Errorf("Follower 1 purged logs despite Leader SafePoint! Files: %d", len(files))
+	// 10. Verify F1 retains logs at/above Leader SafePoint (floor=300)
+	if err := stF1.DB.ScanWAL(301, func([]stonedb.WALRecord) error { return nil }); err != nil {
+		t.Errorf("Follower 1 should retain logs at leader safe point: %v", err)
+	}
+	if err := stF1.DB.ScanWAL(1, func([]stonedb.WALRecord) error { return nil }); err != stonedb.ErrLogUnavailable {
+		t.Errorf("Expected early ops purged below safe point, got %v", err)
 	}
 }
