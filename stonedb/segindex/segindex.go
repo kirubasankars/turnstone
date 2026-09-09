@@ -8,23 +8,19 @@ package segindex
 import (
 	"encoding/binary"
 	"fmt"
-	"os"
-	"path/filepath"
 	"sync"
-
-	"turnstone/stonedb/mmapfile"
 )
 
 const (
-	numSegments       = 256
-	initialSlots      = 1024
-	maxLoadFactorNum  = 3 // grow when keyCount*4 > slotCount*3
-	maxLoadFactorDen  = 4
-	headerSize        = mmapfile.PageSize
-	versionSize   = 29
-	versionNodeSz = versionSize + 8 // next pointer
-	magic         = uint64(0x5447534547) // "TGSEG"
-	formatVersion = uint32(1)
+	numSegments      = 256
+	initialSlots     = 1024
+	maxLoadFactorNum = 3 // grow when keyCount*4 > slotCount*3
+	maxLoadFactorDen = 4
+	headerSize       = 4096
+	versionSize      = 29
+	versionNodeSz    = versionSize + 8 // next pointer
+	magic            = uint64(0x5447534547) // "TGSEG"
+	formatVersion    = uint32(1)
 )
 
 // Version is one MVCC index entry pointing at a log record.
@@ -36,41 +32,27 @@ type Version struct {
 	Tombstone bool
 }
 
-// SegmentedIndex is a sharded mmap hash index with per-segment locking.
+// SegmentedIndex is a sharded in-memory hash index with per-segment locking.
 type SegmentedIndex struct {
-	dir      string
 	segments [numSegments]*segment
 }
 
-// Open creates or opens numSegments mmap segment files under dir.
-func Open(dir string) (*SegmentedIndex, error) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, err
-	}
-	idx := &SegmentedIndex{dir: dir}
+// Open creates numSegments heap-backed index segments.
+func Open() *SegmentedIndex {
+	idx := &SegmentedIndex{}
 	for i := 0; i < numSegments; i++ {
-		path := filepath.Join(dir, fmt.Sprintf("seg-%03d.bin", i))
-		seg, err := openSegment(path)
-		if err != nil {
-			idx.Close()
-			return nil, err
-		}
-		idx.segments[i] = seg
+		idx.segments[i] = newSegment()
 	}
-	return idx, nil
+	return idx
 }
 
 func (idx *SegmentedIndex) Close() error {
-	var first error
 	for _, seg := range idx.segments {
-		if seg == nil {
-			continue
-		}
-		if err := seg.close(); err != nil && first == nil {
-			first = err
+		if seg != nil {
+			seg.close()
 		}
 	}
-	return first
+	return nil
 }
 
 func (idx *SegmentedIndex) segmentFor(key []byte) *segment {
@@ -118,33 +100,38 @@ func (idx *SegmentedIndex) HasLiveRefAtOffset(offset int64) bool {
 }
 
 type segment struct {
-	mu sync.RWMutex
-	mf *mmapfile.File
+	mu   sync.RWMutex
+	data []byte
 }
 
-func openSegment(path string) (*segment, error) {
+func newSegment() *segment {
 	tableBytes := int64(initialSlots * 8)
-	minSize := int64(headerSize) + tableBytes + mmapfile.PageSize
-	mf, err := mmapfile.Open(path, minSize)
-	if err != nil {
-		return nil, err
-	}
-	seg := &segment{mf: mf}
-	if readU64(mf.Data(), hdrMagicOff) != magic {
-		seg.initNew(initialSlots)
-	}
-	return seg, nil
+	minSize := int64(headerSize) + tableBytes + headerSize
+	s := &segment{data: make([]byte, minSize)}
+	s.initNew(initialSlots)
+	return s
 }
 
-func (s *segment) close() error {
+func (s *segment) close() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.mf == nil {
-		return nil
+	s.data = nil
+	s.mu.Unlock()
+}
+
+func (s *segment) grow(minSize int64) {
+	if minSize <= int64(len(s.data)) {
+		return
 	}
-	err := s.mf.Discard()
-	s.mf = nil
-	return err
+	n := len(s.data)
+	if n == 0 {
+		n = int(minSize)
+	}
+	for int64(n) < minSize {
+		n *= 2
+	}
+	out := make([]byte, n)
+	copy(out, s.data)
+	s.data = out
 }
 
 const (
@@ -158,7 +145,7 @@ const (
 )
 
 func (s *segment) initNew(slotCount uint32) {
-	data := s.mf.Data()
+	data := s.data
 	writeU64(data, hdrMagicOff, magic)
 	writeU32(data, hdrVersionOff, formatVersion)
 	writeU32(data, hdrSlotCountOff, slotCount)
@@ -171,40 +158,38 @@ func (s *segment) initNew(slotCount uint32) {
 }
 
 func (s *segment) slotCount() uint32 {
-	return readU32(s.mf.Data(), hdrSlotCountOff)
+	return readU32(s.data, hdrSlotCountOff)
 }
 
 func (s *segment) keyCount() uint32 {
-	return readU32(s.mf.Data(), hdrKeyCountOff)
+	return readU32(s.data, hdrKeyCountOff)
 }
 
 func (s *segment) setKeyCount(n uint32) {
-	writeU32(s.mf.Data(), hdrKeyCountOff, n)
+	writeU32(s.data, hdrKeyCountOff, n)
 }
 
 func (s *segment) tableOff() uint64 {
-	return readU64(s.mf.Data(), hdrTableOffOff)
+	return readU64(s.data, hdrTableOffOff)
 }
 
 func (s *segment) arenaOff() uint64 {
-	return readU64(s.mf.Data(), hdrArenaOffOff)
+	return readU64(s.data, hdrArenaOffOff)
 }
 
 func (s *segment) arenaUsed() uint64 {
-	return readU64(s.mf.Data(), hdrArenaUsedOff)
+	return readU64(s.data, hdrArenaUsedOff)
 }
 
 func (s *segment) setArenaUsed(n uint64) {
-	writeU64(s.mf.Data(), hdrArenaUsedOff, n)
+	writeU64(s.data, hdrArenaUsedOff, n)
 }
 
 func (s *segment) alloc(size int) (uint64, error) {
 	off := s.arenaOff() + s.arenaUsed()
 	need := int64(off) + int64(size)
-	if need > int64(len(s.mf.Data())) {
-		if err := s.mf.Grow(need); err != nil {
-			return 0, err
-		}
+	if need > int64(len(s.data)) {
+		s.grow(need)
 	}
 	s.setArenaUsed(s.arenaUsed() + uint64(size))
 	return off, nil
@@ -217,7 +202,7 @@ func (s *segment) slotIndex(key []byte) uint32 {
 func (s *segment) findKeyRecord(key []byte) (uint64, bool) {
 	slots := s.slotCount()
 	start := s.slotIndex(key)
-	data := s.mf.Data()
+	data := s.data
 	table := int(s.tableOff())
 	for i := uint32(0); i < slots; i++ {
 		slot := (start + i) % slots
@@ -248,7 +233,7 @@ func (s *segment) bumpArenaChainRefs(recOff uint64, delta uint64) {
 	newHead := head + delta
 	s.setVersionHead(recOff, newHead)
 	node := newHead
-	data := s.mf.Data()
+	data := s.data
 	for node != 0 {
 		nextOff := readU64(data, int(node)+versionSize)
 		if nextOff != 0 {
@@ -283,10 +268,8 @@ func (s *segment) growHashTable() error {
 	newTableBytes := uint64(newSlots) * 8
 	newArenaStart := tableStart + newTableBytes
 	need := int64(newArenaStart + used)
-	if err := s.mf.Grow(need); err != nil {
-		return err
-	}
-	data := s.mf.Data()
+	s.grow(need)
+	data := s.data
 	arenaSnap := make([]byte, used)
 	if used > 0 {
 		copy(arenaSnap, data[int(arenaStart):int(arenaStart+used)])
@@ -343,7 +326,7 @@ func (s *segment) growHashTable() error {
 func (s *segment) insertKeySlot(key []byte, recOff uint64) error {
 	slots := s.slotCount()
 	start := s.slotIndex(key)
-	data := s.mf.Data()
+	data := s.data
 	table := int(s.tableOff())
 	for i := uint32(0); i < slots; i++ {
 		slot := (start + i) % slots
@@ -372,7 +355,7 @@ func (s *segment) findOrCreateKeyRecord(key []byte) (uint64, error) {
 		if err != nil {
 			return 0, err
 		}
-		data := s.mf.Data()
+		data := s.data
 		writeU32(data, int(off), uint32(len(key)))
 		writeU64(data, int(off)+4, 0)
 		copy(data[int(off)+12:], key)
@@ -393,7 +376,7 @@ func (s *segment) findOrCreateKeyRecord(key []byte) (uint64, error) {
 }
 
 func (s *segment) keyAt(recOff uint64, key []byte) bool {
-	data := s.mf.Data()
+	data := s.data
 	if int(recOff)+12 > len(data) {
 		return false
 	}
@@ -408,7 +391,7 @@ func (s *segment) keyAt(recOff uint64, key []byte) bool {
 }
 
 func (s *segment) readKey(recOff uint64) []byte {
-	data := s.mf.Data()
+	data := s.data
 	kLen := readU32(data, int(recOff))
 	out := make([]byte, kLen)
 	copy(out, data[int(recOff)+12:int(recOff)+12+int(kLen)])
@@ -416,17 +399,17 @@ func (s *segment) readKey(recOff uint64) []byte {
 }
 
 func (s *segment) versionHead(recOff uint64) uint64 {
-	return readU64(s.mf.Data(), int(recOff)+4)
+	return readU64(s.data, int(recOff)+4)
 }
 
 func (s *segment) setVersionHead(recOff, head uint64) {
-	writeU64(s.mf.Data(), int(recOff)+4, head)
+	writeU64(s.data, int(recOff)+4, head)
 }
 
 func (s *segment) put(key []byte, ver Version) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.mf == nil {
+	if s.data == nil {
 		return
 	}
 
@@ -438,15 +421,15 @@ func (s *segment) put(key []byte, ver Version) {
 	if err != nil {
 		panic("segindex: alloc version: " + err.Error())
 	}
-	writeVersion(s.mf.Data(), int(nodeOff), ver)
-	writeU64(s.mf.Data(), int(nodeOff)+versionSize, s.versionHead(recOff))
+	writeVersion(s.data, int(nodeOff), ver)
+	writeU64(s.data, int(nodeOff)+versionSize, s.versionHead(recOff))
 	s.setVersionHead(recOff, nodeOff)
 }
 
 func (s *segment) walkVersions(key []byte, fn func(Version) bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.mf == nil {
+	if s.data == nil {
 		return
 	}
 
@@ -455,7 +438,7 @@ func (s *segment) walkVersions(key []byte, fn func(Version) bool) {
 		return
 	}
 	node := s.versionHead(recOff)
-	data := s.mf.Data()
+	data := s.data
 	for node != 0 {
 		if int(node)+versionNodeSz > len(data) {
 			break
@@ -471,11 +454,11 @@ func (s *segment) walkVersions(key []byte, fn func(Version) bool) {
 func (s *segment) forEachKey(fn func(key []byte, chain []Version)) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.mf == nil {
+	if s.data == nil {
 		return
 	}
 
-	data := s.mf.Data()
+	data := s.data
 	slots := s.slotCount()
 	table := int(s.tableOff())
 	for slot := uint32(0); slot < slots; slot++ {
@@ -502,14 +485,14 @@ func (s *segment) forEachKey(fn func(key []byte, chain []Version)) {
 func (s *segment) dropXid(xid uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.mf == nil {
+	if s.data == nil {
 		return
 	}
 
 	slots := s.slotCount()
 	table := int(s.tableOff())
 	for slot := uint32(0); slot < slots; slot++ {
-		data := s.mf.Data()
+		data := s.data
 		slotOff := table + int(slot)*8
 		recOff := readU64(data, slotOff)
 		if recOff == 0 {
@@ -517,7 +500,7 @@ func (s *segment) dropXid(xid uint64) {
 		}
 		newHead, empty := s.filterChain(recOff, func(v Version) bool { return v.Xmin != xid })
 		if empty {
-			writeU64(s.mf.Data(), slotOff, 0)
+			writeU64(s.data, slotOff, 0)
 			s.setKeyCount(s.keyCount() - 1)
 		} else {
 			s.setVersionHead(recOff, newHead)
@@ -528,7 +511,7 @@ func (s *segment) dropXid(xid uint64) {
 func (s *segment) removeVersion(key []byte, xmin uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.mf == nil {
+	if s.data == nil {
 		return
 	}
 
@@ -536,7 +519,7 @@ func (s *segment) removeVersion(key []byte, xmin uint64) {
 	if !ok {
 		return
 	}
-	data := s.mf.Data()
+	data := s.data
 	slots := s.slotCount()
 	table := int(s.tableOff())
 	var slotIdx int = -1
@@ -551,7 +534,7 @@ func (s *segment) removeVersion(key []byte, xmin uint64) {
 	newHead, empty := s.filterChain(recOff, func(v Version) bool { return v.Xmin != xmin })
 	if empty {
 		if slotIdx >= 0 {
-			writeU64(s.mf.Data(), slotIdx, 0)
+			writeU64(s.data, slotIdx, 0)
 		}
 		s.setKeyCount(s.keyCount() - 1)
 	} else {
@@ -560,7 +543,7 @@ func (s *segment) removeVersion(key []byte, xmin uint64) {
 }
 
 func (s *segment) filterChain(recOff uint64, keep func(Version) bool) (uint64, bool) {
-	data := s.mf.Data()
+	data := s.data
 	head := s.versionHead(recOff)
 	var kept []Version
 	for node := head; node != 0; node = readU64(data, int(node)+versionSize) {
@@ -581,7 +564,7 @@ func (s *segment) filterChain(recOff uint64, keep func(Version) bool) (uint64, b
 		if err != nil {
 			panic("segindex: filterChain alloc: " + err.Error())
 		}
-		data = s.mf.Data()
+		data = s.data
 		writeVersion(data, int(nodeOff), kept[i])
 		writeU64(data, int(nodeOff)+versionSize, newHead)
 		newHead = nodeOff
@@ -592,7 +575,7 @@ func (s *segment) filterChain(recOff uint64, keep func(Version) bool) (uint64, b
 func (s *segment) hasOffset(target int64) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.mf == nil {
+	if s.data == nil {
 		return false
 	}
 
@@ -612,7 +595,7 @@ func (s *segment) hasOffset(target int64) bool {
 }
 
 func (s *segment) forEachKeyLocked(fn func(key []byte, chain []Version)) {
-	data := s.mf.Data()
+	data := s.data
 	slots := s.slotCount()
 	table := int(s.tableOff())
 	for slot := uint32(0); slot < slots; slot++ {

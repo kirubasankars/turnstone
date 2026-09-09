@@ -16,33 +16,30 @@ import (
 
 const indexVersionSize = 29 // offset(8)+valueLen(4)+xmin(8)+opID(8)+tombstone(1)
 
-// Index is an MVCC index backed by a segmented mmap hash table.
-// Index files are ephemeral: wiped on open, dropped on close (no munmap/writeback), rebuilt from data.log replay.
+// Index is an MVCC index backed by a segmented in-memory hash arena.
+// The index is ephemeral: rebuilt from data.log replay on open and dropped on close.
 type Index struct {
-	dir string
 	seg *segindex.SegmentedIndex
 }
 
-// OpenIndex opens (or recreates) the index under dbDir/index.
-// Any existing index files are removed; log replay on DB open rebuilds contents from scratch.
+// OpenIndex creates a fresh in-memory index. Any leftover index/ files from older
+// builds are removed; log replay on DB open rebuilds contents from scratch.
 func OpenIndex(dbDir string) (*Index, error) {
 	indexDir := filepath.Join(dbDir, "index")
 	if err := os.RemoveAll(indexDir); err != nil {
 		return nil, err
 	}
-	seg, err := segindex.Open(indexDir)
-	if err != nil {
-		return nil, err
-	}
-	return &Index{dir: indexDir, seg: seg}, nil
+	return &Index{seg: segindex.Open()}, nil
 }
 
-// Close drops the in-memory index without unmapping segments. MAP_SHARED munmap would
-// write dirty pages back to seg-*.bin; that work is wasted because OpenIndex wipes
-// index/ on the next open. The kernel reclaims mappings at process exit.
+// Close drops the in-memory index and frees segment buffers.
 func (idx *Index) Close() error {
+	if idx.seg == nil {
+		return nil
+	}
+	err := idx.seg.Close()
 	idx.seg = nil
-	return nil
+	return err
 }
 
 func (idx *Index) Put(key []byte, v indexVersion) {
