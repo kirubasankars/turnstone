@@ -15,16 +15,16 @@ const (
 
 // meta offsets within page 0
 const (
-	metaMagicOff    = 0
-	metaVersionOff  = 8
-	metaRootOff     = 12
-	metaNumPagesOff = 20
-	metaFreeHeadOff = 28
-	metaLeftLeafOff = 36
-	metaHeaderSize  = 44
-	leafHeaderSize  = 19
-	internalHdrSize = 19
-	pageTypeLeaf    = 1
+	metaMagicOff     = 0
+	metaVersionOff   = 8
+	metaRootOff      = 12
+	metaNumPagesOff  = 20
+	metaFreeHeadOff  = 28
+	metaLeftLeafOff  = 36
+	metaHeaderSize   = 44
+	leafHeaderSize   = 19
+	internalHdrSize  = 19
+	pageTypeLeaf     = 1
 	pageTypeInternal = 0
 )
 

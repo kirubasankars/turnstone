@@ -51,13 +51,13 @@ func (t *Tree) initMeta() {
 	writeU64(p, metaLeftLeafOff, 0)
 }
 
-func (t *Tree) rootPage() uint64  { return readU64(t.mf.page(metaPageID), metaRootOff) }
-func (t *Tree) setRoot(p uint64)  { writeU64(t.mf.page(metaPageID), metaRootOff, p) }
-func (t *Tree) leftLeaf() uint64  { return readU64(t.mf.page(metaPageID), metaLeftLeafOff) }
+func (t *Tree) rootPage() uint64     { return readU64(t.mf.page(metaPageID), metaRootOff) }
+func (t *Tree) setRoot(p uint64)     { writeU64(t.mf.page(metaPageID), metaRootOff, p) }
+func (t *Tree) leftLeaf() uint64     { return readU64(t.mf.page(metaPageID), metaLeftLeafOff) }
 func (t *Tree) setLeftLeaf(p uint64) { writeU64(t.mf.page(metaPageID), metaLeftLeafOff, p) }
-func (t *Tree) numPages() uint64  { return readU64(t.mf.page(metaPageID), metaNumPagesOff) }
+func (t *Tree) numPages() uint64     { return readU64(t.mf.page(metaPageID), metaNumPagesOff) }
 func (t *Tree) setNumPages(n uint64) { writeU64(t.mf.page(metaPageID), metaNumPagesOff, n) }
-func (t *Tree) freeHead() uint64  { return readU64(t.mf.page(metaPageID), metaFreeHeadOff) }
+func (t *Tree) freeHead() uint64     { return readU64(t.mf.page(metaPageID), metaFreeHeadOff) }
 func (t *Tree) setFreeHead(p uint64) { writeU64(t.mf.page(metaPageID), metaFreeHeadOff, p) }
 
 func (t *Tree) allocPage() (uint64, error) {
@@ -218,10 +218,10 @@ func (t *Tree) initLeaf(page, prev, next uint64) {
 	writeU64(p, 11, next)
 }
 
-func (t *Tree) leafCount(page uint64) int { return int(readU16(t.mf.page(page), 1)) }
+func (t *Tree) leafCount(page uint64) int       { return int(readU16(t.mf.page(page), 1)) }
 func (t *Tree) setLeafCount(page uint64, n int) { writeU16(t.mf.page(page), 1, uint16(n)) }
-func (t *Tree) leafPrev(page uint64) uint64 { return readU64(t.mf.page(page), 3) }
-func (t *Tree) leafNext(page uint64) uint64 { return readU64(t.mf.page(page), 11) }
+func (t *Tree) leafPrev(page uint64) uint64     { return readU64(t.mf.page(page), 3) }
+func (t *Tree) leafNext(page uint64) uint64     { return readU64(t.mf.page(page), 11) }
 
 func (t *Tree) setLeafLinks(page, prev, next uint64) {
 	p := t.mf.page(page)
@@ -442,7 +442,7 @@ type internalEntry struct {
 	child uint64
 }
 
-func (t *Tree) internalCount(page uint64) int { return int(readU16(t.mf.page(page), 1)) }
+func (t *Tree) internalCount(page uint64) int       { return int(readU16(t.mf.page(page), 1)) }
 func (t *Tree) setInternalCount(page uint64, n int) { writeU16(t.mf.page(page), 1, uint16(n)) }
 
 func (t *Tree) initInternal(page uint64) {

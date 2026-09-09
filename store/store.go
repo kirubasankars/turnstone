@@ -23,10 +23,10 @@ type StoreStats struct {
 	Offset       int64
 	Conflicts    uint64
 	ReplicaLag   uint64
-	WALFiles     int     // always 1 (single data.log)
-	WALSize      int64   // logical size of data.log
-	VLogFiles    int     // deprecated, always 0
-	VLogSize     int64   // allocated on-disk bytes (sparse)
+	WALFiles     int   // always 1 (single data.log)
+	WALSize      int64 // logical size of data.log
+	VLogFiles    int   // deprecated, always 0
+	VLogSize     int64 // allocated on-disk bytes (sparse)
 	KeyCount     int64
 	GarbageBytes int64
 }
