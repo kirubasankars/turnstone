@@ -12,7 +12,6 @@ import (
 	"hash/crc32"
 	"io"
 	"log/slog"
-	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -24,7 +23,7 @@ type DataLog struct {
 	path        string
 	file        *os.File
 	writeOffset int64
-	mu          sync.Mutex
+	mu          sync.RWMutex
 	logger      *slog.Logger
 
 	opOffsets map[uint64]int64 // opID -> frame start offset
@@ -57,8 +56,8 @@ func OpenDataLog(dir string, logger *slog.Logger) (*DataLog, error) {
 }
 
 func (l *DataLog) WriteOffset() int64 {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.mu.RLock()
+	defer l.mu.RUnlock()
 	return l.writeOffset
 }
 
@@ -77,13 +76,11 @@ func (l *DataLog) strictSync() {
 // AppendRecordsWithOpIDs assigns opIDs and appends frames. Returns opIDs and
 // the byte offset of each appended frame.
 func (l *DataLog) AppendRecordsWithOpIDs(nextOpID func() uint64, builders []func(uint64) []byte, sync bool) ([]uint64, []int64, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
 	if len(builders) == 0 {
 		return nil, nil, nil
 	}
 
+	l.mu.Lock()
 	opIDs := make([]uint64, len(builders))
 	offsets := make([]int64, len(builders))
 
@@ -93,11 +90,13 @@ func (l *DataLog) AppendRecordsWithOpIDs(nextOpID func() uint64, builders []func
 		payload := build(opID)
 		off := l.writeOffset
 		if err := l.writeFrameLocked(payload); err != nil {
+			l.mu.Unlock()
 			return nil, nil, err
 		}
 		offsets[i] = off
 		l.opOffsets[opID] = off
 	}
+	l.mu.Unlock()
 
 	if sync {
 		l.strictSync()
@@ -107,15 +106,16 @@ func (l *DataLog) AppendRecordsWithOpIDs(nextOpID func() uint64, builders []func
 
 func (l *DataLog) AppendReplicatedRecord(payload []byte, sync bool) (int64, error) {
 	l.mu.Lock()
-	defer l.mu.Unlock()
-
 	off := l.writeOffset
 	if err := l.writeFrameLocked(payload); err != nil {
+		l.mu.Unlock()
 		return 0, err
 	}
 	if opID, ok := peekOpID(payload); ok {
 		l.opOffsets[opID] = off
 	}
+	l.mu.Unlock()
+
 	if sync {
 		l.strictSync()
 	}
@@ -141,8 +141,8 @@ func (l *DataLog) writeFrameLocked(payload []byte) error {
 }
 
 func (l *DataLog) ReadValueAt(offset int64, valLen uint32) ([]byte, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.mu.RLock()
+	defer l.mu.RUnlock()
 
 	header := make([]byte, LogFrameHeaderSize)
 	if _, err := l.file.ReadAt(header, offset); err != nil {
@@ -183,8 +183,7 @@ func (l *DataLog) Replay(truncateCorrupt bool, history []TimelineHistoryItem, on
 	if stat.Size() == 0 {
 		return nil
 	}
-
-	cutoffOp := timelineCutoff(history)
+	_ = history // timeline metadata is for replication; local replay includes all frames
 
 	pos, err := f.Seek(0, io.SeekStart)
 	if err != nil {
@@ -221,11 +220,6 @@ func (l *DataLog) Replay(truncateCorrupt bool, history []TimelineHistoryItem, on
 			return fmt.Errorf("log corruption at offset %d: %w", pos, rerr)
 		}
 
-		if rec.OpID > cutoffOp {
-			pos = validEnd
-			continue
-		}
-
 		l.opOffsets[rec.OpID] = span.offset
 		if onRecord != nil {
 			onRecord(rec, span)
@@ -233,13 +227,6 @@ func (l *DataLog) Replay(truncateCorrupt bool, history []TimelineHistoryItem, on
 		pos = validEnd
 	}
 	return nil
-}
-
-func timelineCutoff(history []TimelineHistoryItem) uint64 {
-	if len(history) == 0 {
-		return math.MaxUint64
-	}
-	return history[len(history)-1].EndOp
 }
 
 func (l *DataLog) readFrameAt(f *os.File, offset, fileSize int64) (int64, WALRecord, recordSpan, error) {
@@ -282,9 +269,9 @@ func (l *DataLog) readFrameAt(f *os.File, offset, fileSize int64) (int64, WALRec
 
 // Scan streams records from startOpID onward.
 func (l *DataLog) Scan(startOpID uint64, fn func([]WALRecord) error) error {
-	l.mu.Lock()
+	l.mu.RLock()
 	startOff, ok := l.findScanStartLocked(startOpID)
-	l.mu.Unlock()
+	l.mu.RUnlock()
 	if !ok {
 		return ErrLogUnavailable
 	}
@@ -358,8 +345,8 @@ func (l *DataLog) PunchHole(off, length int64) error {
 }
 
 func (l *DataLog) LogicalSize() int64 {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.mu.RLock()
+	defer l.mu.RUnlock()
 	stat, err := l.file.Stat()
 	if err != nil {
 		return 0

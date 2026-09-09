@@ -11,6 +11,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -77,6 +78,10 @@ func main() {
 		log.Fatal(err)
 	}
 
+	if err := preflight(); err != nil {
+		log.Fatal(err)
+	}
+
 	if *readRatio >= 0.0 && *readRatio <= 1.0 {
 		runWorkload("MIXED", tlsConfig, payload, *readRatio)
 	} else {
@@ -106,6 +111,74 @@ func loadTLSConfig() (*tls.Config, error) {
 		RootCAs:      pool,
 		Certificates: []tls.Certificate{cert},
 	}, nil
+}
+
+func preflight() error {
+	caPath := filepath.Join(*home, "certs", "ca.crt")
+	certPath := filepath.Join(*home, "certs", "client.crt")
+	keyPath := filepath.Join(*home, "certs", "client.key")
+
+	cl, err := client.NewMTLSClientHelper(*addr, caPath, certPath, keyPath, nil)
+	if err != nil {
+		return fmt.Errorf("preflight connect failed: %w", err)
+	}
+	defer cl.Close()
+
+	dbName := fmt.Sprintf("%d", *dbNum)
+	if err := cl.Select(dbName); err != nil {
+		return fmt.Errorf("preflight SELECT %s failed: %w", dbName, err)
+	}
+
+	raw, err := cl.Stat()
+	if err != nil {
+		return fmt.Errorf("preflight STAT failed: %w", err)
+	}
+	var st struct {
+		State string `json:"state"`
+	}
+	if err := json.Unmarshal(raw, &st); err != nil {
+		return fmt.Errorf("preflight STAT parse failed: %w (body=%q)", err, raw)
+	}
+	if st.State != "PRIMARY" {
+		return fmt.Errorf(`database %s is %s; writes require PRIMARY
+
+Databases start UNDEFINED after generate-config and reject BEGIN/SET/GET until promoted.
+
+  turnstone-cli -admin -home %s
+  %s> select %s
+  %s> promote
+
+Or start the server with -mode dev to auto-promote every database`,
+			dbName, st.State, *home, dbName, dbName, dbName)
+	}
+	return nil
+}
+
+func statusName(status byte) string {
+	switch status {
+	case client.ResStatusOK:
+		return "OK"
+	case client.ResStatusErr:
+		return "ERR"
+	case client.ResStatusNotFound:
+		return "NOT_FOUND"
+	case client.ResStatusTxRequired:
+		return "TX_REQUIRED"
+	case client.ResStatusTxTimeout:
+		return "TX_TIMEOUT"
+	case client.ResStatusTxConflict:
+		return "TX_CONFLICT"
+	case client.ResStatusTxInProgress:
+		return "TX_IN_PROGRESS"
+	case client.ResStatusServerBusy:
+		return "SERVER_BUSY"
+	case client.ResStatusEntityTooLarge:
+		return "ENTITY_TOO_LARGE"
+	case client.ResStatusMemoryLimit:
+		return "MEMORY_LIMIT"
+	default:
+		return "UNKNOWN"
+	}
 }
 
 func generateKey(clientID, index int) string {
@@ -210,6 +283,7 @@ func runWorkload(phase string, tlsConfig *tls.Config, payload []byte, readPct fl
 			estOpSize := 20 + *valueSize + *keySize
 			writeBuf := make([]byte, 0, *pipelineDepth*(40+(*batchSize*estOpSize)))
 			headerBuf := make([]byte, 5)
+			var logFail sync.Once
 
 			txCount := 0
 
@@ -219,12 +293,10 @@ func runWorkload(phase string, tlsConfig *tls.Config, payload []byte, readPct fl
 
 				// 1. Build Pipeline Request (Depth = Number of parallel Transactions)
 				for d := 0; d < *pipelineDepth; d++ {
-					// Append BEGIN
-					writeBuf = appendHeader(writeBuf, client.OpCodeBegin, 0)
-
-					// Append Batch of OPs
+					// Decide op types for this transaction first so BEGIN mode matches.
+					opIsRead := make([]bool, *batchSize)
+					allRead := true
 					for k := 0; k < *batchSize; k++ {
-						// Determine Op Type
 						isRead := false
 						if phase == "READ " {
 							isRead = true
@@ -233,6 +305,22 @@ func runWorkload(phase string, tlsConfig *tls.Config, payload []byte, readPct fl
 						} else {
 							isRead = r.Float64() < readPct
 						}
+						opIsRead[k] = isRead
+						if !isRead {
+							allRead = false
+						}
+					}
+
+					if allRead {
+						writeBuf = appendHeader(writeBuf, client.OpCodeBegin, 1)
+						writeBuf = append(writeBuf, client.BeginReadOnly)
+					} else {
+						writeBuf = appendHeader(writeBuf, client.OpCodeBegin, 0)
+					}
+
+					// Append Batch of OPs
+					for k := 0; k < *batchSize; k++ {
+						isRead := opIsRead[k]
 
 						// Key selection
 						keyIndex := (txCount * *batchSize) + k
@@ -278,16 +366,28 @@ func runWorkload(phase string, tlsConfig *tls.Config, payload []byte, readPct fl
 					}
 					status := headerBuf[0]
 					length := binary.BigEndian.Uint32(headerBuf[1:])
+					failedStatus := status != client.ResStatusOK && status != client.ResStatusNotFound
 
+					var errBody string
 					if length > 0 {
-						if _, err := reader.Discard(int(length)); err != nil {
+						if failedStatus {
+							buf := make([]byte, length)
+							if _, err := io.ReadFull(reader, buf); err != nil {
+								atomic.AddInt64(&failedOps, int64(*pipelineDepth**batchSize))
+								return
+							}
+							errBody = string(buf)
+						} else if _, err := reader.Discard(int(length)); err != nil {
 							atomic.AddInt64(&failedOps, int64(*pipelineDepth**batchSize))
 							return
 						}
 					}
 
-					if status != client.ResStatusOK && status != client.ResStatusNotFound {
+					if failedStatus {
 						batchFailed = true
+						logFail.Do(func() {
+							log.Printf("%s first failure: status=0x%02x (%s) body=%q", phase, status, statusName(status), errBody)
+						})
 					}
 					if status == client.ResStatusNotFound {
 						atomic.AddInt64(&notFoundOps, 1)

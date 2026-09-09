@@ -30,7 +30,7 @@ LICENSE file in the root of this source tree.
 
 | Area | Detail |
 | --- | --- |
-| Storage | Single append-only `data.log` + mmap B+ tree index (`index/data.bt`) |
+| Storage | Single append-only `data.log` + segmented mmap hash index (`index/seg-*.bin`) |
 | Durability | Eager append on `SET`/`DEL`; group fsync on `COMMIT` |
 | Vacuum | Drop dead MVCC versions; reclaim disk with sparse punch-hole |
 | Security | mTLS on all connections; RBAC via X.509 certificate Organization |
@@ -158,7 +158,7 @@ There is no automatic leader election. Timelines record history forks so promoti
 ## Storage engine
 
 ```
-Client SET/DEL  →  append data.log  →  update B+ tree index
+Client SET/DEL  →  append data.log  →  update segmented hash index
 Client COMMIT   →  append + fsync COMMIT  →  clog[xid] = committed
 Client GET      →  index lookup  →  ReadAt(offset) from data.log
 Open            →  replay data.log (SEEK_DATA skips holes)  →  rebuild index + clog
@@ -168,7 +168,7 @@ Vacuum          →  drop dead versions  →  punch-hole stale ranges
 ### Components
 
 1. **`data.log`** — one unbounded append-only file. Records: `BEGIN`, `SET`, `DEL`, `COMMIT`, `ABORT` (keys and values inline).
-2. **`index/data.bt`** — mmap B+ tree. Keys encode `userKey || (MaxUint64 − xmin)`; values hold log offset and MVCC metadata. Rebuilt from replay on every open.
+2. **`index/seg-*.bin`** — 256-segment mmap hash index. Each user key holds an MVCC version chain pointing at log offsets. Rebuilt from replay on every open.
 3. **In-memory clog** — transaction commit status, rebuilt during replay.
 4. **Vacuum** — removes dead index entries; `fallocate(PUNCH_HOLE|KEEP_SIZE)` on stale byte ranges behind the append tail and below the replication scan floor.
 
@@ -211,7 +211,7 @@ Replication streams differ by role: `server` replicas see the full physical log;
 1. **Single node** — one process, local disk. Scale-out requires application-level sharding (see `cmd/turnstone-load2` for a reference).
 2. **Manual failover** — no Raft/Paxos; an operator runs `stepdown` / `promote`.
 3. **No lock waiting** — hot-key contention surfaces as immediate `TxConflict`; clients must retry.
-4. **Breaking on-disk format** — the current `data.log` + B+ tree layout is not compatible with older WAL/VLog/LevelDB directories.
+4. **Breaking on-disk format** — the current `data.log` + segmented hash index layout is not compatible with older WAL/VLog/LevelDB directories.
 
 ---
 
