@@ -115,9 +115,7 @@ func runRestore(ctx context.Context) error {
 	}
 
 	opts := stonedb.Options{
-		MaxVLogSize:          200 * 1024 * 1024,
 		CompactionMinGarbage: 10 * 1024 * 1024,
-		BlockCacheSize:       64 * 1024 * 1024,
 	}
 
 	log.Println("Initializing storage engine...")
