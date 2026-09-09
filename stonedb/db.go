@@ -36,7 +36,7 @@ type TimelineMeta struct {
 type DB struct {
 	dir    string
 	log    *DataLog
-	index  *MemIndex
+	index  *Index
 	clog   map[uint64]TxStatus
 	clogMu sync.RWMutex
 	logger *slog.Logger
@@ -129,10 +129,16 @@ func Open(dir string, opts Options) (*DB, error) {
 		return nil, fmt.Errorf("open log: %w", err)
 	}
 
+	index, err := OpenIndex(dir)
+	if err != nil {
+		_ = logFile.Close()
+		return nil, fmt.Errorf("open index: %w", err)
+	}
+
 	db := &DB{
 		dir:                    dir,
 		log:                    logFile,
-		index:                  NewMemIndex(),
+		index:                  index,
 		clog:                   make(map[uint64]TxStatus),
 		activeTxns:             make(map[*Transaction]uint64),
 		activeXids:             make(map[uint64]*Transaction),
@@ -694,6 +700,9 @@ func (db *DB) Close() error {
 
 	_ = db.Checkpoint()
 
+	if db.index != nil {
+		_ = db.index.Close()
+	}
 	if db.log != nil {
 		return db.log.Close()
 	}

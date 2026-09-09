@@ -6,8 +6,8 @@
 
 ## 🚀 Key Features
 
-* **⚡ Append-only Log + In-Memory Index**: One unbounded `data.log` holds all records; an in-memory hashmap index tracks MVCC version chains pointing at byte offsets. Vacuum reclaims stale ranges via `fallocate` punch-hole without moving live records.
-* **📝 Eager Logging**: `SET`/`DEL` append to the log and update the in-memory index immediately (not buffered until `COMMIT`). `COMMIT` only group-fsyncs a small commit record and flips visibility. See "Transaction Model: Eager Logging" below.
+* **⚡ Append-only Log + B+ Tree Index**: One unbounded `data.log` holds all records; an mmap B+ tree index tracks MVCC version chains pointing at byte offsets. Vacuum reclaims stale ranges via `fallocate` punch-hole without moving live records.
+* **📝 Eager Logging**: `SET`/`DEL` append to the log and update the B+ tree index immediately (not buffered until `COMMIT`). `COMMIT` only group-fsyncs a small commit record and flips visibility. See "Transaction Model: Eager Logging" below.
 * **🔒 ACID Transactions**: Full support for multi-key transactions with **Snapshot Isolation**. Write-write conflicts are detected eagerly at `SET`/`DEL` time via **first-writer-wins** key locking (no waiting, no deadlocks); read-set validation still runs at `COMMIT` to catch stale-read/write-skew.
 * **🛡️ Secure by Default**: All connections (Client-Server and Inter-Node) are secured via **mTLS** (Mutual TLS). Role-Based Access Control (RBAC) is enforced via X.509 Certificate Organization fields.
 * **📡 Replication & Timelines**: Database-level Leader-Follower replication. Supports **Timelines** to handle split-brain scenarios and allow safe history divergence during promotion.
@@ -268,11 +268,11 @@ Use `turnstone-duck` to watch CDC logs, deduplicate them (handling the "same key
 
 ### Architecture
 
-TurnstoneDB uses a single append-only log file plus an in-memory index:
+TurnstoneDB uses a single append-only log file plus a B+ tree index:
 
 1. **Data Log (`data.log`)**: One unbounded append-only file stores typed WAL records (`BEGIN`/`SET`/`DEL`/`COMMIT`/`ABORT`) with keys and values inline. Durability: eager append, group fsync on `COMMIT`. Recovery is a full replay from offset 0, skipping punched holes via `SEEK_DATA`.
-2. **In-Memory Index**: `map[key][]version` holds MVCC version chains (newest `xmin` first). Each version points at a byte offset in `data.log`. The commit log (`clog`) is also in memory, rebuilt during replay.
-3. **Vacuum**: Dead versions are dropped from the hashmap; stale byte ranges behind the append tail are reclaimed with `fallocate(PUNCH_HOLE|KEEP_SIZE)`. Logical file size never shrinks; actual disk use follows sparse allocation (`st_blocks`).
+2. **B+ Tree Index (`index/data.bt`)**: Memory-mapped B+ tree keyed by `userKey || xmin`; values hold log offsets and MVCC metadata. Rebuilt from log replay on each open. The commit log (`clog`) is in memory.
+3. **Vacuum**: Dead versions are dropped from the index; stale byte ranges behind the append tail are reclaimed with `fallocate(PUNCH_HOLE|KEEP_SIZE)`. Logical file size never shrinks; actual disk use follows sparse allocation (`st_blocks`).
 
 Retention (`PurgeWAL`) raises a scan floor so replication/CDC cannot read ops below the safe point; vacuum may punch holes only below that floor.
 
@@ -321,7 +321,7 @@ Key semantics:
 
 1. **Consensus**: Replication uses async/sync streaming. There is no automated Raft/Paxos failover; promotion must be triggered manually via API/CLI (though `Timelines` make this safe).
 2. **Sharding**: The server is single-node (multi-db). Sharding must be handled client-side (see `cmd/turnstone-load2` for a reference implementation).
-3. **Memory**: The entire MVCC index lives in RAM. Large keyspaces require sufficient memory; values remain on disk in `data.log`.
+3. **Memory**: The MVCC index lives in a memory-mapped B+ tree (`index/data.bt`), rebuilt on open via log replay. Large keyspaces benefit from btree structure; values remain on disk in `data.log`.
 4. **No lock waiting**: Key-level write locks are NOWAIT (see "Transaction Model: Eager Logging" above). Under hot-key contention this shows up as `TxConflict` abort storms rather than a queuing/blocking row-lock behavior — the client is expected to retry, not wait.
 
 ---
