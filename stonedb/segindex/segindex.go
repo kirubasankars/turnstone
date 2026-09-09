@@ -18,7 +18,7 @@ const (
 	maxLoadFactorDen = 4
 	headerSize       = 4096
 	versionSize      = 29
-	versionNodeSz    = versionSize + 8 // next pointer
+	versionNodeSz    = versionSize + 8      // next pointer
 	magic            = uint64(0x5447534547) // "TGSEG"
 	formatVersion    = uint32(1)
 )
