@@ -17,6 +17,12 @@ func (db *DB) processCommitBatch(requests []commitRequest) {
 	if len(requests) == 0 {
 		return
 	}
+	if atomic.LoadInt32(&db.closed) == 1 {
+		for _, req := range requests {
+			req.resp <- ErrDatabaseClosed
+		}
+		return
+	}
 
 	type outcome struct {
 		tx      *Transaction
@@ -83,7 +89,7 @@ func (db *DB) processCommitBatch(requests []commitRequest) {
 		}
 
 		for _, tx := range valid {
-			db.setClog(tx.xid, TxCommitted)
+			db.forgetClog(tx.xid)
 		}
 
 		var totalDelta int64

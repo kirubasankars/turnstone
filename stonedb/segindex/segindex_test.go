@@ -98,6 +98,63 @@ func TestRemoveVersionAndHasOffset(t *testing.T) {
 	}
 }
 
+func TestHashTableGrowSameSegment(t *testing.T) {
+	dir := t.TempDir()
+	idx, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idx.Close()
+
+	var keys [][]byte
+	for i := 0; len(keys) < 1500; i++ {
+		k := []byte(fmt.Sprintf("grow-key-%d", i))
+		if hashKey(k)&255 == 0 {
+			keys = append(keys, k)
+		}
+	}
+	t.Logf("generated %d keys for segment 0", len(keys))
+
+	for i, key := range keys {
+		idx.Put(key, Version{Offset: int64(i), Xmin: uint64(i + 1), OpID: uint64(i + 1)})
+	}
+
+	seen := 0
+	idx.ForEachKey(func(_ []byte, chain []Version) {
+		seen++
+	})
+	t.Logf("forEach seen %d keys", seen)
+	if seen != len(keys) {
+		t.Fatalf("expected %d keys after grow, got %d", len(keys), seen)
+	}
+}
+
+func TestHashTableGrowManyKeys(t *testing.T) {
+	dir := t.TempDir()
+	idx, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idx.Close()
+
+	const n = 5000
+	for i := 0; i < n; i++ {
+		key := []byte(fmt.Sprintf("grow-key-%d", i))
+		idx.Put(key, Version{Offset: int64(i), Xmin: uint64(i + 1), OpID: uint64(i + 1)})
+	}
+
+	seen := 0
+	idx.ForEachKey(func(_ []byte, chain []Version) {
+		seen++
+		if len(chain) == 0 {
+			t.Fatal("empty chain")
+		}
+	})
+	if seen != n {
+		t.Fatalf("expected %d keys after grow, got %d", n, seen)
+	}
+}
+
 func TestConcurrentPutsDifferentKeys(t *testing.T) {
 	dir := t.TempDir()
 	idx, err := Open(dir)

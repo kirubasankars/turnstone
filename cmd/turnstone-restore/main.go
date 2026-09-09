@@ -124,7 +124,7 @@ func runRestore(ctx context.Context) error {
 	}
 
 	log.Println("Initializing storage engine...")
-	db, err := stonedb.Open(dbPath, opts)
+	db, err := stonedb.OpenContext(ctx, dbPath, opts)
 	if err != nil {
 		return fmt.Errorf("failed to open StoneDB: %w", err)
 	}

@@ -297,8 +297,11 @@ func TestTransaction_EmptyWritableCommitAborts(t *testing.T) {
 	if err := tx.Commit(); err != nil {
 		t.Fatalf("empty commit failed: %v", err)
 	}
-	if st := db.clogStatus(xid); st != TxAborted {
-		t.Fatalf("expected TxAborted for empty writable commit, got %v", st)
+	if st := db.clogStatus(xid); st != TxCommitted {
+		t.Fatalf("expected TxCommitted (missing clog) for empty writable commit, got %v", st)
+	}
+	if len(db.clog) != 0 {
+		t.Fatalf("expected empty clog after empty commit, got %d entries", len(db.clog))
 	}
 }
 
