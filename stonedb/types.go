@@ -16,8 +16,8 @@ const (
 	dirMode  = 0o755
 	fileMode = 0o644
 
-	// LogRecordHeader: Type(1) + XID(8) + OpID(8)
-	LogRecordHeaderSize = 17
+	// LogRecordHeader: Type(1) + XID(8)
+	LogRecordHeaderSize = 9
 
 	// Frame header: Length(4) + Checksum(4)
 	LogFrameHeaderSize = 8
@@ -40,7 +40,6 @@ const (
 type WALRecord struct {
 	Type  WALRecordType
 	XID   uint64
-	OpID  uint64
 	Key   []byte
 	Value []byte
 }
@@ -73,7 +72,7 @@ var (
 	ErrChecksum       = errors.New("checksum mismatch")
 	ErrCorruptData    = errors.New("data corruption detected")
 	ErrTruncated      = errors.New("wal truncated due to corruption")
-	ErrLogUnavailable = errors.New("wal log unavailable for requested operation id")
+	ErrLogUnavailable = errors.New("wal log unavailable for requested byte offset")
 	ErrDiskFull       = errors.New("disk usage exceeds threshold")
 	ErrDatabaseClosed = errors.New("database is closed")
 )
@@ -97,15 +96,11 @@ type indexVersion struct {
 	offset    int64
 	valueLen  uint32
 	xmin      uint64
-	opID      uint64
 	tombstone bool
 }
 
 // recordSpan is the on-disk byte range of one log frame (header + payload).
 type recordSpan struct {
-	offset  int64
-	length  int64 // total bytes including frame header
-	opID    uint64
-	xid     uint64
-	recType WALRecordType
+	offset int64
+	length int64 // total bytes including frame header
 }

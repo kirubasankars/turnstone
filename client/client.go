@@ -31,28 +31,22 @@ const defaultIOTimeout = 30 * time.Second
 const ProtoHeaderSize = 5
 
 const (
-	OpCodePing             = 0x01
-	OpCodeGet              = 0x02
-	OpCodeSet              = 0x03
-	OpCodeDel              = 0x04
-	OpCodeSelect           = 0x05
-	OpCodeMGet             = 0x06
-	OpCodeMSet             = 0x07
-	OpCodeMDel             = 0x08
-	OpCodeBegin            = 0x10
-	OpCodeCommit           = 0x11
-	OpCodeAbort            = 0x12
-	OpCodeStat             = 0x20
-	OpCodeReplicaOf        = 0x32
-	OpCodePromote          = 0x34
-	OpCodeStepDown         = 0x35
-	OpCodeFlushDB          = 0x37
-	OpCodeReplHello        = 0x50
-	OpCodeReplAck          = 0x52
-	OpCodeReplSnapshot     = 0x53
-	OpCodeReplSnapshotDone = 0x54
-	OpCodeReplSafePoint    = 0x55
-	OpCodeReplTimeline     = 0x56
+	OpCodePing      = 0x01
+	OpCodeGet       = 0x02
+	OpCodeSet       = 0x03
+	OpCodeDel       = 0x04
+	OpCodeSelect    = 0x05
+	OpCodeMGet      = 0x06
+	OpCodeMSet      = 0x07
+	OpCodeMDel      = 0x08
+	OpCodeBegin     = 0x10
+	OpCodeCommit    = 0x11
+	OpCodeAbort     = 0x12
+	OpCodeStat      = 0x20
+	OpCodeReplicaOf = 0x32
+	OpCodePromote   = 0x34
+	OpCodeStepDown  = 0x35
+	OpCodeFlushDB   = 0x37
 )
 
 // Begin payload flags (OpCodeBegin body).

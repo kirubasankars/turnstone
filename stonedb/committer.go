@@ -55,7 +55,7 @@ func (db *DB) processCommitBatch(requests []commitRequest) {
 		}
 
 		var valid []*Transaction
-		var builders []func(uint64) []byte
+		var builders []func() []byte
 		for _, req := range requests {
 			tx := req.tx
 			if err := tx.checkReadSetConflicts(); err != nil {
@@ -69,8 +69,8 @@ func (db *DB) processCommitBatch(requests []commitRequest) {
 			}
 			valid = append(valid, tx)
 			xid := tx.xid
-			builders = append(builders, func(opID uint64) []byte {
-				return encodeWALRecord(WALRecord{Type: WALRecordCommit, XID: xid, OpID: opID})
+			builders = append(builders, func() []byte {
+				return encodeWALRecord(WALRecord{Type: WALRecordCommit, XID: xid})
 			})
 		}
 
@@ -78,8 +78,7 @@ func (db *DB) processCommitBatch(requests []commitRequest) {
 			return
 		}
 
-		nextOpID := func() uint64 { return atomic.AddUint64(&db.operationID, 1) }
-		_, _, err := db.log.AppendRecordsWithOpIDs(nextOpID, builders, !db.unsafeDisableFsync)
+		_, err := db.log.AppendRecords(builders, !db.unsafeDisableFsync)
 		if err != nil {
 			atomic.StoreInt32(&db.isCorrupt, 1)
 			for _, tx := range valid {
@@ -133,7 +132,7 @@ func (db *DB) processCommitBatch(requests []commitRequest) {
 func (db *DB) releaseCommittedLocks(tx *Transaction) {
 	db.txMu.Lock()
 	delete(db.activeXids, tx.xid)
-	delete(db.beginOpIDs, tx.xid)
+	delete(db.beginOffsets, tx.xid)
 	delete(db.txStartTimes, tx.xid)
 	for k := range tx.keyLocks {
 		if owner, ok := db.keyLocks[k]; ok && owner == tx.xid {
