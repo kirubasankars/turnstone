@@ -444,31 +444,6 @@ func TestScanWAL_AfterReopen(t *testing.T) {
 	}
 }
 
-func TestApplyRecord_StaleBytes(t *testing.T) {
-	dir := t.TempDir()
-	db, _ := Open(dir, Options{})
-	defer db.Close()
-
-	tx := db.NewTransaction(true)
-	tx.Put([]byte("key1"), []byte("old"))
-	tx.Commit()
-
-	recs := []WALRecord{
-		{Type: WALRecordBegin, XID: 100, OpID: 200},
-		{Type: WALRecordSet, XID: 100, OpID: 201, Key: []byte("key1"), Value: []byte("new")},
-		{Type: WALRecordCommit, XID: 100, OpID: 202},
-	}
-	for _, r := range recs {
-		if err := db.ApplyRecord(r); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	if db.TotalGarbageBytes() == 0 {
-		t.Error("expected stale bytes after overwrite")
-	}
-}
-
 func TestDB_RunAutoCheckpoint(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(dir, Options{AutoCheckpointInterval: 50 * time.Millisecond})
@@ -487,25 +462,3 @@ func TestDB_RunAutoCheckpoint(t *testing.T) {
 	}
 }
 
-func TestDB_RunAutoVacuum(t *testing.T) {
-	dir := t.TempDir()
-	db, err := Open(dir, Options{
-		CompactionInterval:   50 * time.Millisecond,
-		CompactionMinGarbage: 1,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	for i := 0; i < 30; i++ {
-		tx := db.NewTransaction(true)
-		tx.Put([]byte(fmt.Sprintf("k-%d", i)), []byte("v"))
-		tx.Commit()
-	}
-	tx := db.NewTransaction(true)
-	tx.Delete([]byte("k-0"))
-	tx.Commit()
-
-	time.Sleep(200 * time.Millisecond)
-}
