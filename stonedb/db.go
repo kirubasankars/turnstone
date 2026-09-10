@@ -53,9 +53,8 @@ type DB struct {
 
 	transactionID uint64
 	operationID   uint64
-	keyCount      int64
-	staleBytes    int64
-	scanWALFloor  uint64
+	keyCount     int64
+	scanWALFloor uint64
 
 	metricsConflicts uint64
 
@@ -81,14 +80,11 @@ type DB struct {
 	commitSiblings     int
 	unsafeDisableFsync bool
 
-	minGarbageThreshold    int64
 	checksumInterval       time.Duration
 	autoCheckpointInterval time.Duration
-	compactionInterval     time.Duration
 	maxDiskUsagePercent    int
 	isDiskFull             int32
 	isCorrupt              int32
-	vacuuming              int32
 
 	timelineMeta TimelineMeta
 }
@@ -106,14 +102,8 @@ func OpenContext(ctx context.Context, dir string, opts Options) (*DB, error) {
 	if err := os.MkdirAll(dir, dirMode); err != nil {
 		return nil, err
 	}
-	if opts.CompactionMinGarbage == 0 {
-		opts.CompactionMinGarbage = 1024 * 1024
-	}
 	if opts.AutoCheckpointInterval == 0 {
 		opts.AutoCheckpointInterval = 60 * time.Second
-	}
-	if opts.CompactionInterval == 0 {
-		opts.CompactionInterval = 20 * time.Second
 	}
 	if opts.TxTimeout == 0 {
 		opts.TxTimeout = protocol.MaxTxDuration
@@ -167,10 +157,8 @@ func OpenContext(ctx context.Context, dir string, opts Options) (*DB, error) {
 		commitDelay:            opts.CommitDelay,
 		commitSiblings:         opts.CommitSiblings,
 		unsafeDisableFsync:     opts.UnsafeDisableFsync,
-		minGarbageThreshold:    opts.CompactionMinGarbage,
 		checksumInterval:       opts.ChecksumInterval,
 		autoCheckpointInterval: opts.AutoCheckpointInterval,
-		compactionInterval:     opts.CompactionInterval,
 		maxDiskUsagePercent:    opts.MaxDiskUsagePercent,
 		timelineMeta:           meta,
 		logger:                 logger,
@@ -275,7 +263,7 @@ func (db *DB) ForceSetClocks(txID, opID uint64) {
 
 func (db *DB) startBackgroundTasks() {
 	db.lastCkptOpID = atomic.LoadUint64(&db.operationID)
-	waitCount := 4
+	waitCount := 3
 	if db.checksumInterval > 0 {
 		waitCount++
 	}
@@ -285,7 +273,6 @@ func (db *DB) startBackgroundTasks() {
 	db.wg.Add(waitCount)
 
 	go db.runAutoCheckpoint()
-	go db.runAutoVacuum()
 	go db.runGroupCommits()
 	go db.runLivenessReaper()
 	if db.checksumInterval > 0 {
@@ -350,10 +337,6 @@ func (db *DB) AbortAllActiveWriteTransactions() {
 
 func (db *DB) KeyCount() (int64, error) {
 	return atomic.LoadInt64(&db.keyCount), nil
-}
-
-func (db *DB) TotalGarbageBytes() int64 {
-	return atomic.LoadInt64(&db.staleBytes)
 }
 
 func (db *DB) StorageStats() (logCount int, logicalSize int64, allocatedSize int64) {
@@ -481,36 +464,6 @@ func (db *DB) runAutoCheckpoint() {
 	}
 }
 
-func (db *DB) runAutoVacuum() {
-	defer db.wg.Done()
-	ticker := time.NewTicker(db.compactionInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-db.closeCh:
-			return
-		case <-ticker.C:
-			for i := 0; i < 10; i++ {
-				select {
-				case <-db.closeCh:
-					return
-				default:
-				}
-				didWork, err := db.RunVacuum()
-				if err != nil {
-					if !strings.Contains(err.Error(), "closed") {
-						db.logger.Error("Auto-vacuum failed", "err", err)
-					}
-					break
-				}
-				if !didWork {
-					break
-				}
-			}
-		}
-	}
-}
-
 func (db *DB) runBackgroundChecksum() {
 	defer db.wg.Done()
 	ticker := time.NewTicker(db.checksumInterval)
@@ -560,7 +513,7 @@ func (db *DB) NewTransaction(update bool) *Transaction {
 	tx := &Transaction{
 		db: db, update: true, xid: xid, snapshot: snap,
 		keyLocks: make(map[string]struct{}), dispositionSeen: make(map[string]bool),
-		ownPriorVer: make(map[string]*indexVersion), staleBytes: make(map[int64]int64),
+		ownPriorVer: make(map[string]*indexVersion),
 		readSet: make(map[string]struct{}),
 	}
 	db.activeXids[xid] = tx
@@ -696,7 +649,6 @@ func (db *DB) ApplyRecord(rec WALRecord) error {
 
 type replTxImpact struct {
 	keyDelta        int64
-	staleBytes      int64
 	dispositionSeen map[string]bool
 }
 
@@ -719,9 +671,6 @@ func (db *DB) accountReplicatedWrite(rec WALRecord) {
 	} else {
 		ver, _, found := db.index.LatestResolved(rec.Key, rec.XID, db.clogStatus)
 		wasLive = found && ver != nil && !ver.tombstone
-		if found && ver != nil {
-			impact.staleBytes += recordSpanSize(len(rec.Key), int(ver.valueLen), WALRecordSet)
-		}
 	}
 
 	db.txMu.Lock()
@@ -742,9 +691,6 @@ func (db *DB) applyReplicatedImpact(impact *replTxImpact) {
 	}
 	if impact.keyDelta != 0 {
 		atomic.AddInt64(&db.keyCount, impact.keyDelta)
-	}
-	if impact.staleBytes > 0 {
-		atomic.AddInt64(&db.staleBytes, impact.staleBytes)
 	}
 }
 
