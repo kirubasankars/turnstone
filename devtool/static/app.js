@@ -6,23 +6,34 @@
   var hasMoreKeys = false;
   var selectedKey = '';
   var refreshTimer = null;
+  var searchTimer = null;
+  var toastTimer = null;
+  var lastKeyCount = 0;
 
   var els = {
     dbSelect: document.getElementById('db-select'),
     dbState: document.getElementById('db-state'),
+    summaryKeys: document.getElementById('summary-keys'),
+    summaryTxs: document.getElementById('summary-txs'),
+    lastUpdated: document.getElementById('last-updated'),
+    keyCount: document.getElementById('key-count'),
     dbStats: document.getElementById('db-stats'),
     serverMetrics: document.getElementById('server-metrics'),
     dbMetrics: document.getElementById('db-metrics'),
     metricsDot: document.getElementById('metrics-dot'),
     prefixFilter: document.getElementById('prefix-filter'),
     keyList: document.getElementById('key-list'),
+    btnMoreKeys: document.getElementById('btn-more-keys'),
     editKey: document.getElementById('edit-key'),
     editValue: document.getElementById('edit-value'),
+    valueSize: document.getElementById('value-size'),
     editorStatus: document.getElementById('editor-status'),
+    toast: document.getElementById('toast'),
     confirmDialog: document.getElementById('confirm-dialog'),
     confirmMessage: document.getElementById('confirm-message'),
     confirmCancel: document.getElementById('confirm-cancel'),
-    confirmOk: document.getElementById('confirm-ok')
+    confirmOk: document.getElementById('confirm-ok'),
+    btnRefresh: document.getElementById('btn-refresh')
   };
 
   function api(path, opts) {
@@ -41,34 +52,10 @@
 
   function fmt(n) {
     if (typeof n !== 'number') return String(n);
-    if (n >= 1e9) return (n / 1e9).toFixed(1) + 'G';
-    if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
-    if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+    if (n >= 1e9) return (n / 1e9).toFixed(1) + ' GB';
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + ' MB';
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + ' KB';
     return String(n);
-  }
-
-  function setStatus(msg, isErr) {
-    els.editorStatus.textContent = msg || '';
-    els.editorStatus.className = 'status' + (isErr ? ' err' : msg ? ' ok' : '');
-  }
-
-  function renderMetrics(container, samples, labelFn) {
-    if (!samples || samples.length === 0) {
-      container.innerHTML = '<p class="placeholder">No metrics available</p>';
-      return;
-    }
-    var html = '<div class="metrics-grid">';
-    for (var i = 0; i < samples.length; i++) {
-      var s = samples[i];
-      var label = labelFn ? labelFn(s) : s.name.replace('turnstone_', '').replace(/_/g, ' ');
-      var cls = '';
-      if (s.name.indexOf('conflict') !== -1 && s.value > 0) cls = 'warn';
-      if (s.name.indexOf('lag') !== -1 && s.value > 0) cls = 'warn';
-      html += '<div class="metric"><div class="label">' + escapeHtml(label) +
-        '</div><div class="value ' + cls + '">' + escapeHtml(fmt(s.value)) + '</div></div>';
-    }
-    html += '</div>';
-    container.innerHTML = html;
   }
 
   function escapeHtml(str) {
@@ -79,6 +66,80 @@
       .replace(/"/g, '&quot;');
   }
 
+  function setStatus(msg, isErr) {
+    els.editorStatus.textContent = msg || '';
+    els.editorStatus.className = 'status' + (isErr ? ' err' : msg ? ' ok' : '');
+  }
+
+  function showToast(msg, type) {
+    els.toast.textContent = msg;
+    els.toast.className = 'toast show' + (type ? ' ' + type : '');
+    els.toast.hidden = false;
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () {
+      els.toast.className = 'toast';
+      els.toast.hidden = true;
+    }, 2800);
+  }
+
+  function setLoading(btn, loading) {
+    if (!btn) return;
+    btn.disabled = loading;
+    btn.classList.toggle('loading', loading);
+  }
+
+  function updateValueSize() {
+    var bytes = new TextEncoder().encode(els.editValue.value).length;
+    els.valueSize.textContent = bytes + (bytes === 1 ? ' byte' : ' bytes');
+  }
+
+  function updateLastUpdated() {
+    var now = new Date();
+    els.lastUpdated.textContent = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  }
+
+  function updateKeyCount(count) {
+    lastKeyCount = count;
+    var label = count === 1 ? '1 key' : count + ' keys';
+    els.keyCount.textContent = label;
+    els.summaryKeys.textContent = fmt(count);
+  }
+
+  function updateMoreButton() {
+    els.btnMoreKeys.disabled = !hasMoreKeys;
+    els.btnMoreKeys.textContent = hasMoreKeys ? 'Load more' : 'No more keys';
+  }
+
+  function emptyKeyList(title, hint) {
+    els.keyList.innerHTML =
+      '<p class="empty-state">' +
+      '<span class="empty-title">' + escapeHtml(title) + '</span>' +
+      (hint ? '<span class="empty-hint">' + escapeHtml(hint) + '</span>' : '') +
+      '</p>';
+  }
+
+  function renderMetrics(container, samples, labelFn, highlights) {
+    highlights = highlights || [];
+    if (!samples || samples.length === 0) {
+      container.innerHTML = '<p class="empty-state"><span class="empty-title">No metrics available</span></p>';
+      return;
+    }
+    var html = '<div class="metrics-grid">';
+    for (var i = 0; i < samples.length; i++) {
+      var s = samples[i];
+      var label = labelFn ? labelFn(s) : s.name.replace('turnstone_', '').replace(/_/g, ' ');
+      var cls = highlights.indexOf(label) !== -1 ? ' highlight' : '';
+      if (s.name.indexOf('conflict') !== -1 && s.value > 0) cls += ' warn-value';
+      if (s.name.indexOf('lag') !== -1 && s.value > 0) cls += ' warn-value';
+      var valueCls = (s.name.indexOf('conflict') !== -1 && s.value > 0) ||
+        (s.name.indexOf('lag') !== -1 && s.value > 0) ? ' warn' : '';
+      html += '<div class="metric' + cls + '"><div class="label">' + escapeHtml(label) +
+        '</div><div class="value' + valueCls + '">' + escapeHtml(fmt(s.value)) + '</div></div>';
+    }
+    html += '</div>';
+    container.innerHTML = html;
+  }
+
   function loadDatabases() {
     return api('/api/databases').then(function (data) {
       var dbs = data.databases || [];
@@ -86,7 +147,7 @@
       for (var i = 0; i < dbs.length; i++) {
         var opt = document.createElement('option');
         opt.value = dbs[i];
-        opt.textContent = dbs[i];
+        opt.textContent = 'DB ' + dbs[i];
         els.dbSelect.appendChild(opt);
       }
       if (dbs.length > 0) {
@@ -101,27 +162,31 @@
       var stateClass = stats.state.split(' ')[0];
       els.dbState.innerHTML = '<span class="state-badge state-' + escapeHtml(stateClass) + '">' +
         escapeHtml(stats.state) + '</span>';
+      els.summaryTxs.textContent = String(stats.active_txs);
+      updateKeyCount(stats.key_count);
 
       var items = [
-        ['Keys', stats.key_count],
-        ['Active Txs', stats.active_txs],
-        ['Connections', stats.active_connections],
-        ['Conflicts', stats.conflicts],
-        ['Log Bytes', stats.log_bytes],
-        ['Log Allocated', stats.log_allocated_bytes],
-        ['Replica Lag', stats.replica_lag],
-        ['Uptime', stats.uptime],
-        ['Min Replicas', stats.min_replicas]
+        ['Keys', stats.key_count, true],
+        ['Active Txs', stats.active_txs, true],
+        ['Connections', stats.active_connections, false],
+        ['Conflicts', stats.conflicts, false],
+        ['Log Size', stats.log_bytes, false],
+        ['Log Allocated', stats.log_allocated_bytes, false],
+        ['Replica Lag', stats.replica_lag, false],
+        ['Uptime', stats.uptime, false],
+        ['Min Replicas', stats.min_replicas, false]
       ];
 
       var html = '<div class="metrics-grid">';
       for (var i = 0; i < items.length; i++) {
         var val = typeof items[i][1] === 'number' ? fmt(items[i][1]) : items[i][1];
-        html += '<div class="metric"><div class="label">' + escapeHtml(items[i][0]) +
+        var hl = items[i][2] ? ' highlight' : '';
+        html += '<div class="metric' + hl + '"><div class="label">' + escapeHtml(items[i][0]) +
           '</div><div class="value">' + escapeHtml(val) + '</div></div>';
       }
       html += '</div>';
       els.dbStats.innerHTML = html;
+      updateLastUpdated();
     });
   }
 
@@ -138,7 +203,8 @@
       });
       els.metricsDot.className = 'dot ok';
     }).catch(function (e) {
-      els.serverMetrics.innerHTML = '<p class="placeholder err">' + escapeHtml(e.message) + '</p>';
+      els.serverMetrics.innerHTML = '<p class="empty-state err"><span class="empty-title">' +
+        escapeHtml(e.message) + '</span></p>';
       els.metricsDot.className = 'dot err';
     });
   }
@@ -146,6 +212,7 @@
   function loadKeys(append) {
     var prefix = els.prefixFilter.value;
     if (!append) keyCursor = 0;
+    els.keyList.classList.add('loading');
 
     return api('/api/databases/' + currentDB + '/keys?prefix=' +
       encodeURIComponent(prefix) + '&cursor=' + keyCursor + '&limit=100')
@@ -153,15 +220,20 @@
         var keys = data.keys || [];
         keyCursor = data.next_cursor;
         hasMoreKeys = data.has_more;
+        updateMoreButton();
 
         if (keys.length === 0 && !append) {
-          els.keyList.innerHTML = '<p class="placeholder">No keys found</p>';
+          if (prefix) {
+            emptyKeyList('No matching keys', 'Try a different prefix or create a new key.');
+          } else {
+            emptyKeyList('No keys found', 'Create one in the editor.');
+          }
           return;
         }
 
         if (!append) {
           els.keyList.innerHTML = '';
-        } else if (els.keyList.querySelector('.placeholder')) {
+        } else if (els.keyList.querySelector('.empty-state')) {
           els.keyList.innerHTML = '';
         }
 
@@ -183,6 +255,9 @@
             els.keyList.appendChild(el);
           })(keys[i]);
         }
+      })
+      .finally(function () {
+        els.keyList.classList.remove('loading');
       });
   }
 
@@ -198,28 +273,72 @@
 
   function getKey() {
     var key = els.editKey.value.trim();
-    if (!key) { setStatus('Enter a key', true); return; }
+    if (!key) { setStatus('Enter a key name', true); return; }
+    setLoading(document.getElementById('btn-get'), true);
     api('/api/databases/' + currentDB + '/keys/' + encodeURIComponent(key))
       .then(function (data) {
         els.editValue.value = data.value;
+        updateValueSize();
         setStatus('Loaded');
+        showToast('Key loaded', 'ok');
       })
-      .catch(function (e) { setStatus(e.message, true); });
+      .catch(function (e) { setStatus(e.message, true); })
+      .finally(function () { setLoading(document.getElementById('btn-get'), false); });
   }
 
   function setKey() {
     var key = els.editKey.value.trim();
     var value = els.editValue.value;
-    if (!key) { setStatus('Enter a key', true); return; }
+    if (!key) { setStatus('Enter a key name', true); return; }
+    setLoading(document.getElementById('btn-set'), true);
     api('/api/databases/' + currentDB + '/keys/' + encodeURIComponent(key), {
       method: 'PUT',
       headers: { 'Content-Type': 'text/plain' },
       body: value
     }).then(function () {
-      setStatus('Set OK');
+      selectedKey = key;
+      setStatus('Saved');
+      showToast('Key saved', 'ok');
       loadKeys();
       loadStats();
-    }).catch(function (e) { setStatus(e.message, true); });
+    }).catch(function (e) { setStatus(e.message, true); })
+      .finally(function () { setLoading(document.getElementById('btn-set'), false); });
+  }
+
+  function copyValue() {
+    var value = els.editValue.value;
+    if (!value) {
+      setStatus('Nothing to copy', true);
+      return;
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(value).then(function () {
+        showToast('Copied to clipboard', 'ok');
+      }).catch(function () {
+        setStatus('Copy failed', true);
+      });
+    } else {
+      els.editValue.select();
+      try {
+        document.execCommand('copy');
+        showToast('Copied to clipboard', 'ok');
+      } catch (_) {
+        setStatus('Copy failed', true);
+      }
+    }
+  }
+
+  function clearEditor() {
+    els.editKey.value = '';
+    els.editValue.value = '';
+    selectedKey = '';
+    updateValueSize();
+    setStatus('');
+    var items = els.keyList.querySelectorAll('.key-item');
+    for (var i = 0; i < items.length; i++) {
+      items[i].classList.remove('selected');
+    }
+    els.editKey.focus();
   }
 
   function confirmDelete(message) {
@@ -229,44 +348,59 @@
         els.confirmDialog.close();
         els.confirmOk.removeEventListener('click', onOk);
         els.confirmCancel.removeEventListener('click', onCancel);
+        document.removeEventListener('keydown', onKey);
         resolve(result);
       }
       function onOk() { cleanup(true); }
       function onCancel() { cleanup(false); }
+      function onKey(ev) {
+        if (ev.key === 'Escape') cleanup(false);
+      }
       els.confirmOk.addEventListener('click', onOk);
       els.confirmCancel.addEventListener('click', onCancel);
+      document.addEventListener('keydown', onKey);
       els.confirmDialog.showModal();
+      els.confirmCancel.focus();
     });
   }
 
   function delKey() {
     var key = els.editKey.value.trim();
-    if (!key) { setStatus('Enter a key', true); return; }
-    confirmDelete('Delete key "' + key + '"?').then(function (ok) {
+    if (!key) { setStatus('Enter a key name', true); return; }
+    confirmDelete('This will permanently delete "' + key + '".').then(function (ok) {
       if (!ok) return;
+      setLoading(document.getElementById('btn-delete'), true);
       api('/api/databases/' + currentDB + '/keys/' + encodeURIComponent(key), {
         method: 'DELETE'
       }).then(function () {
         els.editValue.value = '';
         selectedKey = '';
+        updateValueSize();
         setStatus('Deleted');
-        loadKeys();
-        loadStats();
-      }).catch(function (e) { setStatus(e.message, true); });
+        showToast('Key deleted', 'ok');
+        loadStats().then(function () { loadKeys(); });
+      }).catch(function (e) { setStatus(e.message, true); })
+        .finally(function () { setLoading(document.getElementById('btn-delete'), false); });
     });
   }
 
   function refreshAll() {
-    loadStats();
-    loadMetrics();
-    loadKeys();
+    setLoading(els.btnRefresh, true);
+    Promise.all([loadStats(), loadMetrics(), loadKeys()])
+      .finally(function () { setLoading(els.btnRefresh, false); });
   }
 
   function onDbChange() {
     currentDB = els.dbSelect.value;
     keyCursor = 0;
     selectedKey = '';
+    clearEditor();
     refreshAll();
+  }
+
+  function debouncedSearch() {
+    if (searchTimer) clearTimeout(searchTimer);
+    searchTimer = setTimeout(function () { loadKeys(); }, 300);
   }
 
   function scheduleRefresh() {
@@ -277,18 +411,58 @@
     }, 5000);
   }
 
+  function switchView(view) {
+    var tabs = document.querySelectorAll('.view-tab');
+    var panels = document.querySelectorAll('.view-panel');
+    for (var i = 0; i < tabs.length; i++) {
+      tabs[i].classList.toggle('active', tabs[i].getAttribute('data-view') === view);
+    }
+    for (var j = 0; j < panels.length; j++) {
+      panels[j].classList.toggle('active', panels[j].getAttribute('data-view-panel') === view);
+    }
+  }
+
   document.getElementById('btn-refresh').addEventListener('click', refreshAll);
   document.getElementById('btn-search-keys').addEventListener('click', function () { loadKeys(); });
-  document.getElementById('btn-more-keys').addEventListener('click', function () {
+  els.btnMoreKeys.addEventListener('click', function () {
     if (hasMoreKeys) loadKeys(true);
   });
   document.getElementById('btn-get').addEventListener('click', getKey);
   document.getElementById('btn-set').addEventListener('click', setKey);
+  document.getElementById('btn-copy').addEventListener('click', copyValue);
+  document.getElementById('btn-clear').addEventListener('click', clearEditor);
   document.getElementById('btn-delete').addEventListener('click', delKey);
   els.dbSelect.addEventListener('change', onDbChange);
+  els.prefixFilter.addEventListener('input', debouncedSearch);
   els.prefixFilter.addEventListener('keydown', function (ev) {
     if (ev.key === 'Enter') loadKeys();
   });
+  els.editValue.addEventListener('input', updateValueSize);
 
+  document.querySelectorAll('.view-tab').forEach(function (tab) {
+    tab.addEventListener('click', function () {
+      switchView(tab.getAttribute('data-view'));
+    });
+  });
+
+  document.addEventListener('keydown', function (ev) {
+    var mod = ev.ctrlKey || ev.metaKey;
+    if (mod && ev.key === 's') {
+      ev.preventDefault();
+      setKey();
+    }
+    if (mod && ev.key === 'Enter') {
+      ev.preventDefault();
+      getKey();
+    }
+    if (ev.key === 'r' && !mod && document.activeElement.tagName !== 'INPUT' &&
+        document.activeElement.tagName !== 'TEXTAREA') {
+      ev.preventDefault();
+      refreshAll();
+    }
+  });
+
+  updateMoreButton();
+  updateValueSize();
   loadDatabases().then(refreshAll).then(scheduleRefresh);
 })();
