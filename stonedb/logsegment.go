@@ -17,6 +17,30 @@ type logFrame struct {
 	length int64
 }
 
+// WALFrameBytes returns the on-disk bytes for a single WAL record (frame header + payload).
+func WALFrameBytes(rec WALRecord) []byte {
+	payload := encodeWALRecord(rec)
+	total := int(frameSize(len(payload)))
+	buf := make([]byte, total)
+	binary.BigEndian.PutUint32(buf[0:], uint32(len(payload)))
+	binary.BigEndian.PutUint32(buf[4:], crc32.Checksum(payload, Crc32Table))
+	copy(buf[8:], payload)
+	return buf
+}
+
+// RecordsFromLogSegment decodes each complete WAL record in a raw segment.
+func RecordsFromLogSegment(data []byte) ([]WALRecord, error) {
+	frames, err := validateLogSegment(data)
+	if err != nil {
+		return nil, err
+	}
+	recs := make([]WALRecord, len(frames))
+	for i, f := range frames {
+		recs[i] = f.rec
+	}
+	return recs, nil
+}
+
 // validateLogSegment ensures data is a concatenation of complete WAL frames.
 // Partial frames are rejected so replication stays statement-safe.
 func validateLogSegment(data []byte) ([]logFrame, error) {

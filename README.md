@@ -16,7 +16,6 @@ LICENSE file in the root of this source tree.
 - A **single-node** storage engine with Redis-style `SELECT <db>` namespaces
 - **ACID transactions** with snapshot isolation and first-writer-wins key locking
 - **Optional replication** — one primary and manually attached followers per database
-- **CDC** — stream committed changes to JSONL for ETL/analytics
 
 ## What it is not
 
@@ -121,17 +120,6 @@ There is no automatic leader election. Timelines record history forks so promoti
 
 ---
 
-## CDC and analytics
-
-**CDC mode** tails committed changes to JSONL:
-
-```bash
-# Edit tsdata/turnstone.cdc.json, then:
-./bin/turnstone -mode cdc -home tsdata
-```
-
----
-
 ## Configuration (`turnstone.json`)
 
 | Field | Default | Description |
@@ -187,13 +175,13 @@ sequenceDiagram
 
 Notable semantics:
 
-- **`xid` at `BEGIN`**, **`opID` per record** — `opID` is the replication/CDC cursor.
+- **`xid` at `BEGIN`**, **`opID` per record** — `opID` is the replication cursor.
 - **First-writer-wins** — `SET`/`DEL` takes a NOWAIT key lock; conflicts return immediately, no deadlock.
 - **Read-set validation at `COMMIT`** — detects stale reads / write skew under snapshot isolation.
 - **Read-your-own-writes** — uncommitted versions with `xmin == my xid` are visible inside the transaction.
 - **Aborts are explicit** — conflicts, disconnects, and timeouts append `ABORT`; a reaper aborts transactions exceeding `MaxTxDuration`.
 
-Replication streams differ by role: `server` replicas see the full physical log; `cdc` consumers see committed `SET`/`DEL` only.
+Replication streams raw physical `data.log` byte ranges to follower replicas.
 
 ---
 

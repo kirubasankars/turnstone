@@ -6,7 +6,6 @@
 package main
 
 import (
-	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -14,7 +13,6 @@ import (
 	"strings"
 
 	"turnstone/config"
-	"turnstone/replication"
 )
 
 var (
@@ -61,20 +59,5 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 3. Generate Default CDC Config
-	cdcCfg := replication.DefaultFileConsumerConfig()
-	cdcBytes, err := json.MarshalIndent(cdcCfg, "", "  ")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to marshal CDC config: %v\n", err)
-		os.Exit(1)
-	}
-
-	cdcConfigPath := filepath.Join(*homeDir, "turnstone.cdc.json")
-	if err := os.WriteFile(cdcConfigPath, cdcBytes, 0o644); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to write CDC config: %v\n", err)
-		os.Exit(1)
-	}
-
-	fmt.Printf("CDC configuration written to %s\n", cdcConfigPath)
 	fmt.Println("Initialization complete.")
 }
