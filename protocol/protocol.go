@@ -63,6 +63,11 @@ const (
 	// Sent initially after handshake and upon any timeline fork (Promotion).
 	OpCodeReplTimeline uint8 = 0x56
 
+	// OpCodeReplLogSegment carries a raw byte range of complete WAL frames.
+	// Inner payload (after DB name/count): [StartOffset(8)][EndOffset(8)][RawBytes...]
+	// EndOffset-StartOffset must equal len(RawBytes). Frames are never split.
+	OpCodeReplLogSegment uint8 = 0x57
+
 	OpCodeQuit uint8 = 0xFF
 
 	// Begin payload flags (OpCodeBegin body).
