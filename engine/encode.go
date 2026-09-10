@@ -3,17 +3,17 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root of this source tree.
 
-package stonedb
+package engine
 
 import "encoding/binary"
 
-// encodeWALRecord serializes a WALRecord to its on-disk payload.
-func encodeWALRecord(rec WALRecord) []byte {
+// encodeRecord serializes a Record to its on-disk payload.
+func encodeRecord(rec Record) []byte {
 	var bodyLen int
 	switch rec.Type {
-	case WALRecordSet:
+	case RecordSet:
 		bodyLen = 4 + len(rec.Key) + 4 + len(rec.Value)
-	case WALRecordDelete:
+	case RecordDelete:
 		bodyLen = 4 + len(rec.Key)
 	}
 	buf := make([]byte, LogRecordHeaderSize+bodyLen)
@@ -21,7 +21,7 @@ func encodeWALRecord(rec WALRecord) []byte {
 	binary.BigEndian.PutUint64(buf[1:], rec.XID)
 
 	switch rec.Type {
-	case WALRecordSet:
+	case RecordSet:
 		off := LogRecordHeaderSize
 		binary.BigEndian.PutUint32(buf[off:], uint32(len(rec.Key)))
 		off += 4
@@ -30,7 +30,7 @@ func encodeWALRecord(rec WALRecord) []byte {
 		binary.BigEndian.PutUint32(buf[off:], uint32(len(rec.Value)))
 		off += 4
 		copy(buf[off:], rec.Value)
-	case WALRecordDelete:
+	case RecordDelete:
 		off := LogRecordHeaderSize
 		binary.BigEndian.PutUint32(buf[off:], uint32(len(rec.Key)))
 		off += 4
@@ -39,46 +39,46 @@ func encodeWALRecord(rec WALRecord) []byte {
 	return buf
 }
 
-func decodeWALRecord(payload []byte) (WALRecord, error) {
+func decodeRecord(payload []byte) (Record, error) {
 	if len(payload) < LogRecordHeaderSize {
-		return WALRecord{}, ErrCorruptData
+		return Record{}, ErrCorruptData
 	}
-	rec := WALRecord{
-		Type: WALRecordType(payload[0]),
+	rec := Record{
+		Type: RecordType(payload[0]),
 		XID:  binary.BigEndian.Uint64(payload[1:]),
 	}
 	body := payload[LogRecordHeaderSize:]
 	switch rec.Type {
-	case WALRecordSet:
+	case RecordSet:
 		if len(body) < 4 {
-			return WALRecord{}, ErrCorruptData
+			return Record{}, ErrCorruptData
 		}
 		klen := int(binary.BigEndian.Uint32(body[0:]))
 		off := 4
 		if off+klen+4 > len(body) {
-			return WALRecord{}, ErrCorruptData
+			return Record{}, ErrCorruptData
 		}
 		rec.Key = append([]byte(nil), body[off:off+klen]...)
 		off += klen
 		vlen := int(binary.BigEndian.Uint32(body[off:]))
 		off += 4
 		if off+vlen > len(body) {
-			return WALRecord{}, ErrCorruptData
+			return Record{}, ErrCorruptData
 		}
 		rec.Value = append([]byte(nil), body[off:off+vlen]...)
-	case WALRecordDelete:
+	case RecordDelete:
 		if len(body) < 4 {
-			return WALRecord{}, ErrCorruptData
+			return Record{}, ErrCorruptData
 		}
 		klen := int(binary.BigEndian.Uint32(body[0:]))
 		off := 4
 		if off+klen > len(body) {
-			return WALRecord{}, ErrCorruptData
+			return Record{}, ErrCorruptData
 		}
 		rec.Key = append([]byte(nil), body[off:off+klen]...)
-	case WALRecordBegin, WALRecordCommit, WALRecordAbort:
+	case RecordBegin, RecordCommit, RecordAbort:
 	default:
-		return WALRecord{}, ErrCorruptData
+		return Record{}, ErrCorruptData
 	}
 	return rec, nil
 }

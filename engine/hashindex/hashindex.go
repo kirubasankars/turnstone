@@ -3,7 +3,7 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root of this source tree.
 
-package segindex
+package hashindex
 
 import (
 	"encoding/binary"
@@ -12,14 +12,14 @@ import (
 )
 
 const (
-	numSegments      = 256
+	numShards        = 256
 	initialSlots     = 1024
 	maxLoadFactorNum = 3 // grow when keyCount*4 > slotCount*3
 	maxLoadFactorDen = 4
 	headerSize       = 4096
 	versionSize      = 21
 	versionNodeSz    = versionSize + 8      // next pointer
-	magic            = uint64(0x5447534547) // "TGSEG"
+	magic            = uint64(0x5447485348) // "TGHSH"
 	formatVersion    = uint32(1)
 )
 
@@ -31,22 +31,22 @@ type Version struct {
 	Tombstone bool
 }
 
-// SegmentedIndex is a sharded in-memory hash index with per-segment locking.
-type SegmentedIndex struct {
-	segments [numSegments]*segment
+// Index is a sharded in-memory hash index with per-shard locking.
+type Index struct {
+	shards [numShards]*shard
 }
 
-// Open creates numSegments heap-backed index segments.
-func Open() *SegmentedIndex {
-	idx := &SegmentedIndex{}
-	for i := 0; i < numSegments; i++ {
-		idx.segments[i] = newSegment()
+// New creates numShards heap-backed index shards.
+func New() *Index {
+	idx := &Index{}
+	for i := 0; i < numShards; i++ {
+		idx.shards[i] = newShard()
 	}
 	return idx
 }
 
-func (idx *SegmentedIndex) Close() error {
-	for _, seg := range idx.segments {
+func (idx *Index) Close() error {
+	for _, seg := range idx.shards {
 		if seg != nil {
 			seg.close()
 		}
@@ -54,56 +54,56 @@ func (idx *SegmentedIndex) Close() error {
 	return nil
 }
 
-func (idx *SegmentedIndex) segmentFor(key []byte) *segment {
-	return idx.segments[int(hashKey(key)&255)]
+func (idx *Index) shardFor(key []byte) *shard {
+	return idx.shards[int(hashKey(key)&255)]
 }
 
-func (idx *SegmentedIndex) Put(key []byte, ver Version) {
-	seg := idx.segmentFor(key)
+func (idx *Index) Put(key []byte, ver Version) {
+	seg := idx.shardFor(key)
 	seg.put(key, ver)
 }
 
-func (idx *SegmentedIndex) WalkVersions(key []byte, fn func(Version) bool) {
-	seg := idx.segmentFor(key)
+func (idx *Index) WalkVersions(key []byte, fn func(Version) bool) {
+	seg := idx.shardFor(key)
 	seg.walkVersions(key, fn)
 }
 
-func (idx *SegmentedIndex) DropXid(xid uint64) {
-	for _, seg := range idx.segments {
+func (idx *Index) DropXid(xid uint64) {
+	for _, seg := range idx.shards {
 		if seg != nil {
 			seg.dropXid(xid)
 		}
 	}
 }
 
-func (idx *SegmentedIndex) ForEachKey(fn func(key []byte, chain []Version)) {
-	for _, seg := range idx.segments {
+func (idx *Index) ForEachKey(fn func(key []byte, chain []Version)) {
+	for _, seg := range idx.shards {
 		if seg != nil {
 			seg.forEachKey(fn)
 		}
 	}
 }
 
-type segment struct {
+type shard struct {
 	mu   sync.RWMutex
 	data []byte
 }
 
-func newSegment() *segment {
+func newShard() *shard {
 	tableBytes := int64(initialSlots * 8)
 	minSize := int64(headerSize) + tableBytes + headerSize
-	s := &segment{data: make([]byte, minSize)}
+	s := &shard{data: make([]byte, minSize)}
 	s.initNew(initialSlots)
 	return s
 }
 
-func (s *segment) close() {
+func (s *shard) close() {
 	s.mu.Lock()
 	s.data = nil
 	s.mu.Unlock()
 }
 
-func (s *segment) grow(minSize int64) {
+func (s *shard) grow(minSize int64) {
 	if minSize <= int64(len(s.data)) {
 		return
 	}
@@ -129,7 +129,7 @@ const (
 	hdrArenaUsedOff = 40
 )
 
-func (s *segment) initNew(slotCount uint32) {
+func (s *shard) initNew(slotCount uint32) {
 	data := s.data
 	writeU64(data, hdrMagicOff, magic)
 	writeU32(data, hdrVersionOff, formatVersion)
@@ -142,35 +142,35 @@ func (s *segment) initNew(slotCount uint32) {
 	writeU64(data, hdrArenaUsedOff, 0)
 }
 
-func (s *segment) slotCount() uint32 {
+func (s *shard) slotCount() uint32 {
 	return readU32(s.data, hdrSlotCountOff)
 }
 
-func (s *segment) keyCount() uint32 {
+func (s *shard) keyCount() uint32 {
 	return readU32(s.data, hdrKeyCountOff)
 }
 
-func (s *segment) setKeyCount(n uint32) {
+func (s *shard) setKeyCount(n uint32) {
 	writeU32(s.data, hdrKeyCountOff, n)
 }
 
-func (s *segment) tableOff() uint64 {
+func (s *shard) tableOff() uint64 {
 	return readU64(s.data, hdrTableOffOff)
 }
 
-func (s *segment) arenaOff() uint64 {
+func (s *shard) arenaOff() uint64 {
 	return readU64(s.data, hdrArenaOffOff)
 }
 
-func (s *segment) arenaUsed() uint64 {
+func (s *shard) arenaUsed() uint64 {
 	return readU64(s.data, hdrArenaUsedOff)
 }
 
-func (s *segment) setArenaUsed(n uint64) {
+func (s *shard) setArenaUsed(n uint64) {
 	writeU64(s.data, hdrArenaUsedOff, n)
 }
 
-func (s *segment) alloc(size int) (uint64, error) {
+func (s *shard) alloc(size int) (uint64, error) {
 	off := s.arenaOff() + s.arenaUsed()
 	need := int64(off) + int64(size)
 	if need > int64(len(s.data)) {
@@ -180,11 +180,11 @@ func (s *segment) alloc(size int) (uint64, error) {
 	return off, nil
 }
 
-func (s *segment) slotIndex(key []byte) uint32 {
+func (s *shard) slotIndex(key []byte) uint32 {
 	return uint32(hashKey(key) % uint64(s.slotCount()))
 }
 
-func (s *segment) findKeyRecord(key []byte) (uint64, bool) {
+func (s *shard) findKeyRecord(key []byte) (uint64, bool) {
 	slots := s.slotCount()
 	start := s.slotIndex(key)
 	data := s.data
@@ -202,7 +202,7 @@ func (s *segment) findKeyRecord(key []byte) (uint64, bool) {
 	return 0, false
 }
 
-func (s *segment) tableLoadHigh() bool {
+func (s *shard) tableLoadHigh() bool {
 	slots := s.slotCount()
 	if slots == 0 {
 		return true
@@ -210,7 +210,7 @@ func (s *segment) tableLoadHigh() bool {
 	return uint64(s.keyCount()+1)*uint64(maxLoadFactorDen) > uint64(slots)*uint64(maxLoadFactorNum)
 }
 
-func (s *segment) bumpArenaChainRefs(recOff uint64, delta uint64) {
+func (s *shard) bumpArenaChainRefs(recOff uint64, delta uint64) {
 	head := s.versionHead(recOff)
 	if head == 0 {
 		return
@@ -241,11 +241,11 @@ func readKeyFromArena(buf []byte, recOff, arenaStart uint64) []byte {
 	return out
 }
 
-func (s *segment) growHashTable() error {
+func (s *shard) growHashTable() error {
 	oldSlots := s.slotCount()
 	newSlots := oldSlots * 2
 	if newSlots <= oldSlots {
-		return fmt.Errorf("segment hash table slot overflow")
+		return fmt.Errorf("shard hash table slot overflow")
 	}
 	tableStart := s.tableOff()
 	arenaStart := s.arenaOff()
@@ -273,7 +273,7 @@ func (s *segment) growHashTable() error {
 		}
 		key := readKeyFromArena(arenaSnap, recOff, arenaStart)
 		if key == nil {
-			return fmt.Errorf("segment hash table grow: bad key record")
+			return fmt.Errorf("shard hash table grow: bad key record")
 		}
 		entries = append(entries, entry{
 			key:       key,
@@ -300,7 +300,7 @@ func (s *segment) growHashTable() error {
 			}
 		}
 		if !inserted {
-			return fmt.Errorf("segment hash table rehash failed")
+			return fmt.Errorf("shard hash table rehash failed")
 		}
 	}
 	writeU32(data, hdrSlotCountOff, newSlots)
@@ -308,7 +308,7 @@ func (s *segment) growHashTable() error {
 	return nil
 }
 
-func (s *segment) insertKeySlot(key []byte, recOff uint64) error {
+func (s *shard) insertKeySlot(key []byte, recOff uint64) error {
 	slots := s.slotCount()
 	start := s.slotIndex(key)
 	data := s.data
@@ -322,10 +322,10 @@ func (s *segment) insertKeySlot(key []byte, recOff uint64) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("segment hash table full")
+	return fmt.Errorf("shard hash table full")
 }
 
-func (s *segment) findOrCreateKeyRecord(key []byte) (uint64, error) {
+func (s *shard) findOrCreateKeyRecord(key []byte) (uint64, error) {
 	if off, ok := s.findKeyRecord(key); ok {
 		return off, nil
 	}
@@ -360,7 +360,7 @@ func (s *segment) findOrCreateKeyRecord(key []byte) (uint64, error) {
 	}
 }
 
-func (s *segment) keyAt(recOff uint64, key []byte) bool {
+func (s *shard) keyAt(recOff uint64, key []byte) bool {
 	data := s.data
 	if int(recOff)+12 > len(data) {
 		return false
@@ -375,7 +375,7 @@ func (s *segment) keyAt(recOff uint64, key []byte) bool {
 	return string(data[int(recOff)+12:int(recOff)+12+int(kLen)]) == string(key)
 }
 
-func (s *segment) readKey(recOff uint64) []byte {
+func (s *shard) readKey(recOff uint64) []byte {
 	data := s.data
 	kLen := readU32(data, int(recOff))
 	out := make([]byte, kLen)
@@ -383,15 +383,15 @@ func (s *segment) readKey(recOff uint64) []byte {
 	return out
 }
 
-func (s *segment) versionHead(recOff uint64) uint64 {
+func (s *shard) versionHead(recOff uint64) uint64 {
 	return readU64(s.data, int(recOff)+4)
 }
 
-func (s *segment) setVersionHead(recOff, head uint64) {
+func (s *shard) setVersionHead(recOff, head uint64) {
 	writeU64(s.data, int(recOff)+4, head)
 }
 
-func (s *segment) put(key []byte, ver Version) {
+func (s *shard) put(key []byte, ver Version) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.data == nil {
@@ -400,18 +400,18 @@ func (s *segment) put(key []byte, ver Version) {
 
 	recOff, err := s.findOrCreateKeyRecord(key)
 	if err != nil {
-		panic("segindex: " + err.Error())
+		panic("hashindex: " + err.Error())
 	}
 	nodeOff, err := s.alloc(versionNodeSz)
 	if err != nil {
-		panic("segindex: alloc version: " + err.Error())
+		panic("hashindex: alloc version: " + err.Error())
 	}
 	writeVersion(s.data, int(nodeOff), ver)
 	writeU64(s.data, int(nodeOff)+versionSize, s.versionHead(recOff))
 	s.setVersionHead(recOff, nodeOff)
 }
 
-func (s *segment) walkVersions(key []byte, fn func(Version) bool) {
+func (s *shard) walkVersions(key []byte, fn func(Version) bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.data == nil {
@@ -436,7 +436,7 @@ func (s *segment) walkVersions(key []byte, fn func(Version) bool) {
 	}
 }
 
-func (s *segment) forEachKey(fn func(key []byte, chain []Version)) {
+func (s *shard) forEachKey(fn func(key []byte, chain []Version)) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.data == nil {
@@ -467,7 +467,7 @@ func (s *segment) forEachKey(fn func(key []byte, chain []Version)) {
 	}
 }
 
-func (s *segment) dropXid(xid uint64) {
+func (s *shard) dropXid(xid uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.data == nil {
@@ -493,7 +493,7 @@ func (s *segment) dropXid(xid uint64) {
 	}
 }
 
-func (s *segment) filterChain(recOff uint64, keep func(Version) bool) (uint64, bool) {
+func (s *shard) filterChain(recOff uint64, keep func(Version) bool) (uint64, bool) {
 	data := s.data
 	head := s.versionHead(recOff)
 	var kept []Version
@@ -513,7 +513,7 @@ func (s *segment) filterChain(recOff uint64, keep func(Version) bool) (uint64, b
 	for i := len(kept) - 1; i >= 0; i-- {
 		nodeOff, err := s.alloc(versionNodeSz)
 		if err != nil {
-			panic("segindex: filterChain alloc: " + err.Error())
+			panic("hashindex: filterChain alloc: " + err.Error())
 		}
 		data = s.data
 		writeVersion(data, int(nodeOff), kept[i])

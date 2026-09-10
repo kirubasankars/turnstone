@@ -3,7 +3,7 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root of this source tree.
 
-package stonedb
+package engine
 
 import (
 	"errors"
@@ -138,9 +138,9 @@ func (tx *Transaction) write(key, value []byte, isDelete bool) error {
 		}
 	}
 
-	recType := WALRecordSet
+	recType := RecordSet
 	if isDelete {
-		recType = WALRecordDelete
+		recType = RecordDelete
 	}
 
 	offset, err := db.appendRecord(recType, tx.xid, key, value)
