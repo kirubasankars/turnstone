@@ -395,12 +395,6 @@ func (l *DataLog) findScanStartLocked(targetOpID uint64) (int64, bool) {
 	return 0, true
 }
 
-func (l *DataLog) PunchHole(off, length int64) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return punchHole(int(l.file.Fd()), off, length)
-}
-
 func (l *DataLog) LogicalSize() int64 {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
