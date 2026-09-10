@@ -209,8 +209,5 @@ func generateCerts(outDir string, extraHosts []string) error {
 	if err := genLeaf("client", 3, nil); err != nil {
 		return err
 	}
-	if err := genLeaf("admin", 4, nil); err != nil {
-		return err
-	}
-	return genLeaf("cdc", 5, nil)
+	return genLeaf("admin", 4, nil)
 }
