@@ -11,84 +11,124 @@
   <header class="app-header" data-testid="app-header">
     <div class="brand">
       <h1><span>Turnstone</span> Devtool</h1>
-      <p class="tagline">Local database inspector</p>
     </div>
     <div class="header-actions">
       <label class="field-inline" for="db-select">
         <span class="field-label">Database</span>
         <select id="db-select" data-testid="db-select" aria-label="Select database"></select>
       </label>
-      <button type="button" class="btn secondary" id="btn-refresh" data-testid="btn-refresh">Refresh</button>
+      <button type="button" class="btn secondary icon-btn" id="btn-refresh" data-testid="btn-refresh" title="Refresh all (R)" aria-label="Refresh all">
+        <span class="btn-label">Refresh</span>
+      </button>
     </div>
   </header>
 
+  <div class="summary-bar" data-testid="summary-bar" aria-live="polite">
+    <div class="summary-item">
+      <span class="summary-label">State</span>
+      <span id="db-state" data-testid="db-state" class="summary-value">—</span>
+    </div>
+    <div class="summary-item">
+      <span class="summary-label">Keys</span>
+      <span id="summary-keys" data-testid="summary-keys" class="summary-value mono">—</span>
+    </div>
+    <div class="summary-item">
+      <span class="summary-label">Active txs</span>
+      <span id="summary-txs" data-testid="summary-txs" class="summary-value mono">—</span>
+    </div>
+    <div class="summary-item summary-muted">
+      <span class="summary-label">Updated</span>
+      <span id="last-updated" data-testid="last-updated" class="summary-value">—</span>
+    </div>
+  </div>
+
+  <nav class="view-tabs" data-testid="view-tabs" aria-label="Sections">
+    <button type="button" class="view-tab active" data-view="data" data-testid="tab-data">Keys</button>
+    <button type="button" class="view-tab" data-view="monitor" data-testid="tab-monitor">Monitor</button>
+  </nav>
+
   <main class="app-main" data-testid="app-main">
-    <section class="panel" data-testid="panel-stats">
-      <div class="panel-head">
-        <h2>Overview</h2>
-        <span id="db-state" data-testid="db-state"></span>
-      </div>
-      <div class="panel-body" id="db-stats" data-testid="db-stats">
-        <p class="placeholder">Loading stats…</p>
-      </div>
-    </section>
-
-    <section class="panel" data-testid="panel-server-metrics">
-      <div class="panel-head">
-        <h2>Server</h2>
-        <span class="live-indicator" data-testid="metrics-indicator">
-          <span class="dot" id="metrics-dot"></span>Prometheus
-        </span>
-      </div>
-      <div class="panel-body" id="server-metrics" data-testid="server-metrics">
-        <p class="placeholder">Loading metrics…</p>
-      </div>
-    </section>
-
-    <section class="panel panel-keys" data-testid="panel-keys">
-      <div class="panel-head"><h2>Keys</h2></div>
-      <div class="panel-body">
-        <div class="toolbar" data-testid="key-toolbar">
-          <input id="prefix-filter" data-testid="prefix-filter" type="search" placeholder="Filter by prefix" autocomplete="off" aria-label="Key prefix filter">
-          <button type="button" class="btn secondary" id="btn-search-keys" data-testid="btn-search-keys">Search</button>
-          <button type="button" class="btn secondary" id="btn-more-keys" data-testid="btn-more-keys">More</button>
+    <div class="work-area view-panel active" data-view-panel="data" data-testid="panel-data">
+      <section class="panel panel-keys" data-testid="panel-keys">
+        <div class="panel-head">
+          <h2>Key browser</h2>
+          <span id="key-count" data-testid="key-count" class="badge">0 keys</span>
         </div>
-        <div class="key-list" id="key-list" data-testid="key-list" role="listbox" aria-label="Keys">
-          <p class="placeholder">No keys loaded</p>
+        <div class="panel-body">
+          <div class="search-row" data-testid="key-toolbar">
+            <input id="prefix-filter" data-testid="prefix-filter" type="search" placeholder="Search by prefix…" autocomplete="off" aria-label="Filter keys by prefix">
+            <button type="button" class="btn secondary" id="btn-search-keys" data-testid="btn-search-keys" title="Search now">Search</button>
+          </div>
+          <div class="key-list" id="key-list" data-testid="key-list" role="listbox" aria-label="Keys">
+            <p class="empty-state">
+              <span class="empty-title">No keys yet</span>
+              <span class="empty-hint">Create one in the editor, or search to browse existing keys.</span>
+            </p>
+          </div>
+          <button type="button" class="btn secondary btn-block" id="btn-more-keys" data-testid="btn-more-keys" disabled>Load more</button>
         </div>
-      </div>
-    </section>
+      </section>
 
-    <section class="panel panel-editor" data-testid="panel-editor">
-      <div class="panel-head"><h2>Editor</h2></div>
-      <div class="panel-body editor">
-        <label class="field" for="edit-key">
-          <span class="field-label">Key</span>
-          <input id="edit-key" data-testid="edit-key" type="text" placeholder="Enter key name" autocomplete="off">
-        </label>
-        <label class="field" for="edit-value">
-          <span class="field-label">Value</span>
-          <textarea id="edit-value" data-testid="edit-value" placeholder="Enter value" rows="6"></textarea>
-        </label>
-        <div class="actions" data-testid="editor-actions">
-          <button type="button" class="btn" id="btn-get" data-testid="btn-get">Get</button>
-          <button type="button" class="btn" id="btn-set" data-testid="btn-set">Set</button>
-          <button type="button" class="btn danger" id="btn-delete" data-testid="btn-delete">Delete</button>
+      <section class="panel panel-editor" data-testid="panel-editor">
+        <div class="panel-head"><h2>Editor</h2></div>
+        <div class="panel-body editor">
+          <label class="field" for="edit-key">
+            <span class="field-label">Key</span>
+            <input id="edit-key" data-testid="edit-key" type="text" placeholder="e.g. user:123" autocomplete="off" spellcheck="false">
+          </label>
+          <label class="field" for="edit-value">
+            <span class="field-label-row">
+              <span class="field-label">Value</span>
+              <span id="value-size" data-testid="value-size" class="field-hint">0 bytes</span>
+            </span>
+            <textarea id="edit-value" data-testid="edit-value" placeholder="Enter value…" rows="8" spellcheck="false"></textarea>
+          </label>
+          <div class="actions" data-testid="editor-actions">
+            <button type="button" class="btn primary" id="btn-set" data-testid="btn-set" title="Save (Ctrl+S)">Save</button>
+            <button type="button" class="btn secondary" id="btn-get" data-testid="btn-get" title="Load (Ctrl+Enter)">Load</button>
+            <button type="button" class="btn secondary" id="btn-copy" data-testid="btn-copy" title="Copy value">Copy</button>
+            <button type="button" class="btn secondary" id="btn-clear" data-testid="btn-clear" title="Clear editor">Clear</button>
+            <button type="button" class="btn danger" id="btn-delete" data-testid="btn-delete">Delete</button>
+          </div>
+          <p class="status" id="editor-status" data-testid="editor-status" role="status" aria-live="polite"></p>
         </div>
-        <p class="status" id="editor-status" data-testid="editor-status" role="status" aria-live="polite"></p>
-      </div>
-    </section>
+      </section>
+    </div>
 
-    <section class="panel panel-wide" data-testid="panel-db-metrics">
-      <div class="panel-head"><h2>Database metrics</h2></div>
-      <div class="panel-body" id="db-metrics" data-testid="db-metrics">
-        <p class="placeholder">Loading metrics…</p>
-      </div>
-    </section>
+    <div class="monitor-area view-panel" data-view-panel="monitor" data-testid="panel-monitor">
+      <section class="panel" data-testid="panel-stats">
+        <div class="panel-head"><h2>Database</h2></div>
+        <div class="panel-body" id="db-stats" data-testid="db-stats">
+          <p class="empty-state"><span class="empty-title">Loading…</span></p>
+        </div>
+      </section>
+
+      <section class="panel" data-testid="panel-server-metrics">
+        <div class="panel-head">
+          <h2>Server</h2>
+          <span class="live-indicator" data-testid="metrics-indicator">
+            <span class="dot" id="metrics-dot"></span>Live
+          </span>
+        </div>
+        <div class="panel-body" id="server-metrics" data-testid="server-metrics">
+          <p class="empty-state"><span class="empty-title">Loading…</span></p>
+        </div>
+      </section>
+
+      <section class="panel panel-wide" data-testid="panel-db-metrics">
+        <div class="panel-head"><h2>Prometheus</h2></div>
+        <div class="panel-body" id="db-metrics" data-testid="db-metrics">
+          <p class="empty-state"><span class="empty-title">Loading…</span></p>
+        </div>
+      </section>
+    </div>
   </main>
 
-  <dialog id="confirm-dialog" data-testid="confirm-dialog">
+  <div id="toast" class="toast" data-testid="toast" role="status" aria-live="polite" hidden></div>
+
+  <dialog id="confirm-dialog" data-testid="confirm-dialog" aria-labelledby="confirm-title">
     <div class="dialog-form">
+      <h3 id="confirm-title" class="dialog-title">Delete key?</h3>
       <p id="confirm-message" data-testid="confirm-message"></p>
       <div class="dialog-actions">
         <button type="button" class="btn secondary" id="confirm-cancel" data-testid="confirm-cancel">Cancel</button>
