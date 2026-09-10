@@ -3,7 +3,7 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root of this source tree.
 
-package stonedb
+package engine
 
 import (
 	"fmt"
@@ -22,7 +22,7 @@ func TestValidateLogSegment_RejectsPartialFrame(t *testing.T) {
 	tx.Put([]byte("k"), []byte("v"))
 	tx.Commit()
 
-	seg, _, err := db.ReadLogSegment(0, 1<<20)
+	seg, _, err := db.ReadLogRange(0, 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -30,12 +30,12 @@ func TestValidateLogSegment_RejectsPartialFrame(t *testing.T) {
 		t.Fatal("expected non-empty segment")
 	}
 
-	if _, err := validateLogSegment(seg[:len(seg)-1]); err == nil {
+	if _, err := validateFrames(seg[:len(seg)-1]); err == nil {
 		t.Fatal("expected partial frame to be rejected")
 	}
 }
 
-func TestReadLogSegment_StatementBoundaries(t *testing.T) {
+func TestReadLogRange_StatementBoundaries(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(dir, Options{})
 	if err != nil {
@@ -51,14 +51,14 @@ func TestReadLogSegment_StatementBoundaries(t *testing.T) {
 
 	var offset int64
 	for {
-		seg, next, err := db.ReadLogSegment(offset, 64)
+		seg, next, err := db.ReadLogRange(offset, 64)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if len(seg) == 0 {
 			break
 		}
-		frames, err := validateLogSegment(seg)
+		frames, err := validateFrames(seg)
 		if err != nil {
 			t.Fatalf("segment not statement-safe at offset %d: %v", offset, err)
 		}
@@ -69,7 +69,7 @@ func TestReadLogSegment_StatementBoundaries(t *testing.T) {
 	}
 }
 
-func TestApplyLogSegment_RoundTrip(t *testing.T) {
+func TestApplyLogRange_RoundTrip(t *testing.T) {
 	leaderDir := t.TempDir()
 	followerDir := t.TempDir()
 
@@ -85,7 +85,7 @@ func TestApplyLogSegment_RoundTrip(t *testing.T) {
 		tx.Commit()
 	}
 
-	seg, endOffset, err := leader.ReadLogSegment(0, 1<<20)
+	seg, endOffset, err := leader.ReadLogRange(0, 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +96,7 @@ func TestApplyLogSegment_RoundTrip(t *testing.T) {
 	}
 	defer follower.Close()
 
-	applied, err := follower.ApplyLogSegment(seg)
+	applied, err := follower.ApplyLogRange(seg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +145,7 @@ func TestIsFrameBoundary(t *testing.T) {
 		t.Fatal("offset 1 should not be a frame boundary")
 	}
 
-	seg, next, err := db.ReadLogSegment(0, 1<<20)
+	seg, next, err := db.ReadLogRange(0, 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}

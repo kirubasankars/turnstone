@@ -3,7 +3,7 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root of this source tree.
 
-package stonedb
+package engine
 
 import (
 	"errors"
@@ -25,20 +25,20 @@ const (
 	logFileName = "data.log"
 )
 
-// WALRecordType identifies the kind of a single log record.
-type WALRecordType uint8
+// RecordType identifies the kind of a single log record.
+type RecordType uint8
 
 const (
-	WALRecordBegin  WALRecordType = 1
-	WALRecordSet    WALRecordType = 2
-	WALRecordDelete WALRecordType = 3
-	WALRecordCommit WALRecordType = 4
-	WALRecordAbort  WALRecordType = 5
+	RecordBegin  RecordType = 1
+	RecordSet    RecordType = 2
+	RecordDelete RecordType = 3
+	RecordCommit RecordType = 4
+	RecordAbort  RecordType = 5
 )
 
-// WALRecord is a single decoded log entry.
-type WALRecord struct {
-	Type  WALRecordType
+// Record is a single decoded log entry.
+type Record struct {
+	Type  RecordType
 	XID   uint64
 	Key   []byte
 	Value []byte
@@ -71,24 +71,24 @@ var (
 	ErrKeyNotFound    = errors.New("key not found")
 	ErrChecksum       = errors.New("checksum mismatch")
 	ErrCorruptData    = errors.New("data corruption detected")
-	ErrTruncated      = errors.New("wal truncated due to corruption")
-	ErrLogUnavailable = errors.New("wal log unavailable for requested byte offset")
+	ErrTruncated      = errors.New("log truncated due to corruption")
+	ErrLogUnavailable = errors.New("log unavailable for requested byte offset")
 	ErrDiskFull       = errors.New("disk usage exceeds threshold")
 	ErrDatabaseClosed = errors.New("database is closed")
 )
 
-// Options configures the store on Open.
+// Options configures the engine on Open.
 type Options struct {
-	TruncateCorruptWAL bool
+	TruncateCorruptTail bool
 
-	ChecksumInterval       time.Duration
-	AutoCheckpointInterval time.Duration
-	MaxDiskUsagePercent    int
-	Logger                 *slog.Logger
-	TxTimeout              time.Duration
-	CommitDelay            time.Duration
-	CommitSiblings         int
-	UnsafeDisableFsync     bool
+	ChecksumInterval    time.Duration
+	RetentionInterval   time.Duration
+	MaxDiskUsagePercent int
+	Logger              *slog.Logger
+	TxTimeout           time.Duration
+	CommitDelay         time.Duration
+	CommitSiblings      int
+	UnsafeDisableFsync  bool
 }
 
 // indexVersion points at one MVCC version in the append-only log.

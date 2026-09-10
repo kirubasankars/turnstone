@@ -3,7 +3,7 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root of this source tree.
 
-package stonedb
+package engine
 
 import (
 	"fmt"
@@ -14,7 +14,7 @@ import (
 
 func TestRecovery_CrashConsistency(t *testing.T) {
 	dir := t.TempDir()
-	opts := Options{TruncateCorruptWAL: true}
+	opts := Options{TruncateCorruptTail: true}
 
 	db, err := Open(dir, opts)
 	if err != nil {
@@ -76,7 +76,7 @@ func TestRecovery_LogReplay(t *testing.T) {
 
 func TestRecovery_TruncateCorruptTail(t *testing.T) {
 	dir := t.TempDir()
-	opts := Options{TruncateCorruptWAL: true}
+	opts := Options{TruncateCorruptTail: true}
 
 	db, err := Open(dir, opts)
 	if err != nil {
