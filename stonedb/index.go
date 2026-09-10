@@ -130,66 +130,6 @@ func (idx *Index) LiveKeyCount(clog func(uint64) TxStatus) int64 {
 	return count
 }
 
-func (idx *Index) collectDeadVersions(horizon uint64, clog func(uint64) TxStatus) []struct {
-	key string
-	ver indexVersion
-} {
-	var dead []struct {
-		key string
-		ver indexVersion
-	}
-
-	idx.ForEachKey(func(uk []byte, chain []indexVersion) {
-		var newestCommitted *indexVersion
-		for i := range chain {
-			v := chain[i]
-			if clog(v.xmin) == TxCommitted {
-				cp := v
-				newestCommitted = &cp
-				break
-			}
-		}
-
-		k := string(uk)
-		for _, v := range chain {
-			if clog(v.xmin) == TxInProgress {
-				continue
-			}
-			if clog(v.xmin) == TxAborted {
-				dead = append(dead, struct {
-					key string
-					ver indexVersion
-				}{k, v})
-				continue
-			}
-			isNewest := newestCommitted != nil && v.offset == newestCommitted.offset
-			if isNewest {
-				continue
-			}
-			if v.xmin < horizon {
-				dead = append(dead, struct {
-					key string
-					ver indexVersion
-				}{k, v})
-			}
-		}
-	})
-	return dead
-}
-
-func (idx *Index) RemoveDead(dead []struct {
-	key string
-	ver indexVersion
-}) {
-	for _, d := range dead {
-		idx.seg.RemoveVersion([]byte(d.key), d.ver.xmin)
-	}
-}
-
-func (idx *Index) HasLiveRefAtOffset(offset int64) bool {
-	return idx.seg.HasLiveRefAtOffset(offset)
-}
-
 func (idx *Index) walkKeyVersions(key []byte, fn func(indexVersion) bool) {
 	idx.seg.WalkVersions(key, func(v segindex.Version) bool {
 		return fn(fromSegVersion(v))
@@ -239,29 +179,6 @@ func decodeIndexVersion(data []byte) (indexVersion, error) {
 		opID:      binary.BigEndian.Uint64(data[20:]),
 		tombstone: data[28] == 1,
 	}, nil
-}
-
-func alignRange(start, end, blockSize int64) (int64, int64) {
-	if blockSize <= 0 {
-		blockSize = 4096
-	}
-	alignedStart := (start + blockSize - 1) / blockSize * blockSize
-	alignedEnd := end / blockSize * blockSize
-	if alignedEnd <= alignedStart {
-		return 0, 0
-	}
-	return alignedStart, alignedEnd
-}
-
-func recordSpanSize(keyLen, valLen int, recType WALRecordType) int64 {
-	var body int
-	switch recType {
-	case WALRecordSet:
-		body = 4 + keyLen + 4 + valLen
-	case WALRecordDelete:
-		body = 4 + keyLen
-	}
-	return frameSize(LogRecordHeaderSize + body)
 }
 
 // visibleVersionForKey returns the first visible version for key in snapshot.

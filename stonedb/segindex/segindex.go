@@ -85,20 +85,6 @@ func (idx *SegmentedIndex) ForEachKey(fn func(key []byte, chain []Version)) {
 	}
 }
 
-func (idx *SegmentedIndex) RemoveVersion(key []byte, xmin uint64) {
-	seg := idx.segmentFor(key)
-	seg.removeVersion(key, xmin)
-}
-
-func (idx *SegmentedIndex) HasLiveRefAtOffset(offset int64) bool {
-	for _, seg := range idx.segments {
-		if seg != nil && seg.hasOffset(offset) {
-			return true
-		}
-	}
-	return false
-}
-
 type segment struct {
 	mu   sync.RWMutex
 	data []byte
@@ -508,40 +494,6 @@ func (s *segment) dropXid(xid uint64) {
 	}
 }
 
-func (s *segment) removeVersion(key []byte, xmin uint64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.data == nil {
-		return
-	}
-
-	recOff, ok := s.findKeyRecord(key)
-	if !ok {
-		return
-	}
-	data := s.data
-	slots := s.slotCount()
-	table := int(s.tableOff())
-	var slotIdx int = -1
-	start := s.slotIndex(key)
-	for i := uint32(0); i < slots; i++ {
-		slot := (start + i) % slots
-		if readU64(data, table+int(slot)*8) == recOff {
-			slotIdx = table + int(slot)*8
-			break
-		}
-	}
-	newHead, empty := s.filterChain(recOff, func(v Version) bool { return v.Xmin != xmin })
-	if empty {
-		if slotIdx >= 0 {
-			writeU64(s.data, slotIdx, 0)
-		}
-		s.setKeyCount(s.keyCount() - 1)
-	} else {
-		s.setVersionHead(recOff, newHead)
-	}
-}
-
 func (s *segment) filterChain(recOff uint64, keep func(Version) bool) (uint64, bool) {
 	data := s.data
 	head := s.versionHead(recOff)
@@ -570,28 +522,6 @@ func (s *segment) filterChain(recOff uint64, keep func(Version) bool) (uint64, b
 		newHead = nodeOff
 	}
 	return newHead, false
-}
-
-func (s *segment) hasOffset(target int64) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.data == nil {
-		return false
-	}
-
-	found := false
-	s.forEachKeyLocked(func(_ []byte, chain []Version) {
-		if found {
-			return
-		}
-		for _, v := range chain {
-			if v.Offset == target {
-				found = true
-				return
-			}
-		}
-	})
-	return found
 }
 
 func (s *segment) forEachKeyLocked(fn func(key []byte, chain []Version)) {

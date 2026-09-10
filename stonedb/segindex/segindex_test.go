@@ -66,26 +66,6 @@ func TestForEachKeyAndDropXid(t *testing.T) {
 	}
 }
 
-func TestRemoveVersionAndHasOffset(t *testing.T) {
-	idx := Open()
-	defer idx.Close()
-
-	key := []byte("k")
-	idx.Put(key, Version{Offset: 100, Xmin: 1, OpID: 1})
-	idx.Put(key, Version{Offset: 200, Xmin: 2, OpID: 2})
-
-	if !idx.HasLiveRefAtOffset(100) {
-		t.Fatal("expected live ref at 100")
-	}
-	idx.RemoveVersion(key, 1)
-	if idx.HasLiveRefAtOffset(100) {
-		t.Fatal("offset 100 should be dead")
-	}
-	if !idx.HasLiveRefAtOffset(200) {
-		t.Fatal("offset 200 should remain")
-	}
-}
-
 func TestHashTableGrowSameSegment(t *testing.T) {
 	idx := Open()
 	defer idx.Close()
