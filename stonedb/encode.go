@@ -19,7 +19,6 @@ func encodeWALRecord(rec WALRecord) []byte {
 	buf := make([]byte, LogRecordHeaderSize+bodyLen)
 	buf[0] = byte(rec.Type)
 	binary.BigEndian.PutUint64(buf[1:], rec.XID)
-	binary.BigEndian.PutUint64(buf[9:], rec.OpID)
 
 	switch rec.Type {
 	case WALRecordSet:
@@ -47,7 +46,6 @@ func decodeWALRecord(payload []byte) (WALRecord, error) {
 	rec := WALRecord{
 		Type: WALRecordType(payload[0]),
 		XID:  binary.BigEndian.Uint64(payload[1:]),
-		OpID: binary.BigEndian.Uint64(payload[9:]),
 	}
 	body := payload[LogRecordHeaderSize:]
 	switch rec.Type {
@@ -83,13 +81,6 @@ func decodeWALRecord(payload []byte) (WALRecord, error) {
 		return WALRecord{}, ErrCorruptData
 	}
 	return rec, nil
-}
-
-func peekOpID(payload []byte) (uint64, bool) {
-	if len(payload) < LogRecordHeaderSize {
-		return 0, false
-	}
-	return binary.BigEndian.Uint64(payload[9:17]), true
 }
 
 func frameSize(payloadLen int) int64 {

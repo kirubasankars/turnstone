@@ -16,8 +16,8 @@ func TestPutAndWalkVersions(t *testing.T) {
 	defer idx.Close()
 
 	key := []byte("alpha")
-	idx.Put(key, Version{Offset: 10, ValueLen: 3, Xmin: 1, OpID: 1})
-	idx.Put(key, Version{Offset: 20, ValueLen: 3, Xmin: 2, OpID: 2})
+	idx.Put(key, Version{Offset: 10, ValueLen: 3, Xmin: 1})
+	idx.Put(key, Version{Offset: 20, ValueLen: 3, Xmin: 2})
 
 	var chain []Version
 	idx.WalkVersions(key, func(v Version) bool {
@@ -36,9 +36,9 @@ func TestForEachKeyAndDropXid(t *testing.T) {
 	idx := Open()
 	defer idx.Close()
 
-	idx.Put([]byte("a"), Version{Offset: 1, Xmin: 1, OpID: 1})
-	idx.Put([]byte("b"), Version{Offset: 2, Xmin: 2, OpID: 2})
-	idx.Put([]byte("a"), Version{Offset: 3, Xmin: 3, OpID: 3})
+	idx.Put([]byte("a"), Version{Offset: 1, Xmin: 1})
+	idx.Put([]byte("b"), Version{Offset: 2, Xmin: 2})
+	idx.Put([]byte("a"), Version{Offset: 3, Xmin: 3})
 
 	count := 0
 	idx.ForEachKey(func(_ []byte, chain []Version) {
@@ -80,7 +80,7 @@ func TestHashTableGrowSameSegment(t *testing.T) {
 	t.Logf("generated %d keys for segment 0", len(keys))
 
 	for i, key := range keys {
-		idx.Put(key, Version{Offset: int64(i), Xmin: uint64(i + 1), OpID: uint64(i + 1)})
+		idx.Put(key, Version{Offset: int64(i), Xmin: uint64(i + 1)})
 	}
 
 	seen := 0
@@ -100,7 +100,7 @@ func TestHashTableGrowManyKeys(t *testing.T) {
 	const n = 5000
 	for i := 0; i < n; i++ {
 		key := []byte(fmt.Sprintf("grow-key-%d", i))
-		idx.Put(key, Version{Offset: int64(i), Xmin: uint64(i + 1), OpID: uint64(i + 1)})
+		idx.Put(key, Version{Offset: int64(i), Xmin: uint64(i + 1)})
 	}
 
 	seen := 0
@@ -127,7 +127,7 @@ func TestConcurrentPutsDifferentKeys(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			key := []byte(fmt.Sprintf("key-%d", i))
-			idx.Put(key, Version{Offset: int64(i), ValueLen: 4, Xmin: uint64(i + 1), OpID: uint64(i + 1)})
+			idx.Put(key, Version{Offset: int64(i), ValueLen: 4, Xmin: uint64(i + 1)})
 		}()
 	}
 	wg.Wait()

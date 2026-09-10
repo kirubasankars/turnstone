@@ -111,9 +111,9 @@ func TestClog_EmptyAfterApplyRecordAbort(t *testing.T) {
 
 	const xid = uint64(42)
 	recs := []WALRecord{
-		{Type: WALRecordBegin, XID: xid, OpID: 1},
-		{Type: WALRecordSet, XID: xid, OpID: 2, Key: []byte("k"), Value: []byte("v")},
-		{Type: WALRecordAbort, XID: xid, OpID: 3},
+		{Type: WALRecordBegin, XID: xid},
+		{Type: WALRecordSet, XID: xid, Key: []byte("k"), Value: []byte("v")},
+		{Type: WALRecordAbort, XID: xid},
 	}
 	for _, r := range recs {
 		if err := db.ApplyRecord(r); err != nil {
