@@ -106,6 +106,14 @@ func (db *DB) processCommitBatch(requests []commitRequest) {
 		if stale > 0 {
 			atomic.AddInt64(&db.staleBytes, stale)
 		}
+		if db.segments != nil {
+			for _, tx := range valid {
+				for off, sz := range tx.staleBytes {
+					db.segments.addStaleAtOffset(off, sz)
+				}
+			}
+			db.segments.maybeSealAfterCommit(db.log.WriteOffset())
+		}
 
 		for _, tx := range valid {
 			outcomes = append(outcomes, outcome{tx, nil, true})

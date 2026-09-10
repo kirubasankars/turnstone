@@ -83,6 +83,7 @@ type Options struct {
 	TruncateCorruptWAL bool
 
 	CompactionMinGarbage   int64
+	SegmentTargetSize      int64 // logical data.log segment size; sealed on commit boundary
 	CompactionInterval     time.Duration
 	ChecksumInterval       time.Duration
 	AutoCheckpointInterval time.Duration

@@ -55,6 +55,7 @@ type DB struct {
 	operationID   uint64
 	keyCount      int64
 	staleBytes    int64
+	segments      *segmentTracker
 	scanWALFloor  uint64
 
 	metricsConflicts uint64
@@ -82,6 +83,7 @@ type DB struct {
 	unsafeDisableFsync bool
 
 	minGarbageThreshold    int64
+	segmentTargetSize      int64
 	checksumInterval       time.Duration
 	autoCheckpointInterval time.Duration
 	compactionInterval     time.Duration
@@ -108,6 +110,9 @@ func OpenContext(ctx context.Context, dir string, opts Options) (*DB, error) {
 	}
 	if opts.CompactionMinGarbage == 0 {
 		opts.CompactionMinGarbage = 1024 * 1024
+	}
+	if opts.SegmentTargetSize == 0 {
+		opts.SegmentTargetSize = DefaultSegmentTargetSize
 	}
 	if opts.AutoCheckpointInterval == 0 {
 		opts.AutoCheckpointInterval = 60 * time.Second
@@ -168,6 +173,7 @@ func OpenContext(ctx context.Context, dir string, opts Options) (*DB, error) {
 		commitSiblings:         opts.CommitSiblings,
 		unsafeDisableFsync:     opts.UnsafeDisableFsync,
 		minGarbageThreshold:    opts.CompactionMinGarbage,
+		segmentTargetSize:      opts.SegmentTargetSize,
 		checksumInterval:       opts.ChecksumInterval,
 		autoCheckpointInterval: opts.AutoCheckpointInterval,
 		compactionInterval:     opts.CompactionInterval,
@@ -185,6 +191,7 @@ func OpenContext(ctx context.Context, dir string, opts Options) (*DB, error) {
 		return nil, fmt.Errorf("replay log: %w", err)
 	}
 
+	db.segments = newSegmentTracker(opts.SegmentTargetSize, db.log.WriteOffset())
 	db.startBackgroundTasks()
 	return db, nil
 }
@@ -353,7 +360,20 @@ func (db *DB) KeyCount() (int64, error) {
 }
 
 func (db *DB) TotalGarbageBytes() int64 {
+	if db.segments != nil {
+		return db.segments.totalStaleBytes()
+	}
 	return atomic.LoadInt64(&db.staleBytes)
+}
+
+// segmentGarbageThreshold returns the stale-byte minimum for vacuuming one segment.
+// When the global threshold exceeds the segment size, cap at the segment target so
+// a ~10MB segment can be reclaimed without waiting for 64MB global garbage.
+func (db *DB) segmentGarbageThreshold() int64 {
+	if db.segmentTargetSize > 0 && db.minGarbageThreshold > db.segmentTargetSize {
+		return db.segmentTargetSize
+	}
+	return db.minGarbageThreshold
 }
 
 func (db *DB) StorageStats() (logCount int, logicalSize int64, allocatedSize int64) {
@@ -745,6 +765,9 @@ func (db *DB) applyReplicatedImpact(impact *replTxImpact) {
 	}
 	if impact.staleBytes > 0 {
 		atomic.AddInt64(&db.staleBytes, impact.staleBytes)
+		if db.segments != nil {
+			db.segments.addStaleToActive(impact.staleBytes)
+		}
 	}
 }
 
