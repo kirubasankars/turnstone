@@ -71,6 +71,9 @@ type DB struct {
 	maxDiskUsagePercent int
 	isDiskFull          int32
 	isCorrupt           int32
+
+	indexFragmentationRatio float64
+	indexCompactOnRetention bool
 }
 
 // Open opens a database, replaying data.log to rebuild the ephemeral index.
@@ -100,6 +103,10 @@ func OpenContext(ctx context.Context, dir string, opts Options) (*DB, error) {
 	}
 	if opts.CommitSiblings <= 0 {
 		opts.CommitSiblings = 2
+	}
+	indexFrag := opts.IndexCompactFragmentation
+	if indexFrag <= 0 {
+		indexFrag = defaultIndexFragmentationRatio
 	}
 
 	logger := opts.Logger
@@ -140,6 +147,8 @@ func OpenContext(ctx context.Context, dir string, opts Options) (*DB, error) {
 		retentionInterval:   opts.RetentionInterval,
 		maxDiskUsagePercent: opts.MaxDiskUsagePercent,
 		logger:              logger,
+		indexFragmentationRatio: indexFrag,
+		indexCompactOnRetention: indexCompactOnRetentionEnabled(opts),
 	}
 
 	if opts.UnsafeDisableFsync {
@@ -153,6 +162,13 @@ func OpenContext(ctx context.Context, dir string, opts Options) (*DB, error) {
 
 	db.startBackgroundTasks()
 	return db, nil
+}
+
+func indexCompactOnRetentionEnabled(opts Options) bool {
+	if opts.IndexCompactOnRetention == nil {
+		return true
+	}
+	return *opts.IndexCompactOnRetention
 }
 
 func (db *DB) AdvanceXID(txID uint64) {
@@ -357,6 +373,11 @@ func (db *DB) runRetentionMarker() {
 			if db.log.WriteOffset() > atomic.LoadInt64(&db.retentionOffset) {
 				if err := db.MarkRetention(); err != nil && !strings.Contains(err.Error(), "closed") {
 					db.logger.Error("retention mark failed", "err", err)
+				}
+			}
+			if db.indexCompactOnRetention {
+				if _, err := db.MaybeCompactIndex(); err != nil {
+					db.logger.Error("index compact failed", "err", err)
 				}
 			}
 		}
