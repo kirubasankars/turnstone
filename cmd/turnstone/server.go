@@ -209,4 +209,3 @@ func runServer(logger *slog.Logger, devMode bool) {
 		os.Exit(130)
 	}
 }
-
