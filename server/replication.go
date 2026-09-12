@@ -175,9 +175,14 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 				return // Disconnect
 			}
 
+			slotRole := st.role
+			if replicaID == "turnstone-backup" {
+				slotRole = RoleBackup
+			}
+
 			// INFO: Replica Connected
 			st.logger.Info("Replica subscribed", "db", name, "start_seq", offset)
-			storePtr.RegisterReplica(replicaID, offset, st.role)
+			storePtr.RegisterReplica(replicaID, offset, slotRole)
 
 			// Capture the kill switch for this specific subscription
 			if ch := storePtr.GetReplicaSignalChannel(replicaID); ch != nil {
@@ -434,9 +439,7 @@ func (s *Server) runLogStreamLoop(name string, st *database.Database, startOffse
 				if errors.Is(err, engine.ErrLogUnavailable) {
 					return fmt.Errorf("log unavailable at offset %d: %w", currentByteOffset, err)
 				}
-				logger.Error("Log segment read error", "db", name, "err", err)
-				time.Sleep(100 * time.Millisecond)
-				continue
+				return fmt.Errorf("log read failed at offset %d: %w", currentByteOffset, err)
 			}
 			if len(segData) > 0 {
 				payload := make([]byte, 16+len(segData))

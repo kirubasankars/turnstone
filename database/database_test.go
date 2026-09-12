@@ -9,6 +9,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -300,6 +301,109 @@ func TestDatabase_ReplicaLag(t *testing.T) {
 	expectedLag := newHead - head
 	if stats.ReplicaLag != expectedLag {
 		t.Errorf("expected lag %d, got %d", expectedLag, stats.ReplicaLag)
+	}
+}
+
+func TestIsValidReplicationCursor_HeadAndZero(t *testing.T) {
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	s, err := Open(context.Background(), dir, logger, 0, "none", 90)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	putKV(t, s, "k", "v")
+	head := uint64(s.LastLogOffset())
+
+	if !s.IsValidReplicationCursor(0) {
+		t.Fatal("offset 0 should be valid for full sync")
+	}
+	if !s.IsValidReplicationCursor(head) {
+		t.Fatal("head offset should be valid")
+	}
+	if s.IsValidReplicationCursor(head + 1) {
+		t.Fatal("offset beyond head should be invalid")
+	}
+}
+
+func TestIsValidReplicationCursor_RejectsMidFrame(t *testing.T) {
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	s, err := Open(context.Background(), dir, logger, 0, "none", 90)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	putKV(t, s, "k", "v")
+	head := s.LastLogOffset()
+	if head <= 1 {
+		t.Fatalf("expected head > 1, got %d", head)
+	}
+	if s.IsValidReplicationCursor(1) {
+		t.Fatal("mid-frame offset should be rejected")
+	}
+	if !s.DB.IsValidFrameOffset(0) {
+		t.Fatal("frame boundary at 0 expected")
+	}
+}
+
+func TestMinReplicaOffset_ExcludesBackupRole(t *testing.T) {
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	s, err := Open(context.Background(), dir, logger, 0, "none", 90)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	putKV(t, s, "k", "v")
+	head := uint64(s.LastLogOffset())
+
+	s.RegisterReplica("backup", head/2, ReplicaRoleBackup)
+	if got := s.MinReplicaOffset(); got != math.MaxUint64 {
+		t.Fatalf("backup role should not pin retention, got %d", got)
+	}
+
+	s.RegisterReplica("server", head/3, ReplicaRoleServer)
+	if got := s.MinReplicaOffset(); got != head/3 {
+		t.Fatalf("server role min offset = %d, want %d", got, head/3)
+	}
+}
+
+func TestWaitForQuorum_IgnoresNonServerRoles(t *testing.T) {
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	s, err := Open(context.Background(), dir, logger, 1, "none", 90)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	putKV(t, s, "k", "v")
+	target := uint64(s.LastLogOffset())
+
+	s.RegisterReplica("admin-only", target, ReplicaRoleAdmin)
+	s.RegisterReplica("backup-only", target, ReplicaRoleBackup)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- s.WaitForQuorum(target, 200*time.Millisecond, nil)
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected quorum timeout when only non-server roles acked")
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("WaitForQuorum did not return")
+	}
+
+	s.RegisterReplica("server", target, ReplicaRoleServer)
+	if err := s.WaitForQuorum(target, time.Second, nil); err != nil {
+		t.Fatalf("server role should satisfy quorum: %v", err)
 	}
 }
 
