@@ -21,8 +21,6 @@ const (
 
 	// Frame header: Length(4) + Checksum(4)
 	LogFrameHeaderSize = 8
-
-	logFileName = "data.log"
 )
 
 // RecordType identifies the kind of a single log record.

@@ -61,10 +61,10 @@ func NewTurnstoneCollector(stores map[string]*database.Database, stats ServerSta
 		dbConnections:  newDescWithLabels("db", "connections", "Active connections to this database", []string{"db"}),
 		dbActiveTxs:    newDescWithLabels("db", "active_txs", "Active transactions in database", []string{"db"}),
 		dbConflicts:    newDescWithLabels("db", "conflicts_total", "Total transaction conflicts in database", []string{"db"}),
-		dbOffset:       newDescWithLabels("db", "offset", "Exclusive end byte offset of data.log", []string{"db"}),
+		dbOffset:       newDescWithLabels("db", "offset", "Exclusive end byte offset of the WAL", []string{"db"}),
 		dbReplicaLag:   newDescWithLabels("db", "replica_lag", "Lag of the slowest replica in bytes", []string{"db"}),
-		dbLogBytes:     newDescWithLabels("db", "log_bytes", "Logical size of data.log in bytes", []string{"db"}),
-		dbLogAllocated: newDescWithLabels("db", "log_allocated_bytes", "Allocated on-disk bytes for data.log (sparse)", []string{"db"}),
+		dbLogBytes:     newDescWithLabels("db", "log_bytes", "Logical size of the WAL in bytes", []string{"db"}),
+		dbLogAllocated: newDescWithLabels("db", "log_allocated_bytes", "Allocated on-disk bytes for WAL segments", []string{"db"}),
 		dbKeyCount:     newDescWithLabels("db", "key_count", "Approximate number of live keys in database", []string{"db"}),
 	}
 }

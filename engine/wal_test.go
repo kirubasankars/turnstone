@@ -11,12 +11,8 @@ import (
 	"testing"
 )
 
-func TestWal_MigratesLegacyDataLog(t *testing.T) {
+func TestWal_CreatesFreshManifestOnOpen(t *testing.T) {
 	dir := t.TempDir()
-	legacyPath := filepath.Join(dir, logFileName)
-	if err := os.WriteFile(legacyPath, []byte{0, 0, 0, 0}, 0o644); err != nil {
-		t.Fatal(err)
-	}
 
 	log, err := OpenDataLog(dir, nil, 0)
 	if err != nil {
@@ -24,12 +20,13 @@ func TestWal_MigratesLegacyDataLog(t *testing.T) {
 	}
 	defer log.Close()
 
-	if _, err := os.Stat(legacyPath); !os.IsNotExist(err) {
-		t.Fatal("expected legacy data.log migrated away")
-	}
 	manifestPath := filepath.Join(dir, walDirName, walManifestName)
 	if _, err := os.Stat(manifestPath); err != nil {
 		t.Fatalf("expected manifest at %s: %v", manifestPath, err)
+	}
+	segPath := filepath.Join(dir, walDirName, walSegmentFileName(1))
+	if _, err := os.Stat(segPath); err != nil {
+		t.Fatalf("expected first segment at %s: %v", segPath, err)
 	}
 }
 
