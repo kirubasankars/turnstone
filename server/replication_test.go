@@ -11,6 +11,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -1068,6 +1069,103 @@ func TestReplication_Retention_FollowerRespectsLeaderSafePoint(t *testing.T) {
 	if leaderSafe > 0 {
 		if err := stF1.DB.ScanLog(int64(leaderSafe-1), func([]engine.Record) error { return nil }); err != engine.ErrLogUnavailable {
 			t.Errorf("Expected ops below safe point %d to be purged, got %v", leaderSafe, err)
+		}
+	}
+}
+
+func TestReplication_Stat_IncludesReplicaInfo(t *testing.T) {
+	baseDir, clientTLS := setupSharedCertEnv(t)
+	adminTLS := getRoleTLS(t, baseDir, "admin")
+
+	_, primaryAddr, cancelPrimary := startServerNode(t, baseDir, "stat_primary", clientTLS)
+	defer cancelPrimary()
+	promoteNode(t, baseDir, primaryAddr, "1")
+
+	_, replicaAddr, cancelReplica := startServerNode(t, baseDir, "stat_replica", clientTLS)
+	defer cancelReplica()
+
+	clientPrimary := connectClient(t, primaryAddr, clientTLS)
+	defer clientPrimary.Close()
+	selectDatabase(t, clientPrimary, "1")
+
+	adminReplica := connectClient(t, replicaAddr, adminTLS)
+	defer adminReplica.Close()
+	selectDatabase(t, adminReplica, "1")
+	configureReplication(t, adminReplica, primaryAddr, "1")
+
+	waitForConditionOrTimeout(t, 5*time.Second, func() bool {
+		body := clientPrimary.AssertStatus(protocol.OpCodeStat, nil, protocol.ResStatusOK)
+		var stat struct {
+			Replicas []struct {
+				Connected bool `json:"connected"`
+			} `json:"replicas"`
+		}
+		if err := json.Unmarshal(body, &stat); err != nil {
+			return false
+		}
+		for _, r := range stat.Replicas {
+			if r.Connected {
+				return true
+			}
+		}
+		return false
+	}, "replica did not connect to primary")
+
+	writeKeyVal(t, clientPrimary, "stat-key", "stat-val")
+
+	var lastBody []byte
+	waitForConditionOrTimeout(t, 5*time.Second, func() bool {
+		body := clientPrimary.AssertStatus(protocol.OpCodeStat, nil, protocol.ResStatusOK)
+		lastBody = body
+		var stat struct {
+			ReplicaLag uint64 `json:"replica_lag"`
+			Replicas   []struct {
+				Connected bool   `json:"connected"`
+				Lag       uint64 `json:"lag"`
+			} `json:"replicas"`
+		}
+		if err := json.Unmarshal(body, &stat); err != nil {
+			return false
+		}
+		for _, r := range stat.Replicas {
+			if r.Connected && r.Lag == stat.ReplicaLag {
+				return true
+			}
+		}
+		return len(stat.Replicas) > 0 && stat.ReplicaLag == 0
+	}, "stat did not report caught-up replicas")
+
+	var stat struct {
+		State      string `json:"state"`
+		LogOffset  int64  `json:"log_offset"`
+		ReplicaLag uint64 `json:"replica_lag"`
+		Replicas   []struct {
+			ID        string `json:"id"`
+			Role      string `json:"role"`
+			Connected bool   `json:"connected"`
+			Offset    uint64 `json:"offset"`
+			Lag       uint64 `json:"lag"`
+			LastSeen  string `json:"last_seen"`
+		} `json:"replicas"`
+	}
+	if err := json.Unmarshal(lastBody, &stat); err != nil {
+		t.Fatalf("decode stat: %v", err)
+	}
+	if stat.State != database.StatePrimary {
+		t.Fatalf("state=%q want PRIMARY", stat.State)
+	}
+	if stat.LogOffset <= 0 {
+		t.Fatalf("expected log_offset > 0, got %d", stat.LogOffset)
+	}
+	if len(stat.Replicas) == 0 {
+		t.Fatal("expected at least one replica entry")
+	}
+	for _, r := range stat.Replicas {
+		if r.LastSeen == "" {
+			t.Fatalf("replica %q missing last_seen", r.ID)
+		}
+		if r.Role == "" {
+			t.Fatalf("replica %q missing role", r.ID)
 		}
 	}
 }
