@@ -54,6 +54,14 @@ func TestListKeys(t *testing.T) {
 	if len(prefixKeys) != 1 || prefixKeys[0] != "beta" {
 		t.Fatalf("expected [beta] for prefix be, got %v", prefixKeys)
 	}
+
+	keysAfterDelete, err := db.ListKeys("", 0, 10)
+	if err != nil {
+		t.Fatalf("ListKeys after delete: %v", err)
+	}
+	if len(keysAfterDelete) != 1 || keysAfterDelete[0] != "beta" {
+		t.Fatalf("expected [beta] after alpha delete, got %v", keysAfterDelete)
+	}
 }
 
 func TestListKeysLimit(t *testing.T) {
