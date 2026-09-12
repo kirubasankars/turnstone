@@ -98,6 +98,12 @@ type Options struct {
 	// IndexCompactOnRetention runs MaybeCompactIndex on the retention ticker.
 	// Nil omits the default (enabled on open). Set explicitly to false to disable.
 	IndexCompactOnRetention *bool
+	// WalCopyForwardFragmentation triggers copy-forward when allocated/live bytes
+	// exceeds this ratio during retention (0 = default 3.0).
+	WalCopyForwardFragmentation float64
+	// WalCopyForwardOnRetention runs MaybeCopyForwardWal on the retention ticker.
+	// Nil omits the default (enabled on open). Set explicitly to false to disable.
+	WalCopyForwardOnRetention *bool
 }
 
 // indexVersion points at one MVCC version in the append-only log.
