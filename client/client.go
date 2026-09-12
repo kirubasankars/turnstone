@@ -8,16 +8,17 @@ package client
 import (
 	"bytes"
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
-	"os"
 	"sync"
 	"time"
+
+	"turnstone/internal/tlsutil"
+	"turnstone/protocol"
 )
 
 // defaultIOTimeout is used for Config.ReadTimeout/WriteTimeout when the
@@ -25,47 +26,6 @@ import (
 // network-partitioned server leaves roundTrip() blocked in
 // I/O forever with no way for the caller to notice or recover.
 const defaultIOTimeout = 30 * time.Second
-
-// --- Protocol Constants ---
-
-const ProtoHeaderSize = 5
-
-const (
-	OpCodePing      = 0x01
-	OpCodeGet       = 0x02
-	OpCodeSet       = 0x03
-	OpCodeDel       = 0x04
-	OpCodeSelect    = 0x05
-	OpCodeMGet      = 0x06
-	OpCodeMSet      = 0x07
-	OpCodeMDel      = 0x08
-	OpCodeBegin     = 0x10
-	OpCodeCommit    = 0x11
-	OpCodeAbort     = 0x12
-	OpCodeStat      = 0x20
-	OpCodeReplicaOf = 0x32
-	OpCodePromote   = 0x34
-	OpCodeStepDown  = 0x35
-	OpCodeFlushDB   = 0x37
-)
-
-// Begin payload flags (OpCodeBegin body).
-const (
-	BeginReadOnly = 0
-)
-
-const (
-	ResStatusOK             = 0x00
-	ResStatusErr            = 0x01
-	ResStatusNotFound       = 0x02
-	ResStatusTxRequired     = 0x03
-	ResStatusTxTimeout      = 0x04
-	ResStatusTxConflict     = 0x05
-	ResStatusTxInProgress   = 0x06
-	ResStatusServerBusy     = 0x07
-	ResStatusEntityTooLarge = 0x08
-	ResStatusMemoryLimit    = 0x09
-)
 
 var (
 	ErrNotFound       = errors.New("key not found")
@@ -90,25 +50,25 @@ func (e *ServerError) Error() string {
 
 func mapStatusToError(status byte, body []byte) error {
 	switch status {
-	case ResStatusOK:
+	case protocol.ResStatusOK:
 		return nil
-	case ResStatusErr:
+	case protocol.ResStatusErr:
 		return &ServerError{Message: string(body)}
-	case ResStatusNotFound:
+	case protocol.ResStatusNotFound:
 		return ErrNotFound
-	case ResStatusTxRequired:
+	case protocol.ResStatusTxRequired:
 		return ErrTxRequired
-	case ResStatusTxTimeout:
+	case protocol.ResStatusTxTimeout:
 		return ErrTxTimeout
-	case ResStatusTxConflict:
+	case protocol.ResStatusTxConflict:
 		return ErrTxConflict
-	case ResStatusTxInProgress:
+	case protocol.ResStatusTxInProgress:
 		return ErrTxInProgress
-	case ResStatusServerBusy:
+	case protocol.ResStatusServerBusy:
 		return ErrServerBusy
-	case ResStatusEntityTooLarge:
+	case protocol.ResStatusEntityTooLarge:
 		return ErrEntityTooLarge
-	case ResStatusMemoryLimit:
+	case protocol.ResStatusMemoryLimit:
 		return ErrMemoryLimit
 	default:
 		return fmt.Errorf("unknown server status code: 0x%02x, body: %s", status, string(body))
@@ -158,21 +118,9 @@ func NewClient(cfg Config) (*Client, error) {
 }
 
 func NewMTLSClientHelper(addr, caFile, certFile, keyFile string, logger *slog.Logger) (*Client, error) {
-	caCert, err := os.ReadFile(caFile)
+	tlsConfig, err := tlsutil.LoadMTLS(caFile, certFile, keyFile)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read CA file: %w", err)
-	}
-	caCertPool := x509.NewCertPool()
-	if !caCertPool.AppendCertsFromPEM(caCert) {
-		return nil, fmt.Errorf("failed to parse CA certificate PEM")
-	}
-	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load client keypair: %w", err)
-	}
-	tlsConfig := &tls.Config{
-		RootCAs:      caCertPool,
-		Certificates: []tls.Certificate{cert},
+		return nil, err
 	}
 	return NewClient(Config{
 		Address:   addr,
@@ -226,22 +174,12 @@ func (c *Client) roundTrip(op byte, payload []byte) ([]byte, error) {
 	if c.config.ReadTimeout > 0 {
 		c.conn.SetReadDeadline(time.Now().Add(c.config.ReadTimeout))
 	}
-	reqHeader := make([]byte, ProtoHeaderSize)
-	reqHeader[0] = op
-	binary.BigEndian.PutUint32(reqHeader[1:], uint32(len(payload)))
-	if _, err := c.conn.Write(reqHeader); err != nil {
+	if _, err := c.conn.Write(protocol.EncodeFrame(op, payload)); err != nil {
 		c.conn.Close()
 		c.conn = nil
-		return nil, fmt.Errorf("%w: write header failed: %v", ErrConnection, err)
+		return nil, fmt.Errorf("%w: write frame failed: %v", ErrConnection, err)
 	}
-	if len(payload) > 0 {
-		if _, err := c.conn.Write(payload); err != nil {
-			c.conn.Close()
-			c.conn = nil
-			return nil, fmt.Errorf("%w: write payload failed: %v", ErrConnection, err)
-		}
-	}
-	respHeader := make([]byte, ProtoHeaderSize)
+	respHeader := make([]byte, protocol.ProtoHeaderSize)
 	if _, err := io.ReadFull(c.conn, respHeader); err != nil {
 		c.conn.Close()
 		c.conn = nil
@@ -262,12 +200,12 @@ func (c *Client) roundTrip(op byte, payload []byte) ([]byte, error) {
 }
 
 func (c *Client) Ping() error {
-	_, err := c.roundTrip(OpCodePing, nil)
+	_, err := c.roundTrip(protocol.OpCodePing, nil)
 	return err
 }
 
 func (c *Client) Select(dbName string) error {
-	_, err := c.roundTrip(OpCodeSelect, []byte(dbName))
+	_, err := c.roundTrip(protocol.OpCodeSelect, []byte(dbName))
 	return err
 }
 
@@ -278,7 +216,7 @@ func (c *Client) ReplicaOf(sourceAddr, sourceDB string) error {
 	binary.BigEndian.PutUint32(payload[0:4], uint32(len(addrBytes)))
 	copy(payload[4:], addrBytes)
 	copy(payload[4+len(addrBytes):], dbBytes)
-	_, err := c.roundTrip(OpCodeReplicaOf, payload)
+	_, err := c.roundTrip(protocol.OpCodeReplicaOf, payload)
 	return err
 }
 
@@ -292,29 +230,29 @@ func (c *Client) Promote(minReplicas int) error {
 	}
 	payload := make([]byte, 4)
 	binary.BigEndian.PutUint32(payload, uint32(minReplicas))
-	_, err := c.roundTrip(OpCodePromote, payload)
+	_, err := c.roundTrip(protocol.OpCodePromote, payload)
 	return err
 }
 
 func (c *Client) StepDown() error {
-	_, err := c.roundTrip(OpCodeStepDown, nil)
+	_, err := c.roundTrip(protocol.OpCodeStepDown, nil)
 	return err
 }
 
 func (c *Client) FlushDB() error {
-	_, err := c.roundTrip(OpCodeFlushDB, nil)
+	_, err := c.roundTrip(protocol.OpCodeFlushDB, nil)
 	return err
 }
 
 func (c *Client) Stat() ([]byte, error) {
-	return c.roundTrip(OpCodeStat, nil)
+	return c.roundTrip(protocol.OpCodeStat, nil)
 }
 
 func (c *Client) Get(key string) ([]byte, error) {
-	if !isASCII(key) {
+	if !protocol.IsASCII(key) {
 		return nil, ErrInvalidKey
 	}
-	return c.roundTrip(OpCodeGet, []byte(key))
+	return c.roundTrip(protocol.OpCodeGet, []byte(key))
 }
 
 func (c *Client) MGet(keys ...string) ([][]byte, error) {
@@ -324,13 +262,13 @@ func (c *Client) MGet(keys ...string) ([][]byte, error) {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.BigEndian, uint32(len(keys)))
 	for _, k := range keys {
-		if !isASCII(k) {
+		if !protocol.IsASCII(k) {
 			return nil, ErrInvalidKey
 		}
 		binary.Write(buf, binary.BigEndian, uint32(len(k)))
 		buf.WriteString(k)
 	}
-	payload, err := c.roundTrip(OpCodeMGet, buf.Bytes())
+	payload, err := c.roundTrip(protocol.OpCodeMGet, buf.Bytes())
 	if err != nil {
 		return nil, err
 	}
@@ -364,7 +302,7 @@ func (c *Client) MGet(keys ...string) ([][]byte, error) {
 }
 
 func (c *Client) Set(key string, value []byte) error {
-	if !isASCII(key) {
+	if !protocol.IsASCII(key) {
 		return ErrInvalidKey
 	}
 	kBytes := []byte(key)
@@ -372,7 +310,7 @@ func (c *Client) Set(key string, value []byte) error {
 	binary.BigEndian.PutUint32(payload[0:4], uint32(len(kBytes)))
 	copy(payload[4:], kBytes)
 	copy(payload[4+len(kBytes):], value)
-	_, err := c.roundTrip(OpCodeSet, payload)
+	_, err := c.roundTrip(protocol.OpCodeSet, payload)
 	return err
 }
 
@@ -383,7 +321,7 @@ func (c *Client) MSet(entries map[string][]byte) error {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.BigEndian, uint32(len(entries)))
 	for k, v := range entries {
-		if !isASCII(k) {
+		if !protocol.IsASCII(k) {
 			return ErrInvalidKey
 		}
 		binary.Write(buf, binary.BigEndian, uint32(len(k)))
@@ -391,15 +329,15 @@ func (c *Client) MSet(entries map[string][]byte) error {
 		binary.Write(buf, binary.BigEndian, uint32(len(v)))
 		buf.Write(v)
 	}
-	_, err := c.roundTrip(OpCodeMSet, buf.Bytes())
+	_, err := c.roundTrip(protocol.OpCodeMSet, buf.Bytes())
 	return err
 }
 
 func (c *Client) Del(key string) error {
-	if !isASCII(key) {
+	if !protocol.IsASCII(key) {
 		return ErrInvalidKey
 	}
-	_, err := c.roundTrip(OpCodeDel, []byte(key))
+	_, err := c.roundTrip(protocol.OpCodeDel, []byte(key))
 	return err
 }
 
@@ -410,13 +348,13 @@ func (c *Client) MDel(keys ...string) (int, error) {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.BigEndian, uint32(len(keys)))
 	for _, k := range keys {
-		if !isASCII(k) {
+		if !protocol.IsASCII(k) {
 			return 0, ErrInvalidKey
 		}
 		binary.Write(buf, binary.BigEndian, uint32(len(k)))
 		buf.WriteString(k)
 	}
-	payload, err := c.roundTrip(OpCodeMDel, buf.Bytes())
+	payload, err := c.roundTrip(protocol.OpCodeMDel, buf.Bytes())
 	if err != nil {
 		return 0, err
 	}
@@ -427,31 +365,22 @@ func (c *Client) MDel(keys ...string) (int, error) {
 	return int(count), nil
 }
 
-func isASCII(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if s[i] > 127 {
-			return false
-		}
-	}
-	return true
-}
-
 func (c *Client) Begin() error {
-	_, err := c.roundTrip(OpCodeBegin, nil)
+	_, err := c.roundTrip(protocol.OpCodeBegin, nil)
 	return err
 }
 
 func (c *Client) BeginReadOnly() error {
-	_, err := c.roundTrip(OpCodeBegin, []byte{BeginReadOnly})
+	_, err := c.roundTrip(protocol.OpCodeBegin, []byte{protocol.BeginReadOnly})
 	return err
 }
 
 func (c *Client) Commit() error {
-	_, err := c.roundTrip(OpCodeCommit, nil)
+	_, err := c.roundTrip(protocol.OpCodeCommit, nil)
 	return err
 }
 
 func (c *Client) Abort() error {
-	_, err := c.roundTrip(OpCodeAbort, nil)
+	_, err := c.roundTrip(protocol.OpCodeAbort, nil)
 	return err
 }
