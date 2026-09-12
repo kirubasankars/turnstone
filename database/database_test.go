@@ -79,9 +79,9 @@ func TestDatabase_Recover_CRC_Corruption(t *testing.T) {
 	putKV(t, s1, "key2", "val2")
 	s1.Close()
 
-	logPath := filepath.Join(dir, "data.log")
+	logPath := filepath.Join(dir, "wal", "seg-000001.wal")
 	if _, err := os.Stat(logPath); err != nil {
-		t.Fatalf("No data.log found in %s", dir)
+		t.Fatalf("No wal segment found in %s: %v", dir, err)
 	}
 
 	f, err := os.OpenFile(logPath, os.O_RDWR, 0o644)
@@ -134,7 +134,7 @@ func TestDatabase_Recover_PartialWrite(t *testing.T) {
 	putKV(t, s1, "key1", "val1")
 	s1.Close()
 
-	logPath := filepath.Join(dir, "data.log")
+	logPath := filepath.Join(dir, "wal", "seg-000001.wal")
 	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		t.Fatal(err)
