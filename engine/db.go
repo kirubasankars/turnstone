@@ -72,9 +72,9 @@ type DB struct {
 	isDiskFull          int32
 	isCorrupt           int32
 
-	indexFragmentationRatio float64
-	indexCompactOnRetention bool
-	walCopyForwardRatio     float64
+	indexFragmentationRatio   float64
+	indexCompactOnRetention   bool
+	walCopyForwardRatio       float64
 	walCopyForwardOnRetention bool
 }
 
@@ -133,29 +133,29 @@ func OpenContext(ctx context.Context, dir string, opts Options) (*DB, error) {
 	index := NewIndex()
 
 	db := &DB{
-		dir:                 dir,
-		log:                 logFile,
-		index:               index,
-		clog:                make(map[uint64]TxStatus),
-		activeTxns:          make(map[*Transaction]uint64),
-		activeXids:          make(map[uint64]*Transaction),
-		keyLocks:            make(map[string]uint64),
-		txStartTimes:        make(map[uint64]time.Time),
-		beginOffsets:        make(map[uint64]int64),
-		replImpact:          make(map[uint64]*replTxImpact),
-		txTimeout:           opts.TxTimeout,
-		closeCh:             make(chan struct{}),
-		commitCh:            make(chan commitRequest, 500),
-		commitDelay:         opts.CommitDelay,
-		commitSiblings:      opts.CommitSiblings,
-		unsafeDisableFsync:  opts.UnsafeDisableFsync,
-		checksumInterval:    opts.ChecksumInterval,
-		retentionInterval:   opts.RetentionInterval,
-		maxDiskUsagePercent: opts.MaxDiskUsagePercent,
-		logger:              logger,
-		indexFragmentationRatio: indexFrag,
-		indexCompactOnRetention: indexCompactOnRetentionEnabled(opts),
-		walCopyForwardRatio:     walCopyRatio,
+		dir:                       dir,
+		log:                       logFile,
+		index:                     index,
+		clog:                      make(map[uint64]TxStatus),
+		activeTxns:                make(map[*Transaction]uint64),
+		activeXids:                make(map[uint64]*Transaction),
+		keyLocks:                  make(map[string]uint64),
+		txStartTimes:              make(map[uint64]time.Time),
+		beginOffsets:              make(map[uint64]int64),
+		replImpact:                make(map[uint64]*replTxImpact),
+		txTimeout:                 opts.TxTimeout,
+		closeCh:                   make(chan struct{}),
+		commitCh:                  make(chan commitRequest, 500),
+		commitDelay:               opts.CommitDelay,
+		commitSiblings:            opts.CommitSiblings,
+		unsafeDisableFsync:        opts.UnsafeDisableFsync,
+		checksumInterval:          opts.ChecksumInterval,
+		retentionInterval:         opts.RetentionInterval,
+		maxDiskUsagePercent:       opts.MaxDiskUsagePercent,
+		logger:                    logger,
+		indexFragmentationRatio:   indexFrag,
+		indexCompactOnRetention:   indexCompactOnRetentionEnabled(opts),
+		walCopyForwardRatio:       walCopyRatio,
 		walCopyForwardOnRetention: walCopyForwardOnRetentionEnabled(opts),
 	}
 
