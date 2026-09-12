@@ -6,6 +6,7 @@
 package engine
 
 import (
+	"fmt"
 	"math"
 	"sort"
 
@@ -68,13 +69,17 @@ func (db *DB) MaybeCopyForwardWal(minDeletableLSN int64) (WalRetentionResult, er
 	if db.log == nil || db.index == nil || db.index.hash == nil {
 		return WalRetentionResult{}, nil
 	}
-	if db.ActiveTransactionCount() > 0 {
-		return WalRetentionResult{}, nil
-	}
 
 	ratio := db.walCopyForwardRatio
 	if ratio <= 0 {
 		ratio = defaultWalCopyForwardRatio
+	}
+
+	db.commitMu.Lock()
+	defer db.commitMu.Unlock()
+
+	if db.activeWriteTransactionCount() > 0 {
+		return WalRetentionResult{}, nil
 	}
 
 	ctx := db.BuildIndexGCContext()
@@ -100,19 +105,7 @@ func (db *DB) MaybeCopyForwardWal(minDeletableLSN int64) (WalRetentionResult, er
 		frames[i] = frame
 	}
 
-	deleteThrough := minDeletableLSN
-	if deleteThrough <= 0 {
-		if floor := db.ScanFloor(); floor > 0 {
-			deleteThrough = floor
-		} else {
-			deleteThrough = math.MaxInt64
-		}
-	}
-
-	db.commitMu.Lock()
-	defer db.commitMu.Unlock()
-
-	outcome, err := db.log.copyForwardLiveFrames(oldOffsets, frames, deleteThrough)
+	outcome, err := db.log.appendCopyForwardFrames(oldOffsets, frames)
 	if err != nil {
 		return WalRetentionResult{}, err
 	}
@@ -121,12 +114,18 @@ func (db *DB) MaybeCopyForwardWal(minDeletableLSN int64) (WalRetentionResult, er
 		return WalRetentionResult{}, err
 	}
 
-	reclaimed := outcome.bytesBefore - outcome.bytesAfter
+	deleteThrough := copyForwardSegmentDeleteThrough(minDeletableLSN, outcome.headBefore, db.ScanFloor())
+	deleted, _, err := db.log.deleteSegmentsThrough(deleteThrough)
+	if err != nil {
+		return WalRetentionResult{}, err
+	}
+
+	reclaimed := outcome.bytesBefore - db.log.AllocatedBytesOnDisk()
 	if reclaimed < 0 {
 		reclaimed = 0
 	}
 	return WalRetentionResult{
-		SegmentsDeleted: outcome.segmentsPurged,
+		SegmentsDeleted: deleted,
 		BytesReclaimed:  reclaimed,
 		FramesCopied:    len(oldOffsets),
 		DeleteThrough:   deleteThrough,
@@ -191,7 +190,7 @@ func (db *DB) collectLiveFrameOffsets(ctx IndexGCContext) ([]int64, int64, error
 		if readErr != nil {
 			return
 		}
-		kept := ctx.FilterVersions(key, chain)
+		kept := ctx.FilterVersionsForWalRetain(key, chain)
 		for _, v := range kept {
 			if _, ok := seen[v.offset]; ok {
 				continue
@@ -218,21 +217,21 @@ func (db *DB) remapIndexOffsets(ctx IndexGCContext, remap map[int64]int64) error
 	if len(remap) == 0 {
 		return nil
 	}
+	if err := db.validateRemapCoverage(ctx, remap); err != nil {
+		return err
+	}
 	filter := func(key []byte, chain []hashindex.Version) []hashindex.Version {
 		in := make([]indexVersion, len(chain))
 		for i, v := range chain {
 			in[i] = fromHashVersion(v)
 		}
-		kept := ctx.FilterVersions(key, in)
+		kept := ctx.FilterVersionsForWalRetain(key, in)
 		if len(kept) == 0 {
 			return nil
 		}
 		out := make([]hashindex.Version, len(kept))
 		for i, v := range kept {
-			newOff, ok := remap[v.offset]
-			if !ok {
-				return nil
-			}
+			newOff := remap[v.offset]
 			out[i] = hashindex.Version{
 				Offset:    newOff,
 				ValueLen:  v.valueLen,
@@ -244,6 +243,26 @@ func (db *DB) remapIndexOffsets(ctx IndexGCContext, remap map[int64]int64) error
 	}
 	_, err := db.index.hash.CompactAll(filter)
 	return err
+}
+
+func (db *DB) validateRemapCoverage(ctx IndexGCContext, remap map[int64]int64) error {
+	var missing int64
+	found := false
+	db.index.ForEachKey(func(_ []byte, chain []indexVersion) {
+		for _, v := range ctx.FilterVersionsForWalRetain(nil, chain) {
+			found = true
+			if _, ok := remap[v.offset]; !ok && missing == 0 {
+				missing = v.offset
+			}
+		}
+	})
+	if !found {
+		return nil
+	}
+	if missing != 0 {
+		return fmt.Errorf("wal copy-forward: missing remap for offset %d", missing)
+	}
+	return nil
 }
 
 func (db *DB) indexMinReferencedOffset() (int64, bool) {
