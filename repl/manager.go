@@ -390,6 +390,7 @@ func (rm *Manager) connectAndSync(ctx context.Context, addr string, dbs []Source
 	logger.Info("Connected to Leader", "db_count", len(dbs))
 
 	remoteToLocal := make(map[string][]string)
+	expectedOffset := make(map[string]uint64)
 
 	// Handshake
 	// Format: [Ver:4][IDLen:4][ID][NumDBs:4] ... [NameLen:4][Name][Offset:8]
@@ -494,30 +495,35 @@ func (rm *Manager) connectAndSync(ctx context.Context, addr string, dbs []Source
 		if opCode == protocol.OpCodeReplLogRange {
 			remoteDBName, cursor, ok := readLenPrefixedString(payload, 0)
 			if !ok || cursor+4 > len(payload) {
-				logger.Warn("Malformed log segment packet, skipping", "len", len(payload))
-				continue
+				return fmt.Errorf("malformed log segment packet (len=%d)", len(payload))
 			}
 			cursor += 4 // skip count/reserved
 			if cursor+16 > len(payload) {
-				logger.Warn("Malformed log segment header, skipping", "len", len(payload))
-				continue
+				return fmt.Errorf("malformed log segment header (len=%d)", len(payload))
 			}
 			startOff := binary.BigEndian.Uint64(payload[cursor : cursor+8])
 			endOff := binary.BigEndian.Uint64(payload[cursor+8 : cursor+16])
 			cursor += 16
 			segData := payload[cursor:]
 			if endOff < startOff || int(endOff-startOff) != len(segData) {
-				logger.Warn("Log segment offset mismatch", "start", startOff, "end", endOff, "len", len(segData))
-				continue
+				return fmt.Errorf("log segment offset mismatch (start=%d end=%d len=%d)", startOff, endOff, len(segData))
 			}
 
 			if localDBNames, ok := remoteToLocal[remoteDBName]; ok {
 				for _, localDBName := range localDBNames {
 					if st, ok := rm.stores[localDBName]; ok {
+						exp, ok := expectedOffset[localDBName]
+						if !ok {
+							exp = st.LastLogOffset()
+						}
+						if startOff != exp {
+							return fmt.Errorf("log range start mismatch for db %s: got %d want %d", localDBName, startOff, exp)
+						}
 						if _, err := st.ApplyLogRange(segData); err != nil {
 							logger.Error("Failed to apply log segment", "db", localDBName, "err", err)
 							return err
 						}
+						expectedOffset[localDBName] = endOff
 						if endOff > 0 {
 							ackBuf := new(bytes.Buffer)
 							binary.Write(ackBuf, binary.BigEndian, uint32(len(remoteDBName)))

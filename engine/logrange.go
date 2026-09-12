@@ -7,7 +7,6 @@ package engine
 
 import (
 	"encoding/binary"
-	"fmt"
 	"hash/crc32"
 	"io"
 	"os"
@@ -67,7 +66,7 @@ func (l *DataLog) ReadLogRange(startOffset int64, maxBytes int64) ([]byte, int64
 
 	startIdx := l.segmentIndexForLSN(startOffset)
 	if startIdx < 0 {
-		return nil, startOffset, fmt.Errorf("invalid log range start %d", startOffset)
+		return nil, startOffset, ErrLogUnavailable
 	}
 
 	var out []byte
@@ -85,6 +84,9 @@ func (l *DataLog) ReadLogRange(startOffset int64, maxBytes int64) ([]byte, int64
 
 		f, err := os.Open(seg.path)
 		if err != nil {
+			if os.IsNotExist(err) {
+				return nil, startOffset, ErrLogUnavailable
+			}
 			return nil, startOffset, err
 		}
 		stat, err := f.Stat()

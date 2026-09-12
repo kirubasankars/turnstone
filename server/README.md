@@ -46,7 +46,19 @@ When a follower connects:
 3. `streamDB` / `runLogStreamLoop` reads WAL ranges via `ReadLogRange` and sends `ReplLogRange` packets.
 4. Follower acks advance `ReplicaSlot.Offset`; leader broadcasts `ReplSafePoint` for cluster retention.
 
-Slow consumers may be dropped to protect leader memory — see `TestReplication_SlowConsumer_Dropped`.
+Only **server-role** replica slots pin WAL retention and count toward sync-replication quorum. Backup streams (`turnstone-backup`) register as `backup` role: they receive WAL ranges but do not block `MinReplicaOffset` or quorum.
+
+Slow consumers may be dropped to protect leader memory — see `TestReplication_SlowConsumer_Dropped`. If a follower requests bytes that were physically purged, the stream stops immediately (`ErrLogUnavailable`) instead of retrying forever.
+
+## Sync replication quorum
+
+When `min_replicas > 0` on a `PRIMARY` database:
+
+1. The leader **commits locally first** (WAL fsync on the primary).
+2. The server then blocks the client response until enough **connected server-role** replicas have ACKed the commit's end byte offset (`WaitForQuorum`).
+3. If quorum is not met before the timeout (default 30s), the client receives `SERVER_BUSY` even though the write is already durable on the primary.
+
+Disconnected or stale slots reloaded from `repl.slots` do **not** satisfy quorum until the replica reconnects.
 
 ## Step-down coordination
 

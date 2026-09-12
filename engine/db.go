@@ -575,7 +575,11 @@ func (db *DB) ApplyLogRange(data []byte) (int64, error) {
 }
 
 func (db *DB) ReadLogRange(startOffset int64, maxBytes int64) ([]byte, int64, error) {
-	return db.log.ReadLogRange(startOffset, maxBytes)
+	data, next, err := db.log.ReadLogRange(startOffset, maxBytes)
+	if err != nil {
+		return nil, startOffset, err
+	}
+	return data, next, nil
 }
 
 func (db *DB) ApplyRecord(rec Record) error {
