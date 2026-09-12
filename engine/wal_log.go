@@ -620,62 +620,11 @@ func (l *DataLog) OldestSegmentBaseLSN() int64 {
 // deleteSegmentsThrough removes sealed segments whose exclusive end LSN is at or
 // below maxEndLSN. The active segment is never deleted.
 func (l *DataLog) deleteSegmentsThrough(maxEndLSN int64) (int, int64, error) {
-	if maxEndLSN <= 0 {
-		return 0, 0, nil
-	}
-
 	l.mu.Lock()
 	defer l.mu.Unlock()
-
-	var kept []walSegment
-	var deleted int
-	var reclaimed int64
-
-	for i, seg := range l.segments {
-		if i == l.activeIndex {
-			kept = append(kept, seg)
-			continue
-		}
-		end := seg.endLSN
-		if end == 0 {
-			info, err := os.Stat(seg.path)
-			if err != nil {
-				return deleted, reclaimed, err
-			}
-			end = seg.baseLSN + info.Size()
-		}
-		if end > maxEndLSN {
-			kept = append(kept, seg)
-			continue
-		}
-
-		info, err := os.Stat(seg.path)
-		if err != nil && !os.IsNotExist(err) {
-			return deleted, reclaimed, err
-		}
-		if err == nil {
-			reclaimed += info.Size()
-		}
-		if err := os.Remove(seg.path); err != nil && !os.IsNotExist(err) {
-			return deleted, reclaimed, err
-		}
-		deleted++
-	}
-
-	if deleted == 0 {
-		return 0, 0, nil
-	}
-
-	l.segments = kept
-	l.activeIndex = -1
-	for i, seg := range l.segments {
-		if seg.writer != nil {
-			l.activeIndex = i
-			break
-		}
-	}
-	if l.activeIndex < 0 {
-		return deleted, reclaimed, fmt.Errorf("wal: no active segment after delete")
+	deleted, reclaimed, err := l.deleteSegmentsThroughLocked(maxEndLSN)
+	if err != nil || deleted == 0 {
+		return deleted, reclaimed, err
 	}
 	if err := l.persistManifestLocked(); err != nil {
 		return deleted, reclaimed, err

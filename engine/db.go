@@ -74,6 +74,8 @@ type DB struct {
 
 	indexFragmentationRatio float64
 	indexCompactOnRetention bool
+	walCopyForwardRatio     float64
+	walCopyForwardOnRetention bool
 }
 
 // Open opens a database, replaying the WAL to rebuild the ephemeral index.
@@ -107,6 +109,10 @@ func OpenContext(ctx context.Context, dir string, opts Options) (*DB, error) {
 	indexFrag := opts.IndexCompactFragmentation
 	if indexFrag <= 0 {
 		indexFrag = defaultIndexFragmentationRatio
+	}
+	walCopyRatio := opts.WalCopyForwardFragmentation
+	if walCopyRatio <= 0 {
+		walCopyRatio = defaultWalCopyForwardRatio
 	}
 
 	logger := opts.Logger
@@ -149,6 +155,8 @@ func OpenContext(ctx context.Context, dir string, opts Options) (*DB, error) {
 		logger:              logger,
 		indexFragmentationRatio: indexFrag,
 		indexCompactOnRetention: indexCompactOnRetentionEnabled(opts),
+		walCopyForwardRatio:     walCopyRatio,
+		walCopyForwardOnRetention: walCopyForwardOnRetentionEnabled(opts),
 	}
 
 	if opts.UnsafeDisableFsync {
@@ -169,6 +177,13 @@ func indexCompactOnRetentionEnabled(opts Options) bool {
 		return true
 	}
 	return *opts.IndexCompactOnRetention
+}
+
+func walCopyForwardOnRetentionEnabled(opts Options) bool {
+	if opts.WalCopyForwardOnRetention == nil {
+		return true
+	}
+	return *opts.WalCopyForwardOnRetention
 }
 
 func (db *DB) AdvanceXID(txID uint64) {
