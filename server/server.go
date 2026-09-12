@@ -1298,18 +1298,18 @@ func (s *Server) handleStat(w io.Writer, st *connState) {
 	}
 
 	response := struct {
-		State             string                `json:"state"`
-		KeyCount          int64                 `json:"key_count"`
-		Conflicts         uint64                `json:"conflicts"`
-		ActiveConnections int64                 `json:"active_connections"`
-		LogBytes          int64                 `json:"log_bytes"`
-		LogAllocatedBytes int64                 `json:"log_allocated_bytes"`
-		LogOffset         int64                 `json:"log_offset"`
-		ActiveTxs         int                   `json:"active_txs"`
-		ReplicaLag        uint64                `json:"replica_lag"`
+		State             string                 `json:"state"`
+		KeyCount          int64                  `json:"key_count"`
+		Conflicts         uint64                 `json:"conflicts"`
+		ActiveConnections int64                  `json:"active_connections"`
+		LogBytes          int64                  `json:"log_bytes"`
+		LogAllocatedBytes int64                  `json:"log_allocated_bytes"`
+		LogOffset         int64                  `json:"log_offset"`
+		ActiveTxs         int                    `json:"active_txs"`
+		ReplicaLag        uint64                 `json:"replica_lag"`
 		Replicas          []database.ReplicaInfo `json:"replicas"`
-		Uptime            string                `json:"uptime"`
-		MinReplicas       int                   `json:"min_replicas"`
+		Uptime            string                 `json:"uptime"`
+		MinReplicas       int                    `json:"min_replicas"`
 	}{
 		State:             dbState,
 		KeyCount:          stats.KeyCount,
