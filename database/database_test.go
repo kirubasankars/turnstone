@@ -302,6 +302,40 @@ func TestDatabase_ReplicaLag(t *testing.T) {
 	if stats.ReplicaLag != expectedLag {
 		t.Errorf("expected lag %d, got %d", expectedLag, stats.ReplicaLag)
 	}
+	if len(stats.Replicas) != 1 {
+		t.Fatalf("expected 1 replica in stats, got %d", len(stats.Replicas))
+	}
+	if stats.Replicas[0].ID != "r1" || stats.Replicas[0].Lag != expectedLag {
+		t.Fatalf("unexpected replica info: %+v", stats.Replicas[0])
+	}
+}
+
+func TestDatabase_ReplicaLag_ReportsSlowestReplica(t *testing.T) {
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	s, err := Open(context.Background(), dir, logger, 0, "none", 90)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	putKV(t, s, "k1", "v1")
+	head := s.LastLogOffset()
+
+	s.RegisterReplica("caught-up", head, "server")
+	s.RegisterReplica("slow", head/2, "server")
+
+	putKV(t, s, "k2", "v2")
+	newHead := s.LastLogOffset()
+	wantSlowLag := newHead - head/2
+
+	stats := s.Stats()
+	if stats.ReplicaLag != wantSlowLag {
+		t.Fatalf("replica_lag=%d want slowest lag %d", stats.ReplicaLag, wantSlowLag)
+	}
+	if len(stats.Replicas) != 2 {
+		t.Fatalf("expected 2 replicas, got %d", len(stats.Replicas))
+	}
 }
 
 func TestIsValidReplicationCursor_HeadAndZero(t *testing.T) {
