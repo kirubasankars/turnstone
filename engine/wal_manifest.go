@@ -13,9 +13,9 @@ import (
 )
 
 const (
-	walDirName       = "wal"
-	walManifestName  = "manifest.json"
-	defaultWalSegSize = 64 << 20 // 64 MiB
+	walDirName         = "wal"
+	walManifestName    = "manifest.json"
+	defaultWalSegSize  = 64 << 20 // 64 MiB
 	walManifestVersion = 1
 )
 
