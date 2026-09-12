@@ -12,7 +12,6 @@ import (
 	"crypto/x509"
 	"encoding/binary"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -25,75 +24,90 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/spf13/cobra"
+
 	"turnstone/client"
 )
 
-var (
-	addr          = flag.String("addr", "localhost:6379", "Server address")
-	home          = flag.String("home", ".", "Path to home directory containing certs/")
-	concurrency   = flag.Int("c", 50, "Number of concurrent clients")
-	totalOps      = flag.Int("n", 10000, "Total number of operations per phase")
-	valueSize     = flag.Int("v", 128, "Value size in bytes (for SET operations)")
-	keySize       = flag.Int("k", 32, "Minimum key size in bytes (padded if shorter)")
-	readRatio     = flag.Float64("ratio", -1.0, "Read ratio (0.0 to 1.0). If set, runs a mixed workload")
-	pipelineDepth = flag.Int("depth", 1, "Pipeline depth (transactions per network round-trip)")
-	batchSize     = flag.Int("batch", 1, "Batch size (operations per transaction)")
-	dbNum         = flag.Int("db", 1, "Database number to use (DB 0 is typically read-only)")
-	keyPrefix     = flag.String("prefix", "bench", "Key prefix to avoid collisions between concurrent benchmark runs")
-)
+func newBenchCmd() *cobra.Command {
+	var addr string
+	var concurrency int
+	var totalOps int
+	var valueSize int
+	var keySize int
+	var readRatio float64
+	var pipelineDepth int
+	var batchSize int
+	var dbNum int
+	var keyPrefix string
 
-func main() {
-	flag.Parse()
+	cmd := &cobra.Command{
+		Use:   "bench",
+		Short: "Run a load and throughput benchmark",
+		Run: func(cmd *cobra.Command, args []string) {
+			if totalOps <= 0 || concurrency <= 0 || pipelineDepth <= 0 || batchSize <= 0 {
+				log.Fatal("Invalid --ops, --concurrency, --depth, or --batch values. Must be > 0")
+			}
 
-	if *totalOps <= 0 || *concurrency <= 0 || *pipelineDepth <= 0 || *batchSize <= 0 {
-		log.Fatal("Invalid -n, -c, -depth, or -batch values. Must be > 0")
+			payload := make([]byte, valueSize)
+			if _, err := rand.Read(payload); err != nil {
+				log.Fatalf("Failed to generate payload: %v", err)
+			}
+
+			fmt.Printf("--- TurnstoneDB Benchmark (Async Pipeline) ---\n")
+			fmt.Printf("Server:       %s\n", addr)
+			fmt.Printf("Home:         %s\n", homeDir)
+			fmt.Printf("Database:     %d\n", dbNum)
+			fmt.Printf("Concurrency:  %d clients\n", concurrency)
+			fmt.Printf("Total Ops:    %d\n", totalOps)
+			fmt.Printf("Pipeline:     %d tx/batch (inflight)\n", pipelineDepth)
+			fmt.Printf("Batch Size:   %d ops/tx\n", batchSize)
+			fmt.Printf("Payload:      %d bytes\n", valueSize)
+			fmt.Printf("Key Prefix:   %s\n", keyPrefix)
+
+			mode := "Sequential (Write -> Read)"
+			if readRatio >= 0.0 && readRatio <= 1.0 {
+				mode = fmt.Sprintf("Mixed (%.0f%% Read / %.0f%% Write)", readRatio*100, (1.0-readRatio)*100)
+			}
+			fmt.Printf("Mode:         %s\n", mode)
+			fmt.Println("--------------------------------------------------")
+
+			tlsConfig, err := loadBenchTLSConfig()
+			if err != nil {
+				log.Fatal(err)
+			}
+
+			if err := benchPreflight(addr, dbNum); err != nil {
+				log.Fatal(err)
+			}
+
+			if readRatio >= 0.0 && readRatio <= 1.0 {
+				runWorkload(addr, dbNum, concurrency, totalOps, pipelineDepth, batchSize, valueSize, keySize, keyPrefix, "MIXED", tlsConfig, payload, readRatio)
+			} else {
+				runWorkload(addr, dbNum, concurrency, totalOps, pipelineDepth, batchSize, valueSize, keySize, keyPrefix, "WRITE", tlsConfig, payload, 0.0)
+				runWorkload(addr, dbNum, concurrency, totalOps, pipelineDepth, batchSize, valueSize, keySize, keyPrefix, "READ ", tlsConfig, payload, 1.0)
+			}
+		},
 	}
 
-	// Prepare payload once
-	payload := make([]byte, *valueSize)
-	if _, err := rand.Read(payload); err != nil {
-		log.Fatalf("Failed to generate payload: %v", err)
-	}
+	cmd.Flags().StringVar(&addr, "addr", "localhost:6379", "Server address")
+	cmd.Flags().IntVar(&concurrency, "concurrency", 50, "Number of concurrent clients")
+	cmd.Flags().IntVar(&totalOps, "ops", 10000, "Total number of operations per phase")
+	cmd.Flags().IntVar(&valueSize, "value-size", 128, "Value size in bytes (for SET operations)")
+	cmd.Flags().IntVar(&keySize, "key-size", 32, "Minimum key size in bytes (padded if shorter)")
+	cmd.Flags().Float64Var(&readRatio, "read-ratio", -1.0, "Read ratio (0.0 to 1.0). If set, runs a mixed workload")
+	cmd.Flags().IntVar(&pipelineDepth, "depth", 1, "Pipeline depth (transactions per network round-trip)")
+	cmd.Flags().IntVar(&batchSize, "batch", 1, "Batch size (operations per transaction)")
+	cmd.Flags().IntVar(&dbNum, "db", 1, "Database number to use (DB 0 is typically read-only)")
+	cmd.Flags().StringVar(&keyPrefix, "prefix", "bench", "Key prefix to avoid collisions between concurrent benchmark runs")
 
-	fmt.Printf("--- TurnstoneDB Benchmark (Async Pipeline) ---\n")
-	fmt.Printf("Server:       %s\n", *addr)
-	fmt.Printf("Home:         %s\n", *home)
-	fmt.Printf("Database:     %d\n", *dbNum)
-	fmt.Printf("Concurrency:  %d clients\n", *concurrency)
-	fmt.Printf("Total Ops:    %d\n", *totalOps)
-	fmt.Printf("Pipeline:     %d tx/batch (inflight)\n", *pipelineDepth)
-	fmt.Printf("Batch Size:   %d ops/tx\n", *batchSize)
-	fmt.Printf("Payload:      %d bytes\n", *valueSize)
-	fmt.Printf("Key Prefix:   %s\n", *keyPrefix)
-
-	mode := "Sequential (Write -> Read)"
-	if *readRatio >= 0.0 && *readRatio <= 1.0 {
-		mode = fmt.Sprintf("Mixed (%.0f%% Read / %.0f%% Write)", *readRatio*100, (1.0-*readRatio)*100)
-	}
-	fmt.Printf("Mode:         %s\n", mode)
-	fmt.Println("--------------------------------------------------")
-
-	tlsConfig, err := loadTLSConfig()
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	if err := preflight(); err != nil {
-		log.Fatal(err)
-	}
-
-	if *readRatio >= 0.0 && *readRatio <= 1.0 {
-		runWorkload("MIXED", tlsConfig, payload, *readRatio)
-	} else {
-		runWorkload("WRITE", tlsConfig, payload, 0.0)
-		runWorkload("READ ", tlsConfig, payload, 1.0)
-	}
+	return cmd
 }
 
-func loadTLSConfig() (*tls.Config, error) {
-	caPath := filepath.Join(*home, "certs", "ca.crt")
-	certPath := filepath.Join(*home, "certs", "client.crt")
-	keyPath := filepath.Join(*home, "certs", "client.key")
+func loadBenchTLSConfig() (*tls.Config, error) {
+	caPath := filepath.Join(homeDir, "certs", "ca.crt")
+	certPath := filepath.Join(homeDir, "certs", "client.crt")
+	keyPath := filepath.Join(homeDir, "certs", "client.key")
 
 	caCert, err := os.ReadFile(caPath)
 	if err != nil {
@@ -113,18 +127,18 @@ func loadTLSConfig() (*tls.Config, error) {
 	}, nil
 }
 
-func preflight() error {
-	caPath := filepath.Join(*home, "certs", "ca.crt")
-	certPath := filepath.Join(*home, "certs", "client.crt")
-	keyPath := filepath.Join(*home, "certs", "client.key")
+func benchPreflight(addr string, dbNum int) error {
+	caPath := filepath.Join(homeDir, "certs", "ca.crt")
+	certPath := filepath.Join(homeDir, "certs", "client.crt")
+	keyPath := filepath.Join(homeDir, "certs", "client.key")
 
-	cl, err := client.NewMTLSClientHelper(*addr, caPath, certPath, keyPath, nil)
+	cl, err := client.NewMTLSClientHelper(addr, caPath, certPath, keyPath, nil)
 	if err != nil {
 		return fmt.Errorf("preflight connect failed: %w", err)
 	}
 	defer cl.Close()
 
-	dbName := fmt.Sprintf("%d", *dbNum)
+	dbName := fmt.Sprintf("%d", dbNum)
 	if err := cl.Select(dbName); err != nil {
 		return fmt.Errorf("preflight SELECT %s failed: %w", dbName, err)
 	}
@@ -142,14 +156,14 @@ func preflight() error {
 	if st.State != "PRIMARY" {
 		return fmt.Errorf(`database %s is %s; writes require PRIMARY
 
-Databases start UNDEFINED after generate-config and reject BEGIN/SET/GET until promoted.
+Databases start UNDEFINED after init and reject BEGIN/SET/GET until promoted.
 
-  turnstone-cli -admin -home %s
+  turnstone cli --admin --home %s
   %s> select %s
   %s> promote
 
-Or start the server with -mode dev to auto-promote every database`,
-			dbName, st.State, *home, dbName, dbName, dbName)
+Or start the server with --dev to auto-promote every database`,
+			dbName, st.State, homeDir, dbName, dbName, dbName)
 	}
 	return nil
 }
@@ -181,15 +195,29 @@ func statusName(status byte) string {
 	}
 }
 
-func generateKey(clientID, index int) string {
-	baseKey := fmt.Sprintf("%s-%d-%d", *keyPrefix, clientID, index)
-	if len(baseKey) < *keySize {
-		return baseKey + strings.Repeat("x", *keySize-len(baseKey))
+func generateKey(keyPrefix string, keySize int, clientID, index int) string {
+	baseKey := fmt.Sprintf("%s-%d-%d", keyPrefix, clientID, index)
+	if len(baseKey) < keySize {
+		return baseKey + strings.Repeat("x", keySize-len(baseKey))
 	}
 	return baseKey
 }
 
-func runWorkload(phase string, tlsConfig *tls.Config, payload []byte, readPct float64) {
+func runWorkload(
+	addr string,
+	dbNum int,
+	concurrency int,
+	totalOps int,
+	pipelineDepth int,
+	batchSize int,
+	valueSize int,
+	keySize int,
+	keyPrefix string,
+	phase string,
+	tlsConfig *tls.Config,
+	payload []byte,
+	readPct float64,
+) {
 	fmt.Printf("Starting %s phase...\n", phase)
 
 	var wg sync.WaitGroup
@@ -198,16 +226,14 @@ func runWorkload(phase string, tlsConfig *tls.Config, payload []byte, readPct fl
 	var notFoundOps int64
 	var totalDuration int64
 
-	// Distribute operations
-	baseOps := *totalOps / *concurrency
-	remainder := *totalOps % *concurrency
+	baseOps := totalOps / concurrency
+	remainder := totalOps % concurrency
 
 	startTotal := time.Now()
 
-	for i := 0; i < *concurrency; i++ {
+	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
 
-		// Calculate ops for this specific client
 		opsForThisClient := baseOps
 		if i < remainder {
 			opsForThisClient++
@@ -220,28 +246,20 @@ func runWorkload(phase string, tlsConfig *tls.Config, payload []byte, readPct fl
 				return
 			}
 
-			// Adjust calculations for batch size based on this client's quota
-			txsPerClient := numOps / *batchSize
+			txsPerClient := numOps / batchSize
 			if txsPerClient == 0 && numOps > 0 {
-				txsPerClient = 1 // Ensure at least one TX if ops < batchSize (though awkward)
+				txsPerClient = 1
 			}
 
-			// batchesOfPipeline is how many times we fill the pipeline depth
-			batchesOfPipeline := txsPerClient / *pipelineDepth
+			batchesOfPipeline := txsPerClient / pipelineDepth
 			if batchesOfPipeline == 0 && txsPerClient > 0 {
 				batchesOfPipeline = 1
 			}
 
-			// Re-calculate actual total ops this client will perform based on batch alignment
-			// (If 10 ops, batch 3 => 3 txs => 9 ops. 1 op lost to floor division unless handled.
-			// For benchmarking, slightly under-shooting due to batch alignment is acceptable
-			// if batch > 1, but we try to match numOps).
-
-			// Local random source
 			seed, _ := rand.Int(rand.Reader, big.NewInt(1<<62))
 			r := mrand.New(mrand.NewSource(seed.Int64()))
 
-			conn, err := tls.Dial("tcp", *addr, tlsConfig)
+			conn, err := tls.Dial("tcp", addr, tlsConfig)
 			if err != nil {
 				log.Printf("[Client %d] Dial failed: %v", clientID, err)
 				atomic.AddInt64(&failedOps, int64(numOps))
@@ -251,8 +269,7 @@ func runWorkload(phase string, tlsConfig *tls.Config, payload []byte, readPct fl
 
 			reader := bufio.NewReader(conn)
 
-			// --- Select Database ---
-			dbName := []byte(fmt.Sprintf("%d", *dbNum))
+			dbName := []byte(fmt.Sprintf("%d", dbNum))
 			selBuf := appendHeader(make([]byte, 0, 5+len(dbName)), client.OpCodeSelect, len(dbName))
 			selBuf = append(selBuf, dbName...)
 			if _, err := conn.Write(selBuf); err != nil {
@@ -261,7 +278,6 @@ func runWorkload(phase string, tlsConfig *tls.Config, payload []byte, readPct fl
 				return
 			}
 
-			// Read Select Response
 			selHead := make([]byte, 5)
 			if _, err := io.ReadFull(reader, selHead); err != nil {
 				log.Printf("[Client %d] Select read failed: %v", clientID, err)
@@ -278,10 +294,9 @@ func runWorkload(phase string, tlsConfig *tls.Config, payload []byte, readPct fl
 					return
 				}
 			}
-			// -------------------------
 
-			estOpSize := 20 + *valueSize + *keySize
-			writeBuf := make([]byte, 0, *pipelineDepth*(40+(*batchSize*estOpSize)))
+			estOpSize := 20 + valueSize + keySize
+			writeBuf := make([]byte, 0, pipelineDepth*(40+(batchSize*estOpSize)))
 			headerBuf := make([]byte, 5)
 			var logFail sync.Once
 
@@ -291,12 +306,10 @@ func runWorkload(phase string, tlsConfig *tls.Config, payload []byte, readPct fl
 				writeBuf = writeBuf[:0]
 				startBatch := time.Now()
 
-				// 1. Build Pipeline Request (Depth = Number of parallel Transactions)
-				for d := 0; d < *pipelineDepth; d++ {
-					// Decide op types for this transaction first so BEGIN mode matches.
-					opIsRead := make([]bool, *batchSize)
+				for d := 0; d < pipelineDepth; d++ {
+					opIsRead := make([]bool, batchSize)
 					allRead := true
-					for k := 0; k < *batchSize; k++ {
+					for k := 0; k < batchSize; k++ {
 						isRead := false
 						if phase == "READ " {
 							isRead = true
@@ -318,16 +331,14 @@ func runWorkload(phase string, tlsConfig *tls.Config, payload []byte, readPct fl
 						writeBuf = appendHeader(writeBuf, client.OpCodeBegin, 0)
 					}
 
-					// Append Batch of OPs
-					for k := 0; k < *batchSize; k++ {
+					for k := 0; k < batchSize; k++ {
 						isRead := opIsRead[k]
 
-						// Key selection
-						keyIndex := (txCount * *batchSize) + k
+						keyIndex := (txCount * batchSize) + k
 						if phase == "MIXED" {
 							keyIndex = r.Intn(numOps)
 						}
-						key := generateKey(clientID, keyIndex)
+						key := generateKey(keyPrefix, keySize, clientID, keyIndex)
 
 						if isRead {
 							writeBuf = appendHeader(writeBuf, client.OpCodeGet, len(key))
@@ -344,24 +355,21 @@ func runWorkload(phase string, tlsConfig *tls.Config, payload []byte, readPct fl
 						}
 					}
 
-					// Append COMMIT
 					writeBuf = appendHeader(writeBuf, client.OpCodeCommit, 0)
 					txCount++
 				}
 
-				// 2. Flush Write
 				if _, err := conn.Write(writeBuf); err != nil {
-					atomic.AddInt64(&failedOps, int64(*pipelineDepth**batchSize))
+					atomic.AddInt64(&failedOps, int64(pipelineDepth*batchSize))
 					return
 				}
 
-				// 3. Read Responses
-				expectedResps := *pipelineDepth * (2 + *batchSize)
+				expectedResps := pipelineDepth * (2 + batchSize)
 				batchFailed := false
 
 				for i := 0; i < expectedResps; i++ {
 					if _, err := io.ReadFull(reader, headerBuf); err != nil {
-						atomic.AddInt64(&failedOps, int64(*pipelineDepth**batchSize))
+						atomic.AddInt64(&failedOps, int64(pipelineDepth*batchSize))
 						return
 					}
 					status := headerBuf[0]
@@ -373,12 +381,12 @@ func runWorkload(phase string, tlsConfig *tls.Config, payload []byte, readPct fl
 						if failedStatus {
 							buf := make([]byte, length)
 							if _, err := io.ReadFull(reader, buf); err != nil {
-								atomic.AddInt64(&failedOps, int64(*pipelineDepth**batchSize))
+								atomic.AddInt64(&failedOps, int64(pipelineDepth*batchSize))
 								return
 							}
 							errBody = string(buf)
 						} else if _, err := reader.Discard(int(length)); err != nil {
-							atomic.AddInt64(&failedOps, int64(*pipelineDepth**batchSize))
+							atomic.AddInt64(&failedOps, int64(pipelineDepth*batchSize))
 							return
 						}
 					}
@@ -396,7 +404,7 @@ func runWorkload(phase string, tlsConfig *tls.Config, payload []byte, readPct fl
 
 				latency := time.Since(startBatch).Nanoseconds()
 
-				opsInBatch := int64(*pipelineDepth * *batchSize)
+				opsInBatch := int64(pipelineDepth * batchSize)
 				if batchFailed {
 					atomic.AddInt64(&failedOps, opsInBatch)
 				} else {
@@ -409,7 +417,7 @@ func runWorkload(phase string, tlsConfig *tls.Config, payload []byte, readPct fl
 
 	wg.Wait()
 	elapsed := time.Since(startTotal)
-	printStats(phase, elapsed, completedOps, failedOps, notFoundOps, totalDuration)
+	printBenchStats(phase, elapsed, completedOps, failedOps, notFoundOps, totalDuration)
 }
 
 func appendHeader(buf []byte, op byte, length int) []byte {
@@ -419,11 +427,10 @@ func appendHeader(buf []byte, op byte, length int) []byte {
 	return append(buf, header[:]...)
 }
 
-func printStats(phase string, elapsed time.Duration, success, failed, notFound int64, totalLatencyNs int64) {
+func printBenchStats(phase string, elapsed time.Duration, success, failed, notFound int64, totalLatencyNs int64) {
 	tps := float64(success) / elapsed.Seconds()
 	avgLatency := float64(0)
 
-	// Note: Latency calculation here is "Latency per Network Round Trip" (Pipeline Batch)
 	if success > 0 {
 		avgLatency = (float64(totalLatencyNs) / float64(success)) / 1e6
 	}
