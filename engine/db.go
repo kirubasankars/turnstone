@@ -300,6 +300,18 @@ func (db *DB) ActiveTransactionCount() int {
 	return len(db.activeTxns)
 }
 
+func (db *DB) activeWriteTransactionCount() int {
+	db.activeTxnsMu.Lock()
+	defer db.activeTxnsMu.Unlock()
+	n := 0
+	for tx := range db.activeTxns {
+		if tx.update {
+			n++
+		}
+	}
+	return n
+}
+
 const maxCommitBatchSize = 128
 const shutdownBackgroundWait = 2 * time.Second
 const shutdownCommitWait = 2 * time.Second

@@ -389,3 +389,64 @@ func TestDeleteWalSegments_ScanUnavailableAfterDelete(t *testing.T) {
 	}
 	db.Close()
 }
+
+func TestDeleteWalSegments_ReopenPreservesData(t *testing.T) {
+	dir := t.TempDir()
+	openOpts := Options{
+		WalSegmentSize:          256,
+		IndexCompactOnRetention: indexCompactDisabled(),
+	}
+
+	db, err := Open(dir, openOpts)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	key := []byte("keep")
+	if err := commitKeyValue(db, key, "v0"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 25; i++ {
+		w := db.NewTransaction(true)
+		if err := w.Put(key, []byte("abort")); err != nil {
+			t.Fatal(err)
+		}
+		w.Discard()
+	}
+	if err := commitKeyValue(db, key, "v1"); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"k2", "k3"} {
+		if err := commitKeyValue(db, []byte(k), k+"-val"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	_, floor, err := db.ReadLogRange(0, db.LastLogOffset()/2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetScanFloor(floor); err != nil {
+		t.Fatal(err)
+	}
+	ctx := db.BuildIndexGCContext()
+	if _, err := db.CompactIndex(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DeleteWalSegments(floor); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db2, err := Open(dir, openOpts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+
+	checkKey(t, db2, "keep", "v1")
+	checkKey(t, db2, "k2", "k2-val")
+	checkKey(t, db2, "k3", "k3-val")
+}
