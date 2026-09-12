@@ -40,7 +40,7 @@ func newRestoreCmd() *cobra.Command {
 restored alone. Differential backups must be applied in order after their
 parent chain (use --chain for multiple directories).
 
-Each backup's opid fields describe the global byte LSN range contained in the
+Each backup's LSN fields describe the global byte range contained in the
 artifact.`,
 		Run: func(cmd *cobra.Command, args []string) {
 			ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -148,14 +148,14 @@ func runRestore(ctx context.Context, opts restoreOptions) error {
 			log.Printf("Warning: compression flag in meta (%v) differs from file extension for %s", meta.Compressed, bkPath)
 		}
 
-		fmt.Printf("Ingesting %s (%s, opid [%d, %d))\n", bkPath, meta.Type, meta.BaseOpID, meta.EndOpID)
+		fmt.Printf("Ingesting %s (%s, LSN [%d, %d))\n", bkPath, meta.Type, meta.BaseLSN, meta.EndLSN)
 		if err := ingestBackupFile(ctx, bkPath, meta, opts.Verify, db); err != nil {
 			return err
 		}
 	}
 
-	finalOpID := metas[len(metas)-1].EndOpID
-	fmt.Printf("Restore complete. Database at %s (end_opid=%d)\n", dbDir, finalOpID)
+	finalLSN := metas[len(metas)-1].EndLSN
+	fmt.Printf("Restore complete. Database at %s (end_lsn=%d)\n", dbDir, finalLSN)
 	return nil
 }
 
@@ -166,24 +166,24 @@ func validateRestoreChain(metas []BackupMeta) error {
 	if metas[0].Type != backupTypeFull {
 		return fmt.Errorf("first backup must be type full, got %q", metas[0].Type)
 	}
-	if metas[0].BaseOpID != 0 {
-		return fmt.Errorf("full backup must start at opid 0, got %d", metas[0].BaseOpID)
+	if metas[0].BaseLSN != 0 {
+		return fmt.Errorf("full backup must start at LSN 0, got %d", metas[0].BaseLSN)
 	}
 
-	prevEnd := metas[0].EndOpID
+	prevEnd := metas[0].EndLSN
 	prevSHA := metas[0].SHA256
 	for i := 1; i < len(metas); i++ {
 		meta := metas[i]
 		if meta.Type != backupTypeDifferential {
 			return fmt.Errorf("backup %d must be differential, got %q", i, meta.Type)
 		}
-		if meta.BaseOpID != prevEnd {
-			return fmt.Errorf("backup %d base_opid %d does not match previous end_opid %d", i, meta.BaseOpID, prevEnd)
+		if meta.BaseLSN != prevEnd {
+			return fmt.Errorf("backup %d base_lsn %d does not match previous end_lsn %d", i, meta.BaseLSN, prevEnd)
 		}
 		if meta.ParentSHA256 != "" && meta.ParentSHA256 != prevSHA {
 			return fmt.Errorf("backup %d parent_sha256 does not match previous backup", i)
 		}
-		prevEnd = meta.EndOpID
+		prevEnd = meta.EndLSN
 		prevSHA = meta.SHA256
 	}
 	return nil

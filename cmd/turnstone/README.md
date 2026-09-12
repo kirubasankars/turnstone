@@ -10,7 +10,7 @@ The `turnstone` executable is the only shipped program. It uses [Cobra](https://
 | `turnstone server` | `server.go` | Load config, open databases, start mTLS listener, Prometheus metrics, replication manager |
 | `turnstone cli` | `cli.go`, `clicommand.go`, `cliconn.go` | Interactive REPL or `cli exec <one-liner>` against a running server |
 | `turnstone bench` | `bench.go` | Concurrent load generator for throughput experiments |
-| `turnstone backup` | `backup.go`, `replstream.go`, `backupmeta.go` | Stream physical WAL backup from a primary (full or differential by opid/LSN) |
+| `turnstone backup` | `backup.go`, `replstream.go`, `backupmeta.go` | Stream physical WAL backup from a primary (full or differential by WAL LSN) |
 | `turnstone restore` | `restore.go`, `backupmeta.go` | Offline restore of WAL backup chains into a new home directory |
 
 ## File reference

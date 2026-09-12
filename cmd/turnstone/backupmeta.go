@@ -21,11 +21,24 @@ const (
 )
 
 // BackupMeta describes a WAL backup artifact set.
-// OpID fields store the global byte LSN (exclusive-end replication cursor).
+// LSN fields are the global byte offsets used as the replication cursor.
 type BackupMeta struct {
 	Timestamp    time.Time `json:"timestamp"`
 	Database     string    `json:"database"`
 	Type         string    `json:"type"`
+	BaseLSN      uint64    `json:"base_lsn"`
+	EndLSN       uint64    `json:"end_lsn"`
+	ParentSHA256 string    `json:"parent_sha256,omitempty"`
+	Compressed   bool      `json:"compressed"`
+	SHA256       string    `json:"sha256"`
+}
+
+type backupMetaRaw struct {
+	Timestamp    time.Time `json:"timestamp"`
+	Database     string    `json:"database"`
+	Type         string    `json:"type"`
+	BaseLSN      uint64    `json:"base_lsn"`
+	EndLSN       uint64    `json:"end_lsn"`
 	BaseOpID     uint64    `json:"base_opid"`
 	EndOpID      uint64    `json:"end_opid"`
 	ParentSHA256 string    `json:"parent_sha256,omitempty"`
@@ -38,9 +51,25 @@ func loadBackupMeta(path string) (BackupMeta, error) {
 	if err != nil {
 		return BackupMeta{}, err
 	}
-	var meta BackupMeta
-	if err := json.Unmarshal(data, &meta); err != nil {
+	var raw backupMetaRaw
+	if err := json.Unmarshal(data, &raw); err != nil {
 		return BackupMeta{}, fmt.Errorf("invalid backup meta: %w", err)
+	}
+	meta := BackupMeta{
+		Timestamp:    raw.Timestamp,
+		Database:     raw.Database,
+		Type:         raw.Type,
+		BaseLSN:      raw.BaseLSN,
+		EndLSN:       raw.EndLSN,
+		ParentSHA256: raw.ParentSHA256,
+		Compressed:   raw.Compressed,
+		SHA256:       raw.SHA256,
+	}
+	if meta.BaseLSN == 0 && raw.BaseOpID != 0 {
+		meta.BaseLSN = raw.BaseOpID
+	}
+	if meta.EndLSN == 0 && raw.EndOpID != 0 {
+		meta.EndLSN = raw.EndOpID
 	}
 	if meta.Database == "" {
 		return BackupMeta{}, fmt.Errorf("backup meta missing database")
