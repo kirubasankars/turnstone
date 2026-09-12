@@ -101,6 +101,10 @@ The `turnstone` binary has six subcommands. All share `--home` (default `tsdata`
 
 # Benchmark
 ./bin/turnstone bench --home tsdata --ops 10000 --concurrency 50
+
+# Backup / restore
+./bin/turnstone backup --home tsdata --db 1 --out backup_full
+./bin/turnstone restore --in backup_full --out restored_home
 ```
 
 All writes require a transaction (`begin` → `set`/`del` → `commit`). Admin commands (`promote`, `stepdown`, `replicaof`, `flushdb`) need `--admin`.
