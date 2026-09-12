@@ -80,6 +80,14 @@ func (ctx IndexGCContext) FilterVersions(_ []byte, chain []indexVersion) []index
 }
 
 func (ctx IndexGCContext) keepMask(chain []indexVersion) []bool {
+	return ctx.keepMaskInternal(chain, true)
+}
+
+func (ctx IndexGCContext) keepMaskForWalRetain(chain []indexVersion) []bool {
+	return ctx.keepMaskInternal(chain, false)
+}
+
+func (ctx IndexGCContext) keepMaskInternal(chain []indexVersion, applyLogFloor bool) []bool {
 	n := len(chain)
 	keep := make([]bool, n)
 
@@ -108,11 +116,27 @@ func (ctx IndexGCContext) keepMask(chain []indexVersion) []bool {
 		if _, ok := ctx.ActiveXids[v.xmin]; ok {
 			keep[i] = true
 		}
-		if ctx.LogFloor > 0 && v.offset < ctx.LogFloor {
+		if applyLogFloor && ctx.LogFloor > 0 && v.offset < ctx.LogFloor {
 			keep[i] = false
 		}
 	}
 	return keep
+}
+
+// FilterVersionsForWalRetain returns MVCC-visible versions without log-floor pruning.
+// Used to find the minimum WAL offset that must remain reachable for reads.
+func (ctx IndexGCContext) FilterVersionsForWalRetain(_ []byte, chain []indexVersion) []indexVersion {
+	if len(chain) == 0 {
+		return nil
+	}
+	mask := ctx.keepMaskForWalRetain(chain)
+	out := make([]indexVersion, 0, len(chain))
+	for i, v := range chain {
+		if mask[i] {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 // IndexCompactResult reports arena shrink from a compact pass.
