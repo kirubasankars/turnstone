@@ -55,7 +55,7 @@ make build
 # begin → set mykey hello → commit → get mykey
 
 # Turnstone Console (opened automatically with --dev)
-# http://127.0.0.1:8080 — browse keys, edit values, view metrics
+# http://127.0.0.1:8080 — live dashboard and metrics
 ```
 
 The server listens on `:6379` by default. Logical databases `0`–`N` are independent keyspaces.
@@ -64,14 +64,14 @@ The server listens on `:6379` by default. Logical databases `0`–`N` are indepe
 
 ## Turnstone Console
 
-With `--dev`, TurnstoneDB serves a local web UI at **http://127.0.0.1:8080** (override with `--devtool-addr`).
+With `--dev`, TurnstoneDB serves a local read-only Console at **http://127.0.0.1:8080** (override with `--console-addr`).
 
 | Section | What you can do |
 | --- | --- |
-| **Keys** | Search by prefix, browse, create, edit, and delete keys |
-| **Monitor** | Live server stats and Prometheus metrics |
+| **Dashboard** | Live server stats, WAL/hash segment counts, GC/live bytes, and Prometheus tiles |
+| **Metrics** | Time-series charts for server and database gauges |
 
-Turnstone Console binds to localhost only. Use it for development and debugging — not as a production admin surface.
+Turnstone Console binds to localhost only. It is a read-only dashboard — not a production admin surface. Edit keys with `turnstone cli`.
 
 ---
 
@@ -84,7 +84,7 @@ Full reference: **[docs/cli.md](docs/cli.md)**
 | `turnstone init` | Create home directory, TLS certs, and `turnstone.json` |
 | `turnstone server` | Run the database (`--dev` for local use + Turnstone Console) |
 | `turnstone cli` | Interactive REPL or `cli exec <command>` one-shot |
-| `turnstone bench` | Load and throughput benchmark |
+| `turnstone bench` | Load and throughput benchmark (`--ops` or `--duration`) |
 | `turnstone backup` | Stream a physical WAL backup from a primary |
 | `turnstone restore` | Restore WAL backups into a new home directory |
 
@@ -95,8 +95,11 @@ Full reference: **[docs/cli.md](docs/cli.md)**
 # Admin failover (requires --admin cert)
 ./bin/turnstone cli --admin exec promote
 
-# Benchmark
+# Benchmark (fixed op count)
 ./bin/turnstone bench --home tsdata --ops 10000 --concurrency 50
+
+# Soak (30s mixed GET/SET)
+./bin/turnstone bench --home tsdata --duration 30s --concurrency 50
 ```
 
 All writes require a transaction (`begin` → `set`/`del` → `commit`). Admin commands (`promote`, `stepdown`, `replicaof`, `flushdb`) need `--admin`.
@@ -170,7 +173,7 @@ All connections use **mTLS**. Client authorization is driven by the certificate 
 | Surface | Address | Use |
 | --- | --- | --- |
 | Prometheus | `:9090` (configurable) | Scrape server and per-database metrics |
-| Turnstone Console | `127.0.0.1:8080` (with `--dev`) | Key browser and live dashboard |
+| Turnstone Console | `127.0.0.1:8080` (with `--dev`) | Live dashboard and metrics |
 | `stat` command | CLI (`--admin`) | JSON replication state, offsets, replica lag |
 
 ---

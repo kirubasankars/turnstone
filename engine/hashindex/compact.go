@@ -9,11 +9,12 @@ import "fmt"
 
 // ShardStats reports arena usage for one hash shard.
 type ShardStats struct {
-	ShardIndex uint32
-	SlotCount  uint32
-	KeyCount   uint32
-	ArenaUsed  uint64
-	LiveBytes  uint64
+	ShardIndex     uint32
+	SlotCount      uint32
+	KeyCount       uint32
+	ArenaUsed      uint64 // bump-allocated key/version bytes
+	AllocatedBytes uint64 // shard buffer length, including header and slot table
+	LiveBytes      uint64
 }
 
 // IndexStats aggregates per-shard arena usage.
@@ -41,12 +42,15 @@ func (s *shard) stats(shardIndex uint32) ShardStats {
 		return ShardStats{ShardIndex: shardIndex}
 	}
 	st := ShardStats{
-		ShardIndex: shardIndex,
-		SlotCount:  s.slotCount(),
-		KeyCount:   s.keyCount(),
-		ArenaUsed:  s.arenaUsed(),
+		ShardIndex:     shardIndex,
+		SlotCount:      s.slotCount(),
+		KeyCount:       s.keyCount(),
+		ArenaUsed:      s.arenaUsed(),
+		AllocatedBytes: uint64(len(s.data)),
 	}
-	st.LiveBytes = s.liveBytesLocked(nil)
+	if st.KeyCount > 0 {
+		st.LiveBytes = s.liveBytesLocked(nil)
+	}
 	return st
 }
 
@@ -114,11 +118,12 @@ func (idx *Index) CompactShard(shardIndex int, filter VersionFilter) (ShardStats
 		return ShardStats{}, err
 	}
 	return ShardStats{
-		ShardIndex: uint32(shardIndex),
-		SlotCount:  seg.slotCount(),
-		KeyCount:   seg.keyCount(),
-		ArenaUsed:  res.ArenaAfter,
-		LiveBytes:  res.ArenaAfter,
+		ShardIndex:     uint32(shardIndex),
+		SlotCount:      seg.slotCount(),
+		KeyCount:       seg.keyCount(),
+		ArenaUsed:      res.ArenaAfter,
+		AllocatedBytes: uint64(len(seg.data)),
+		LiveBytes:      res.ArenaAfter,
 	}, nil
 }
 

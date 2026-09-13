@@ -85,16 +85,26 @@ func TestNewTurnstoneCollector(t *testing.T) {
 
 	// Map of expected metric names to verify existence
 	expectedFamilies := map[string]bool{
-		"turnstone_server_connections_active":         false,
-		"turnstone_server_connections_accepted_total": false,
-		"turnstone_server_transactions_active":        false,
-		"turnstone_db_connections":                    false,
-		"turnstone_db_active_txs":                     false,
-		"turnstone_db_conflicts_total":                false,
-		"turnstone_db_offset":                         false,
-		"turnstone_db_replica_lag":                    false,
-		"turnstone_db_log_bytes":                      false,
-		"turnstone_db_log_allocated_bytes":            false,
+		"turnstone_server_connections_active":              false,
+		"turnstone_server_connections_accepted_total":      false,
+		"turnstone_server_transactions_active":             false,
+		"turnstone_db_connections":                         false,
+		"turnstone_db_active_txs":                          false,
+		"turnstone_db_conflicts_total":                     false,
+		"turnstone_db_offset":                              false,
+		"turnstone_db_replica_lag":                         false,
+		"turnstone_db_replicas":                            false,
+		"turnstone_db_log_bytes":                           false,
+		"turnstone_db_log_allocated_bytes":                 false,
+		"turnstone_db_key_count":                           false,
+		"turnstone_db_wal_segments":                        false,
+		"turnstone_db_hash_shards":                         false,
+		"turnstone_db_index_arena_bytes":                   false,
+		"turnstone_db_index_allocated_bytes":               false,
+		"turnstone_db_index_live_bytes":                    false,
+		"turnstone_db_hash_shards_compacted_total":         false,
+		"turnstone_db_index_compact_bytes_reclaimed_total": false,
+		"turnstone_db_hash_compact_last_timestamp_seconds": false,
 	}
 
 	for _, mf := range mfs {

@@ -24,8 +24,8 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"turnstone/config"
+	"turnstone/console"
 	"turnstone/database"
-	"turnstone/devtool"
 	"turnstone/internal/tlsutil"
 	"turnstone/metrics"
 	"turnstone/repl"
@@ -34,7 +34,7 @@ import (
 
 func newServerCmd() *cobra.Command {
 	var devMode bool
-	var devtoolAddr string
+	var consoleAddr string
 
 	cmd := &cobra.Command{
 		Use:   "server",
@@ -48,21 +48,21 @@ func newServerCmd() *cobra.Command {
 				os.Exit(1)
 			}
 
-			runServer(logger, devMode, devtoolAddr)
+			runServer(logger, devMode, consoleAddr)
 		},
 	}
 
 	cmd.Flags().BoolVar(&devMode, "dev", false, "Disable transaction timeouts and auto-promote all databases to PRIMARY")
-	cmd.Flags().StringVar(&devtoolAddr, "devtool-addr", "", "Address for the Turnstone Console web UI (default 127.0.0.1:8080 when --dev is set)")
+	cmd.Flags().StringVar(&consoleAddr, "console-addr", "", "Address for the read-only Turnstone Console (default 127.0.0.1:8080 when --dev is set)")
 
 	return cmd
 }
 
-func runServer(logger *slog.Logger, devMode bool, devtoolAddr string) {
+func runServer(logger *slog.Logger, devMode bool, consoleAddr string) {
 	if devMode {
 		logger.Info("Starting in DEV mode: Transaction timeouts disabled, all DBs auto-promoted")
-		if devtoolAddr == "" {
-			devtoolAddr = "127.0.0.1:8080"
+		if consoleAddr == "" {
+			consoleAddr = "127.0.0.1:8080"
 		}
 	}
 
@@ -182,9 +182,9 @@ func runServer(logger *slog.Logger, devMode bool, devtoolAddr string) {
 		metrics.StartMetricsServer(cfg.MetricsAddr, stores, srv, logger)
 	}
 
-	if devtoolAddr != "" {
-		devtool.Start(devtool.Config{
-			Addr:        devtoolAddr,
+	if consoleAddr != "" {
+		console.Start(console.Config{
+			Addr:        consoleAddr,
 			MetricsAddr: cfg.MetricsAddr,
 			Stores:      stores,
 			ServerStats: srv,

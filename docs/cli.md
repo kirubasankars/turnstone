@@ -23,7 +23,7 @@ make build
 | `turnstone init` | Create home directory, TLS certs, and `turnstone.json` |
 | `turnstone server` | Run the database server |
 | `turnstone cli` | Interactive REPL or `cli exec <command>` one-shot |
-| `turnstone bench` | Load and throughput benchmark |
+| `turnstone bench` | Load and throughput benchmark (`--ops` or `--duration`) |
 | `turnstone backup` | Stream a physical WAL backup from a primary |
 | `turnstone restore` | Restore WAL backups into a new home directory |
 
@@ -70,10 +70,12 @@ turnstone server --home tsdata
 | Flag | Description |
 | --- | --- |
 | `--dev` | Disable transaction timeouts and auto-promote all databases to `PRIMARY` |
+| `--console-addr` | Bind address for the read-only Turnstone Console (default `127.0.0.1:8080` when `--dev` is set) |
 
 Use `--dev` for local development only. Production failover semantics are bypassed.
 
 Prometheus metrics are served on the address in `metrics_addr` (default `:9090`).
+With `--dev`, a read-only Console also listens on `127.0.0.1:8080` (override with `--console-addr`).
 
 ---
 
@@ -214,7 +216,7 @@ Backup streams (`turnstone-backup`) and admin replication connections do **not**
 
 ## `turnstone bench`
 
-Run a concurrent load and throughput benchmark against a running server.
+Run a concurrent load and throughput benchmark against a running server. Default is a fixed `--ops` count. Pass `--duration` to soak until a wall-clock timer expires instead of `--ops`.
 
 ```bash
 turnstone bench --home tsdata --addr localhost:6379 --ops 10000 --concurrency 50
@@ -228,14 +230,16 @@ The database must be in `PRIMARY` state. If not, promote it first or start the s
 | --- | --- | --- |
 | `--addr` | `localhost:6379` | Server address |
 | `--concurrency` | `50` | Number of concurrent clients |
-| `--ops` | `10000` | Total operations per phase |
+| `--ops` | `10000` | Total operations per phase (ignored when `--duration` is set) |
+| `--duration` | `0` | Run until this elapsed time instead of `--ops` |
+| `--report` | `0` | Live success/fail/TPS interval; `0` disables. Defaults to `5s` with `--duration` |
 | `--db` | `1` | Logical database number |
 | `--batch` | `1` | Operations per transaction |
 | `--depth` | `1` | Pipeline depth (transactions per round-trip) |
 | `--value-size` | `128` | Value size in bytes for SET operations |
 | `--key-size` | `32` | Minimum key size in bytes |
 | `--prefix` | `bench` | Key prefix to avoid collisions between runs |
-| `--read-ratio` | `-1` | Read ratio `0.0`–`1.0` for mixed workload; `-1` runs separate write then read phases |
+| `--read-ratio` | `-1` | Read ratio `0.0`–`1.0` for mixed workload; `-1` runs separate write then read phases (`--ops`) or mixed 50/50 (`--duration`) |
 
 ### Examples
 
@@ -249,6 +253,18 @@ High-throughput pipelined writes:
 
 ```bash
 turnstone bench --home tsdata --batch 10 --depth 5 --ops 100000
+```
+
+Duration-based soak (30s mixed GET/SET, live TPS every 5s):
+
+```bash
+turnstone bench --home tsdata --duration 30s --concurrency 50 --read-ratio 0.5
+```
+
+Write-heavy one-minute soak:
+
+```bash
+turnstone bench --home tsdata --duration 1m --read-ratio 0.1 --concurrency 100
 ```
 
 ---

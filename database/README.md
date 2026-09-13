@@ -48,7 +48,7 @@ type Database struct {
 | Quorum | `WaitForQuorum`, `SetMinReplicas` | Sync replication: commit waits for N followers to ack offset |
 | Replication apply | `ApplyLogRange` | Follower ingests raw WAL frames from leader |
 | Admin | `Promote`, `StepDown`, role checks | Coordinates with `server` handlers |
-| Stats | `Stats` | Active txs, conflicts, log size, key count, replica lag |
+| Stats | `Stats`, `StorageDetail`, `IndexHashMetrics` | Cheap scrape stats; Console WAL live/garbage; hash shard arena/allocated/live for Console and Prometheus |
 
 ## On-disk artifacts (per database)
 

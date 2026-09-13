@@ -651,6 +651,8 @@ func TestServer_Backpressure(t *testing.T) {
 	defer c1.Close()
 	c1.AssertStatus(protocol.OpCodePing, nil, protocol.ResStatusOK)
 
+	accepted := gatherMetrics(t, srv)["turnstone_server_connections_accepted_total"]
+
 	// 2. Reject Overflow (2/1)
 	// We use raw Dial here because connectClient expects success/handshake
 	conn2, err := tls.Dial("tcp", addr, tlsConfig)
@@ -676,6 +678,10 @@ func TestServer_Backpressure(t *testing.T) {
 	}
 	if string(body) != "Max connections" {
 		t.Errorf("Unexpected error body: %s", string(body))
+	}
+
+	if got := gatherMetrics(t, srv)["turnstone_server_connections_accepted_total"]; got != accepted {
+		t.Errorf("busy rejection counted as accepted: got %v want %v", got, accepted)
 	}
 
 	// 3. Release Capacity

@@ -9,7 +9,7 @@ The `turnstone` executable is the only shipped program. It uses [Cobra](https://
 | `turnstone init` | `initcmd.go` | Create home dir, TLS CA + server/client/admin certs, database directories, `turnstone.json` |
 | `turnstone server` | `server.go` | Load config, open databases, start mTLS listener, Prometheus metrics, replication manager |
 | `turnstone cli` | `cli.go`, `clicommand.go`, `cliconn.go` | Interactive REPL or `cli exec <one-liner>` against a running server |
-| `turnstone bench` | `bench.go` | Concurrent load generator for throughput experiments |
+| `turnstone bench` | `bench.go` | Concurrent load generator (`--ops` or `--duration` soak) |
 | `turnstone backup` | `backup.go` | Stream physical WAL backup from a primary (uses `internal/backup`) |
 | `turnstone restore` | `restore.go` | Offline restore of WAL backup chains (uses `internal/backup`) |
 
@@ -24,7 +24,7 @@ The `turnstone` executable is the only shipped program. It uses [Cobra](https://
 | `cli.go` | `cli` REPL loop, history-friendly UX |
 | `clicommand.go` | Parses REPL tokens into protocol operations |
 | `cliconn.go` | mTLS dial + framed read/write for CLI |
-| `bench.go` | Benchmark driver using `client` package |
+| `bench.go` | Benchmark driver (`--ops` or `--duration`; TLS preflight via `client`) |
 | `backup.go` | `backup` — thin wrapper around `internal/backup` |
 | `restore.go` | `restore` — thin wrapper around `internal/backup` |
 
@@ -39,7 +39,8 @@ Understanding this sequence is essential for debugging “server won’t start�
 5. Construct `repl.Manager` for outbound `replicaof` connections.
 6. Construct `server.Server` with stores map, connection limits, dev mode.
 7. Start Prometheus scrape endpoint (`metrics_addr`, default `:9090`).
-8. Block in `Server.Run()` until SIGINT/SIGTERM.
+8. If `--dev` or `--console-addr` is set, start the read-only Turnstone Console (`console` package).
+9. Block in `Server.Run()` until SIGINT/SIGTERM.
 
 ### Dev mode (`--dev`)
 
@@ -47,6 +48,7 @@ When enabled:
 
 - Transaction timeouts are disabled at the engine layer.
 - All databases are auto-promoted to `PRIMARY` on startup (no manual `promote`).
+- The read-only Console listens on `127.0.0.1:8080` unless `--console-addr` is set.
 
 Use only for local development; production failover semantics are bypassed.
 
@@ -71,7 +73,7 @@ Subcommands map cleanly to operator workflows (`init` once, `server` always-on, 
 
 ### Benchmark subcommand
 
-`bench` exists to exercise the **client → server → engine** path under concurrency without writing a separate tool. Review `bench.go` when investigating latency outliers or connection pool behavior.
+`bench` exists to exercise the **client → server → engine** path without writing a separate tool. Default is a fixed `--ops` count; `--duration` soaks until a wall-clock timer expires. Review `bench.go` when investigating latency outliers or connection pool behavior.
 
 ## Review checklist
 
@@ -85,4 +87,4 @@ Subcommands map cleanly to operator workflows (`init` once, `server` always-on, 
 
 1. Run `turnstone init --home /tmp/ts-test --ip 127.0.0.1` and inspect generated `certs/` and `turnstone.json`.
 2. Start `turnstone server --home /tmp/ts-test --dev` and trace logs while connecting with `turnstone cli --home /tmp/ts-test`.
-3. Use `turnstone bench` with varying `--concurrency` and correlate with `turnstone_server_connections_active` metrics.
+3. Use `turnstone bench` (`--ops` or `--duration 30s`) with varying `--concurrency` and correlate with `turnstone_server_connections_active` metrics.

@@ -39,6 +39,7 @@ Everything on disk that matters lives here; the in-memory index is rebuilt from 
 | `types.go` | Record types, options, errors, snapshot struct |
 | `encode.go` | Log record encoding/decoding |
 | `wal_log.go`, `wal_manifest.go` | Segmented WAL I/O, rotation, manifest |
+| `wal_stats.go` | Per-segment size, estimated live bytes, garbage |
 | `logrange.go` | `ReadLogRange`, `AppendRawFrames` for replication |
 | `index.go` | MVCC visibility, version chains on top of `hashindex` |
 | `clog.go` | Commit status, snapshot construction |
@@ -46,7 +47,7 @@ Everything on disk that matters lives here; the in-memory index is rebuilt from 
 | `isolation.go` | Read-set validation at commit (write skew detection) |
 | `recovery.go` | WAL replay on open |
 | `wal_retention.go`, `wal_copyforward.go` | Maintenance pipeline |
-| `index_gc.go` | Index compaction driver |
+| `index_gc.go` | Index compaction driver; hash arena/allocated/live aggregates and compact counters |
 | `disk_unix.go` | Disk usage monitoring |
 
 Tests (`*_test.go`, `correctness_test.go`, `benchmark_test.go`) are extensive — treat them as executable specification.
@@ -86,7 +87,7 @@ Executed when retention policy allows (from `database.EnforceRetentionPolicy`):
 2. **WAL copy-forward** — copy MVCC-visible frames to new segment when allocated WAL > ~3× live; remap index offsets.
 3. **Segment delete** — remove sealed segments ≤ `min(scanFloor, mvccFloor)`.
 
-Skips copy-forward while write transactions are active; read-only snapshots pin older frames.
+Skips copy-forward while write transactions are already active. Once a copy starts, new write begins and replica apply wait so index offsets cannot race remap. Read-only snapshots pin older frames.
 
 ## `Options` (engine open)
 

@@ -36,6 +36,9 @@ type DB struct {
 	logger *slog.Logger
 
 	commitMu   sync.Mutex
+	// walRewriteMu excludes write begins and replica apply from WAL copy-forward
+	// collect/remap. Lock order: commitMu, then walRewriteMu.
+	walRewriteMu sync.Mutex
 	shutdownMu sync.RWMutex
 
 	transactionID   uint64
@@ -43,7 +46,10 @@ type DB struct {
 	scanFloor       int64
 	retentionOffset int64
 
-	metricsConflicts uint64
+	metricsConflicts            uint64
+	metricsHashShardsCompacted  uint64
+	metricsHashCompactReclaimed uint64
+	metricsHashCompactUnix      int64
 
 	activeTxnsMu sync.Mutex
 	activeTxns   map[*Transaction]uint64
@@ -274,6 +280,7 @@ func (db *DB) KeyCount() (int64, error) {
 	return atomic.LoadInt64(&db.keyCount), nil
 }
 
+// StorageStats returns retained WAL LSN span and on-disk allocated bytes.
 func (db *DB) StorageStats() (logicalSize int64, allocatedSize int64) {
 	return db.log.LogicalSize(), db.log.AllocatedSize()
 }
@@ -296,6 +303,18 @@ func (db *DB) IsValidFrameOffset(offset int64) bool {
 
 func (db *DB) GetConflicts() uint64 {
 	return atomic.LoadUint64(&db.metricsConflicts)
+}
+
+func (db *DB) HashShardsCompacted() uint64 {
+	return atomic.LoadUint64(&db.metricsHashShardsCompacted)
+}
+
+func (db *DB) HashCompactBytesReclaimed() uint64 {
+	return atomic.LoadUint64(&db.metricsHashCompactReclaimed)
+}
+
+func (db *DB) HashCompactUnix() int64 {
+	return atomic.LoadInt64(&db.metricsHashCompactUnix)
 }
 
 func (db *DB) ActiveTransactionCount() int {
@@ -455,6 +474,9 @@ func (db *DB) NewTransaction(update bool) *Transaction {
 		return tx
 	}
 
+	db.walRewriteMu.Lock()
+	defer db.walRewriteMu.Unlock()
+
 	db.txMu.Lock()
 	xid := atomic.AddUint64(&db.transactionID, 1)
 	snap := db.buildSnapshotLocked()
@@ -529,6 +551,9 @@ func (db *DB) ApplyLogRange(data []byte) (int64, error) {
 		return db.log.WriteOffset(), nil
 	}
 
+	db.walRewriteMu.Lock()
+	defer db.walRewriteMu.Unlock()
+
 	fsync := frames[len(frames)-1].rec.Type == RecordCommit
 	startOff, err := db.log.AppendRawFrames(data, fsync)
 	if err != nil {
@@ -594,6 +619,10 @@ func (db *DB) ApplyRecord(rec Record) error {
 	if atomic.LoadInt32(&db.isCorrupt) == 1 {
 		return errors.New("database is corrupt")
 	}
+
+	db.walRewriteMu.Lock()
+	defer db.walRewriteMu.Unlock()
+
 	payload := encodeRecord(rec)
 
 	switch rec.Type {

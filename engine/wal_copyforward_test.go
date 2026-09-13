@@ -7,6 +7,7 @@ package engine
 
 import (
 	"testing"
+	"time"
 )
 
 func TestMaybeCopyForwardWal_ReclaimsFragmentedLog(t *testing.T) {
@@ -91,6 +92,76 @@ func TestMaybeCopyForwardWal_SkipsWithActiveTransaction(t *testing.T) {
 		t.Fatalf("expected skip with active txn, got %+v", res)
 	}
 	tx.Discard()
+}
+
+func TestMaybeCopyForwardWal_ExcludesConcurrentWriter(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, Options{
+		WalSegmentSize:              256,
+		WalCopyForwardFragmentation: 2.0,
+		WalCopyForwardOnRetention:   walCopyForwardDisabled(),
+		IndexCompactOnRetention:     indexCompactDisabled(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	key := []byte("k")
+	if err := commitKeyValue(db, key, "keep"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 25; i++ {
+		w := db.NewTransaction(true)
+		if err := w.Put(key, []byte("abort")); err != nil {
+			t.Fatal(err)
+		}
+		w.Discard()
+	}
+
+	writeErr := make(chan error, 1)
+	testingAfterCopyForwardCollect = func() {
+		if db.walRewriteMu.TryLock() {
+			db.walRewriteMu.Unlock()
+			t.Error("walRewriteMu not held during copy-forward collect")
+		}
+		go func() {
+			tx := db.NewTransaction(true)
+			if err := tx.Put([]byte("concurrent"), []byte("v")); err != nil {
+				tx.Discard()
+				writeErr <- err
+				return
+			}
+			writeErr <- tx.Commit()
+		}()
+		time.Sleep(50 * time.Millisecond)
+		select {
+		case err := <-writeErr:
+			t.Errorf("write completed during copy-forward: %v", err)
+		default:
+		}
+	}
+	t.Cleanup(func() { testingAfterCopyForwardCollect = nil })
+
+	res, err := db.MaybeCopyForwardWal(0)
+	if err != nil {
+		t.Fatalf("copy-forward: %v", err)
+	}
+	if res.FramesCopied == 0 {
+		t.Fatal("expected copy-forward")
+	}
+
+	select {
+	case err := <-writeErr:
+		if err != nil {
+			t.Fatalf("concurrent write: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("concurrent write still blocked after copy-forward")
+	}
+
+	checkKey(t, db, "k", "keep")
+	checkKey(t, db, "concurrent", "v")
 }
 
 func TestMaybeCopyForwardWal_RemapsIndexOffsets(t *testing.T) {

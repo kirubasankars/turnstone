@@ -413,6 +413,12 @@ func TestMaybeCompactIndex_RegressionCompactsFragmentedShard(t *testing.T) {
 	if res.ShardsCompacted == 0 {
 		t.Fatalf("expected compacted shard, arena=%d live=%d", arenaBefore, liveBefore)
 	}
+	if db.HashShardsCompacted() == 0 {
+		t.Fatal("expected hash compact counter to increase")
+	}
+	if db.HashCompactUnix() == 0 {
+		t.Fatal("expected last compact timestamp")
+	}
 	if res.ArenaAfter >= res.ArenaBefore {
 		t.Fatalf("expected arena shrink, result=%+v", res)
 	}

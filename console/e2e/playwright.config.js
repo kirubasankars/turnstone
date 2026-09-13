@@ -14,7 +14,7 @@ module.exports = defineConfig({
   workers: 1,
   reporter: process.env.CI ? 'github' : 'list',
   use: {
-    baseURL: process.env.DEVTOOL_URL || 'http://127.0.0.1:18080',
+    baseURL: process.env.CONSOLE_URL || 'http://127.0.0.1:18080',
     trace: 'on-first-retry',
     screenshot: 'only-on-failure',
   },
