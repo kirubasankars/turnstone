@@ -156,17 +156,17 @@ func (s *httpServer) handleDBStats(w http.ResponseWriter, db *database.Database,
 	}
 	state := db.GetState()
 	s.writeJSON(w, http.StatusOK, map[string]any{
-		"db":                 dbName,
-		"state":              state,
-		"key_count":          stats.KeyCount,
-		"conflicts":          stats.Conflicts,
-		"active_connections": conns,
-		"log_bytes":          stats.LogSize,
+		"db":                  dbName,
+		"state":               state,
+		"key_count":           stats.KeyCount,
+		"conflicts":           stats.Conflicts,
+		"active_connections":  conns,
+		"log_bytes":           stats.LogSize,
 		"log_allocated_bytes": stats.LogAllocated,
-		"active_txs":         stats.ActiveTxs,
-		"replica_lag":        stats.ReplicaLag,
-		"uptime":             stats.Uptime,
-		"min_replicas":       db.MinReplicas(),
+		"active_txs":          stats.ActiveTxs,
+		"replica_lag":         stats.ReplicaLag,
+		"uptime":              stats.Uptime,
+		"min_replicas":        db.MinReplicas(),
 	})
 }
 

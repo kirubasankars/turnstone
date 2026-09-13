@@ -13,8 +13,8 @@ import (
 )
 
 var (
-	ErrInvalidKey   = errors.New("key must contain only ASCII characters")
-	ErrReadOnlyDB   = errors.New("database is not writable")
+	ErrInvalidKey = errors.New("key must contain only ASCII characters")
+	ErrReadOnlyDB = errors.New("database is not writable")
 )
 
 // Set stores a value for key.
