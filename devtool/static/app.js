@@ -9,6 +9,8 @@
   var searchTimer = null;
   var toastTimer = null;
   var lastKeyCount = 0;
+  var sparkHistory = { replica_lag: [], log_bytes: [], key_count: [] };
+  var SPARK_MAX = 24;
 
   var els = {
     dbSelect: document.getElementById('db-select'),
@@ -17,11 +19,19 @@
     summaryTxs: document.getElementById('summary-txs'),
     lastUpdated: document.getElementById('last-updated'),
     keyCount: document.getElementById('key-count'),
+    keyCountInline: document.getElementById('key-count-inline'),
+    overviewKeys: document.getElementById('overview-keys'),
+    overviewTxs: document.getElementById('overview-txs'),
+    overviewState: document.getElementById('overview-state'),
+    overviewUpdated: document.getElementById('overview-updated'),
+    globalStateDot: document.getElementById('global-state-dot'),
     dbStats: document.getElementById('db-stats'),
     serverMetrics: document.getElementById('server-metrics'),
     dbMetrics: document.getElementById('db-metrics'),
+    dbMetricsProm: document.getElementById('db-metrics-prom'),
     metricsDot: document.getElementById('metrics-dot'),
     prefixFilter: document.getElementById('prefix-filter'),
+    headerSearch: document.getElementById('header-search'),
     keyList: document.getElementById('key-list'),
     btnMoreKeys: document.getElementById('btn-more-keys'),
     editKey: document.getElementById('edit-key'),
@@ -33,7 +43,10 @@
     confirmMessage: document.getElementById('confirm-message'),
     confirmCancel: document.getElementById('confirm-cancel'),
     confirmOk: document.getElementById('confirm-ok'),
-    btnRefresh: document.getElementById('btn-refresh')
+    btnRefresh: document.getElementById('btn-refresh'),
+    settingsDbSelect: document.getElementById('settings-db-select'),
+    btnSettingsRefresh: document.getElementById('btn-settings-refresh'),
+    dataArea: document.querySelector('.data-area')
   };
 
   function api(path, opts) {
@@ -66,6 +79,37 @@
       .replace(/"/g, '&quot;');
   }
 
+  function pushSpark(key, value) {
+    if (!sparkHistory[key]) sparkHistory[key] = [];
+    sparkHistory[key].push(value);
+    if (sparkHistory[key].length > SPARK_MAX) sparkHistory[key].shift();
+  }
+
+  function drawSparkline(canvas, values) {
+    if (!canvas || !values || values.length < 2) return;
+    var ctx = canvas.getContext('2d');
+    var w = canvas.width = canvas.offsetWidth || 120;
+    var h = canvas.height = 28;
+    ctx.clearRect(0, 0, w, h);
+    var max = 0;
+    var min = Infinity;
+    for (var i = 0; i < values.length; i++) {
+      if (values[i] > max) max = values[i];
+      if (values[i] < min) min = values[i];
+    }
+    if (max === min) max = min + 1;
+    ctx.strokeStyle = '#ffc107';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    for (var j = 0; j < values.length; j++) {
+      var x = (j / (values.length - 1)) * (w - 4) + 2;
+      var y = h - 4 - ((values[j] - min) / (max - min)) * (h - 8);
+      if (j === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+
   function setStatus(msg, isErr) {
     els.editorStatus.textContent = msg || '';
     els.editorStatus.className = 'status' + (isErr ? ' err' : msg ? ' ok' : '');
@@ -95,14 +139,19 @@
 
   function updateLastUpdated() {
     var now = new Date();
-    els.lastUpdated.textContent = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    var timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    els.lastUpdated.textContent = timeStr;
+    if (els.overviewUpdated) els.overviewUpdated.textContent = 'Last Updated: ' + timeStr;
   }
 
   function updateKeyCount(count) {
     lastKeyCount = count;
     var label = count === 1 ? '1 key' : count + ' keys';
     els.keyCount.textContent = label;
+    if (els.keyCountInline) els.keyCountInline.textContent = label;
     els.summaryKeys.textContent = fmt(count);
+    if (els.overviewKeys) els.overviewKeys.textContent = fmt(count);
+    pushSpark('key_count', count);
   }
 
   function updateMoreButton() {
@@ -118,8 +167,14 @@
       '</p>';
   }
 
-  function renderMetrics(container, samples, labelFn, highlights) {
+  function metricIconClass(label) {
+    if (/active|tx/i.test(label)) return 'orange';
+    return 'teal';
+  }
+
+  function renderMetrics(container, samples, labelFn, highlights, sparkKeys) {
     highlights = highlights || [];
+    sparkKeys = sparkKeys || {};
     if (!samples || samples.length === 0) {
       container.innerHTML = '<p class="empty-state"><span class="empty-title">No metrics available</span></p>';
       return;
@@ -129,63 +184,126 @@
       var s = samples[i];
       var label = labelFn ? labelFn(s) : s.name.replace('turnstone_', '').replace(/_/g, ' ');
       var cls = highlights.indexOf(label) !== -1 ? ' highlight' : '';
-      if (s.name.indexOf('conflict') !== -1 && s.value > 0) cls += ' warn-value';
-      if (s.name.indexOf('lag') !== -1 && s.value > 0) cls += ' warn-value';
+      if (/active tx/i.test(label)) cls += ' warn-tile';
       var valueCls = (s.name.indexOf('conflict') !== -1 && s.value > 0) ||
         (s.name.indexOf('lag') !== -1 && s.value > 0) ? ' warn' : '';
-      html += '<div class="metric' + cls + '"><div class="label">' + escapeHtml(label) +
-        '</div><div class="value' + valueCls + '">' + escapeHtml(fmt(s.value)) + '</div></div>';
+      var iconCls = metricIconClass(label);
+      var sparkId = 'spark-' + container.id + '-' + i;
+      var sparkHtml = '';
+      var sparkKey = sparkKeys[label] || sparkKeys[s.name];
+      if (sparkKey && sparkHistory[sparkKey] && sparkHistory[sparkKey].length > 1) {
+        sparkHtml = '<div class="metric-sparkline"><canvas id="' + sparkId + '" height="28"></canvas></div>';
+      }
+      html += '<div class="metric' + cls + '"><div class="label">' +
+        '<span class="metric-icon ' + iconCls + '"></span>' + escapeHtml(label) +
+        '</div><div class="value' + valueCls + '">' + escapeHtml(fmt(s.value)) + '</div>' +
+        sparkHtml + '</div>';
     }
     html += '</div>';
     container.innerHTML = html;
+
+    for (var j = 0; j < samples.length; j++) {
+      var s2 = samples[j];
+      var lbl = labelFn ? labelFn(s2) : s2.name.replace('turnstone_', '').replace(/_/g, ' ');
+      var sk = sparkKeys[lbl] || sparkKeys[s2.name];
+      if (sk && sparkHistory[sk] && sparkHistory[sk].length > 1) {
+        var canvas = document.getElementById('spark-' + container.id + '-' + j);
+        drawSparkline(canvas, sparkHistory[sk]);
+      }
+    }
+  }
+
+  function renderStateBadge(state) {
+    var stateClass = state.split(' ')[0];
+    return '<span class="state-badge state-' + escapeHtml(stateClass) + '">' + escapeHtml(state) + '</span>';
+  }
+
+  function updateStateUI(state) {
+    var badge = renderStateBadge(state);
+    els.dbState.innerHTML = badge;
+    if (els.overviewState) els.overviewState.innerHTML = badge;
+    if (els.globalStateDot) {
+      els.globalStateDot.className = 'status-dot state';
+      if (stateClass(state) === 'PRIMARY') els.globalStateDot.style.background = 'var(--ok)';
+      else if (stateClass(state) === 'REPLICA') els.globalStateDot.style.background = 'var(--orange)';
+      else els.globalStateDot.style.background = 'var(--text-muted)';
+    }
+  }
+
+  function stateClass(state) {
+    return state.split(' ')[0];
   }
 
   function loadDatabases() {
     return api('/api/databases').then(function (data) {
       var dbs = data.databases || [];
       els.dbSelect.innerHTML = '';
+      if (els.settingsDbSelect) els.settingsDbSelect.innerHTML = '';
       for (var i = 0; i < dbs.length; i++) {
         var opt = document.createElement('option');
         opt.value = dbs[i];
         opt.textContent = 'DB ' + dbs[i];
         els.dbSelect.appendChild(opt);
+        if (els.settingsDbSelect) {
+          var opt2 = document.createElement('option');
+          opt2.value = dbs[i];
+          opt2.textContent = 'DB ' + dbs[i];
+          els.settingsDbSelect.appendChild(opt2);
+        }
       }
       if (dbs.length > 0) {
         currentDB = dbs[0];
         els.dbSelect.value = currentDB;
+        if (els.settingsDbSelect) els.settingsDbSelect.value = currentDB;
       }
     });
   }
 
   function loadStats() {
     return api('/api/databases/' + currentDB + '/stats').then(function (stats) {
-      var stateClass = stats.state.split(' ')[0];
-      els.dbState.innerHTML = '<span class="state-badge state-' + escapeHtml(stateClass) + '">' +
-        escapeHtml(stats.state) + '</span>';
+      updateStateUI(stats.state);
       els.summaryTxs.textContent = String(stats.active_txs);
+      if (els.overviewTxs) els.overviewTxs.textContent = String(stats.active_txs);
       updateKeyCount(stats.key_count);
+      pushSpark('replica_lag', stats.replica_lag || 0);
+      pushSpark('log_bytes', stats.log_bytes || 0);
 
       var items = [
-        ['Keys', stats.key_count, true],
-        ['Active Txs', stats.active_txs, true],
-        ['Connections', stats.active_connections, false],
-        ['Conflicts', stats.conflicts, false],
-        ['Log Size', stats.log_bytes, false],
-        ['Log Allocated', stats.log_allocated_bytes, false],
-        ['Replica Lag', stats.replica_lag, false],
-        ['Uptime', stats.uptime, false],
-        ['Min Replicas', stats.min_replicas, false]
+        ['Keys', stats.key_count, true, 'key_count'],
+        ['Active Txs', stats.active_txs, true, null],
+        ['Connections', stats.active_connections, false, null],
+        ['Conflicts', stats.conflicts, false, null],
+        ['Log Size', stats.log_bytes, false, 'log_bytes'],
+        ['Log Allocated', stats.log_allocated_bytes, false, null],
+        ['Replica Lag', stats.replica_lag, false, 'replica_lag'],
+        ['Uptime', stats.uptime, false, null],
+        ['Min Replicas', stats.min_replicas, false, null]
       ];
 
       var html = '<div class="metrics-grid">';
       for (var i = 0; i < items.length; i++) {
         var val = typeof items[i][1] === 'number' ? fmt(items[i][1]) : items[i][1];
         var hl = items[i][2] ? ' highlight' : '';
-        html += '<div class="metric' + hl + '"><div class="label">' + escapeHtml(items[i][0]) +
-          '</div><div class="value">' + escapeHtml(val) + '</div></div>';
+        if (items[i][0] === 'Active Txs') hl += ' warn-tile';
+        var iconCls = items[i][0] === 'Active Txs' ? 'orange' : 'teal';
+        var sparkHtml = '';
+        if (items[i][3] && sparkHistory[items[i][3]] && sparkHistory[items[i][3]].length > 1) {
+          sparkHtml = '<div class="metric-sparkline"><canvas class="db-spark" data-spark="' +
+            items[i][3] + '" height="28"></canvas></div>';
+        }
+        html += '<div class="metric' + hl + '"><div class="label">' +
+          '<span class="metric-icon ' + iconCls + '"></span>' + escapeHtml(items[i][0]) +
+          '</div><div class="value">' + escapeHtml(val) + '</div>' + sparkHtml + '</div>';
       }
       html += '</div>';
       els.dbStats.innerHTML = html;
+
+      var sparks = els.dbStats.querySelectorAll('.db-spark');
+      for (var s = 0; s < sparks.length; s++) {
+        var key = sparks[s].getAttribute('data-spark');
+        drawSparkline(sparks[s], sparkHistory[key]);
+      }
+
       updateLastUpdated();
     });
   }
@@ -198,9 +316,15 @@
       var dbSamples = (data.db || []).filter(function (s) {
         return s.labels && s.labels.db === currentDB;
       });
+      var sparkMap = { 'key count': 'key_count', 'log bytes': 'log_bytes', 'replica lag': 'replica_lag' };
       renderMetrics(els.dbMetrics, dbSamples, function (s) {
         return s.name.replace('turnstone_db_', '').replace(/_/g, ' ');
-      });
+      }, [], sparkMap);
+      if (els.dbMetricsProm) {
+        renderMetrics(els.dbMetricsProm, dbSamples, function (s) {
+          return s.name.replace('turnstone_db_', '').replace(/_/g, ' ');
+        }, [], sparkMap);
+      }
       els.metricsDot.className = 'dot ok';
     }).catch(function (e) {
       els.serverMetrics.innerHTML = '<p class="empty-state err"><span class="empty-title">' +
@@ -392,15 +516,25 @@
 
   function onDbChange() {
     currentDB = els.dbSelect.value;
+    if (els.settingsDbSelect) els.settingsDbSelect.value = currentDB;
     keyCursor = 0;
     selectedKey = '';
     clearEditor();
+    sparkHistory = { replica_lag: [], log_bytes: [], key_count: [] };
     refreshAll();
   }
 
   function debouncedSearch() {
     if (searchTimer) clearTimeout(searchTimer);
     searchTimer = setTimeout(function () { loadKeys(); }, 300);
+  }
+
+  function syncSearchFields(fromHeader) {
+    if (fromHeader) {
+      els.prefixFilter.value = els.headerSearch.value;
+    } else {
+      els.headerSearch.value = els.prefixFilter.value;
+    }
   }
 
   function scheduleRefresh() {
@@ -413,12 +547,23 @@
 
   function switchView(view) {
     var tabs = document.querySelectorAll('.view-tab');
-    var panels = document.querySelectorAll('.view-panel');
+    var panels = document.querySelectorAll('[data-view-panel]');
     for (var i = 0; i < tabs.length; i++) {
       tabs[i].classList.toggle('active', tabs[i].getAttribute('data-view') === view);
     }
     for (var j = 0; j < panels.length; j++) {
-      panels[j].classList.toggle('active', panels[j].getAttribute('data-view-panel') === view);
+      var panelView = panels[j].getAttribute('data-view-panel');
+      var active = panelView === view;
+      if (view === 'data' && panelView === 'editor') active = false;
+      if (view === 'editor' && panelView === 'data') {
+        active = true;
+        if (els.dataArea) {
+          els.dataArea.classList.add('editor-only');
+        }
+      } else if (els.dataArea) {
+        els.dataArea.classList.remove('editor-only');
+      }
+      panels[j].classList.toggle('active', active);
     }
   }
 
@@ -433,11 +578,33 @@
   document.getElementById('btn-clear').addEventListener('click', clearEditor);
   document.getElementById('btn-delete').addEventListener('click', delKey);
   els.dbSelect.addEventListener('change', onDbChange);
-  els.prefixFilter.addEventListener('input', debouncedSearch);
+  els.prefixFilter.addEventListener('input', function () {
+    syncSearchFields(false);
+    debouncedSearch();
+  });
   els.prefixFilter.addEventListener('keydown', function (ev) {
     if (ev.key === 'Enter') loadKeys();
   });
+  if (els.headerSearch) {
+    els.headerSearch.addEventListener('input', function () {
+      syncSearchFields(true);
+      debouncedSearch();
+    });
+    els.headerSearch.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter') loadKeys();
+    });
+  }
   els.editValue.addEventListener('input', updateValueSize);
+
+  if (els.settingsDbSelect) {
+    els.settingsDbSelect.addEventListener('change', function () {
+      els.dbSelect.value = els.settingsDbSelect.value;
+      onDbChange();
+    });
+  }
+  if (els.btnSettingsRefresh) {
+    els.btnSettingsRefresh.addEventListener('click', refreshAll);
+  }
 
   document.querySelectorAll('.view-tab').forEach(function (tab) {
     tab.addEventListener('click', function () {
