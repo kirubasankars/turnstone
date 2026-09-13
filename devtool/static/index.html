@@ -8,11 +8,43 @@
   <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
+  <div class="global-bar" data-testid="summary-bar" aria-live="polite">
+    <span class="global-bar-label">Global Status Bar</span>
+    <span class="global-bar-sep">|</span>
+    <span class="global-bar-item">
+      <span class="status-dot state" id="global-state-dot"></span>
+      <span id="db-state" data-testid="db-state">—</span>
+    </span>
+    <span class="global-bar-sep">|</span>
+    <span class="global-bar-item">
+      <span class="status-dot txs"></span>
+      Active Txs <span id="summary-txs" data-testid="summary-txs" class="mono">—</span>
+    </span>
+    <span class="global-bar-sep">|</span>
+    <span class="global-bar-item">
+      Updated <span id="last-updated" data-testid="last-updated">—</span>
+    </span>
+    <span class="global-bar-keys" hidden>
+      Keys <span id="summary-keys" data-testid="summary-keys">—</span>
+    </span>
+  </div>
+
   <header class="app-header" data-testid="app-header">
     <div class="brand">
-      <h1><span>Turnstone</span> Devtool</h1>
+      <span class="brand-logo" aria-hidden="true">T</span>
+      <h1>Turnstone Devtool</h1>
     </div>
     <div class="header-actions">
+      <label class="search-field" for="header-search">
+        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C8.01 14 6 11.99 6 9.5S8.01 5 10.5 5 15 7.01 15 9.5 12.99 14 10.5 14z"/></svg>
+        <input id="header-search" type="search" placeholder="Search keys…" autocomplete="off" aria-label="Search keys">
+      </label>
+      <button type="button" class="icon-btn" aria-label="Notifications" disabled>
+        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22c1.1 0 2-.9 2-2h-4c0 1.1.9 2 2 2zm6-6v-5c0-3.07-1.63-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.64 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2z"/></svg>
+      </button>
+      <button type="button" class="icon-btn" aria-label="Profile" disabled>
+        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>
+      </button>
       <label class="field-inline" for="db-select">
         <span class="field-label">Database</span>
         <select id="db-select" data-testid="db-select" aria-label="Select database"></select>
@@ -23,41 +55,106 @@
     </div>
   </header>
 
-  <div class="summary-bar" data-testid="summary-bar" aria-live="polite">
-    <div class="summary-item">
-      <span class="summary-label">State</span>
-      <span id="db-state" data-testid="db-state" class="summary-value">—</span>
-    </div>
-    <div class="summary-item">
-      <span class="summary-label">Keys</span>
-      <span id="summary-keys" data-testid="summary-keys" class="summary-value mono">—</span>
-    </div>
-    <div class="summary-item">
-      <span class="summary-label">Active txs</span>
-      <span id="summary-txs" data-testid="summary-txs" class="summary-value mono">—</span>
-    </div>
-    <div class="summary-item summary-muted">
-      <span class="summary-label">Updated</span>
-      <span id="last-updated" data-testid="last-updated" class="summary-value">—</span>
-    </div>
-  </div>
-
   <nav class="view-tabs" data-testid="view-tabs" aria-label="Sections">
-    <button type="button" class="view-tab active" data-view="data" data-testid="tab-data">Keys</button>
-    <button type="button" class="view-tab" data-view="monitor" data-testid="tab-monitor">Monitor</button>
+    <button type="button" class="view-tab" data-view="dashboard" data-testid="tab-monitor">
+      <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z"/></svg>
+      <span>Dashboard Overview</span>
+    </button>
+    <button type="button" class="view-tab active" data-view="data" data-testid="tab-data">
+      <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M10 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/></svg>
+      <span>Key Browser</span>
+    </button>
+    <button type="button" class="view-tab" data-view="editor" data-testid="tab-editor">
+      <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/></svg>
+      <span>Editor</span>
+    </button>
+    <button type="button" class="view-tab" data-view="prometheus" data-testid="tab-prometheus">
+      <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M13.5.67s.74 2.65.74 4.8c0 2.06-1.35 3.73-3.41 3.73-2.07 0-3.63-1.67-3.63-3.73 0-2.15.74-4.8.74-4.8H11v14.51H6.5c-2.5 0-4.5-2-4.5-4.5S4 10.51 6.5 10.51H11V.67h2.5z"/></svg>
+      <span>Prometheus Metrics</span>
+    </button>
+    <button type="button" class="view-tab" data-view="settings" data-testid="tab-settings">
+      <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M19.14 12.94c.04-.31.06-.63.06-.94 0-.31-.02-.63-.06-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.49.49 0 0 0-.59-.22l-2.39.96a7.02 7.02 0 0 0-1.63-.94l-.36-2.54A.49.49 0 0 0 14 2h-4a.49.49 0 0 0-.49.42l-.36 2.54c-.59.24-1.13.56-1.63.94l-2.39-.96a.49.49 0 0 0-.59.22L2.62 8.04a.49.49 0 0 0 .12.61l2.03 1.58c-.04.31-.06.63-.06.94s.02.63.06.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.04.7 1.63.94l.36 2.54c.05.28.27.48.49.48h4c.22 0 .44-.2.49-.48l.36-2.54c.59-.24 1.13-.56 1.63-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32a.49.49 0 0 0-.12-.61l-2.03-1.58zM12 15.6A3.6 3.6 0 1 1 12 8.4a3.6 3.6 0 0 1 0 7.2z"/></svg>
+      <span>Settings</span>
+    </button>
   </nav>
 
   <main class="app-main" data-testid="app-main">
-    <div class="work-area view-panel active" data-view-panel="data" data-testid="panel-data">
-      <section class="panel panel-keys" data-testid="panel-keys">
-        <div class="panel-head">
+    <div class="dashboard-area view-panel" data-view-panel="dashboard" data-testid="panel-monitor">
+      <div class="dashboard-grid">
+        <section class="card card-overview" data-testid="card-overview">
+          <div class="card-head"><h2>Overview</h2></div>
+          <div class="card-body overview-metrics">
+            <div class="overview-stat">
+              <span class="stat-label">Keys</span>
+              <span class="stat-value mono" id="overview-keys">—</span>
+            </div>
+            <div class="overview-stat">
+              <span class="stat-label">Active Txs</span>
+              <span class="stat-value mono" id="overview-txs">—</span>
+            </div>
+            <div class="overview-stat overview-state">
+              <span class="stat-label">State</span>
+              <span id="overview-state"></span>
+            </div>
+            <div class="overview-stat overview-updated">
+              <span class="stat-label">Updated</span>
+              <span class="stat-value" id="overview-updated">—</span>
+            </div>
+          </div>
+        </section>
+
+        <section class="card card-server-mini" data-testid="card-server-mini">
+          <div class="card-head"><h2>Server Overview</h2></div>
+          <div class="card-body server-mini">
+            <span>Live Connection</span>
+            <span class="live-pill" data-testid="metrics-indicator">
+              <span class="dot ok" id="metrics-dot"></span> Live
+            </span>
+          </div>
+        </section>
+
+        <section class="card card-wide" data-testid="panel-stats">
+          <div class="card-head">
+            <h2>Database</h2>
+            <span id="key-count" data-testid="key-count" class="badge">0 keys</span>
+          </div>
+          <div class="card-body" id="db-stats" data-testid="db-stats">
+            <p class="empty-state"><span class="empty-title">Loading…</span></p>
+          </div>
+        </section>
+
+        <section class="card" data-testid="panel-server-metrics">
+          <div class="card-head">
+            <h2>Server</h2>
+            <span class="live-pill"><span class="dot ok"></span> Live</span>
+          </div>
+          <div class="card-body" id="server-metrics" data-testid="server-metrics">
+            <p class="empty-state"><span class="empty-title">Loading…</span></p>
+          </div>
+        </section>
+
+        <section class="card card-wide card-prom" data-testid="panel-db-metrics">
+          <div class="card-head">
+            <span class="prom-logo" aria-hidden="true">🔥</span>
+            <h2>Prometheus</h2>
+          </div>
+          <div class="card-body" id="db-metrics" data-testid="db-metrics">
+            <p class="empty-state"><span class="empty-title">Loading…</span></p>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <div class="data-area view-panel active" data-view-panel="data" data-testid="panel-data">
+      <section class="card panel-keys" data-testid="panel-keys">
+        <div class="card-head">
           <h2>Key browser</h2>
-          <span id="key-count" data-testid="key-count" class="badge">0 keys</span>
+          <span class="badge badge-muted" id="key-count-inline">0 keys</span>
         </div>
-        <div class="panel-body">
+        <div class="card-body">
           <div class="search-row" data-testid="key-toolbar">
             <input id="prefix-filter" data-testid="prefix-filter" type="search" placeholder="Search by prefix…" autocomplete="off" aria-label="Filter keys by prefix">
-            <button type="button" class="btn secondary" id="btn-search-keys" data-testid="btn-search-keys" title="Search now">Search</button>
+            <button type="button" class="btn secondary" id="btn-search-keys" data-testid="btn-search-keys">Search</button>
           </div>
           <div class="key-list" id="key-list" data-testid="key-list" role="listbox" aria-label="Keys">
             <p class="empty-state">
@@ -69,9 +166,9 @@
         </div>
       </section>
 
-      <section class="panel panel-editor" data-testid="panel-editor">
-        <div class="panel-head"><h2>Editor</h2></div>
-        <div class="panel-body editor">
+      <section class="card panel-editor" data-testid="panel-editor">
+        <div class="card-head"><h2>Editor</h2></div>
+        <div class="card-body editor">
           <label class="field" for="edit-key">
             <span class="field-label">Key</span>
             <input id="edit-key" data-testid="edit-key" type="text" placeholder="e.g. user:123" autocomplete="off" spellcheck="false">
@@ -95,30 +192,37 @@
       </section>
     </div>
 
-    <div class="monitor-area view-panel" data-view-panel="monitor" data-testid="panel-monitor">
-      <section class="panel" data-testid="panel-stats">
-        <div class="panel-head"><h2>Database</h2></div>
-        <div class="panel-body" id="db-stats" data-testid="db-stats">
+    <div class="editor-area view-panel" data-view-panel="editor">
+      <section class="card panel-editor-standalone" data-testid="panel-editor-standalone">
+        <div class="card-head"><h2>Editor</h2></div>
+        <div class="card-body editor editor-duplicate-hint">
+          <p class="empty-hint">Use the editor in the Key Browser tab, or edit below.</p>
+        </div>
+      </section>
+    </div>
+
+    <div class="prom-area view-panel" data-view-panel="prometheus" data-testid="panel-prometheus">
+      <section class="card card-wide card-prom">
+        <div class="card-head">
+          <span class="prom-logo" aria-hidden="true">🔥</span>
+          <h2>Prometheus Metrics</h2>
+        </div>
+        <div class="card-body" id="db-metrics-prom" data-testid="db-metrics-prom">
           <p class="empty-state"><span class="empty-title">Loading…</span></p>
         </div>
       </section>
+    </div>
 
-      <section class="panel" data-testid="panel-server-metrics">
-        <div class="panel-head">
-          <h2>Server</h2>
-          <span class="live-indicator" data-testid="metrics-indicator">
-            <span class="dot" id="metrics-dot"></span>Live
-          </span>
-        </div>
-        <div class="panel-body" id="server-metrics" data-testid="server-metrics">
-          <p class="empty-state"><span class="empty-title">Loading…</span></p>
-        </div>
-      </section>
-
-      <section class="panel panel-wide" data-testid="panel-db-metrics">
-        <div class="panel-head"><h2>Prometheus</h2></div>
-        <div class="panel-body" id="db-metrics" data-testid="db-metrics">
-          <p class="empty-state"><span class="empty-title">Loading…</span></p>
+    <div class="settings-area view-panel" data-view-panel="settings" data-testid="panel-settings">
+      <section class="card">
+        <div class="card-head"><h2>Settings</h2></div>
+        <div class="card-body settings-body">
+          <label class="field" for="settings-db-select">
+            <span class="field-label">Default database</span>
+            <select id="settings-db-select" aria-label="Default database"></select>
+          </label>
+          <p class="empty-hint">Devtool binds to localhost only. Use <code>--devtool-addr</code> to change the listen address.</p>
+          <button type="button" class="btn secondary" id="btn-settings-refresh">Refresh all data</button>
         </div>
       </section>
     </div>
