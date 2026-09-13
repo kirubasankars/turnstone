@@ -3,14 +3,12 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root of this source tree.
 
-package devtool
+package console
 
 import (
 	"encoding/json"
-	"io"
 	"log/slog"
 	"net/http"
-	"strconv"
 	"strings"
 
 	"turnstone/database"
@@ -136,13 +134,6 @@ func (s *httpServer) handleDatabase(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.handleDBStats(w, db, dbName)
-	case "keys":
-		if len(parts) == 2 {
-			s.handleKeyList(w, r, db)
-			return
-		}
-		key := strings.Join(parts[2:], "/")
-		s.handleKeyValue(w, r, dbName, key)
 	default:
 		s.writeError(w, http.StatusNotFound, "not found")
 	}
@@ -150,97 +141,35 @@ func (s *httpServer) handleDatabase(w http.ResponseWriter, r *http.Request) {
 
 func (s *httpServer) handleDBStats(w http.ResponseWriter, db *database.Database, dbName string) {
 	stats := db.Stats()
+	detail := db.StorageDetail()
 	conns := int64(0)
 	if s.serverStats != nil {
 		conns = s.serverStats.DatabaseConns(dbName)
 	}
 	state := db.GetState()
 	s.writeJSON(w, http.StatusOK, map[string]any{
-		"db":                  dbName,
-		"state":               state,
-		"key_count":           stats.KeyCount,
-		"conflicts":           stats.Conflicts,
-		"active_connections":  conns,
-		"log_bytes":           stats.LogSize,
-		"log_allocated_bytes": stats.LogAllocated,
-		"active_txs":          stats.ActiveTxs,
-		"replica_lag":         stats.ReplicaLag,
-		"uptime":              stats.Uptime,
-		"min_replicas":        db.MinReplicas(),
+		"db":                           dbName,
+		"state":                        state,
+		"key_count":                    stats.KeyCount,
+		"conflicts":                    stats.Conflicts,
+		"active_connections":           conns,
+		"log_bytes":                    stats.LogSize,
+		"log_allocated_bytes":          stats.LogAllocated,
+		"active_txs":                   stats.ActiveTxs,
+		"replica_lag":                  stats.ReplicaLag,
+		"uptime":                       stats.Uptime,
+		"min_replicas":                 db.MinReplicas(),
+		"index_arena_bytes":            detail.IndexArenaBytes,
+		"index_allocated_bytes":        detail.IndexAllocatedBytes,
+		"index_live_bytes":             detail.IndexLiveBytes,
+		"wal_live_bytes":               detail.WalLiveBytes,
+		"wal_garbage_bytes":            detail.WalGarbageBytes,
+		"wal_segments":                 db.WalSegmentCount(),
+		"hash_shards":                  detail.HashShards,
+		"hash_shards_compacted":        stats.HashShardsCompacted,
+		"hash_compact_bytes_reclaimed": stats.HashCompactBytesReclaimed,
+		"hash_compact_unix":            stats.HashCompactUnix,
 	})
-}
-
-func (s *httpServer) handleKeyList(w http.ResponseWriter, r *http.Request, db *database.Database) {
-	if r.Method != http.MethodGet {
-		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	prefix := r.URL.Query().Get("prefix")
-	cursor, _ := strconv.Atoi(r.URL.Query().Get("cursor"))
-	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	if limit == 0 {
-		limit = 100
-	}
-	keys, err := db.ListKeys(prefix, cursor, limit)
-	if err != nil {
-		s.writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	nextCursor := cursor + len(keys)
-	s.writeJSON(w, http.StatusOK, map[string]any{
-		"keys":        keys,
-		"cursor":      cursor,
-		"next_cursor": nextCursor,
-		"has_more":    len(keys) == limit,
-	})
-}
-
-func (s *httpServer) handleKeyValue(w http.ResponseWriter, r *http.Request, dbName, key string) {
-	db := s.stores[dbName]
-	switch r.Method {
-	case http.MethodGet:
-		value, err := getKey(db, key)
-		if err != nil {
-			status, msg := mapDataError(err)
-			s.writeError(w, status, msg)
-			return
-		}
-		s.writeJSON(w, http.StatusOK, map[string]any{"key": key, "value": string(value)})
-	case http.MethodPut:
-		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 4*1024*1024+1024))
-		if err != nil {
-			s.writeError(w, http.StatusBadRequest, "invalid body")
-			return
-		}
-		value := extractValue(body, r.Header.Get("Content-Type"))
-		if err := setKey(db, key, value); err != nil {
-			status, msg := mapDataError(err)
-			s.writeError(w, status, msg)
-			return
-		}
-		w.WriteHeader(http.StatusNoContent)
-	case http.MethodDelete:
-		if err := delKey(db, key); err != nil {
-			status, msg := mapDataError(err)
-			s.writeError(w, status, msg)
-			return
-		}
-		w.WriteHeader(http.StatusNoContent)
-	default:
-		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-	}
-}
-
-func extractValue(body []byte, contentType string) []byte {
-	if strings.Contains(contentType, "application/json") {
-		var payload struct {
-			Value string `json:"value"`
-		}
-		if err := json.Unmarshal(body, &payload); err == nil {
-			return []byte(payload.Value)
-		}
-	}
-	return body
 }
 
 func (s *httpServer) handleMetrics(w http.ResponseWriter, r *http.Request) {

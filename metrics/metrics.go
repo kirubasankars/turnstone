@@ -37,14 +37,23 @@ type TurnstoneCollector struct {
 	totalActiveTxs *prometheus.Desc
 
 	// Per-database metrics
-	dbConnections  *prometheus.Desc
-	dbActiveTxs    *prometheus.Desc
-	dbConflicts    *prometheus.Desc
-	dbOffset       *prometheus.Desc
-	dbReplicaLag   *prometheus.Desc
-	dbLogBytes     *prometheus.Desc
-	dbLogAllocated *prometheus.Desc
-	dbKeyCount     *prometheus.Desc
+	dbConnections          *prometheus.Desc
+	dbActiveTxs            *prometheus.Desc
+	dbConflicts            *prometheus.Desc
+	dbOffset               *prometheus.Desc
+	dbReplicaLag           *prometheus.Desc
+	dbReplicas             *prometheus.Desc
+	dbLogBytes             *prometheus.Desc
+	dbLogAllocated         *prometheus.Desc
+	dbKeyCount             *prometheus.Desc
+	dbWalSegments          *prometheus.Desc
+	dbHashShards           *prometheus.Desc
+	dbIndexArenaBytes      *prometheus.Desc
+	dbIndexAllocatedBytes  *prometheus.Desc
+	dbIndexLiveBytes       *prometheus.Desc
+	dbHashCompacted        *prometheus.Desc
+	dbHashCompactReclaimed *prometheus.Desc
+	dbHashCompactUnix      *prometheus.Desc
 }
 
 func NewTurnstoneCollector(stores map[string]*database.Database, stats ServerStatsProvider) *TurnstoneCollector {
@@ -54,18 +63,27 @@ func NewTurnstoneCollector(stores map[string]*database.Database, stats ServerSta
 
 		// Server Wide
 		activeConns:    newDesc("server", "connections_active", "Active connections"),
-		totalConns:     newDesc("server", "connections_accepted_total", "Total connections"),
+		totalConns:     newDesc("server", "connections_accepted_total", "Connections that started a handler"),
 		totalActiveTxs: newDesc("server", "transactions_active", "Total active transactions across server"),
 
 		// Per Database
-		dbConnections:  newDescWithLabels("db", "connections", "Active connections to this database", []string{"db"}),
-		dbActiveTxs:    newDescWithLabels("db", "active_txs", "Active transactions in database", []string{"db"}),
-		dbConflicts:    newDescWithLabels("db", "conflicts_total", "Total transaction conflicts in database", []string{"db"}),
-		dbOffset:       newDescWithLabels("db", "offset", "Exclusive end byte offset of the WAL", []string{"db"}),
-		dbReplicaLag:   newDescWithLabels("db", "replica_lag", "Lag of the slowest replica in bytes", []string{"db"}),
-		dbLogBytes:     newDescWithLabels("db", "log_bytes", "Logical size of the WAL in bytes", []string{"db"}),
-		dbLogAllocated: newDescWithLabels("db", "log_allocated_bytes", "Allocated on-disk bytes for WAL segments", []string{"db"}),
-		dbKeyCount:     newDescWithLabels("db", "key_count", "Approximate number of live keys in database", []string{"db"}),
+		dbConnections:          newDescWithLabels("db", "connections", "Active connections currently selected on this database", []string{"db"}),
+		dbActiveTxs:            newDescWithLabels("db", "active_txs", "Active transactions in database", []string{"db"}),
+		dbConflicts:            newDescWithLabels("db", "conflicts_total", "Total transaction conflicts in database", []string{"db"}),
+		dbOffset:               newDescWithLabels("db", "offset", "Exclusive end byte offset of the WAL", []string{"db"}),
+		dbReplicaLag:           newDescWithLabels("db", "replica_lag", "Lag of the slowest server-role replica in bytes; 0 if none", []string{"db"}),
+		dbReplicas:             newDescWithLabels("db", "replicas", "Server-role replication slots (connected or not)", []string{"db"}),
+		dbLogBytes:             newDescWithLabels("db", "log_bytes", "Retained WAL LSN span in bytes (write head minus oldest segment base)", []string{"db"}),
+		dbLogAllocated:         newDescWithLabels("db", "log_allocated_bytes", "Allocated on-disk bytes for WAL segments", []string{"db"}),
+		dbKeyCount:             newDescWithLabels("db", "key_count", "Approximate number of live keys in database", []string{"db"}),
+		dbWalSegments:          newDescWithLabels("db", "wal_segments", "Number of WAL segment files", []string{"db"}),
+		dbHashShards:           newDescWithLabels("db", "hash_shards", "Hash-index shards that currently hold keys", []string{"db"}),
+		dbIndexArenaBytes:      newDescWithLabels("db", "index_arena_bytes", "Bump-allocated hash-index key and version bytes", []string{"db"}),
+		dbIndexAllocatedBytes:  newDescWithLabels("db", "index_allocated_bytes", "Allocated hash-index shard buffer bytes (header, slot table, and capacity)", []string{"db"}),
+		dbIndexLiveBytes:       newDescWithLabels("db", "index_live_bytes", "Estimated live hash-index key and version payload bytes", []string{"db"}),
+		dbHashCompacted:        newDescWithLabels("db", "hash_shards_compacted_total", "Hash-index shards compacted by index GC", []string{"db"}),
+		dbHashCompactReclaimed: newDescWithLabels("db", "index_compact_bytes_reclaimed_total", "Bump-arena bytes reclaimed by hash-index compaction", []string{"db"}),
+		dbHashCompactUnix:      newDescWithLabels("db", "hash_compact_last_timestamp_seconds", "Unix time of last hash-index compaction; 0 if never", []string{"db"}),
 	}
 }
 
@@ -86,9 +104,18 @@ func (c *TurnstoneCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.dbConflicts
 	ch <- c.dbOffset
 	ch <- c.dbReplicaLag
+	ch <- c.dbReplicas
 	ch <- c.dbLogBytes
 	ch <- c.dbLogAllocated
 	ch <- c.dbKeyCount
+	ch <- c.dbWalSegments
+	ch <- c.dbHashShards
+	ch <- c.dbIndexArenaBytes
+	ch <- c.dbIndexAllocatedBytes
+	ch <- c.dbIndexLiveBytes
+	ch <- c.dbHashCompacted
+	ch <- c.dbHashCompactReclaimed
+	ch <- c.dbHashCompactUnix
 }
 
 func (c *TurnstoneCollector) Collect(ch chan<- prometheus.Metric) {
@@ -111,9 +138,19 @@ func (c *TurnstoneCollector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(c.dbConflicts, prometheus.CounterValue, float64(stats.Conflicts), name)
 		ch <- prometheus.MustNewConstMetric(c.dbOffset, prometheus.GaugeValue, float64(stats.Offset), name)
 		ch <- prometheus.MustNewConstMetric(c.dbReplicaLag, prometheus.GaugeValue, float64(stats.ReplicaLag), name)
+		ch <- prometheus.MustNewConstMetric(c.dbReplicas, prometheus.GaugeValue, float64(stats.ServerReplicas), name)
 		ch <- prometheus.MustNewConstMetric(c.dbLogBytes, prometheus.GaugeValue, float64(stats.LogSize), name)
 		ch <- prometheus.MustNewConstMetric(c.dbLogAllocated, prometheus.GaugeValue, float64(stats.LogAllocated), name)
 		ch <- prometheus.MustNewConstMetric(c.dbKeyCount, prometheus.GaugeValue, float64(stats.KeyCount), name)
+		ch <- prometheus.MustNewConstMetric(c.dbWalSegments, prometheus.GaugeValue, float64(db.WalSegmentCount()), name)
+		hash := db.IndexHashMetrics()
+		ch <- prometheus.MustNewConstMetric(c.dbHashShards, prometheus.GaugeValue, float64(hash.ShardsUsed), name)
+		ch <- prometheus.MustNewConstMetric(c.dbIndexArenaBytes, prometheus.GaugeValue, float64(hash.ArenaBytes), name)
+		ch <- prometheus.MustNewConstMetric(c.dbIndexAllocatedBytes, prometheus.GaugeValue, float64(hash.AllocatedBytes), name)
+		ch <- prometheus.MustNewConstMetric(c.dbIndexLiveBytes, prometheus.GaugeValue, float64(hash.LiveBytes), name)
+		ch <- prometheus.MustNewConstMetric(c.dbHashCompacted, prometheus.CounterValue, float64(stats.HashShardsCompacted), name)
+		ch <- prometheus.MustNewConstMetric(c.dbHashCompactReclaimed, prometheus.CounterValue, float64(stats.HashCompactBytesReclaimed), name)
+		ch <- prometheus.MustNewConstMetric(c.dbHashCompactUnix, prometheus.GaugeValue, float64(stats.HashCompactUnix), name)
 	}
 }
 

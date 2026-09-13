@@ -1,5 +1,5 @@
 {
-  "name": "turnstone-devtool-e2e",
+  "name": "turnstone-console-e2e",
   "private": true,
   "scripts": {
     "test": "playwright test",

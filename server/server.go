@@ -204,9 +204,9 @@ func (s *Server) Run(ctx context.Context) error {
 			continue
 		}
 
-		atomic.AddUint64(&s.totalConns, 1)
 		select {
 		case s.sem <- struct{}{}:
+			atomic.AddUint64(&s.totalConns, 1)
 			atomic.AddInt64(&s.activeConns, 1)
 			s.wg.Add(1)
 			go s.handleConnection(ctx, conn)

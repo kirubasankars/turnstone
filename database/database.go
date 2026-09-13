@@ -25,15 +25,19 @@ import (
 
 // Stats holds basic metrics.
 type Stats struct {
-	ActiveTxs    int
-	Uptime       string
-	Offset       int64
-	Conflicts    uint64
-	ReplicaLag   uint64 // lag of the slowest connected consumer in bytes
-	LogSize      int64  // logical WAL size (global write head)
-	LogAllocated int64  // allocated on-disk WAL bytes (all segments)
-	KeyCount     int64
-	Replicas     []ReplicaInfo
+	ActiveTxs                 int
+	Uptime                    string
+	Offset                    int64
+	Conflicts                 uint64
+	ReplicaLag                uint64 // lag of the slowest server-role replica in bytes; 0 if none
+	LogSize                   int64  // retained WAL LSN span (write head minus oldest segment base)
+	LogAllocated              int64  // allocated on-disk WAL bytes (all segments)
+	KeyCount                  int64
+	HashShardsCompacted       uint64
+	HashCompactBytesReclaimed uint64
+	HashCompactUnix           int64
+	ServerReplicas            int // server-role replication slots (connected or not)
+	Replicas                  []ReplicaInfo
 }
 
 // ReplicaInfo is a point-in-time view of one replication slot.
@@ -499,6 +503,7 @@ func (s *Database) Stats() Stats {
 	head := s.LastLogOffset()
 
 	maxLag := uint64(0)
+	serverReplicas := 0
 	replicas := make([]ReplicaInfo, 0, len(s.replicas))
 
 	s.mu.Lock()
@@ -507,8 +512,11 @@ func (s *Database) Stats() Stats {
 		if head > r.Offset {
 			lag = head - r.Offset
 		}
-		if lag > maxLag {
-			maxLag = lag
+		if r.Role == ReplicaRoleServer {
+			serverReplicas++
+			if lag > maxLag {
+				maxLag = lag
+			}
 		}
 		replicas = append(replicas, ReplicaInfo{
 			ID:        id,
@@ -526,16 +534,77 @@ func (s *Database) Stats() Stats {
 	})
 
 	return Stats{
-		ActiveTxs:    s.DB.ActiveTransactionCount(),
-		Uptime:       time.Since(s.startTime).Round(time.Second).String(),
-		Offset:       int64(head),
-		Conflicts:    s.DB.GetConflicts(),
-		ReplicaLag:   maxLag,
-		LogSize:      logical,
-		LogAllocated: allocated,
-		KeyCount:     keyCount,
-		Replicas:     replicas,
+		ActiveTxs:                 s.DB.ActiveTransactionCount(),
+		Uptime:                    time.Since(s.startTime).Round(time.Second).String(),
+		Offset:                    int64(head),
+		Conflicts:                 s.DB.GetConflicts(),
+		ReplicaLag:                maxLag,
+		LogSize:                   logical,
+		LogAllocated:              allocated,
+		KeyCount:                  keyCount,
+		HashShardsCompacted:       s.DB.HashShardsCompacted(),
+		HashCompactBytesReclaimed: s.DB.HashCompactBytesReclaimed(),
+		HashCompactUnix:           s.DB.HashCompactUnix(),
+		ServerReplicas:            serverReplicas,
+		Replicas:                  replicas,
 	}
+}
+
+// StorageDetail is WAL-segment and index GC usage for the Console. It walks
+// the MVCC index, so callers must not use it on the Prometheus scrape path.
+type StorageDetail struct {
+	HashShards          int
+	IndexArenaBytes     uint64
+	IndexAllocatedBytes uint64
+	IndexLiveBytes      uint64
+	WalLiveBytes        int64
+	WalGarbageBytes     int64
+	Segments            []engine.WalSegmentInfo
+}
+
+// StorageDetail returns WAL live/garbage totals and index arena totals.
+func (s *Database) StorageDetail() StorageDetail {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	if s.DB == nil {
+		return StorageDetail{Segments: []engine.WalSegmentInfo{}}
+	}
+	hash := s.DB.IndexHashMetrics()
+	wal := s.DB.WalSegmentMetrics()
+	segments := wal.Segments
+	if segments == nil {
+		segments = []engine.WalSegmentInfo{}
+	}
+	return StorageDetail{
+		HashShards:          hash.ShardsUsed,
+		IndexArenaBytes:     hash.ArenaBytes,
+		IndexAllocatedBytes: hash.AllocatedBytes,
+		IndexLiveBytes:      hash.LiveBytes,
+		WalLiveBytes:        wal.LiveBytes,
+		WalGarbageBytes:     wal.GarbageBytes,
+		Segments:            segments,
+	}
+}
+
+// IndexHashMetrics returns nonempty hash-shard count and arena/allocated/live totals.
+// Unlike StorageDetail, this does not walk WAL frames.
+func (s *Database) IndexHashMetrics() engine.IndexHashMetrics {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	if s.DB == nil {
+		return engine.IndexHashMetrics{}
+	}
+	return s.DB.IndexHashMetrics()
+}
+
+// WalSegmentCount returns the number of WAL segment files.
+func (s *Database) WalSegmentCount() int {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	if s.DB == nil {
+		return 0
+	}
+	return s.DB.WalSegmentCount()
 }
 
 // GetReplicaSignalChannel returns the kill-switch channel for a specific replica ID.

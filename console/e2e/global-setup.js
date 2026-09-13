@@ -11,7 +11,7 @@ const path = require('path');
 const ROOT = path.join(__dirname, '..', '..');
 const HOME = path.join(__dirname, '.testdata');
 const BIN = path.join(ROOT, 'bin', 'turnstone');
-const DEVTOOL_URL = 'http://127.0.0.1:18080';
+const CONSOLE_URL = 'http://127.0.0.1:18080';
 const PID_FILE = path.join(__dirname, '.server-pid');
 
 function waitFor(url, attempts) {
@@ -64,7 +64,7 @@ module.exports = async function globalSetup() {
   var logFile = fs.openSync(path.join(__dirname, 'server.log'), 'w');
   var proc = spawn(BIN, [
     'server', '--home', HOME, '--dev',
-    '--devtool-addr', '127.0.0.1:18080',
+    '--console-addr', '127.0.0.1:18080',
   ], {
     cwd: ROOT,
     stdio: ['ignore', logFile, logFile],
@@ -73,7 +73,7 @@ module.exports = async function globalSetup() {
   proc.unref();
 
   fs.writeFileSync(PID_FILE, String(proc.pid));
-  process.env.DEVTOOL_URL = DEVTOOL_URL;
+  process.env.CONSOLE_URL = CONSOLE_URL;
 
-  await waitFor(DEVTOOL_URL);
+  await waitFor(CONSOLE_URL);
 };

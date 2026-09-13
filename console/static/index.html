@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <title>Turnstone Console</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="app-header" data-testid="app-header">
+      <div class="brand">
+        <span class="brand-logo" aria-hidden="true">
+          <svg viewBox="0 0 32 32" fill="none">
+            <rect width="32" height="32" fill="url(#mark)"/>
+            <path d="M9 10.5h14M16 10.5v11" stroke="#041210" stroke-width="2.4" stroke-linecap="square"/>
+            <defs>
+              <linearGradient id="mark" x1="4" y1="2" x2="28" y2="30" gradientUnits="userSpaceOnUse">
+                <stop stop-color="#5eead4"/>
+                <stop offset="1" stop-color="#14b8a6"/>
+              </linearGradient>
+            </defs>
+          </svg>
+        </span>
+        <div class="brand-copy">
+          <h1>Turnstone Console</h1>
+          <p class="brand-tag">Local database workspace</p>
+        </div>
+      </div>
+      <div class="header-actions">
+        <label class="field-inline" for="db-select">
+          <span class="field-label">Database</span>
+          <select id="db-select" data-testid="db-select" aria-label="Select database"></select>
+        </label>
+        <button type="button" class="btn secondary" id="btn-refresh" data-testid="btn-refresh" title="Refresh all (R)" aria-label="Refresh all">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M17.65 6.35A7.95 7.95 0 0 0 12 4V1L7 6l5 5V7c2.76 0 5 2.24 5 5a5 5 0 0 1-8.9 3.1L6.7 16.5A8 8 0 1 0 17.65 6.35z"/></svg>
+          <span class="btn-label">Refresh</span>
+        </button>
+      </div>
+    </header>
+
+    <nav class="view-tabs" data-testid="view-tabs" aria-label="Sections">
+      <button type="button" class="view-tab active" data-view="dashboard" data-testid="tab-monitor">
+        <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z"/></svg>
+        <span>Dashboard</span>
+      </button>
+      <button type="button" class="view-tab" data-view="prometheus" data-testid="tab-prometheus">
+        <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 18.5h17v2h-17zm1.6-4.3 1.4 1.4 4-7 3.5 5.1 2.4-3.2 3.1 4.1 1.6-1.2-4.5-6-2.6 3.5-3.4-5z"/></svg>
+        <span>Metrics</span>
+      </button>
+    </nav>
+
+    <main class="app-main" data-testid="app-main">
+      <div class="dashboard-area view-panel active" data-view-panel="dashboard" data-testid="panel-monitor">
+        <section class="card card-dashboard">
+          <div class="card-head">
+            <div class="card-head-title">
+              <h2>Dashboard</h2>
+              <span id="overview-state" data-testid="db-state"></span>
+            </div>
+            <div class="dash-head-meta">
+              <span id="key-count" data-testid="key-count" class="badge">0 keys</span>
+              <span class="live-pill" data-testid="metrics-indicator">
+                <span class="dot ok" id="metrics-dot"></span> Live
+              </span>
+              <span class="dash-updated">Updated <span id="overview-updated" data-testid="overview-updated">—</span></span>
+            </div>
+          </div>
+          <div class="dash-status">
+            <div class="dash-status-item">
+              <span class="stat-label">Keys</span>
+              <span class="stat-value mono" id="overview-keys" data-testid="overview-keys">—</span>
+            </div>
+            <div class="dash-status-item">
+              <span class="stat-label">Active txs</span>
+              <span class="stat-value mono" id="overview-txs">—</span>
+            </div>
+          </div>
+          <div class="card-body dash-groups">
+            <div class="dash-group" data-testid="panel-stats">
+              <h3 class="dash-group-label">Database</h3>
+              <div id="db-stats" data-testid="db-stats">
+                <p class="empty-state"><span class="empty-title">Loading…</span></p>
+              </div>
+            </div>
+            <div class="dash-group" data-testid="panel-gc">
+              <h3 class="dash-group-label">GC</h3>
+              <div id="gc-stats" data-testid="gc-stats">
+                <p class="empty-state"><span class="empty-title">Loading…</span></p>
+              </div>
+            </div>
+            <div class="dash-group" data-testid="panel-server-metrics">
+              <h3 class="dash-group-label">Server</h3>
+              <div id="server-metrics" data-testid="server-metrics">
+                <p class="empty-state"><span class="empty-title">Loading…</span></p>
+              </div>
+            </div>
+            <div class="dash-group" data-testid="panel-db-metrics">
+              <h3 class="dash-group-label">
+                <span class="prom-logo" aria-hidden="true"></span>
+                Prometheus
+              </h3>
+              <div id="db-metrics" data-testid="db-metrics">
+                <p class="empty-state"><span class="empty-title">Loading…</span></p>
+              </div>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <div class="prom-area view-panel" data-view-panel="prometheus" data-testid="panel-prometheus">
+        <section class="card card-wide card-prom">
+          <div class="card-head">
+            <div class="card-head-title">
+              <span class="prom-logo" aria-hidden="true"></span>
+              <h2>Metrics</h2>
+            </div>
+          </div>
+          <div class="card-body" id="db-metrics-prom" data-testid="db-metrics-prom">
+            <p class="empty-state"><span class="empty-title">Loading…</span></p>
+          </div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

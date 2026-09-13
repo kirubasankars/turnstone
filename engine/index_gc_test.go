@@ -145,6 +145,49 @@ func TestDB_CompactIndex_ShrinksAfterAbortFragmentation(t *testing.T) {
 	rtx.Discard()
 }
 
+func TestIndexHashMetrics_AfterWrites(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, Options{IndexCompactOnRetention: indexCompactDisabled()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := commitKeyValue(db, []byte("hash-a"), "1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := commitKeyValue(db, []byte("hash-b"), "2"); err != nil {
+		t.Fatal(err)
+	}
+
+	m := db.IndexHashMetrics()
+	if m.ShardsUsed < 1 {
+		t.Fatalf("expected nonempty hash shards, got %+v", m)
+	}
+	if m.AllocatedBytes == 0 || m.LiveBytes == 0 {
+		t.Fatalf("expected allocated and live bytes, got %+v", m)
+	}
+	if m.AllocatedBytes <= m.LiveBytes {
+		t.Fatalf("allocated buffers should exceed live payload, got %+v", m)
+	}
+	if m.ArenaBytes == 0 {
+		t.Fatalf("expected bump arena, got %+v", m)
+	}
+	if m.ArenaBytes < m.LiveBytes {
+		t.Fatalf("bump arena should be at least live payload, got %+v", m)
+	}
+	bump, live := db.IndexArenaStats()
+	if live != m.LiveBytes {
+		t.Fatalf("live mismatch: IndexArenaStats=%d metrics=%d", live, m.LiveBytes)
+	}
+	if bump != m.ArenaBytes {
+		t.Fatalf("bump arena mismatch: IndexArenaStats=%d metrics=%d", bump, m.ArenaBytes)
+	}
+	if bump > m.AllocatedBytes {
+		t.Fatalf("bump arena %d should be within allocated %d", bump, m.AllocatedBytes)
+	}
+}
+
 func TestIndexGCContext_MinActiveSnapshotXmax(t *testing.T) {
 	ctx := IndexGCContext{
 		Readers: []IndexGCReader{

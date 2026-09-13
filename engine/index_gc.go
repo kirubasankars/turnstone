@@ -8,6 +8,7 @@ package engine
 import (
 	"math"
 	"sync/atomic"
+	"time"
 
 	"turnstone/engine/hashindex"
 )
@@ -172,11 +173,13 @@ func (db *DB) CompactIndex(ctx IndexGCContext) (IndexCompactResult, error) {
 		after += statsAfter.Shards[i].ArenaUsed
 	}
 
-	return IndexCompactResult{
+	res := IndexCompactResult{
 		ShardsCompacted: numHashShards(statsBefore),
 		ArenaBefore:     before,
 		ArenaAfter:      after,
-	}, nil
+	}
+	db.recordIndexCompact(res)
+	return res, nil
 }
 
 func numHashShards(stats hashindex.IndexStats) int {
@@ -228,11 +231,24 @@ func (db *DB) MaybeCompactIndex() (IndexCompactResult, error) {
 	if compacted == 0 {
 		return IndexCompactResult{}, nil
 	}
-	return IndexCompactResult{
+	res := IndexCompactResult{
 		ShardsCompacted: compacted,
 		ArenaBefore:     before,
 		ArenaAfter:      after,
-	}, nil
+	}
+	db.recordIndexCompact(res)
+	return res, nil
+}
+
+func (db *DB) recordIndexCompact(res IndexCompactResult) {
+	if res.ShardsCompacted <= 0 {
+		return
+	}
+	atomic.AddUint64(&db.metricsHashShardsCompacted, uint64(res.ShardsCompacted))
+	if res.ArenaBefore > res.ArenaAfter {
+		atomic.AddUint64(&db.metricsHashCompactReclaimed, res.ArenaBefore-res.ArenaAfter)
+	}
+	atomic.StoreInt64(&db.metricsHashCompactUnix, time.Now().Unix())
 }
 
 func (db *DB) indexVersionFilter(ctx IndexGCContext) hashindex.VersionFilter {
@@ -253,7 +269,38 @@ func (db *DB) indexVersionFilter(ctx IndexGCContext) hashindex.VersionFilter {
 	}
 }
 
-// IndexArenaStats returns total arena bytes and estimated live bytes.
+// IndexHashMetrics is aggregate hash-index shard usage (no per-shard breakdown).
+// ArenaBytes is bump-allocated key/version bytes (comparable to LiveBytes and
+// compact reclaimed). AllocatedBytes is shard buffer size (header, slot table,
+// and capacity). LiveBytes is estimated live key and version payload.
+type IndexHashMetrics struct {
+	ShardsUsed     int
+	ArenaBytes     uint64
+	AllocatedBytes uint64
+	LiveBytes      uint64
+}
+
+// IndexHashMetrics returns nonempty shard count plus arena, allocated, and live bytes.
+func (db *DB) IndexHashMetrics() IndexHashMetrics {
+	if db.index == nil || db.index.hash == nil {
+		return IndexHashMetrics{}
+	}
+	stats := db.index.hash.Stats()
+	var out IndexHashMetrics
+	for i := range stats.Shards {
+		st := stats.Shards[i]
+		if st.KeyCount > 0 {
+			out.ShardsUsed++
+		}
+		out.ArenaBytes += st.ArenaUsed
+		out.AllocatedBytes += st.AllocatedBytes
+		out.LiveBytes += st.LiveBytes
+	}
+	return out
+}
+
+// IndexArenaStats returns bump-allocated arena bytes and estimated live payload.
+// Compact tests and GC use this bump-pointer total, not allocated buffer size.
 func (db *DB) IndexArenaStats() (arenaUsed, liveBytes uint64) {
 	if db.index == nil || db.index.hash == nil {
 		return 0, 0

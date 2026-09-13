@@ -75,6 +75,15 @@ func TestDeleteWalSegments_RemovesSealedBelowFloor(t *testing.T) {
 	if db.log.OldestSegmentBaseLSN() < floor {
 		t.Fatalf("oldest segment base %d below floor %d", db.log.OldestSegmentBaseLSN(), floor)
 	}
+	logical, _ := db.StorageStats()
+	head := db.LastLogOffset()
+	oldest := db.log.OldestSegmentBaseLSN()
+	if logical != head-oldest {
+		t.Fatalf("retained log span %d want head-oldest %d-%d", logical, head, oldest)
+	}
+	if oldest > 0 && logical >= head {
+		t.Fatalf("retained log span %d should be below write head %d after truncate", logical, head)
+	}
 
 	rtx := db.NewTransaction(false)
 	val, err := rtx.Get(key)

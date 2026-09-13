@@ -573,10 +573,19 @@ func (l *DataLog) IsFrameBoundary(offset int64) bool {
 	return err == nil
 }
 
+// LogicalSize is the retained WAL LSN span (write head minus oldest segment base).
+// After segment delete this is smaller than WriteOffset.
 func (l *DataLog) LogicalSize() int64 {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-	return l.writeOffset
+	if len(l.segments) == 0 {
+		return 0
+	}
+	size := l.writeOffset - l.segments[0].baseLSN
+	if size < 0 {
+		return 0
+	}
+	return size
 }
 
 func (l *DataLog) AllocatedSize() int64 {

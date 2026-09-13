@@ -271,8 +271,35 @@ func TestStats_ConflictsAndStorage(t *testing.T) {
 	if stats.LogSize == 0 {
 		t.Error("expected >0 bytes log logical size")
 	}
+	if stats.LogSize != stats.Offset {
+		t.Errorf("before truncation log_bytes should equal offset, log=%d offset=%d", stats.LogSize, stats.Offset)
+	}
 	if stats.LogAllocated == 0 {
 		t.Error("expected >0 allocated log bytes")
+	}
+
+	detail := s.StorageDetail()
+	if len(detail.Segments) == 0 {
+		t.Fatal("expected at least one wal segment")
+	}
+	if detail.WalLiveBytes == 0 {
+		t.Fatal("expected wal live bytes after writes")
+	}
+	if detail.IndexAllocatedBytes <= detail.IndexLiveBytes {
+		t.Fatalf("allocated buffers should exceed live payload, allocated=%d live=%d", detail.IndexAllocatedBytes, detail.IndexLiveBytes)
+	}
+	if detail.IndexArenaBytes < detail.IndexLiveBytes {
+		t.Fatalf("bump arena should be at least live payload, arena=%d live=%d", detail.IndexArenaBytes, detail.IndexLiveBytes)
+	}
+	if detail.HashShards < 1 {
+		t.Fatalf("expected nonempty hash shards, got %d", detail.HashShards)
+	}
+	hash := s.IndexHashMetrics()
+	if hash.ShardsUsed != detail.HashShards || hash.ArenaBytes != detail.IndexArenaBytes || hash.AllocatedBytes != detail.IndexAllocatedBytes || hash.LiveBytes != detail.IndexLiveBytes {
+		t.Fatalf("IndexHashMetrics mismatch: %+v detail shards=%d arena=%d allocated=%d live=%d", hash, detail.HashShards, detail.IndexArenaBytes, detail.IndexAllocatedBytes, detail.IndexLiveBytes)
+	}
+	if s.WalSegmentCount() != len(detail.Segments) {
+		t.Fatalf("segment count %d != %d", s.WalSegmentCount(), len(detail.Segments))
 	}
 }
 
@@ -308,6 +335,9 @@ func TestDatabase_ReplicaLag(t *testing.T) {
 	if stats.Replicas[0].ID != "r1" || stats.Replicas[0].Lag != expectedLag {
 		t.Fatalf("unexpected replica info: %+v", stats.Replicas[0])
 	}
+	if stats.ServerReplicas != 1 {
+		t.Fatalf("expected 1 server replica, got %d", stats.ServerReplicas)
+	}
 }
 
 func TestDatabase_ReplicaLag_ReportsSlowestReplica(t *testing.T) {
@@ -335,6 +365,44 @@ func TestDatabase_ReplicaLag_ReportsSlowestReplica(t *testing.T) {
 	}
 	if len(stats.Replicas) != 2 {
 		t.Fatalf("expected 2 replicas, got %d", len(stats.Replicas))
+	}
+	if stats.ServerReplicas != 2 {
+		t.Fatalf("expected 2 server replicas, got %d", stats.ServerReplicas)
+	}
+}
+
+func TestDatabase_ReplicaLag_IgnoresNonServerRoles(t *testing.T) {
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	s, err := Open(context.Background(), dir, logger, 0, "none", 90)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	putKV(t, s, "k1", "v1")
+	head := s.LastLogOffset()
+	s.RegisterReplica("backup", head/2, ReplicaRoleBackup)
+	s.RegisterReplica("admin", head/3, ReplicaRoleAdmin)
+
+	putKV(t, s, "k2", "v2")
+	stats := s.Stats()
+	if stats.ReplicaLag != 0 {
+		t.Fatalf("backup/admin should not set replica_lag, got %d", stats.ReplicaLag)
+	}
+	if stats.ServerReplicas != 0 {
+		t.Fatalf("expected 0 server replicas, got %d", stats.ServerReplicas)
+	}
+
+	s.RegisterReplica("server", head, ReplicaRoleServer)
+	stats = s.Stats()
+	newHead := s.LastLogOffset()
+	want := uint64(newHead) - uint64(head)
+	if stats.ReplicaLag != want {
+		t.Fatalf("replica_lag=%d want server lag %d", stats.ReplicaLag, want)
+	}
+	if stats.ServerReplicas != 1 {
+		t.Fatalf("expected 1 server replica, got %d", stats.ServerReplicas)
 	}
 }
 
