@@ -19,7 +19,7 @@ LICENSE file in the root of this source tree.
 | Simple ops | One binary, local disk, Redis-style `SELECT <db>` namespaces |
 | Standby copies | Optional primary → follower replication per database |
 | Recovery | Physical WAL backup and restore (full + differential chains) |
-| Visibility | Prometheus metrics and a built-in devtool for local development |
+| Visibility | Prometheus metrics and a built-in Turnstone Console for local development |
 
 TurnstoneDB is a **single-node store** with **optional replication**. It is not a distributed database — there is no Raft, sharding, or automatic failover.
 
@@ -47,14 +47,14 @@ make build
 ./bin/turnstone server --home tsdata --dev
 ```
 
-**3. Use the database** — interactive CLI or devtool:
+**3. Use the database** — interactive CLI or Turnstone Console:
 
 ```bash
 # CLI
 ./bin/turnstone cli --home tsdata
 # begin → set mykey hello → commit → get mykey
 
-# Devtool (opened automatically with --dev)
+# Turnstone Console (opened automatically with --dev)
 # http://127.0.0.1:8080 — browse keys, edit values, view metrics
 ```
 
@@ -62,7 +62,7 @@ The server listens on `:6379` by default. Logical databases `0`–`N` are indepe
 
 ---
 
-## Devtool
+## Turnstone Console
 
 With `--dev`, TurnstoneDB serves a local web UI at **http://127.0.0.1:8080** (override with `--devtool-addr`).
 
@@ -71,7 +71,7 @@ With `--dev`, TurnstoneDB serves a local web UI at **http://127.0.0.1:8080** (ov
 | **Keys** | Search by prefix, browse, create, edit, and delete keys |
 | **Monitor** | Live server stats and Prometheus metrics |
 
-The devtool binds to localhost only. Use it for development and debugging — not as a production admin surface.
+Turnstone Console binds to localhost only. Use it for development and debugging — not as a production admin surface.
 
 ---
 
@@ -82,7 +82,7 @@ Full reference: **[docs/cli.md](docs/cli.md)**
 | Command | Purpose |
 | --- | --- |
 | `turnstone init` | Create home directory, TLS certs, and `turnstone.json` |
-| `turnstone server` | Run the database (`--dev` for local use + devtool) |
+| `turnstone server` | Run the database (`--dev` for local use + Turnstone Console) |
 | `turnstone cli` | Interactive REPL or `cli exec <command>` one-shot |
 | `turnstone bench` | Load and throughput benchmark |
 | `turnstone backup` | Stream a physical WAL backup from a primary |
@@ -170,7 +170,7 @@ All connections use **mTLS**. Client authorization is driven by the certificate 
 | Surface | Address | Use |
 | --- | --- | --- |
 | Prometheus | `:9090` (configurable) | Scrape server and per-database metrics |
-| Devtool | `127.0.0.1:8080` (with `--dev`) | Key browser and live dashboard |
+| Turnstone Console | `127.0.0.1:8080` (with `--dev`) | Key browser and live dashboard |
 | `stat` command | CLI (`--admin`) | JSON replication state, offsets, replica lag |
 
 ---

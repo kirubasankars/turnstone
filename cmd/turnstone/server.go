@@ -53,7 +53,7 @@ func newServerCmd() *cobra.Command {
 	}
 
 	cmd.Flags().BoolVar(&devMode, "dev", false, "Disable transaction timeouts and auto-promote all databases to PRIMARY")
-	cmd.Flags().StringVar(&devtoolAddr, "devtool-addr", "", "Address for the devtool web UI (default 127.0.0.1:8080 when --dev is set)")
+	cmd.Flags().StringVar(&devtoolAddr, "devtool-addr", "", "Address for the Turnstone Console web UI (default 127.0.0.1:8080 when --dev is set)")
 
 	return cmd
 }
