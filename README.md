@@ -7,44 +7,27 @@ LICENSE file in the root of this source tree.
 
 # TurnstoneDB
 
-**TurnstoneDB** is a persistent, transactional key-value store written in Go. Each server process holds multiple isolated databases on local disk. Optional leader-follower replication is configured explicitly per database — there is no built-in sharding, consensus, or automatic cluster failover.
+**TurnstoneDB** is a persistent, transactional key-value database in Go. Run it on a single machine, split workloads across logical databases, replicate to followers when you need redundancy, and back up the write-ahead log for disaster recovery.
 
-> **Disclaimer:** TurnstoneDB is research-quality software. It implements group commit, MVCC, and mTLS, but it is not recommended for mission-critical production use without further hardening.
+> **Disclaimer:** TurnstoneDB is research-quality software. It ships group commit, MVCC, mTLS, and physical replication, but it is not recommended for mission-critical production use without further hardening.
 
-## What it is
+## Why TurnstoneDB
 
-- A **single-node** storage engine with Redis-style `SELECT <db>` namespaces
-- **ACID transactions** with snapshot isolation and first-writer-wins key locking
-- **Optional replication** — one primary and manually attached followers per database
-
-## What it is not
-
-- Not a distributed database (no partition tolerance, no client-side routing, no Raft)
-- Not a managed cluster — failover is manual via `stepdown` / `promote` / `replicaof`
-- Not SQL — keys and opaque byte values only
-
----
-
-## Features
-
-| Area | Detail |
+| You need… | TurnstoneDB gives you… |
 | --- | --- |
-| Storage | Segmented WAL (`wal/seg-*.wal`) + global byte LSN + in-memory sharded hash index arena |
-| Durability | Eager append on `SET`/`DEL`; group fsync on `COMMIT` |
-| Retention | Scan floor, MVCC-aware segment delete, optional copy-forward and index compaction |
-| Security | mTLS on all connections; RBAC via X.509 certificate Organization |
-| Replication | Async or sync (quorum ack); byte-offset streaming from leader WAL |
-| Observability | Prometheus metrics on `:9090` |
+| Safe writes | ACID transactions with snapshot isolation |
+| Simple ops | One binary, local disk, Redis-style `SELECT <db>` namespaces |
+| Standby copies | Optional primary → follower replication per database |
+| Recovery | Physical WAL backup and restore (full + differential chains) |
+| Visibility | Prometheus metrics and a built-in devtool for local development |
+
+TurnstoneDB is a **single-node store** with **optional replication**. It is not a distributed database — there is no Raft, sharding, or automatic failover.
 
 ---
 
 ## Quick start
 
-### Prerequisites
-
-- Go 1.25+ (see `go.mod`)
-
-### Build
+**Prerequisites:** Go 1.25+ (see `go.mod`)
 
 ```bash
 git clone https://github.com/kirubasankars/turnstone.git
@@ -52,59 +35,68 @@ cd turnstone
 make build
 ```
 
-### Initialize
-
-Generate a home directory with TLS certificates and default config:
+**1. Initialize** a home directory (TLS certs + config):
 
 ```bash
-./bin/turnstone init --home tsdata --ip 192.168.1.10,myserver.local
+./bin/turnstone init --home tsdata --ip 127.0.0.1,localhost
 ```
 
-### Run
-
-```bash
-./bin/turnstone server --home tsdata
-```
-
-For local development (auto-promote all databases, no transaction timeouts):
+**2. Start the server** in development mode (auto-promote databases, no tx timeouts):
 
 ```bash
 ./bin/turnstone server --home tsdata --dev
 ```
 
-The server listens on `:6379` by default. Databases `0`–`N` are independent keyspaces (`number_of_databases` in config).
+**3. Use the database** — interactive CLI or devtool:
+
+```bash
+# CLI
+./bin/turnstone cli --home tsdata
+# begin → set mykey hello → commit → get mykey
+
+# Devtool (opened automatically with --dev)
+# http://127.0.0.1:8080 — browse keys, edit values, view metrics
+```
+
+The server listens on `:6379` by default. Logical databases `0`–`N` are independent keyspaces.
 
 ---
 
-## CLI usage
+## Devtool
 
-Full command reference: **[docs/cli.md](docs/cli.md)**
+With `--dev`, TurnstoneDB serves a local web UI at **http://127.0.0.1:8080** (override with `--devtool-addr`).
 
-The `turnstone` binary has six subcommands. All share `--home` (default `tsdata`).
+| Section | What you can do |
+| --- | --- |
+| **Keys** | Search by prefix, browse, create, edit, and delete keys |
+| **Monitor** | Live server stats and Prometheus metrics |
+
+The devtool binds to localhost only. Use it for development and debugging — not as a production admin surface.
+
+---
+
+## Everyday commands
+
+Full reference: **[docs/cli.md](docs/cli.md)**
 
 | Command | Purpose |
 | --- | --- |
 | `turnstone init` | Create home directory, TLS certs, and `turnstone.json` |
-| `turnstone server` | Run the database server (`--dev` for local use) |
+| `turnstone server` | Run the database (`--dev` for local use + devtool) |
 | `turnstone cli` | Interactive REPL or `cli exec <command>` one-shot |
 | `turnstone bench` | Load and throughput benchmark |
 | `turnstone backup` | Stream a physical WAL backup from a primary |
 | `turnstone restore` | Restore WAL backups into a new home directory |
 
 ```bash
-# Interactive client (certs loaded from --home)
-./bin/turnstone cli --home tsdata
-
-# One-shot command
+# One-shot read
 ./bin/turnstone cli exec get mykey
+
+# Admin failover (requires --admin cert)
 ./bin/turnstone cli --admin exec promote
 
 # Benchmark
 ./bin/turnstone bench --home tsdata --ops 10000 --concurrency 50
-
-# Backup / restore
-./bin/turnstone backup --home tsdata --db 1 --out backup_full
-./bin/turnstone restore --in backup_full --out restored_home
 ```
 
 All writes require a transaction (`begin` → `set`/`del` → `commit`). Admin commands (`promote`, `stepdown`, `replicaof`, `flushdb`) need `--admin`.
@@ -113,155 +105,94 @@ All writes require a transaction (`begin` → `set`/`del` → `commit`). Admin c
 
 ## Replication and failover
 
-Replication is **per database**, not whole-server. Each database follows a small state machine:
+Replication is configured **per database**. Each database follows:
 
 `UNDEFINED` → `REPLICA` → `PRIMARY`
 
-Admin commands (via `turnstone cli --admin`):
-
-| Command | Effect |
+| Admin command | Effect |
 | --- | --- |
-| `replicaof <host:port> <db>` | Follow a remote primary (REPLICA state) |
-| `stepdown` | Drain writes, sync followers, return to UNDEFINED |
+| `replicaof <host:port> <db>` | Follow a remote primary |
+| `stepdown` | Drain writes and return to `UNDEFINED` |
 | `promote [min_replicas]` | Become primary; optional sync quorum |
 
-### Manual failover (A → B)
+**Manual failover (node A → node B):**
 
 1. **Node A:** `select 1` → `stepdown`
 2. **Node B:** `select 1` → `promote`
 3. **Node A:** `select 1` → `replicaof <B>:6379 1`
 
-There is no automatic leader election. An operator must invoke failover.
+There is no automatic leader election — an operator runs failover.
+
+Sync replication (`promote N` with N > 0) waits for N follower ACKs after each commit. Backup streams do not count toward quorum.
 
 ---
 
-## Configuration (`turnstone.json`)
+## Backup and restore
+
+Back up a running primary, then restore offline into a fresh home directory:
+
+```bash
+# Full WAL backup
+./bin/turnstone backup --home tsdata --host localhost:6379 --db 1 --out backup_full
+
+# Differential backup (smaller, resumes from previous end LSN)
+./bin/turnstone backup --home tsdata --db 1 --type differential \
+  --base-meta backup_full/backup.meta --out backup_diff
+
+# Restore chain and serve
+./bin/turnstone restore --chain backup_full,backup_diff --out restored_home
+./bin/turnstone server --home restored_home --dev
+```
+
+See **[docs/cli.md](docs/cli.md)** for `backup.meta` schema, chain validation, and LSN semantics.
+
+---
+
+## Configuration
+
+Key fields in `turnstone.json`:
 
 | Field | Default | Description |
 | --- | --- | --- |
-| `id` | hostname-based | Node identifier |
 | `port` | `:6379` | Listen address |
-| `max_conns` | `1000` | Max concurrent connections |
 | `number_of_databases` | `4` | Logical databases (`0` … `N`) |
-| `log_retention` | `replication` | Purge policy: `replication` or `none` |
+| `log_retention` | `replication` | WAL purge policy: `replication` or `none` |
 | `max_disk_usage_percent` | `90` | Reject writes above this disk usage |
 | `metrics_addr` | `:9090` | Prometheus scrape address |
-| `tls_cert_file` | `certs/server.crt` | Server certificate |
-| `tls_client_cert_file` | `certs/server.crt` | Cert for outbound replication |
+
+All connections use **mTLS**. Client authorization is driven by the certificate **Organization** field.
 
 ---
 
-## Storage engine
+## Observability
 
-```
-Client SET/DEL  →  append wal/seg-*.wal  →  update sharded hash index
-Client COMMIT   →  append + fsync COMMIT  →  clog[xid] = committed
-Client GET      →  index lookup  →  ReadAt(global LSN) from WAL
-Open            →  replay WAL segments  →  rebuild index + clog
-Retention       →  scan floor  →  index compact / copy-forward / segment delete
-```
-
-### On-disk layout
-
-Each database directory contains:
-
-```
-<db>/
-  wal/
-    manifest.json    # segment list, active segment, segment size
-    seg-000001.wal   # sealed segments
-    seg-000002.wal
-    ...
-  repl.slots         # replication follower ack positions (when used)
-```
-
-### Components
-
-1. **Segmented WAL** — append-only log split into rotating segments (default **64 MiB** per segment). Each frame has a CRC32 header. A **global byte LSN** spans all segments, so index offsets and replication cursors stay stable across rotation.
-2. **In-memory index** — 256-shard hash arena (ephemeral runtime cache). Rebuilt from WAL replay on open and dropped on close. Only the WAL is durable.
-3. **In-memory clog** — transaction commit status, rebuilt during replay.
-
-### Retention and maintenance
-
-When `log_retention` is `replication` (default), a background pass raises the **scan floor** from the tightest of:
-
-- local retention mark (`MarkRetention`)
-- slowest registered follower ack
-- leader-propagated safe point
-
-Then `RunWalMaintenance()` runs, in order:
-
-1. **Index compaction** (default on) — MVCC-aware prune of stale version chains; reclaims arena space when fragmentation exceeds ~3× live bytes.
-2. **WAL copy-forward** (default on) — when allocated WAL bytes exceed ~3× live bytes, copies MVCC-visible frames into a fresh segment, remaps index offsets, then deletes old segments. Skips while write transactions are active; read-only snapshots still pin older frames.
-3. **Segment delete** — removes sealed segments at or below the effective delete floor (`min(scan floor, MVCC-visible min offset)`).
-
-Bytes below the scan floor return `ErrLogUnavailable` for `ScanLog` / replication replay. Physical deletion respects replication and snapshot constraints.
-
-### Transaction model (eager logging)
-
-Writes are logged immediately at `SET`/`DEL` time, not buffered until commit:
-
-```mermaid
-sequenceDiagram
-    participant Client
-    participant Tx
-    participant Log
-    participant Index
-    participant Clog
-    Client->>Tx: BEGIN
-    Tx->>Log: BEGIN xid
-    Client->>Tx: SET k v
-    Tx->>Log: SET xid,k,v
-    Tx->>Index: xmin=xid
-    Client->>Tx: COMMIT
-    Tx->>Log: COMMIT xid
-    Note over Log: group fsync
-    Tx->>Clog: committed
-```
-
-Notable semantics:
-
-- **Replication cursor** — handshake, acks, and retention use the exclusive-end **global byte LSN** in the WAL, not the transaction `xid`.
-- **`xid` at `BEGIN`** — a monotonic transaction id stored inside log records.
-- **First-writer-wins** — `SET`/`DEL` takes a NOWAIT key lock; conflicts return immediately, no deadlock.
-- **Read-set validation at `COMMIT`** — detects stale reads / write skew under snapshot isolation.
-- **Read-your-own-writes** — uncommitted versions with `xmin == my xid` are visible inside the transaction.
-- **Aborts are explicit** — conflicts, disconnects, and timeouts append `ABORT`; a reaper aborts transactions exceeding `MaxTxDuration`.
-
-Replication streams raw physical WAL byte ranges (possibly spanning segment boundaries) to follower replicas.
+| Surface | Address | Use |
+| --- | --- | --- |
+| Prometheus | `:9090` (configurable) | Scrape server and per-database metrics |
+| Devtool | `127.0.0.1:8080` (with `--dev`) | Key browser and live dashboard |
+| `stat` command | CLI (`--admin`) | JSON replication state, offsets, replica lag |
 
 ---
 
 ## Limitations
 
-1. **Single node** — one process, local disk. Scale-out requires application-level sharding.
-2. **Manual failover** — no Raft/Paxos; an operator runs `stepdown` / `promote`.
-3. **No lock waiting** — hot-key contention surfaces as immediate `TxConflict`; clients must retry.
-4. **On-disk format** — segmented WAL under `wal/` with a global byte LSN. Not compatible with older monolithic-log or LevelDB directory layouts.
+1. **Single node** — one process, local disk; scale-out needs application-level sharding.
+2. **Manual failover** — no Raft/Paxos; operators run `stepdown` / `promote`.
+3. **No lock waiting** — hot-key conflicts return immediately; clients must retry.
+4. **Keys and bytes only** — not SQL.
 
 ---
 
-## Codebase documentation
+## Documentation
 
-Per-package guides for learning and code review live next to the source:
-
-| Package | Guide |
+| Topic | Guide |
 | --- | --- |
-| CLI usage guide | [docs/cli.md](docs/cli.md) |
-| Overview & reading order | [docs/README.md](docs/README.md) |
-| CLI (`cmd/`) | [cmd/README.md](cmd/README.md) |
-| Binary subcommands | [cmd/turnstone/README.md](cmd/turnstone/README.md) |
+| CLI reference | [docs/cli.md](docs/cli.md) |
+| Architecture & reading order | [docs/README.md](docs/README.md) |
+| Storage engine internals | [engine/README.md](engine/README.md) |
+| Replication | [database/README.md](database/README.md), [repl/README.md](repl/README.md) |
 | Wire protocol | [protocol/README.md](protocol/README.md) |
-| Go client | [client/README.md](client/README.md) |
-| Configuration & PKI | [config/README.md](config/README.md) |
-| TCP/mTLS server | [server/README.md](server/README.md) |
-| Database + replication | [database/README.md](database/README.md) |
-| Outbound replication | [repl/README.md](repl/README.md) |
-| Storage engine | [engine/README.md](engine/README.md) |
-| Hash index | [engine/hashindex/README.md](engine/hashindex/README.md) |
-| Internal utilities | [internal/README.md](internal/README.md) |
-| Prometheus metrics | [metrics/README.md](metrics/README.md) |
-| CI | [.github/README.md](.github/README.md) |
+| Package index | [docs/README.md](docs/README.md) |
 
 ---
 
