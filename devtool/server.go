@@ -17,7 +17,7 @@ import (
 	"turnstone/metrics"
 )
 
-// Config configures the devtool HTTP server.
+// Config configures the Turnstone Console HTTP server.
 type Config struct {
 	Addr        string
 	MetricsAddr string
@@ -26,7 +26,7 @@ type Config struct {
 	Logger      *slog.Logger
 }
 
-// Start launches the devtool HTTP server on localhost.
+// Start launches the Turnstone Console HTTP server on localhost.
 func Start(cfg Config) {
 	if cfg.Addr == "" {
 		return
@@ -55,9 +55,9 @@ func Start(cfg Config) {
 	mux.HandleFunc("/api/server", srv.handleServer)
 
 	go func() {
-		logger.Info("Devtool UI starting", "addr", cfg.Addr)
+		logger.Info("Console UI starting", "addr", cfg.Addr)
 		if err := http.ListenAndServe(cfg.Addr, mux); err != nil {
-			logger.Error("Devtool server stopped", "err", err)
+			logger.Error("Console server stopped", "err", err)
 		}
 	}()
 }

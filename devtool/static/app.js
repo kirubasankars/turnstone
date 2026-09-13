@@ -98,7 +98,7 @@
       if (values[i] < min) min = values[i];
     }
     if (max === min) max = min + 1;
-    ctx.strokeStyle = '#ffc107';
+    ctx.strokeStyle = '#fbbf24';
     ctx.lineWidth = 1.5;
     ctx.beginPath();
     for (var j = 0; j < values.length; j++) {
@@ -141,7 +141,7 @@
     var now = new Date();
     var timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
     els.lastUpdated.textContent = timeStr;
-    if (els.overviewUpdated) els.overviewUpdated.textContent = 'Last Updated: ' + timeStr;
+    if (els.overviewUpdated) els.overviewUpdated.textContent = timeStr;
   }
 
   function updateKeyCount(count) {

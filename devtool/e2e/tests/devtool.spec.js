@@ -6,7 +6,7 @@
 const { test, expect } = require('@playwright/test');
 const { showMonitorTab } = require('./helpers');
 
-test.describe('Turnstone Devtool', function () {
+test.describe('Turnstone Console', function () {
   test.beforeEach(async function ({ page }) {
     await page.goto('/');
     await expect(page.getByTestId('app-header')).toBeVisible();
@@ -14,7 +14,7 @@ test.describe('Turnstone Devtool', function () {
   });
 
   test('loads overview and metrics panels', async function ({ page }) {
-    await expect(page.getByRole('heading', { name: 'Turnstone Devtool' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Turnstone Console' })).toBeVisible();
     await expect(page.getByTestId('summary-bar')).toBeVisible();
     await expect(page.getByTestId('db-state')).toContainText('PRIMARY');
     await expect(page.getByTestId('panel-keys')).toBeVisible();
