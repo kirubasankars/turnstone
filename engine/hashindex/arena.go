@@ -52,16 +52,46 @@ func (s *shard) grow(minSize int64) error {
 	if s.isClosed() {
 		return fmt.Errorf("hashindex: shard is closed")
 	}
-	return growShardBuffer(s.buf, minSize)
+	if s.parent == nil {
+		return growShardBuffer(s.buf, minSize)
+	}
+	oldLen := int64(len(s.buf.data))
+	if minSize <= oldLen {
+		return nil
+	}
+	planned := plannedBufferSize(oldLen, minSize)
+	delta := planned - oldLen
+	if err := s.parent.accountDelta(delta); err != nil {
+		return err
+	}
+	if err := growShardBuffer(s.buf, minSize); err != nil {
+		_ = s.parent.accountDelta(-delta)
+		return err
+	}
+	if adj := int64(len(s.buf.data)) - planned; adj != 0 {
+		if err := s.parent.accountDelta(adj); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-func (s *shard) replaceBuffer(next *shardBuffer) {
+func (s *shard) replaceBuffer(next *shardBuffer) error {
 	if next == nil {
 		panic("hashindex: nil replacement buffer")
+	}
+	oldLen := int64(0)
+	if s.buf != nil {
+		oldLen = int64(len(s.buf.data))
+	}
+	newLen := int64(len(next.data))
+	if err := s.parent.accountDelta(newLen - oldLen); err != nil {
+		return err
 	}
 	old := s.buf
 	s.buf = next
 	if old != nil {
 		old.close()
 	}
+	return nil
 }

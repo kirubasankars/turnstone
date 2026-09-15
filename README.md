@@ -158,6 +158,7 @@ Key fields in `turnstone.json`:
 | `number_of_databases` | `4` | Logical databases (`0` … `N`) |
 | `log_retention` | `replication` | WAL purge policy: `replication` or `none` |
 | `max_disk_usage_percent` | `90` | Reject writes above this disk usage |
+| `max_index_arena_bytes` | `0` | Reject writes when index arenas exceed this size (bytes); `0` disables |
 | `metrics_addr` | `:9090` | Prometheus scrape address |
 
 All connections use **mTLS**. Client authorization is driven by the certificate **Organization** field.

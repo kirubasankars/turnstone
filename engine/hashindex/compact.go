@@ -144,6 +144,10 @@ func (s *shard) compact(filter VersionFilter) (compactResult, error) {
 	if s.isClosed() {
 		return compactResult{}, fmt.Errorf("hashindex: shard is closed")
 	}
+	if s.parent != nil {
+		s.parent.SetEnforceLimit(false)
+		defer s.parent.SetEnforceLimit(true)
+	}
 
 	res := compactResult{
 		ArenaBefore: s.arenaUsed(),
@@ -206,7 +210,7 @@ func (s *shard) compact(filter VersionFilter) (compactResult, error) {
 	writeU64(newData, hdrArenaOffOff, arenaOff)
 	writeU64(newData, hdrArenaUsedOff, 0)
 
-	work := &shard{buf: newBuf}
+	work := &shard{buf: newBuf, parent: s.parent}
 	work.setArenaUsed(0)
 
 	for _, e := range entries {
@@ -240,7 +244,10 @@ func (s *shard) compact(filter VersionFilter) (compactResult, error) {
 		}
 	}
 
-	s.replaceBuffer(newBuf)
+	if err := s.replaceBuffer(newBuf); err != nil {
+		newBuf.close()
+		return res, err
+	}
 	res.ArenaAfter = s.arenaUsed()
 	res.KeysAfter = s.keyCount()
 	return res, nil

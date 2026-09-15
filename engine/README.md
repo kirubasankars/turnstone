@@ -97,6 +97,7 @@ Notable tunables in `types.go` `Options`:
 - `UnsafeDisableFsync` — tests only
 - `IndexCompactOnRetention`, `WalCopyForwardOnRetention` — maintenance toggles
 - `MaxDiskUsagePercent` — reject writes when disk full
+- `MaxIndexArenaBytes` — reject writes when total index shard buffers would exceed cap (0 disables)
 
 ## Educational focus
 

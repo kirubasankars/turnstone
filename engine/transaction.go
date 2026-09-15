@@ -149,10 +149,13 @@ func (tx *Transaction) write(key, value []byte, isDelete bool) error {
 		return err
 	}
 
-	db.index.Put(key, indexVersion{
+	if err := db.index.Put(key, indexVersion{
 		offset: offset, valueLen: uint32(len(value)),
 		xmin: tx.xid, tombstone: isDelete,
-	})
+	}); err != nil {
+		rollbackImpact()
+		return err
+	}
 
 	ver := &indexVersion{offset: offset, valueLen: uint32(len(value)), xmin: tx.xid, tombstone: isDelete}
 	tx.ownPriorVer[keyStr] = ver

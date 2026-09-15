@@ -119,7 +119,7 @@ func runServer(logger *slog.Logger, devMode bool, devtoolAddr string) {
 				return err
 			}
 			dbLogger.Info("Opening database...")
-			st, err := database.Open(openCtx, path, dbLogger, 0, cfg.LogRetention, cfg.MaxDiskUsagePercent)
+			st, err := database.Open(openCtx, path, dbLogger, 0, cfg.LogRetention, cfg.MaxDiskUsagePercent, cfg.MaxIndexArenaBytes)
 			if err != nil {
 				return fmt.Errorf("db %s: %w", name, err)
 			}

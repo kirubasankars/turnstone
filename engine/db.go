@@ -131,6 +131,8 @@ func OpenContext(ctx context.Context, dir string, opts Options) (*DB, error) {
 		return nil, fmt.Errorf("remove leftover index dir: %w", err)
 	}
 	index := NewIndex()
+	index.SetMaxArenaBytes(opts.MaxIndexArenaBytes)
+	index.SetEnforceLimit(false)
 
 	db := &DB{
 		dir:                       dir,
@@ -167,6 +169,8 @@ func OpenContext(ctx context.Context, dir string, opts Options) (*DB, error) {
 		db.Close()
 		return nil, fmt.Errorf("replay log: %w", err)
 	}
+	db.index.SetEnforceLimit(true)
+	db.index.RecalcUsedBytes()
 
 	db.startBackgroundTasks()
 	return db, nil
@@ -542,10 +546,12 @@ func (db *DB) ApplyLogRange(data []byte) (int64, error) {
 			db.txMu.Unlock()
 		case RecordSet, RecordDelete:
 			isDelete := rec.Type == RecordDelete
-			db.index.Put(rec.Key, indexVersion{
+			if err := db.index.Put(rec.Key, indexVersion{
 				offset: off, valueLen: uint32(len(rec.Value)),
 				xmin: rec.XID, tombstone: isDelete,
-			})
+			}); err != nil {
+				return 0, err
+			}
 			db.accountReplicatedWrite(rec)
 		case RecordCommit:
 			db.forgetClog(rec.XID)
@@ -558,7 +564,9 @@ func (db *DB) ApplyLogRange(data []byte) (int64, error) {
 			db.applyReplicatedImpact(impact)
 		case RecordAbort:
 			db.setClog(rec.XID, TxAborted)
-			db.index.DropXid(rec.XID)
+			if err := db.index.DropXid(rec.XID); err != nil {
+				return 0, err
+			}
 			db.txMu.Lock()
 			delete(db.activeXids, rec.XID)
 			delete(db.beginOffsets, rec.XID)
@@ -608,10 +616,13 @@ func (db *DB) ApplyRecord(rec Record) error {
 			return err
 		}
 		isDelete := rec.Type == RecordDelete
-		db.index.Put(rec.Key, indexVersion{
+		if err := db.index.Put(rec.Key, indexVersion{
 			offset: off, valueLen: uint32(len(rec.Value)),
 			xmin: rec.XID, tombstone: isDelete,
-		})
+		}); err != nil {
+			atomic.StoreInt32(&db.isCorrupt, 1)
+			return err
+		}
 		db.accountReplicatedWrite(rec)
 		db.AdvanceXID(rec.XID)
 		return nil
@@ -636,7 +647,9 @@ func (db *DB) ApplyRecord(rec Record) error {
 			return err
 		}
 		db.setClog(rec.XID, TxAborted)
-		db.index.DropXid(rec.XID)
+		if err := db.index.DropXid(rec.XID); err != nil {
+			return err
+		}
 		db.txMu.Lock()
 		delete(db.activeXids, rec.XID)
 		delete(db.beginOffsets, rec.XID)
