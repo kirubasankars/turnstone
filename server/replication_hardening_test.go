@@ -40,7 +40,7 @@ func startServerNodeWithRetention(t *testing.T, baseDir, name string, sharedTLS 
 	stores := make(map[string]*database.Database)
 	for _, dbName := range []string{"0", "1", "2", "3"} {
 		partPath := filepath.Join(nodeDir, "data", dbName)
-		st, err := database.Open(context.Background(), partPath, logger, minReplicas, "replication", 90)
+		st, err := database.Open(context.Background(), partPath, logger, minReplicas, "replication", 90, 0)
 		if err != nil {
 			t.Fatalf("Failed to init store %s: %v", dbName, err)
 		}

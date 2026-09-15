@@ -36,6 +36,7 @@ type Config struct {
 	NumberOfDatabases   int    `json:"number_of_databases"`
 	LogRetention        string `json:"log_retention"` // "replication" or "none"
 	MaxDiskUsagePercent int    `json:"max_disk_usage_percent"`
+	MaxIndexArenaBytes  int64  `json:"max_index_arena_bytes"`
 }
 
 // ResolvePath returns an absolute path relative to the home directory if strictly necessary.
@@ -61,6 +62,9 @@ func ResolvePath(homeDir, path string) string {
 func ValidateConfig(cfg Config) error {
 	if cfg.MaxDiskUsagePercent < 0 || cfg.MaxDiskUsagePercent > 100 {
 		return fmt.Errorf("max_disk_usage_percent must be between 0 and 100 (0 disables the check), got %d", cfg.MaxDiskUsagePercent)
+	}
+	if cfg.MaxIndexArenaBytes < 0 {
+		return fmt.Errorf("max_index_arena_bytes must be >= 0 (0 disables the check), got %d", cfg.MaxIndexArenaBytes)
 	}
 	return nil
 }

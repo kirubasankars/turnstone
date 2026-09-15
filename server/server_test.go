@@ -75,7 +75,7 @@ func setupTestEnv(t *testing.T) (string, map[string]*database.Database, *Server,
 	stores := make(map[string]*database.Database)
 	for i := 0; i < 4; i++ {
 		dbName := strconv.Itoa(i)
-		s, err := database.Open(context.Background(), filepath.Join(dir, "data", dbName), logger, 0, "none", 90)
+		s, err := database.Open(context.Background(), filepath.Join(dir, "data", dbName), logger, 0, "none", 90, 0)
 		if err != nil {
 			t.Fatal(err)
 		}

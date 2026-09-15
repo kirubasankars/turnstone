@@ -74,7 +74,9 @@ func (db *DB) abortTransaction(tx *Transaction) {
 			panic("CRITICAL: ABORT record append failed: " + err.Error())
 		}
 		db.setClog(tx.xid, TxAborted)
-		db.index.DropXid(tx.xid)
+		if err := db.index.DropXid(tx.xid); err != nil {
+			panic("CRITICAL: index DropXid failed: " + err.Error())
+		}
 
 		db.txMu.Lock()
 		delete(db.activeXids, tx.xid)

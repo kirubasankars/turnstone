@@ -22,12 +22,12 @@ func (db *DB) replayLog(ctx context.Context, truncateCorrupt bool) error {
 		case RecordBegin:
 			inProgress[rec.XID] = struct{}{}
 		case RecordSet:
-			db.index.Put(rec.Key, indexVersion{
+			_ = db.index.Put(rec.Key, indexVersion{
 				offset: span.offset, valueLen: uint32(len(rec.Value)),
 				xmin: rec.XID, tombstone: false,
 			})
 		case RecordDelete:
-			db.index.Put(rec.Key, indexVersion{
+			_ = db.index.Put(rec.Key, indexVersion{
 				offset: span.offset, valueLen: 0,
 				xmin: rec.XID, tombstone: true,
 			})
@@ -36,7 +36,7 @@ func (db *DB) replayLog(ctx context.Context, truncateCorrupt bool) error {
 			db.forgetClog(rec.XID)
 		case RecordAbort:
 			delete(inProgress, rec.XID)
-			db.index.DropXid(rec.XID)
+			_ = db.index.DropXid(rec.XID)
 			db.forgetClog(rec.XID)
 		}
 	})
@@ -45,7 +45,7 @@ func (db *DB) replayLog(ctx context.Context, truncateCorrupt bool) error {
 	}
 
 	for xid := range inProgress {
-		db.index.DropXid(xid)
+		_ = db.index.DropXid(xid)
 		db.forgetClog(xid)
 	}
 

@@ -202,22 +202,25 @@ func TestValidateConfig(t *testing.T) {
 	cases := []struct {
 		name    string
 		pct     int
+		arena   int64
 		wantErr bool
 	}{
-		{"disabled", 0, false},
-		{"typical", 90, false},
-		{"max", 100, false},
-		{"negative", -5, true},
-		{"over100", 150, true},
+		{"disabled", 0, 0, false},
+		{"typical", 90, 0, false},
+		{"max", 100, 0, false},
+		{"negative", -5, 0, true},
+		{"over100", 150, 0, true},
+		{"negative index arena bytes", 0, -1, true},
+		{"disabled index arena limit", 0, 0, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := ValidateConfig(Config{MaxDiskUsagePercent: tc.pct})
+			err := ValidateConfig(Config{MaxDiskUsagePercent: tc.pct, MaxIndexArenaBytes: tc.arena})
 			if tc.wantErr && err == nil {
-				t.Errorf("expected error for pct=%d, got nil", tc.pct)
+				t.Errorf("expected error for pct=%d arena=%d, got nil", tc.pct, tc.arena)
 			}
 			if !tc.wantErr && err != nil {
-				t.Errorf("expected no error for pct=%d, got %v", tc.pct, err)
+				t.Errorf("expected no error for pct=%d arena=%d, got %v", tc.pct, tc.arena, err)
 			}
 		})
 	}

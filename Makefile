@@ -21,9 +21,9 @@ test:
 test-race:
 	go test -race -count=1 ./... | tee test-race.log
 
-# bench runs Go microbenchmarks in engine. -run=^$ skips unit tests.
+# bench runs Go microbenchmarks in engine and hashindex. -run=^$ skips unit tests.
 bench:
-	go test -run='^$$' -bench=. -benchmem -count=1 ./engine/ | tee bench.log
+	go test -run='^$$' -bench=. -benchmem -count=1 ./engine/ ./engine/hashindex/ | tee bench.log
 
 # bench-all runs microbenchmarks in every package.
 bench-all:
