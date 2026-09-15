@@ -22,7 +22,7 @@ func alignShardBufferSize(n int64) int64 {
 	return (n + ps - 1) &^ (ps - 1)
 }
 
-func newShardBuffer(size int64) (*shardBuffer, error) {
+func mmapNewShardBuffer(size int64) (*shardBuffer, error) {
 	mappedSize := alignShardBufferSize(size)
 	mapped, err := syscall.Mmap(-1, 0, int(mappedSize), syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_ANON|syscall.MAP_PRIVATE)
 	if err != nil {
@@ -35,7 +35,7 @@ func newShardBuffer(size int64) (*shardBuffer, error) {
 	}, nil
 }
 
-func growShardBuffer(b *shardBuffer, minSize int64) error {
+func mmapGrowShardBuffer(b *shardBuffer, minSize int64) error {
 	if b == nil || b.data == nil {
 		return fmt.Errorf("hashindex: buffer is closed")
 	}
@@ -49,12 +49,12 @@ func growShardBuffer(b *shardBuffer, minSize int64) error {
 	for int64(n) < minSize {
 		n *= 2
 	}
-	next, err := newShardBuffer(int64(n))
+	next, err := mmapNewShardBuffer(int64(n))
 	if err != nil {
 		return err
 	}
 	copy(next.data, b.data)
-	releaseShardBuffer(b)
+	mmapReleaseShardBuffer(b)
 	b.data = next.data
 	b.mmapBacking = next.mmapBacking
 	next.data = nil
@@ -62,7 +62,7 @@ func growShardBuffer(b *shardBuffer, minSize int64) error {
 	return nil
 }
 
-func releaseShardBuffer(b *shardBuffer) {
+func mmapReleaseShardBuffer(b *shardBuffer) {
 	if b == nil || b.mmapBacking == nil {
 		return
 	}
