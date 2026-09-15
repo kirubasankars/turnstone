@@ -19,6 +19,7 @@ The `config` package owns **on-disk configuration** for a TurnstoneDB node: JSON
 | `NumberOfDatabases` | `number_of_databases` | `4` | Count of isolated keyspaces `0 … N-1` |
 | `LogRetention` | `log_retention` | `replication` | `replication` or `none` |
 | `MaxDiskUsagePercent` | `max_disk_usage_percent` | `90` | Write rejection threshold; `0` disables |
+| `MaxIndexArenaBytes` | `max_index_arena_bytes` | `0` | Total index shard buffer cap; `0` disables |
 
 Paths in JSON are **relative to `--home`** unless absolute; use `ResolvePath(home, path)` consistently.
 

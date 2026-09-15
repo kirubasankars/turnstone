@@ -45,12 +45,14 @@ func testVisible(clog map[uint64]TxStatus) func(uint64, Snapshot) bool {
 func putVersionChain(t *testing.T, idx *Index, key []byte, xmins ...uint64) {
 	t.Helper()
 	for i, xmin := range xmins {
-		idx.Put(key, indexVersion{
+		if err := idx.Put(key, indexVersion{
 			offset:    int64(100 * (i + 1)),
 			valueLen:  3,
 			xmin:      xmin,
 			tombstone: false,
-		})
+		}); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -150,7 +152,9 @@ func TestGetVisible_SkipsAbortedVersionsViaDropXid(t *testing.T) {
 	defer idx.Close()
 
 	putVersionChain(t, idx, key, 1, 2, 3)
-	idx.DropXid(3)
+	if err := idx.DropXid(3); err != nil {
+		t.Fatal(err)
+	}
 
 	snap := Snapshot{Xmax: 4, Xip: map[uint64]bool{}}
 	visible := testVisible(map[uint64]TxStatus{3: TxAborted})

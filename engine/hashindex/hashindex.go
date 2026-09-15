@@ -7,6 +7,7 @@ package hashindex
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"sync"
 )
@@ -33,15 +34,19 @@ type Version struct {
 
 // Index is a sharded in-memory hash index with per-shard locking.
 type Index struct {
-	shards [numShards]*shard
+	shards        [numShards]*shard
+	maxArenaBytes int64
+	usedBytes     int64
+	enforceLimit  int32
 }
 
-// New creates numShards heap-backed index shards.
+// New creates numShards mmap-backed index shards (heap fallback on non-Unix).
 func New() *Index {
-	idx := &Index{}
+	idx := &Index{enforceLimit: 1}
 	for i := 0; i < numShards; i++ {
-		idx.shards[i] = newShard()
+		idx.shards[i] = idx.newShard()
 	}
+	idx.RecalcUsedBytes()
 	return idx
 }
 
@@ -58,9 +63,9 @@ func (idx *Index) shardFor(key []byte) *shard {
 	return idx.shards[int(hashKey(key)&255)]
 }
 
-func (idx *Index) Put(key []byte, ver Version) {
+func (idx *Index) Put(key []byte, ver Version) error {
 	seg := idx.shardFor(key)
-	seg.put(key, ver)
+	return seg.put(key, ver)
 }
 
 func (idx *Index) WalkVersions(key []byte, fn func(Version) bool) {
@@ -68,12 +73,17 @@ func (idx *Index) WalkVersions(key []byte, fn func(Version) bool) {
 	seg.walkVersions(key, fn)
 }
 
-func (idx *Index) DropXid(xid uint64) {
+func (idx *Index) DropXid(xid uint64) error {
+	idx.SetEnforceLimit(false)
+	defer idx.SetEnforceLimit(true)
 	for _, seg := range idx.shards {
 		if seg != nil {
-			seg.dropXid(xid)
+			if err := seg.dropXid(xid); err != nil {
+				return err
+			}
 		}
 	}
+	return nil
 }
 
 func (idx *Index) ForEachKey(fn func(key []byte, chain []Version)) {
@@ -85,38 +95,33 @@ func (idx *Index) ForEachKey(fn func(key []byte, chain []Version)) {
 }
 
 type shard struct {
-	mu   sync.RWMutex
-	data []byte
+	mu     sync.RWMutex
+	buf    *shardBuffer
+	parent *Index
 }
 
-func newShard() *shard {
+func (idx *Index) newShard() *shard {
 	tableBytes := int64(initialSlots * 8)
 	minSize := int64(headerSize) + tableBytes + headerSize
-	s := &shard{data: make([]byte, minSize)}
+	buf, err := newShardBuffer(minSize)
+	if err != nil {
+		panic("hashindex: new shard buffer: " + err.Error())
+	}
+	s := &shard{buf: buf, parent: idx}
 	s.initNew(initialSlots)
 	return s
 }
 
 func (s *shard) close() {
 	s.mu.Lock()
-	s.data = nil
+	if s.buf != nil {
+		if s.parent != nil {
+			_ = s.parent.accountDelta(-int64(len(s.buf.data)))
+		}
+		s.buf.close()
+		s.buf = nil
+	}
 	s.mu.Unlock()
-}
-
-func (s *shard) grow(minSize int64) {
-	if minSize <= int64(len(s.data)) {
-		return
-	}
-	n := len(s.data)
-	if n == 0 {
-		n = int(minSize)
-	}
-	for int64(n) < minSize {
-		n *= 2
-	}
-	out := make([]byte, n)
-	copy(out, s.data)
-	s.data = out
 }
 
 const (
@@ -130,7 +135,7 @@ const (
 )
 
 func (s *shard) initNew(slotCount uint32) {
-	data := s.data
+	data := s.shardData()
 	writeU64(data, hdrMagicOff, magic)
 	writeU32(data, hdrVersionOff, formatVersion)
 	writeU32(data, hdrSlotCountOff, slotCount)
@@ -143,38 +148,40 @@ func (s *shard) initNew(slotCount uint32) {
 }
 
 func (s *shard) slotCount() uint32 {
-	return readU32(s.data, hdrSlotCountOff)
+	return readU32(s.shardData(), hdrSlotCountOff)
 }
 
 func (s *shard) keyCount() uint32 {
-	return readU32(s.data, hdrKeyCountOff)
+	return readU32(s.shardData(), hdrKeyCountOff)
 }
 
 func (s *shard) setKeyCount(n uint32) {
-	writeU32(s.data, hdrKeyCountOff, n)
+	writeU32(s.shardData(), hdrKeyCountOff, n)
 }
 
 func (s *shard) tableOff() uint64 {
-	return readU64(s.data, hdrTableOffOff)
+	return readU64(s.shardData(), hdrTableOffOff)
 }
 
 func (s *shard) arenaOff() uint64 {
-	return readU64(s.data, hdrArenaOffOff)
+	return readU64(s.shardData(), hdrArenaOffOff)
 }
 
 func (s *shard) arenaUsed() uint64 {
-	return readU64(s.data, hdrArenaUsedOff)
+	return readU64(s.shardData(), hdrArenaUsedOff)
 }
 
 func (s *shard) setArenaUsed(n uint64) {
-	writeU64(s.data, hdrArenaUsedOff, n)
+	writeU64(s.shardData(), hdrArenaUsedOff, n)
 }
 
 func (s *shard) alloc(size int) (uint64, error) {
 	off := s.arenaOff() + s.arenaUsed()
 	need := int64(off) + int64(size)
-	if need > int64(len(s.data)) {
-		s.grow(need)
+	if need > int64(len(s.shardData())) {
+		if err := s.grow(need); err != nil {
+			return 0, err
+		}
 	}
 	s.setArenaUsed(s.arenaUsed() + uint64(size))
 	return off, nil
@@ -187,7 +194,7 @@ func (s *shard) slotIndex(key []byte) uint32 {
 func (s *shard) findKeyRecord(key []byte) (uint64, bool) {
 	slots := s.slotCount()
 	start := s.slotIndex(key)
-	data := s.data
+	data := s.shardData()
 	table := int(s.tableOff())
 	for i := uint32(0); i < slots; i++ {
 		slot := (start + i) % slots
@@ -218,7 +225,7 @@ func (s *shard) bumpArenaChainRefs(recOff uint64, delta uint64) {
 	newHead := head + delta
 	s.setVersionHead(recOff, newHead)
 	node := newHead
-	data := s.data
+	data := s.shardData()
 	for node != 0 {
 		nextOff := readU64(data, int(node)+versionSize)
 		if nextOff != 0 {
@@ -253,8 +260,10 @@ func (s *shard) growHashTable() error {
 	newTableBytes := uint64(newSlots) * 8
 	newArenaStart := tableStart + newTableBytes
 	need := int64(newArenaStart + used)
-	s.grow(need)
-	data := s.data
+	if err := s.grow(need); err != nil {
+		return err
+	}
+	data := s.shardData()
 	arenaSnap := make([]byte, used)
 	if used > 0 {
 		copy(arenaSnap, data[int(arenaStart):int(arenaStart+used)])
@@ -311,7 +320,7 @@ func (s *shard) growHashTable() error {
 func (s *shard) insertKeySlot(key []byte, recOff uint64) error {
 	slots := s.slotCount()
 	start := s.slotIndex(key)
-	data := s.data
+	data := s.shardData()
 	table := int(s.tableOff())
 	for i := uint32(0); i < slots; i++ {
 		slot := (start + i) % slots
@@ -340,7 +349,7 @@ func (s *shard) findOrCreateKeyRecord(key []byte) (uint64, error) {
 		if err != nil {
 			return 0, err
 		}
-		data := s.data
+		data := s.shardData()
 		writeU32(data, int(off), uint32(len(key)))
 		writeU64(data, int(off)+4, 0)
 		copy(data[int(off)+12:], key)
@@ -361,7 +370,7 @@ func (s *shard) findOrCreateKeyRecord(key []byte) (uint64, error) {
 }
 
 func (s *shard) keyAt(recOff uint64, key []byte) bool {
-	data := s.data
+	data := s.shardData()
 	if int(recOff)+12 > len(data) {
 		return false
 	}
@@ -376,7 +385,7 @@ func (s *shard) keyAt(recOff uint64, key []byte) bool {
 }
 
 func (s *shard) readKey(recOff uint64) []byte {
-	data := s.data
+	data := s.shardData()
 	kLen := readU32(data, int(recOff))
 	out := make([]byte, kLen)
 	copy(out, data[int(recOff)+12:int(recOff)+12+int(kLen)])
@@ -384,37 +393,38 @@ func (s *shard) readKey(recOff uint64) []byte {
 }
 
 func (s *shard) versionHead(recOff uint64) uint64 {
-	return readU64(s.data, int(recOff)+4)
+	return readU64(s.shardData(), int(recOff)+4)
 }
 
 func (s *shard) setVersionHead(recOff, head uint64) {
-	writeU64(s.data, int(recOff)+4, head)
+	writeU64(s.shardData(), int(recOff)+4, head)
 }
 
-func (s *shard) put(key []byte, ver Version) {
+func (s *shard) put(key []byte, ver Version) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.data == nil {
-		return
+	if s.isClosed() {
+		return errors.New("hashindex: shard is closed")
 	}
 
 	recOff, err := s.findOrCreateKeyRecord(key)
 	if err != nil {
-		panic("hashindex: " + err.Error())
+		return err
 	}
 	nodeOff, err := s.alloc(versionNodeSz)
 	if err != nil {
-		panic("hashindex: alloc version: " + err.Error())
+		return err
 	}
-	writeVersion(s.data, int(nodeOff), ver)
-	writeU64(s.data, int(nodeOff)+versionSize, s.versionHead(recOff))
+	writeVersion(s.shardData(), int(nodeOff), ver)
+	writeU64(s.shardData(), int(nodeOff)+versionSize, s.versionHead(recOff))
 	s.setVersionHead(recOff, nodeOff)
+	return nil
 }
 
 func (s *shard) walkVersions(key []byte, fn func(Version) bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.data == nil {
+	if s.isClosed() {
 		return
 	}
 
@@ -423,7 +433,7 @@ func (s *shard) walkVersions(key []byte, fn func(Version) bool) {
 		return
 	}
 	node := s.versionHead(recOff)
-	data := s.data
+	data := s.shardData()
 	for node != 0 {
 		if int(node)+versionNodeSz > len(data) {
 			break
@@ -439,11 +449,11 @@ func (s *shard) walkVersions(key []byte, fn func(Version) bool) {
 func (s *shard) forEachKey(fn func(key []byte, chain []Version)) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.data == nil {
+	if s.isClosed() {
 		return
 	}
 
-	data := s.data
+	data := s.shardData()
 	slots := s.slotCount()
 	table := int(s.tableOff())
 	for slot := uint32(0); slot < slots; slot++ {
@@ -467,34 +477,38 @@ func (s *shard) forEachKey(fn func(key []byte, chain []Version)) {
 	}
 }
 
-func (s *shard) dropXid(xid uint64) {
+func (s *shard) dropXid(xid uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.data == nil {
-		return
+	if s.isClosed() {
+		return nil
 	}
 
 	slots := s.slotCount()
 	table := int(s.tableOff())
 	for slot := uint32(0); slot < slots; slot++ {
-		data := s.data
+		data := s.shardData()
 		slotOff := table + int(slot)*8
 		recOff := readU64(data, slotOff)
 		if recOff == 0 {
 			continue
 		}
-		newHead, empty := s.filterChain(recOff, func(v Version) bool { return v.Xmin != xid })
+		newHead, empty, err := s.filterChain(recOff, func(v Version) bool { return v.Xmin != xid })
+		if err != nil {
+			return err
+		}
 		if empty {
-			writeU64(s.data, slotOff, 0)
+			writeU64(s.shardData(), slotOff, 0)
 			s.setKeyCount(s.keyCount() - 1)
 		} else {
 			s.setVersionHead(recOff, newHead)
 		}
 	}
+	return nil
 }
 
-func (s *shard) filterChain(recOff uint64, keep func(Version) bool) (uint64, bool) {
-	data := s.data
+func (s *shard) filterChain(recOff uint64, keep func(Version) bool) (uint64, bool, error) {
+	data := s.shardData()
 	head := s.versionHead(recOff)
 	var kept []Version
 	for node := head; node != 0; node = readU64(data, int(node)+versionSize) {
@@ -507,20 +521,20 @@ func (s *shard) filterChain(recOff uint64, keep func(Version) bool) (uint64, boo
 		}
 	}
 	if len(kept) == 0 {
-		return 0, true
+		return 0, true, nil
 	}
 	var newHead uint64
 	for i := len(kept) - 1; i >= 0; i-- {
 		nodeOff, err := s.alloc(versionNodeSz)
 		if err != nil {
-			panic("hashindex: filterChain alloc: " + err.Error())
+			return 0, false, err
 		}
-		data = s.data
+		data = s.shardData()
 		writeVersion(data, int(nodeOff), kept[i])
 		writeU64(data, int(nodeOff)+versionSize, newHead)
 		newHead = nodeOff
 	}
-	return newHead, false
+	return newHead, false, nil
 }
 
 func hashKey(key []byte) uint64 {

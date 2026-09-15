@@ -37,7 +37,7 @@ func (idx *Index) Stats() IndexStats {
 func (s *shard) stats(shardIndex uint32) ShardStats {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.data == nil {
+	if s.isClosed() {
 		return ShardStats{ShardIndex: shardIndex}
 	}
 	st := ShardStats{
@@ -54,7 +54,7 @@ func (s *shard) stats(shardIndex uint32) ShardStats {
 type VersionFilter func(key []byte, chain []Version) []Version
 
 func (s *shard) liveBytesLocked(filter VersionFilter) uint64 {
-	data := s.data
+	data := s.shardData()
 	if data == nil {
 		return 0
 	}
@@ -82,7 +82,7 @@ func (s *shard) liveBytesLocked(filter VersionFilter) uint64 {
 }
 
 func (s *shard) readChainLocked(recOff uint64) []Version {
-	data := s.data
+	data := s.shardData()
 	var chain []Version
 	for node := s.versionHead(recOff); node != 0; node = readU64(data, int(node)+versionSize) {
 		if int(node)+versionNodeSz > len(data) {
@@ -141,8 +141,12 @@ func (idx *Index) CompactAll(filter VersionFilter) (IndexStats, error) {
 func (s *shard) compact(filter VersionFilter) (compactResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.data == nil {
+	if s.isClosed() {
 		return compactResult{}, fmt.Errorf("hashindex: shard is closed")
+	}
+	if s.parent != nil {
+		s.parent.SetEnforceLimit(false)
+		defer s.parent.SetEnforceLimit(true)
 	}
 
 	res := compactResult{
@@ -155,7 +159,7 @@ func (s *shard) compact(filter VersionFilter) (compactResult, error) {
 		versions []Version
 	}
 
-	data := s.data
+	data := s.shardData()
 	slots := s.slotCount()
 	table := int(s.tableOff())
 	var entries []keyEntry
@@ -191,7 +195,11 @@ func (s *shard) compact(filter VersionFilter) (compactResult, error) {
 		newSize = int64(headerSize) + int64(tableBytes) + headerSize
 	}
 
-	newData := make([]byte, newSize)
+	newBuf, err := newShardBuffer(newSize)
+	if err != nil {
+		return res, err
+	}
+	newData := newBuf.data
 	writeU64(newData, hdrMagicOff, magic)
 	writeU32(newData, hdrVersionOff, formatVersion)
 	writeU32(newData, hdrSlotCountOff, slotCount)
@@ -202,37 +210,44 @@ func (s *shard) compact(filter VersionFilter) (compactResult, error) {
 	writeU64(newData, hdrArenaOffOff, arenaOff)
 	writeU64(newData, hdrArenaUsedOff, 0)
 
-	newShard := &shard{data: newData}
-	newShard.setArenaUsed(0)
+	work := &shard{buf: newBuf, parent: s.parent}
+	work.setArenaUsed(0)
 
 	for _, e := range entries {
 		recSize := 12 + len(e.key)
-		recOff, err := newShard.alloc(recSize)
+		recOff, err := work.alloc(recSize)
 		if err != nil {
+			newBuf.close()
 			return res, err
 		}
-		writeU32(newShard.data, int(recOff), uint32(len(e.key)))
-		writeU64(newShard.data, int(recOff)+4, 0)
-		copy(newShard.data[int(recOff)+12:], e.key)
+		workData := work.shardData()
+		writeU32(workData, int(recOff), uint32(len(e.key)))
+		writeU64(workData, int(recOff)+4, 0)
+		copy(workData[int(recOff)+12:], e.key)
 
 		var head uint64
 		for i := len(e.versions) - 1; i >= 0; i-- {
-			nodeOff, err := newShard.alloc(versionNodeSz)
+			nodeOff, err := work.alloc(versionNodeSz)
 			if err != nil {
+				newBuf.close()
 				return res, err
 			}
-			writeVersion(newShard.data, int(nodeOff), e.versions[i])
-			writeU64(newShard.data, int(nodeOff)+versionSize, head)
+			writeVersion(workData, int(nodeOff), e.versions[i])
+			writeU64(workData, int(nodeOff)+versionSize, head)
 			head = nodeOff
 		}
-		newShard.setVersionHead(recOff, head)
+		work.setVersionHead(recOff, head)
 
-		if err := newShard.insertKeySlot(e.key, recOff); err != nil {
+		if err := work.insertKeySlot(e.key, recOff); err != nil {
+			newBuf.close()
 			return res, err
 		}
 	}
 
-	s.data = newShard.data
+	if err := s.replaceBuffer(newBuf); err != nil {
+		newBuf.close()
+		return res, err
+	}
 	res.ArenaAfter = s.arenaUsed()
 	res.KeysAfter = s.keyCount()
 	return res, nil

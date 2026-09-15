@@ -40,7 +40,7 @@ func setupReplTestEnv(t *testing.T) (string, map[string]*database.Database, *tls
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	stores := make(map[string]*database.Database)
-	st, err := database.Open(context.Background(), filepath.Join(dir, "data", "0"), logger, 0, "none", 90)
+	st, err := database.Open(context.Background(), filepath.Join(dir, "data", "0"), logger, 0, "none", 90, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +175,7 @@ func TestManager_ApplyLogRange_MalformedPacket(t *testing.T) {
 
 func TestManager_ApplyLogRange_ValidSegment(t *testing.T) {
 	leaderDir := t.TempDir()
-	leaderDB, err := database.Open(context.Background(), filepath.Join(leaderDir, "data"), slog.New(slog.NewTextHandler(io.Discard, nil)), 0, "none", 90)
+	leaderDB, err := database.Open(context.Background(), filepath.Join(leaderDir, "data"), slog.New(slog.NewTextHandler(io.Discard, nil)), 0, "none", 90, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
