@@ -64,15 +64,16 @@ func (s Snapshot) contains(xid uint64) bool {
 var Crc32Table = crc32.MakeTable(crc32.Castagnoli)
 
 var (
-	ErrTxnFinished    = errors.New("transaction is already finished")
-	ErrWriteConflict  = errors.New("write conflict detected")
-	ErrKeyNotFound    = errors.New("key not found")
-	ErrChecksum       = errors.New("checksum mismatch")
-	ErrCorruptData    = errors.New("data corruption detected")
-	ErrTruncated      = errors.New("log truncated due to corruption")
-	ErrLogUnavailable = errors.New("log unavailable for requested byte offset")
-	ErrDiskFull       = errors.New("disk usage exceeds threshold")
-	ErrDatabaseClosed = errors.New("database is closed")
+	ErrTxnFinished     = errors.New("transaction is already finished")
+	ErrWriteConflict   = errors.New("write conflict detected")
+	ErrKeyNotFound     = errors.New("key not found")
+	ErrChecksum        = errors.New("checksum mismatch")
+	ErrCorruptData     = errors.New("data corruption detected")
+	ErrTruncated       = errors.New("log truncated due to corruption")
+	ErrLogUnavailable  = errors.New("log unavailable for requested byte offset")
+	ErrDiskFull        = errors.New("disk usage exceeds threshold")
+	ErrIndexArenaLimit = errors.New("index arena size exceeds limit")
+	ErrDatabaseClosed  = errors.New("database is closed")
 )
 
 // Options configures the engine on Open.
@@ -82,11 +83,14 @@ type Options struct {
 	ChecksumInterval    time.Duration
 	RetentionInterval   time.Duration
 	MaxDiskUsagePercent int
-	Logger              *slog.Logger
-	TxTimeout           time.Duration
-	CommitDelay         time.Duration
-	CommitSiblings      int
-	UnsafeDisableFsync  bool
+	// MaxIndexArenaBytes rejects writes when total index shard buffer bytes
+	// would exceed this limit (0 disables).
+	MaxIndexArenaBytes int64
+	Logger             *slog.Logger
+	TxTimeout          time.Duration
+	CommitDelay        time.Duration
+	CommitSiblings     int
+	UnsafeDisableFsync bool
 
 	// WalSegmentSize rotates the active WAL segment at this many bytes (0 = default 64MB).
 	WalSegmentSize int64

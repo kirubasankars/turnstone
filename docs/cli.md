@@ -202,7 +202,7 @@ Example `stat` response on a primary with one connected follower:
 | `ERR: Transaction Timeout` | Transaction exceeded `MaxTxDuration` (30s) |
 | `ERR: Server Busy` | Connection limit reached, or sync-replication quorum not met after local commit |
 | `ERR: Entity Too Large` | Value exceeds size limit |
-| `ERR: Server Memory Limit Exceeded` | Disk usage above configured threshold |
+| `ERR: Server Memory Limit Exceeded` | Disk usage above configured threshold, or index arena above `max_index_arena_bytes` |
 
 ### Sync replication (`promote N`)
 

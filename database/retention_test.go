@@ -17,7 +17,7 @@ import (
 func openTestDB(t *testing.T, dir string) *Database {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s, err := Open(context.Background(), dir, logger, 0, "none", 90)
+	s, err := Open(context.Background(), dir, logger, 0, "none", 90, 0)
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -101,7 +101,7 @@ func TestEvictZombieReplica_UnblocksMinReplicaOffset(t *testing.T) {
 func TestEnforceRetentionPolicy_RunsWalMaintenance(t *testing.T) {
 	dir := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s, err := Open(context.Background(), dir, logger, 0, "none", 90)
+	s, err := Open(context.Background(), dir, logger, 0, "none", 90, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

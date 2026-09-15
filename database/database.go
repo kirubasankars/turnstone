@@ -126,7 +126,7 @@ func (s *Database) UnlockAdmin() {
 	s.adminMu.Unlock()
 }
 
-func Open(ctx context.Context, dir string, logger *slog.Logger, minReplicas int, retentionStrategy string, maxDiskUsage int) (*Database, error) {
+func Open(ctx context.Context, dir string, logger *slog.Logger, minReplicas int, retentionStrategy string, maxDiskUsage int, maxIndexArenaBytes int64) (*Database, error) {
 	truncateTail := false
 	if os.Getenv("TS_TEST_LOG_TRUNCATE") == "true" {
 		truncateTail = true
@@ -135,6 +135,7 @@ func Open(ctx context.Context, dir string, logger *slog.Logger, minReplicas int,
 	opts := engine.Options{
 		TruncateCorruptTail: truncateTail,
 		MaxDiskUsagePercent: maxDiskUsage,
+		MaxIndexArenaBytes:  maxIndexArenaBytes,
 		Logger:              logger,
 		UnsafeDisableFsync:  os.Getenv("TS_UNSAFE_DISABLE_FSYNC") == "true",
 	}

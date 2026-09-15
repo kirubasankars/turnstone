@@ -55,7 +55,7 @@ func setupTestEnv(t *testing.T) (string, *server.Server, func()) {
 	for i := 0; i < 4; i++ {
 		dbName := strconv.Itoa(i)
 		// No special system database at 0 anymore
-		s, err := database.Open(context.Background(), filepath.Join(dir, "data", dbName), logger, 0, "none", 90)
+		s, err := database.Open(context.Background(), filepath.Join(dir, "data", dbName), logger, 0, "none", 90, 0)
 		if err != nil {
 			t.Fatal(err)
 		}

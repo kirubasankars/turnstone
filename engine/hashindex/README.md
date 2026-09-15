@@ -8,7 +8,7 @@ The `hashindex` package implements a **256-shard open-addressing hash table** wi
 | --- | --- |
 | Concurrent writes | 256 shards, hash key → shard by low 8 bits |
 | MVCC | Linked list of `Version` nodes per key |
-| Memory efficiency | mmap-backed arenas per shard (Unix); bump-pointer layout with compaction |
+| Memory efficiency | mmap-backed arenas per shard (Unix); optional `max_index_arena_bytes` cap |
 | Crash safety | None required — rebuilt from WAL on open |
 
 ## Core types

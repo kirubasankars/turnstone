@@ -30,12 +30,18 @@ func (idx *Index) Close() error {
 	return err
 }
 
-func (idx *Index) Put(key []byte, v indexVersion) {
-	idx.hash.Put(key, toHashVersion(v))
+func (idx *Index) Put(key []byte, v indexVersion) error {
+	if idx.hash == nil {
+		return ErrDatabaseClosed
+	}
+	return mapIndexError(idx.hash.Put(key, toHashVersion(v)))
 }
 
-func (idx *Index) DropXid(xid uint64) {
-	idx.hash.DropXid(xid)
+func (idx *Index) DropXid(xid uint64) error {
+	if idx.hash == nil {
+		return nil
+	}
+	return mapIndexError(idx.hash.DropXid(xid))
 }
 
 func (idx *Index) LatestResolved(key []byte, excludeXid uint64, clog func(uint64) TxStatus) (*indexVersion, uint64, bool) {

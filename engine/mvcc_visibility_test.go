@@ -254,8 +254,12 @@ func TestLiveKeyCount_IgnoresTombstoneHead(t *testing.T) {
 	idx := NewIndex()
 	defer idx.Close()
 
-	idx.Put([]byte("live"), indexVersion{offset: 10, xmin: 1, tombstone: false})
-	idx.Put([]byte("deleted"), indexVersion{offset: 30, xmin: 3, tombstone: true})
+	if err := idx.Put([]byte("live"), indexVersion{offset: 10, xmin: 1, tombstone: false}); err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.Put([]byte("deleted"), indexVersion{offset: 30, xmin: 3, tombstone: true}); err != nil {
+		t.Fatal(err)
+	}
 
 	clogCommitted := func(uint64) TxStatus { return TxCommitted }
 	if n := idx.LiveKeyCount(clogCommitted); n != 1 {
@@ -268,8 +272,12 @@ func TestGetVisible_ReturnsTombstoneVersion(t *testing.T) {
 	defer idx.Close()
 
 	key := []byte("k")
-	idx.Put(key, indexVersion{offset: 100, xmin: 1, tombstone: false})
-	idx.Put(key, indexVersion{offset: 200, xmin: 2, tombstone: true})
+	if err := idx.Put(key, indexVersion{offset: 100, xmin: 1, tombstone: false}); err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.Put(key, indexVersion{offset: 200, xmin: 2, tombstone: true}); err != nil {
+		t.Fatal(err)
+	}
 
 	snap := Snapshot{Xmax: 10, Xip: map[uint64]bool{}}
 	ver, ok := idx.GetVisible(key, snap, 0, false, testVisible(nil))

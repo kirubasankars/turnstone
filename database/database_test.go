@@ -34,7 +34,7 @@ func TestDatabase_Recover_Basic(t *testing.T) {
 	dir := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	s1, err := Open(context.Background(), dir, logger, 0, "none", 90)
+	s1, err := Open(context.Background(), dir, logger, 0, "none", 90, 0)
 	if err != nil {
 		t.Fatalf("Failed to create initial database: %v", err)
 	}
@@ -48,7 +48,7 @@ func TestDatabase_Recover_Basic(t *testing.T) {
 		t.Fatalf("Failed to close database 1: %v", err)
 	}
 
-	s2, err := Open(context.Background(), dir, logger, 0, "none", 90)
+	s2, err := Open(context.Background(), dir, logger, 0, "none", 90, 0)
 	if err != nil {
 		t.Fatalf("Failed to create recovered database: %v", err)
 	}
@@ -72,7 +72,7 @@ func TestDatabase_Recover_CRC_Corruption(t *testing.T) {
 	dir := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	s1, err := Open(context.Background(), dir, logger, 0, "none", 90)
+	s1, err := Open(context.Background(), dir, logger, 0, "none", 90, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +102,7 @@ func TestDatabase_Recover_CRC_Corruption(t *testing.T) {
 	}
 	f.Close()
 
-	s2, err := Open(context.Background(), dir, logger, 0, "none", 90)
+	s2, err := Open(context.Background(), dir, logger, 0, "none", 90, 0)
 	if err != nil {
 		t.Fatalf("Failed to recover database: %v", err)
 	}
@@ -128,7 +128,7 @@ func TestDatabase_Recover_PartialWrite(t *testing.T) {
 	dir := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	s1, err := Open(context.Background(), dir, logger, 0, "none", 90)
+	s1, err := Open(context.Background(), dir, logger, 0, "none", 90, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +145,7 @@ func TestDatabase_Recover_PartialWrite(t *testing.T) {
 	}
 	f.Close()
 
-	s2, err := Open(context.Background(), dir, logger, 0, "none", 90)
+	s2, err := Open(context.Background(), dir, logger, 0, "none", 90, 0)
 	if err != nil {
 		t.Fatalf("Recovery failed on partial write: %v", err)
 	}
@@ -160,7 +160,7 @@ func TestDatabase_Replication_Quorum(t *testing.T) {
 	dir := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	s, err := Open(context.Background(), dir, logger, 1, "none", 90)
+	s, err := Open(context.Background(), dir, logger, 1, "none", 90, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,7 +205,7 @@ func TestDatabase_CommitPuts(t *testing.T) {
 	dir := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	s, err := Open(context.Background(), dir, logger, 0, "none", 90)
+	s, err := Open(context.Background(), dir, logger, 0, "none", 90, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,7 +234,7 @@ func TestDatabase_CommitPuts(t *testing.T) {
 func TestStats_ConflictsAndStorage(t *testing.T) {
 	dir := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s, err := Open(context.Background(), dir, logger, 0, "none", 90)
+	s, err := Open(context.Background(), dir, logger, 0, "none", 90, 0)
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -279,7 +279,7 @@ func TestStats_ConflictsAndStorage(t *testing.T) {
 func TestDatabase_ReplicaLag(t *testing.T) {
 	dir := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s, err := Open(context.Background(), dir, logger, 0, "none", 90)
+	s, err := Open(context.Background(), dir, logger, 0, "none", 90, 0)
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -313,7 +313,7 @@ func TestDatabase_ReplicaLag(t *testing.T) {
 func TestDatabase_ReplicaLag_ReportsSlowestReplica(t *testing.T) {
 	dir := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s, err := Open(context.Background(), dir, logger, 0, "none", 90)
+	s, err := Open(context.Background(), dir, logger, 0, "none", 90, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -341,7 +341,7 @@ func TestDatabase_ReplicaLag_ReportsSlowestReplica(t *testing.T) {
 func TestIsValidReplicationCursor_HeadAndZero(t *testing.T) {
 	dir := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s, err := Open(context.Background(), dir, logger, 0, "none", 90)
+	s, err := Open(context.Background(), dir, logger, 0, "none", 90, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -364,7 +364,7 @@ func TestIsValidReplicationCursor_HeadAndZero(t *testing.T) {
 func TestIsValidReplicationCursor_RejectsMidFrame(t *testing.T) {
 	dir := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s, err := Open(context.Background(), dir, logger, 0, "none", 90)
+	s, err := Open(context.Background(), dir, logger, 0, "none", 90, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -386,7 +386,7 @@ func TestIsValidReplicationCursor_RejectsMidFrame(t *testing.T) {
 func TestMinReplicaOffset_ExcludesBackupRole(t *testing.T) {
 	dir := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s, err := Open(context.Background(), dir, logger, 0, "none", 90)
+	s, err := Open(context.Background(), dir, logger, 0, "none", 90, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -409,7 +409,7 @@ func TestMinReplicaOffset_ExcludesBackupRole(t *testing.T) {
 func TestWaitForQuorum_IgnoresNonServerRoles(t *testing.T) {
 	dir := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s, err := Open(context.Background(), dir, logger, 1, "none", 90)
+	s, err := Open(context.Background(), dir, logger, 1, "none", 90, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -445,7 +445,7 @@ func TestDatabase_BasicInit(t *testing.T) {
 	dir := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	s, err := Open(context.Background(), dir, logger, 0, "none", 90)
+	s, err := Open(context.Background(), dir, logger, 0, "none", 90, 0)
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}

@@ -13,6 +13,7 @@ import (
 	"crypto/x509"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -802,13 +803,16 @@ func (s *Server) handleSet(w io.Writer, payload []byte, st *connState) {
 // happens eagerly, not just at COMMIT), matching Postgres's "current transaction
 // is aborted" behavior for subsequent ops on the same connection.
 func (s *Server) writeWriteError(w io.Writer, st *connState, op, key string, err error) {
-	switch err {
-	case engine.ErrWriteConflict:
+	switch {
+	case errors.Is(err, engine.ErrWriteConflict):
 		st.logger.Debug(op+" operation conflict", "key", key)
 		_ = s.writeBinaryResponse(w, protocol.ResStatusTxConflict, []byte(err.Error()))
-	case engine.ErrDiskFull:
+	case errors.Is(err, engine.ErrDiskFull):
 		st.logger.Error(op + " failed: Disk Full")
 		_ = s.writeBinaryResponse(w, protocol.ResStatusServerBusy, []byte("ERR disk is full"))
+	case errors.Is(err, engine.ErrIndexArenaLimit):
+		st.logger.Error(op + " failed: index arena limit")
+		_ = s.writeBinaryResponse(w, protocol.ResStatusMemoryLimit, []byte("ERR index arena limit exceeded"))
 	default:
 		st.logger.Error(op+" operation failed", "key", key, "err", err)
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte(err.Error()))
