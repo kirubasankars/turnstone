@@ -1,6 +1,6 @@
 # `engine/hashindex/` — Sharded in-memory hash index
 
-The `hashindex` package implements a **256-shard open-addressing hash table** with per-shard mutexes, storing **MVCC version chains** in a custom arena allocator. It is used exclusively through `engine.Index` — callers outside `engine` should not import it directly.
+The `hashindex` package implements a **256-shard open-addressing hash table** with per-shard mutexes, storing **MVCC version chains** in mmap-backed arenas (Unix) or heap buffers (other platforms). It is used exclusively through `engine.Index` — callers outside `engine` should not import it directly.
 
 ## Design goals
 
@@ -8,7 +8,7 @@ The `hashindex` package implements a **256-shard open-addressing hash table** wi
 | --- | --- |
 | Concurrent writes | 256 shards, hash key → shard by low 8 bits |
 | MVCC | Linked list of `Version` nodes per key |
-| Memory efficiency | Bump-pointer arena per shard; compaction reclaims fragmentation |
+| Memory efficiency | mmap-backed arenas per shard (Unix); bump-pointer layout with compaction |
 | Crash safety | None required — rebuilt from WAL on open |
 
 ## Core types
@@ -47,7 +47,7 @@ Each `shard` owns:
 Triggered from `engine.index_gc` when estimated fragmentation exceeds ratio thresholds:
 
 1. Walk all keys; drop versions invisible to current GC context.
-2. If arena live bytes ≪ allocated, copy live nodes to fresh arena.
+2. If arena live bytes ≪ allocated, copy live nodes to a fresh mmap arena and unmap the old mapping.
 3. Preserve offsets referenced by active snapshots / replication floor.
 
 Regression tests: `compact_regression_test.go`, `compact_test.go`.
