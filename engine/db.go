@@ -35,11 +35,11 @@ type DB struct {
 	clogMu sync.RWMutex
 	logger *slog.Logger
 
-	commitMu   sync.Mutex
+	commitMu sync.Mutex
 	// walRewriteMu excludes write begins and replica apply from WAL copy-forward
 	// collect/remap. Lock order: commitMu, then walRewriteMu.
 	walRewriteMu sync.Mutex
-	shutdownMu sync.RWMutex
+	shutdownMu   sync.RWMutex
 
 	transactionID   uint64
 	keyCount        int64
