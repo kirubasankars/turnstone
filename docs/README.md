@@ -40,7 +40,7 @@ Then branch by interest:
 | Internal utils | `internal/` | [internal/README.md](../internal/README.md) |
 | TLS helpers | `internal/tlsutil/` | [internal/tlsutil/README.md](../internal/tlsutil/README.md) |
 | Metrics | `metrics/` | [metrics/README.md](../metrics/README.md) |
-| CI | `.github/` | [.github/README.md](../.github/README.md) |
+| CI | `.github/workflows/` | [ci.yml](../.github/workflows/ci.yml) |
 
 ## Layer diagram
 
