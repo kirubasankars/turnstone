@@ -374,7 +374,7 @@ func TestDatabase_ReplicaLag_ReportsSlowestReplica(t *testing.T) {
 func TestDatabase_ReplicaLag_IgnoresNonServerRoles(t *testing.T) {
 	dir := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s, err := Open(context.Background(), dir, logger, 0, "none", 90)
+	s, err := Open(context.Background(), dir, logger, 0, "none", 90, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
