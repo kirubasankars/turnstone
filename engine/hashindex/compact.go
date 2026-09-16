@@ -46,7 +46,7 @@ func (s *shard) stats(shardIndex uint32) ShardStats {
 		SlotCount:      s.slotCount(),
 		KeyCount:       s.keyCount(),
 		ArenaUsed:      s.arenaUsed(),
-		AllocatedBytes: uint64(len(s.data)),
+		AllocatedBytes: uint64(len(s.shardData())),
 	}
 	if st.KeyCount > 0 {
 		st.LiveBytes = s.liveBytesLocked(nil)
@@ -122,7 +122,7 @@ func (idx *Index) CompactShard(shardIndex int, filter VersionFilter) (ShardStats
 		SlotCount:      seg.slotCount(),
 		KeyCount:       seg.keyCount(),
 		ArenaUsed:      res.ArenaAfter,
-		AllocatedBytes: uint64(len(seg.data)),
+		AllocatedBytes: uint64(len(seg.shardData())),
 		LiveBytes:      res.ArenaAfter,
 	}, nil
 }
