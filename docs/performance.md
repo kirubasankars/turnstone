@@ -44,12 +44,16 @@ foreign keys. Use PostgreSQL there.
 5. **No `BEGIN` WAL record.** Recovery treats `SET`/`DEL` without `COMMIT`
    as in-progress, unless that xid already committed. Copy-forward writes
    a `COMMIT` per copied xid. That cuts one log frame per write transaction.
-6. **Keep WAL files open.** GET used to `open` + `close` the segment on
-   every read. Sealed segments now keep a reader FD; the active segment
-   reuses the writer.
-7. **Offset value cache (64 MiB default).** Writes populate a sharded
-   cache keyed by WAL offset. Hot GETs return memory, not a WAL decode.
-   Disable with `Options.ValueCacheBytes < 0`.
+6. **Keep WAL files open and mmap them.** GET used to `open` + `close`
+   the segment on every read. Sealed segments keep a reader FD; the
+   active segment reuses the writer. On Unix the file is also
+   `mmap(MAP_SHARED)` with `madvise` (`RANDOM` for point GET, `SEQUENTIAL`
+   on replay, `WILLNEED` after append, `DONTNEED` on unmap).
+7. **Shared buffers + decoded value cache.** An 8 KiB page pool
+   (`SharedBuffersBytes`, default 64 MiB) holds hot WAL pages so concurrent
+   GETs share one copy instead of each `pread`'ing. A 64 MiB offset value
+   cache sits in front for decoded payloads. Disable the page pool with
+   `SharedBuffersBytes < 0`, the decoded cache with `ValueCacheBytes < 0`.
 8. **Batch writes in one transaction.** `--batch N` on `turnstone bench`
    amortizes one group fsync across N keys — the same advice as
    multi-row `INSERT` in PostgreSQL.
@@ -102,8 +106,8 @@ sides.
 - **Do not** set a multi-millisecond `CommitDelay` on NVMe. That was the
   old 2 ms default and capped serial commit rate near 500 TPS.
 - **Do** batch independent keys in one transaction.
-- **Do** keep the working set inside `ValueCacheBytes` (default 64 MiB)
-  if the goal is memory-latency GETs.
+- **Do** keep the working set inside `SharedBuffersBytes` (WAL pages)
+  and `ValueCacheBytes` (decoded values) if the goal is memory-latency GETs.
 - **Do not** compare Turnstone `--dev` + `UnsafeDisableFsync` to
   production PostgreSQL.
 - **Do** pin PostgreSQL to the same disk, `fsync=on`, and a single

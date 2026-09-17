@@ -334,8 +334,13 @@ func (db *DB) remapIndexOffsets(ctx IndexGCContext, remap map[int64]int64) error
 		return out
 	}
 	_, err := db.index.hash.CompactAll(filter)
-	if err == nil && db.valueCache != nil {
-		db.valueCache.clear()
+	if err == nil {
+		if db.valueCache != nil {
+			db.valueCache.clear()
+		}
+		if db.log != nil {
+			db.log.buffers.clear()
+		}
 	}
 	return err
 }

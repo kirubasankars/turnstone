@@ -22,24 +22,12 @@ func (l *DataLog) readFrameBytesAtLocked(lsn int64) ([]byte, error) {
 	if !ok {
 		return nil, fmt.Errorf("invalid log offset %d", lsn)
 	}
-	f, closeFn, err := segmentReadFile(seg)
-	if err != nil {
-		return nil, err
-	}
-	if closeFn != nil {
-		defer closeFn()
-	}
-
-	stat, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	_, _, span, err := readFrameAtFile(f, local, stat.Size())
+	_, _, span, err := l.readFrameAtSeg(seg, local, l.segmentScanLimit(seg, fileSizeOf(seg.path)))
 	if err != nil {
 		return nil, err
 	}
 	frame := make([]byte, span.length)
-	if _, err := f.ReadAt(frame, local); err != nil {
+	if err := l.readSegmentAt(seg, local, frame); err != nil {
 		return nil, err
 	}
 	return frame, nil
@@ -104,6 +92,8 @@ func (l *DataLog) appendCopyForwardFrames(oldOffsets []int64, frames [][]byte) (
 		if int64(n) != int64(len(frame)) {
 			return walCopyForwardOutcome{}, fmt.Errorf("wal copy-forward: short write")
 		}
+		l.buffers.applyWrite(seg.id, localOff, frame[:n])
+		adviseWALRange(seg.mapping, localOff, int64(n), walAdviseWillneed())
 		l.writeOffset += int64(n)
 		out.remap[oldOffsets[i]] = off
 
@@ -170,6 +160,9 @@ func (l *DataLog) deleteSegmentsThroughLocked(maxEndLSN int64) (int, int64, erro
 		}
 		if err == nil {
 			reclaimed += info.Size()
+		}
+		if l.buffers != nil {
+			l.buffers.invalidateSegment(seg.id)
 		}
 		closeSegmentFiles(&l.segments[i])
 		if _, err := l.recycleOrRemove(seg.path); err != nil {

@@ -95,10 +95,15 @@ type Options struct {
 	CommitDelay        time.Duration
 	CommitSiblings     int
 	UnsafeDisableFsync bool
-	// ValueCacheBytes caps the in-memory WAL-offset value cache (0 = 64 MiB
-	// default; negative disables). Hot GETs avoid re-reading the WAL, which is
-	// the main way a hash KV store beats PostgreSQL shared_buffers+btree.
+	// ValueCacheBytes caps the decoded WAL-offset value cache (0 = 64 MiB
+	// default; negative disables). Hot GETs return a heap copy without
+	// decoding a WAL frame.
 	ValueCacheBytes int64
+	// SharedBuffersBytes caps the 8 KiB WAL page pool used to assemble
+	// values from mmap'd segments (0 = 64 MiB default; negative disables).
+	// This is the PostgreSQL shared_buffers analog: concurrent GETs share
+	// resident pages instead of each pread'ing the file.
+	SharedBuffersBytes int64
 
 	// WalSegmentSize rotates the active WAL segment at this many bytes (0 = default 64MB).
 	WalSegmentSize int64
