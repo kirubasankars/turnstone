@@ -82,46 +82,43 @@ func (l *DataLog) ReadLogRange(startOffset int64, maxBytes int64) ([]byte, int64
 			continue
 		}
 
-		f, err := os.Open(seg.path)
-		if err != nil {
+		if _, err := os.Stat(seg.path); err != nil {
 			if os.IsNotExist(err) {
 				return nil, startOffset, ErrLogUnavailable
 			}
 			return nil, startOffset, err
 		}
-		stat, err := f.Stat()
-		if err != nil {
-			f.Close()
-			return nil, startOffset, err
-		}
-		fileSize := stat.Size()
+
+		fileSize := l.segmentScanLimit(seg, fileSizeOf(seg.path))
 		localPos := pos - seg.baseLSN
 
 		for localPos < fileSize && pos < segEnd {
-			validEnd, _, span, rerr := readFrameAtFile(f, localPos, fileSize)
+			validEnd, _, span, rerr := l.readFrameAtSeg(seg, localPos, fileSize)
 			if rerr != nil {
-				f.Close()
 				if rerr == io.EOF {
 					break
+				}
+				if os.IsNotExist(rerr) {
+					return nil, startOffset, ErrLogUnavailable
 				}
 				return nil, startOffset, rerr
 			}
 			frameLen := span.length
 			if len(out) > 0 && int64(len(out))+frameLen > maxBytes {
-				f.Close()
 				return out, pos, nil
 			}
 
 			frame := make([]byte, frameLen)
-			if _, err := f.ReadAt(frame, localPos); err != nil {
-				f.Close()
+			if err := l.readSegmentAt(seg, localPos, frame); err != nil {
+				if os.IsNotExist(err) {
+					return nil, startOffset, ErrLogUnavailable
+				}
 				return nil, startOffset, err
 			}
 			out = append(out, frame...)
 			localPos = validEnd
 			pos = seg.baseLSN + localPos
 		}
-		f.Close()
 	}
 
 	return out, pos, nil
@@ -139,22 +136,31 @@ func (l *DataLog) AppendRawFrames(data []byte, fsync bool) (int64, error) {
 
 	l.mu.Lock()
 	startOff := l.writeOffset
-	seg := &l.segments[l.activeIndex]
-	localOff := l.writeOffset - seg.baseLSN
-	n, err := seg.writer.WriteAt(data, localOff)
-	if err != nil {
-		l.mu.Unlock()
-		return 0, err
-	}
-	if int64(n) != int64(len(data)) {
-		l.mu.Unlock()
-		return 0, io.ErrShortWrite
-	}
-	l.writeOffset += int64(n)
-	if l.writeOffset-seg.baseLSN >= l.segmentSize {
-		if err := l.rotateSegmentLocked(); err != nil {
+	pos := 0
+	for _, fr := range frames {
+		raw := data[pos : pos+int(fr.length)]
+		pos += int(fr.length)
+		if err := l.rotateIfNeededLocked(fr.length); err != nil {
 			l.mu.Unlock()
 			return 0, err
+		}
+		seg := &l.segments[l.activeIndex]
+		localOff := l.writeOffset - seg.baseLSN
+		n, err := seg.writer.WriteAt(raw, localOff)
+		if err != nil {
+			l.mu.Unlock()
+			return 0, err
+		}
+		if int64(n) != fr.length {
+			l.mu.Unlock()
+			return 0, io.ErrShortWrite
+		}
+		l.writeOffset += fr.length
+		if l.writeOffset-seg.baseLSN >= l.usableSegmentSize() {
+			if err := l.rotateSegmentLocked(); err != nil {
+				l.mu.Unlock()
+				return 0, err
+			}
 		}
 	}
 	if fsync {

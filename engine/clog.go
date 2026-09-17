@@ -10,11 +10,14 @@ import (
 )
 
 func (db *DB) buildSnapshotLocked() Snapshot {
+	xmax := atomic.LoadUint64(&db.transactionID) + 1
+	if len(db.activeXids) == 0 {
+		return Snapshot{Xmax: xmax}
+	}
 	xip := make(map[uint64]bool, len(db.activeXids))
 	for xid := range db.activeXids {
 		xip[xid] = true
 	}
-	xmax := atomic.LoadUint64(&db.transactionID) + 1
 	return Snapshot{Xmax: xmax, Xip: xip}
 }
 
@@ -70,12 +73,14 @@ func (db *DB) abortTransaction(tx *Transaction) {
 			return
 		}
 
-		if _, err := db.appendRecord(RecordAbort, tx.xid, nil, nil); err != nil {
-			panic("CRITICAL: ABORT record append failed: " + err.Error())
-		}
-		db.setClog(tx.xid, TxAborted)
-		if err := db.index.DropXid(tx.xid); err != nil {
-			panic("CRITICAL: index DropXid failed: " + err.Error())
+		if tx.didWrite {
+			if _, err := db.appendRecord(RecordAbort, tx.xid, nil, nil); err != nil {
+				panic("CRITICAL: ABORT record append failed: " + err.Error())
+			}
+			db.setClog(tx.xid, TxAborted)
+			if err := db.index.DropXid(tx.xid); err != nil {
+				panic("CRITICAL: index DropXid failed: " + err.Error())
+			}
 		}
 
 		db.txMu.Lock()
@@ -88,6 +93,8 @@ func (db *DB) abortTransaction(tx *Transaction) {
 			}
 		}
 		db.txMu.Unlock()
-		db.forgetClog(tx.xid)
+		if tx.didWrite {
+			db.forgetClog(tx.xid)
+		}
 	})
 }

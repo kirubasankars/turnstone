@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -265,6 +266,72 @@ func TestDB_ApplyRecord(t *testing.T) {
 	count, _ := db.KeyCount()
 	if count != 2 {
 		t.Errorf("Expected KeyCount 2, got %d", count)
+	}
+}
+
+func TestDB_ApplyRecord_SetWithoutBegin(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	const xid = uint64(200)
+	if err := db.ApplyRecord(Record{Type: RecordSet, XID: xid, Key: []byte("nb"), Value: []byte("v")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ApplyRecord(Record{Type: RecordCommit, XID: xid}); err != nil {
+		t.Fatal(err)
+	}
+
+	tx := db.NewTransaction(false)
+	defer tx.Discard()
+	val, err := tx.Get([]byte("nb"))
+	if err != nil || string(val) != "v" {
+		t.Fatalf("Get after SET/COMMIT without BEGIN: %v %q", err, val)
+	}
+}
+
+func TestDB_DefaultCommitDelayZero(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if db.commitDelay != 0 {
+		t.Fatalf("default CommitDelay = %v, want 0 (Postgres-style group commit)", db.commitDelay)
+	}
+}
+
+func TestDB_ValueCacheHitAfterWrite(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	tx := db.NewTransaction(true)
+	if err := tx.Put([]byte("cached"), []byte("payload")); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if db.valueCache == nil {
+		t.Fatal("expected default value cache")
+	}
+	hits := atomic.LoadUint64(&db.valueCache.hits)
+	rtx := db.NewTransaction(false)
+	defer rtx.Discard()
+	val, err := rtx.Get([]byte("cached"))
+	if err != nil || string(val) != "payload" {
+		t.Fatalf("Get: %v %q", err, val)
+	}
+	if atomic.LoadUint64(&db.valueCache.hits) <= hits {
+		t.Fatal("expected value cache hit on GET after write")
 	}
 }
 

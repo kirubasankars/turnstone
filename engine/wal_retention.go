@@ -137,6 +137,13 @@ func (db *DB) MaybeCopyForwardWal(minDeletableLSN int64) (WalRetentionResult, er
 		return WalRetentionResult{}, err
 	}
 
+	// Copied SET/DEL frames have no COMMIT. Write one per xid so reopen does
+	// not treat them as crashed in-progress transactions (BEGIN is no longer
+	// written on the live path).
+	if err := db.appendCopyForwardCommits(frames); err != nil {
+		return WalRetentionResult{}, err
+	}
+
 	if err := db.remapIndexOffsets(ctx, outcome.remap); err != nil {
 		return WalRetentionResult{}, err
 	}
@@ -211,6 +218,36 @@ func (db *DB) indexMinMVCCReferencedOffset(ctx IndexGCContext) (int64, bool) {
 	return minOff, true
 }
 
+func (db *DB) appendCopyForwardCommits(frames [][]byte) error {
+	seen := make(map[uint64]struct{})
+	var builders []func() []byte
+	for _, frame := range frames {
+		if len(frame) < LogFrameHeaderSize+LogRecordHeaderSize {
+			continue
+		}
+		rec, err := decodeRecord(frame[LogFrameHeaderSize:])
+		if err != nil {
+			return err
+		}
+		if rec.Type != RecordSet && rec.Type != RecordDelete {
+			continue
+		}
+		if _, ok := seen[rec.XID]; ok {
+			continue
+		}
+		seen[rec.XID] = struct{}{}
+		xid := rec.XID
+		builders = append(builders, func() []byte {
+			return encodeRecord(Record{Type: RecordCommit, XID: xid})
+		})
+	}
+	if len(builders) == 0 {
+		return nil
+	}
+	_, err := db.log.AppendRecords(builders, !db.unsafeDisableFsync)
+	return err
+}
+
 // copyForwardPlan collects live frame offsets when allocated WAL exceeds live
 // bytes by ratio. Empty offsets means skip (nothing live or not fragmented).
 func (db *DB) copyForwardPlan(ratio float64) (IndexGCContext, []int64, error) {
@@ -222,7 +259,10 @@ func (db *DB) copyForwardPlan(ratio float64) (IndexGCContext, []int64, error) {
 	if len(oldOffsets) == 0 {
 		return ctx, nil, nil
 	}
-	allocated := db.log.AllocatedBytesOnDisk()
+	allocated := db.log.logicalUsedBytes()
+	if allocated == 0 {
+		allocated = db.log.AllocatedBytesOnDisk()
+	}
 	if float64(allocated) <= float64(liveBytes)*ratio {
 		return ctx, nil, nil
 	}
@@ -294,6 +334,14 @@ func (db *DB) remapIndexOffsets(ctx IndexGCContext, remap map[int64]int64) error
 		return out
 	}
 	_, err := db.index.hash.CompactAll(filter)
+	if err == nil {
+		if db.valueCache != nil {
+			db.valueCache.clear()
+		}
+		if db.log != nil {
+			db.log.buffers.clear()
+		}
+	}
 	return err
 }
 

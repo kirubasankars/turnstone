@@ -524,7 +524,7 @@ func TestMetrics_StorageIO(t *testing.T) {
 	// Capture baseline metrics
 	// Note: Metric keys now use "db" prefix
 	m0 := gatherMetrics(t, srv)
-	baseLogAllocated := m0["turnstone_db_log_allocated_bytes"]
+	baseLogBytes := m0["turnstone_db_log_bytes"]
 
 	// Write Data
 	client.AssertStatus(protocol.OpCodeBegin, nil, protocol.ResStatusOK)
@@ -537,10 +537,10 @@ func TestMetrics_StorageIO(t *testing.T) {
 	client.AssertStatus(protocol.OpCodeSet, setPayload, protocol.ResStatusOK)
 	client.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusOK)
 
-	// Verify that allocated log bytes increased (sparse data.log)
+	// Preallocated segments do not grow on write; the logical LSN span does.
 	m1 := gatherMetrics(t, srv)
-	if m1["turnstone_db_log_allocated_bytes"] <= baseLogAllocated {
-		t.Errorf("Expected allocated log bytes increase, got %v (was %v)", m1["turnstone_db_log_allocated_bytes"], baseLogAllocated)
+	if m1["turnstone_db_log_bytes"] <= baseLogBytes {
+		t.Errorf("Expected logical log bytes increase, got %v (was %v)", m1["turnstone_db_log_bytes"], baseLogBytes)
 	}
 
 	// Read Data

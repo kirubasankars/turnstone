@@ -22,22 +22,12 @@ func (l *DataLog) readFrameBytesAtLocked(lsn int64) ([]byte, error) {
 	if !ok {
 		return nil, fmt.Errorf("invalid log offset %d", lsn)
 	}
-	f, err := os.Open(seg.path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	stat, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	_, _, span, err := readFrameAtFile(f, local, stat.Size())
+	_, _, span, err := l.readFrameAtSeg(seg, local, l.segmentScanLimit(seg, fileSizeOf(seg.path)))
 	if err != nil {
 		return nil, err
 	}
 	frame := make([]byte, span.length)
-	if _, err := f.ReadAt(frame, local); err != nil {
+	if err := l.readSegmentAt(seg, local, frame); err != nil {
 		return nil, err
 	}
 	return frame, nil
@@ -102,10 +92,12 @@ func (l *DataLog) appendCopyForwardFrames(oldOffsets []int64, frames [][]byte) (
 		if int64(n) != int64(len(frame)) {
 			return walCopyForwardOutcome{}, fmt.Errorf("wal copy-forward: short write")
 		}
+		l.buffers.applyWrite(seg.id, localOff, frame[:n])
+		adviseWALRange(seg.mapping, localOff, int64(n), walAdviseWillneed())
 		l.writeOffset += int64(n)
 		out.remap[oldOffsets[i]] = off
 
-		if l.writeOffset-seg.baseLSN >= l.segmentSize {
+		if l.writeOffset-seg.baseLSN >= l.usableSegmentSize() {
 			if err := l.rotateSegmentLocked(); err != nil {
 				return walCopyForwardOutcome{}, err
 			}
@@ -155,11 +147,7 @@ func (l *DataLog) deleteSegmentsThroughLocked(maxEndLSN int64) (int, int64, erro
 		}
 		end := seg.endLSN
 		if end == 0 {
-			info, err := os.Stat(seg.path)
-			if err != nil {
-				return deleted, reclaimed, err
-			}
-			end = seg.baseLSN + info.Size()
+			end = seg.baseLSN + l.logicalSizeFromFile(seg.path, fileSizeOf(seg.path))
 		}
 		if end > maxEndLSN {
 			kept = append(kept, seg)
@@ -173,7 +161,11 @@ func (l *DataLog) deleteSegmentsThroughLocked(maxEndLSN int64) (int, int64, erro
 		if err == nil {
 			reclaimed += info.Size()
 		}
-		if err := os.Remove(seg.path); err != nil && !os.IsNotExist(err) {
+		if l.buffers != nil {
+			l.buffers.invalidateSegment(seg.id)
+		}
+		closeSegmentFiles(&l.segments[i])
+		if _, err := l.recycleOrRemove(seg.path); err != nil {
 			return deleted, reclaimed, err
 		}
 		deleted++

@@ -27,7 +27,7 @@ Everything on disk that matters lives here; the in-memory index is rebuilt from 
                     │    clog     │  xid → committed | aborted
                     └─────────────┘
 
-  COMMIT ──► committer goroutine ──► group fsync ──► setClog(committed)
+  COMMIT ──► committer goroutine ──► group fdatasync ──► setClog(committed)
 ```
 
 ## File map
@@ -54,12 +54,29 @@ Tests (`*_test.go`, `correctness_test.go`, `benchmark_test.go`) are extensive �
 
 ## WAL format (summary)
 
-- Segments: `wal/seg-NNNNNN.wal`, rotated at ~64 MiB (see `normalizeWalSegmentSize`).
+- Segments: `wal/seg-NNNNNN.wal`, **preallocated** to the configured size (~64 MiB; see `normalizeWalSegmentSize`).
+- A 16-byte footer (`TSF1` + used-bytes + CRC) stores the logical end so file size is not the write head.
+- Retired segments are **renamed** into `wal/recycle/` (up to 8) and reused on the next rotation instead of unlink+create.
 - **Global byte LSN** spans segments; index `Version.Offset` uses this address space.
 - Each frame: `Length(4) + CRC32(4) + payload`.
 - Log record header: `Type(1) + XID(8)` + key/value bodies for SET/DEL.
 
-`manifest.json` tracks active segment and sealed segment list.
+`manifest.json` tracks active segment and sealed segment list. Saves are
+atomic: write `manifest.json.tmp`, full `fsync`, rename over dest, `fsync`
+the `wal/` directory. A crash mid-write leaves the previous dest; a crash
+after the tmp fsync but before rename is recovered on the next `Open`.
+
+## Corruption handling
+
+| Damage | `TruncateCorruptTail` | Result |
+| --- | --- | --- |
+| Active-segment tail (short frame, bad CRC, garbage, huge length) | on | Rewind logical end to last valid frame; prefix kept; file not shrunk |
+| Same tail errors | off | `Open` fails |
+| Sealed-segment CRC / missing file / bad `manifest.json` | either | `Open` fails |
+| Recycled unused bytes | n/a | Ignored (`used=0` footer) |
+| Live `GET` / `VerifyChecksums` | n/a | Return checksum/corrupt error; no silent repair |
+
+Executable cases: `corruption_test.go`.
 
 ## Transaction semantics
 
@@ -67,7 +84,7 @@ Tests (`*_test.go`, `correctness_test.go`, `benchmark_test.go`) are extensive �
 | --- | --- |
 | Isolation | Snapshot isolation |
 | Writes | Eager log at `SET`/`DEL` time |
-| Durability | Group `fsync` on `COMMIT` |
+| Durability | Group `fdatasync` on `COMMIT` (Unix); optional `CommitDelay` gather window (default 0) |
 | Conflicts | First-writer-wins per key (`NOWAIT` lock) |
 | Read own writes | `xmin == myXid` visible before commit |
 | Stale reads | `checkReadSetConflicts` at commit |
@@ -94,7 +111,9 @@ Skips copy-forward while write transactions are already active. Once a copy star
 Notable tunables in `types.go` `Options`:
 
 - `TruncateCorruptTail` — recovery behavior on partial last frame
-- `CommitDelay` / `CommitSiblings` — group commit batching
+- `CommitDelay` / `CommitSiblings` — optional gather window (default 0) plus drain-after-fsync batching
+- `ValueCacheBytes` — decoded WAL-offset value cache (0 = 64 MiB, negative disables)
+- `SharedBuffersBytes` — 8 KiB WAL page pool (0 = 64 MiB, negative disables)
 - `UnsafeDisableFsync` — tests only
 - `IndexCompactOnRetention`, `WalCopyForwardOnRetention` — maintenance toggles
 - `MaxDiskUsagePercent` — reject writes when disk full
@@ -115,7 +134,21 @@ Mixing these when reading code is a common source of confusion.
 
 ### Group commit
 
-`committer.go` batches concurrent `COMMIT` requests to amortize `fsync` cost — study `committer_test.go` for latency/throughput tradeoffs.
+`committer.go` batches concurrent `COMMIT` requests to amortize `fdatasync` cost — study `committer_test.go` for latency/throughput tradeoffs. Default `CommitDelay` is 0 (PostgreSQL-style: do not sleep; batch what queued during the previous flush).
+
+### Why no BEGIN record
+
+Write transactions allocate an xid and pin `beginOffsets` at the current WAL head. Recovery treats `SET`/`DEL` without `COMMIT` as in-progress and drops those versions, unless a later `COMMIT` for that xid was already seen (copy-forwarded SET frames). Copy-forward appends a `COMMIT` record per copied xid so reopen does not treat compacted live data as a crash.
+
+### WAL mmap, madvise, and shared buffers
+
+On Unix each WAL segment is `mmap(MAP_SHARED)` after open. Point reads copy from the mapping (no `pread`). `madvise` hints: `MADV_RANDOM` after map, `MADV_SEQUENTIAL` during replay, `MADV_WILLNEED` on the just-written range, `MADV_DONTNEED` before unmap, plus `MADV_DONTFORK`/`MADV_DONTDUMP` on Linux.
+
+`shared_buffers` is an 8 KiB page pool (clock sweep, pin counts) keyed by `(segment id, page)`. A GET that misses the decoded value cache pins the pages covering the frame, CRC-checks, and decodes. Writes write-through into resident pages so a neighbor key on the same page stays valid. Copy-forward and segment delete drop the matching buffers.
+
+The decoded value cache remains an L1 heap copy keyed by WAL offset. Copy-forward remaps clear both caches.
+
+Beating PostgreSQL on this KV shape: **[docs/performance.md](../docs/performance.md)**.
 
 ## Review checklist
 
@@ -137,4 +170,4 @@ Mixing these when reading code is a common source of confusion.
 
 - Formal on-disk format document generated from `encode.go`.
 - Optional `EXPLAIN`-style debug API for visibility decisions per key.
-- Pluggable `fsync` policy for NVMe vs remote disk.
+- Tunable `CommitDelay` for HDD vs NVMe (default 0 is correct for NVMe).
