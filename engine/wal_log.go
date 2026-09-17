@@ -60,22 +60,14 @@ func OpenDataLog(dir string, logger *slog.Logger, segmentSize int64) (*DataLog, 
 	walDir := filepath.Join(dir, walDirName)
 	manifestPath := filepath.Join(walDir, walManifestName)
 
-	var (
-		manifest *walManifest
-		err      error
-	)
-	if _, err = os.Stat(manifestPath); err == nil {
-		manifest, err = loadWalManifest(manifestPath)
-		if err != nil {
-			return nil, fmt.Errorf("load wal manifest: %w", err)
-		}
-	} else if os.IsNotExist(err) {
+	manifest, err := loadWalManifest(manifestPath)
+	if os.IsNotExist(err) {
 		manifest, err = createFreshWalManifest(walDir, segmentSize)
 		if err != nil {
 			return nil, fmt.Errorf("create wal: %w", err)
 		}
-	} else {
-		return nil, err
+	} else if err != nil {
+		return nil, fmt.Errorf("load wal manifest: %w", err)
 	}
 
 	if manifest.SegmentSize <= 0 {
