@@ -49,7 +49,8 @@ func TestWAL_ReplayUsesMapping(t *testing.T) {
 	}
 	for i := 0; i < 8; i++ {
 		payload := encodeRecord(Record{Type: RecordSet, XID: uint64(i + 1), Key: []byte("k"), Value: []byte("v")})
-		if _, err := log.AppendEncoded(payload, false); err != nil {
+		sync := i == 7
+		if _, err := log.AppendEncoded(payload, sync); err != nil {
 			t.Fatal(err)
 		}
 	}
