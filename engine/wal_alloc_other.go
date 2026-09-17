@@ -9,9 +9,8 @@ package engine
 
 import "os"
 
-func preallocateFile(f *os.File, size int64) error {
-	if size <= 0 {
-		return nil
-	}
+func isQuotaExceeded(error) bool { return false }
+
+func preallocateFileOS(f *os.File, size int64) error {
 	return f.Truncate(size)
 }

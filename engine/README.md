@@ -57,6 +57,7 @@ Tests (`*_test.go`, `correctness_test.go`, `benchmark_test.go`) are extensive â€
 - Segments: `wal/seg-NNNNNN.wal`, **preallocated** to the configured size (~64 MiB; see `normalizeWalSegmentSize`).
 - A 16-byte footer (`TSF1` + used-bytes + CRC) stores the logical end so file size is not the write head.
 - Retired segments are **renamed** into `wal/recycle/` (up to 8) and reused on the next rotation instead of unlink+create.
+- If `fallocate`/`truncate` hits `ENOSPC` (tight `/tmp`, small tmpfs), the segment **grows as it is written** instead of failing `Open`. No end-of-file footer and no mmap until the file is full size.
 - **Global byte LSN** spans segments; index `Version.Offset` uses this address space.
 - Each frame: `Length(4) + CRC32(4) + payload`.
 - Log record header: `Type(1) + XID(8)` + key/value bodies for SET/DEL.
