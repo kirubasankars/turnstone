@@ -151,11 +151,16 @@ type IndexCompactResult struct {
 	ArenaAfter      uint64
 }
 
+var testingAfterIndexGCContext func()
+
 // CompactIndex rewrites every shard, dropping unneeded versions and reclaiming arena space.
 func (db *DB) CompactIndex(ctx IndexGCContext) (IndexCompactResult, error) {
 	if db.index == nil || db.index.hash == nil {
 		return IndexCompactResult{}, nil
 	}
+
+	db.walRewriteMu.Lock()
+	defer db.walRewriteMu.Unlock()
 
 	statsBefore := db.index.hash.Stats()
 	var before uint64
@@ -199,12 +204,18 @@ func (db *DB) MaybeCompactIndex() (IndexCompactResult, error) {
 		return IndexCompactResult{}, nil
 	}
 
+	db.walRewriteMu.Lock()
+	defer db.walRewriteMu.Unlock()
+
 	ratio := db.indexFragmentationRatio
 	if ratio <= 0 {
 		ratio = defaultIndexFragmentationRatio
 	}
 
 	ctx := db.BuildIndexGCContext()
+	if testingAfterIndexGCContext != nil {
+		testingAfterIndexGCContext()
+	}
 	// Retention may raise scan floor to the write head (after COMMIT). FilterVersions
 	// would then treat the live SET (offset < floor) as dead. Use WAL-retain
 	// visibility so overwrite garbage compact cannot drop the current value.

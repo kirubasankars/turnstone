@@ -247,3 +247,97 @@ func TestRecovery_CopyForwardedSetAfterCommitStaysVisible(t *testing.T) {
 		t.Fatalf("copy-forwarded SET after COMMIT must stay visible, got %v %q", err, val)
 	}
 }
+
+func TestApplyRecord_CopyForwardedSetStaysVisibleLive(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.ApplyRecord(Record{Type: RecordSet, XID: 7, Key: []byte("k"), Value: []byte("v")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ApplyRecord(Record{Type: RecordCommit, XID: 7}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ApplyRecord(Record{Type: RecordSet, XID: 7, Key: []byte("k"), Value: []byte("v2")}); err != nil {
+		t.Fatal(err)
+	}
+
+	rtx := db.NewTransaction(false)
+	val, err := rtx.Get([]byte("k"))
+	rtx.Discard()
+	if err != nil || string(val) != "v2" {
+		t.Fatalf("live GET between copied SET and extra COMMIT: %v %q", err, val)
+	}
+
+	if err := db.ApplyRecord(Record{Type: RecordCommit, XID: 7}); err != nil {
+		t.Fatal(err)
+	}
+	rtx = db.NewTransaction(false)
+	defer rtx.Discard()
+	val, err = rtx.Get([]byte("k"))
+	if err != nil || string(val) != "v2" {
+		t.Fatalf("GET after extra COMMIT: %v %q", err, val)
+	}
+}
+
+func TestApplyLogRange_CopyForwardedSetStaysVisibleLive(t *testing.T) {
+	dir := t.TempDir()
+	leader, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer leader.Close()
+
+	if err := leader.ApplyRecord(Record{Type: RecordSet, XID: 9, Key: []byte("k"), Value: []byte("a")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := leader.ApplyRecord(Record{Type: RecordCommit, XID: 9}); err != nil {
+		t.Fatal(err)
+	}
+	if err := leader.ApplyRecord(Record{Type: RecordSet, XID: 9, Key: []byte("k"), Value: []byte("b")}); err != nil {
+		t.Fatal(err)
+	}
+
+	seg, _, err := leader.ReadLogRange(0, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	frames, err := validateFrames(seg)
+	if err != nil || len(frames) < 3 {
+		t.Fatalf("leader frames: n=%d err=%v", len(frames), err)
+	}
+	cut := frames[0].length + frames[1].length
+
+	follower, err := Open(t.TempDir(), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer follower.Close()
+	if _, err := follower.ApplyLogRange(seg[:cut]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := follower.ApplyLogRange(seg[cut:]); err != nil {
+		t.Fatal(err)
+	}
+	rtx := follower.NewTransaction(false)
+	val, err := rtx.Get([]byte("k"))
+	rtx.Discard()
+	if err != nil || string(val) != "b" {
+		t.Fatalf("follower GET between copied SET and extra COMMIT: %v %q", err, val)
+	}
+
+	if err := follower.ApplyRecord(Record{Type: RecordCommit, XID: 9}); err != nil {
+		t.Fatal(err)
+	}
+	rtx = follower.NewTransaction(false)
+	defer rtx.Discard()
+	val, err = rtx.Get([]byte("k"))
+	if err != nil || string(val) != "b" {
+		t.Fatalf("follower GET after extra COMMIT: %v %q", err, val)
+	}
+}

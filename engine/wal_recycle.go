@@ -22,6 +22,9 @@ const (
 	maxRecycledSegments        = 8
 )
 
+// testingRecycleOrRemoveHook, if set, runs at the start of recycleOrRemove.
+var testingRecycleOrRemoveHook func(path string) error
+
 func (l *DataLog) usableSegmentSize() int64 {
 	if l.segmentSize <= walSegFooterSize+64 {
 		return l.segmentSize
@@ -210,6 +213,11 @@ func (l *DataLog) takeRecycledSegment(nextPath string) (*os.File, bool, error) {
 }
 
 func (l *DataLog) recycleOrRemove(path string) (recycled bool, err error) {
+	if testingRecycleOrRemoveHook != nil {
+		if hookErr := testingRecycleOrRemoveHook(path); hookErr != nil {
+			return false, hookErr
+		}
+	}
 	if len(l.recycle) >= maxRecycledSegments {
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 			return false, err

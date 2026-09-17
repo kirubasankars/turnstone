@@ -41,6 +41,8 @@ type WalRetentionResult struct {
 // Order matters: index compact drops stale versions first; copy-forward rewrites
 // live frames and remaps offsets before physical segment delete runs.
 func (db *DB) RunWalMaintenance() error {
+	db.walMaintMu.Lock()
+	defer db.walMaintMu.Unlock()
 	if db.indexCompactOnRetention {
 		if _, err := db.MaybeCompactIndex(); err != nil {
 			return err
@@ -375,19 +377,21 @@ func (db *DB) remapIndexOffsets(ctx IndexGCContext, remap map[int64]int64) error
 
 func (db *DB) validateRemapCoverage(ctx IndexGCContext, remap map[int64]int64) error {
 	var missing int64
+	missingSet := false
 	found := false
 	db.index.ForEachKey(func(_ []byte, chain []indexVersion) {
 		for _, v := range ctx.FilterVersionsForWalRetain(nil, chain) {
 			found = true
-			if _, ok := remap[v.offset]; !ok && missing == 0 {
+			if _, ok := remap[v.offset]; !ok && !missingSet {
 				missing = v.offset
+				missingSet = true
 			}
 		}
 	})
 	if !found {
 		return nil
 	}
-	if missing != 0 {
+	if missingSet {
 		return fmt.Errorf("wal copy-forward: missing remap for offset %d", missing)
 	}
 	return nil

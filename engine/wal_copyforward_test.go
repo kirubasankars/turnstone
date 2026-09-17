@@ -535,3 +535,54 @@ func TestOverwriteCommitLatency_StableAfterMaintenance(t *testing.T) {
 		checkKey(t, db, string(key), "c")
 	}
 }
+
+func TestGet_RetriesAfterCopyForwardRemap(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, Options{
+		WalSegmentSize:              256,
+		WalCopyForwardFragmentation: 2.0,
+		WalCopyForwardOnRetention:   walCopyForwardDisabled(),
+		IndexCompactOnRetention:     indexCompactDisabled(),
+		ValueCacheBytes:             -1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	key := []byte("k")
+	if err := commitKeyValue(db, key, "keep"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 25; i++ {
+		w := db.NewTransaction(true)
+		if err := w.Put(key, []byte("abort")); err != nil {
+			t.Fatal(err)
+		}
+		w.Discard()
+	}
+
+	rtx := db.NewTransaction(false)
+	defer rtx.Discard()
+
+	n := 0
+	testingAfterGetVisible = func() {
+		n++
+		if n != 1 {
+			return
+		}
+		testingAfterGetVisible = nil
+		if _, err := db.MaybeCopyForwardWal(0); err != nil {
+			t.Errorf("copy-forward during GET: %v", err)
+		}
+	}
+	t.Cleanup(func() { testingAfterGetVisible = nil })
+
+	val, err := rtx.Get(key)
+	if err != nil {
+		t.Fatalf("GET after remap: %v", err)
+	}
+	if string(val) != "keep" {
+		t.Fatalf("got %q want keep", val)
+	}
+}

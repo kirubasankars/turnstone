@@ -68,6 +68,7 @@ type ReplicaSlot struct {
 	Role      string    `json:"role"`
 	LastSeen  time.Time `json:"last_seen"`
 	Connected bool      `json:"connected"`
+	gen       uint64    `json:"-"`
 
 	// quitCh is used to signal the network handler to drop the connection.
 	// It is not serialized to JSON.
@@ -98,7 +99,8 @@ type Database struct {
 	quorumTimeout     time.Duration
 
 	// Coordination for StepDown
-	safePointCh chan struct{} // Signal to force broadcast of SafePoint
+	safePointCh  chan struct{} // Signal to force broadcast of SafePoint
+	safePointSeq uint64
 
 	// Leader-Propagated Safety Barrier
 	// If we are a follower, the leader tells us the cluster retain offset.
@@ -167,7 +169,7 @@ func OpenWithEngineOpts(ctx context.Context, dir string, logger *slog.Logger, mi
 		dir:                dir,
 		dbOpts:             opts,
 		state:              StateUndefined,
-		safePointCh:        make(chan struct{}),
+		safePointCh:        make(chan struct{}, 1),
 		replicaTimeout:     1 * time.Minute, // Default strict timeout for lagging replicas
 		quorumTimeout:      defaultQuorumTimeout,
 		closeCh:            make(chan struct{}),
@@ -286,7 +288,7 @@ func (s *Database) GetLeaderRetainOffset() uint64 {
 }
 
 // MinReplicaOffset calculates the minimum offset required by replication
-// consumers that pin WAL retention (server-role replicas only).
+// consumers that pin WAL retention (server-role slots, and connected backups).
 func (s *Database) MinReplicaOffset() uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -295,7 +297,14 @@ func (s *Database) MinReplicaOffset() uint64 {
 	hasSlots := false
 
 	for _, slot := range s.replicas {
-		if slot.Role != ReplicaRoleServer {
+		if slot.Role == ReplicaRoleAdmin {
+			continue
+		}
+		if slot.Role == ReplicaRoleBackup {
+			if !slot.Connected {
+				continue
+			}
+		} else if slot.Role != ReplicaRoleServer {
 			continue
 		}
 		hasSlots = true
@@ -664,11 +673,43 @@ func (s *Database) GetReplicaSignalChannel(id string) <-chan struct{} {
 	return nil
 }
 
+func closeReplicaQuitCh(ch chan struct{}) {
+	if ch == nil {
+		return
+	}
+	select {
+	case <-ch:
+	default:
+		close(ch)
+	}
+}
+
 // RegisterReplica adds or resets a replica slot in the tracking map.
 func (s *Database) RegisterReplica(id string, offset uint64, role string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.registerReplicaLocked(id, offset, role)
+}
 
+// RegisterReplicaHello remaps cursor 0 to the oldest retained LSN and registers
+// the slot in one critical section so retention cannot purge the start offset
+// between sample and pin.
+func (s *Database) RegisterReplicaHello(id string, offset uint64, role string) (start uint64, gen uint64) {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if offset == 0 && s.DB != nil {
+		if off := s.DB.OldestLogOffset(); off > 0 {
+			offset = uint64(off)
+		}
+	}
+	gen = s.registerReplicaLocked(id, offset, role)
+	return offset, gen
+}
+
+func (s *Database) registerReplicaLocked(id string, offset uint64, role string) uint64 {
+	gen := uint64(1)
 	if old, ok := s.replicas[id]; ok {
 		s.logger.Info("Replica re-registered (slot reset for this db)",
 			"id", id,
@@ -676,6 +717,11 @@ func (s *Database) RegisterReplica(id string, offset uint64, role string) {
 			"new_offset", offset,
 			"role", role,
 		)
+		closeReplicaQuitCh(old.quitCh)
+		gen = old.gen + 1
+		if gen == 0 {
+			gen = 1
+		}
 	} else {
 		s.logger.Info("New replica registered", "id", id, "offset", offset, "role", role)
 	}
@@ -685,11 +731,21 @@ func (s *Database) RegisterReplica(id string, offset uint64, role string) {
 		Role:      role,
 		LastSeen:  time.Now(),
 		Connected: true,
+		gen:       gen,
 		quitCh:    make(chan struct{}),
 	}
 	s.dirty = true
-	// Notify waiters that a new replica joined (might satisfy quorum)
 	s.cond.Broadcast()
+	return gen
+}
+
+func (s *Database) ReplicaGeneration(id string) uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if slot, ok := s.replicas[id]; ok {
+		return slot.gen
+	}
+	return 0
 }
 
 // ReplicaRole returns the role recorded for a replica slot, if present.
@@ -730,6 +786,19 @@ func (s *Database) UnregisterReplica(id string) {
 	}
 }
 
+// UnregisterReplicaGen marks the replica disconnected only if gen still owns the slot.
+func (s *Database) UnregisterReplicaGen(id string, gen uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if slot, ok := s.replicas[id]; ok && slot.gen == gen {
+		if slot.Connected {
+			s.logger.Info("Replica disconnected", "id", id)
+			slot.Connected = false
+			s.dirty = true
+		}
+	}
+}
+
 // RemoveAllReplicas drops all connected replicas.
 func (s *Database) RemoveAllReplicas() {
 	s.mu.Lock()
@@ -742,13 +811,7 @@ func (s *Database) RemoveAllReplicas() {
 	s.logger.Info("Disconnecting and removing all replicas (role change/reset)", "count", len(s.replicas))
 
 	for _, slot := range s.replicas {
-		if slot.quitCh != nil {
-			select {
-			case <-slot.quitCh:
-			default:
-				close(slot.quitCh)
-			}
-		}
+		closeReplicaQuitCh(slot.quitCh)
 	}
 
 	s.replicas = make(map[string]*ReplicaSlot)
@@ -993,8 +1056,15 @@ func (s *Database) SafePointSignal() <-chan struct{} {
 	return s.safePointCh
 }
 
+// SafePointSeq is a monotonic counter bumped on each TriggerSafePoint so a
+// stream blocked on outCh still observes the request on the next poll.
+func (s *Database) SafePointSeq() uint64 {
+	return atomic.LoadUint64(&s.safePointSeq)
+}
+
 // TriggerSafePoint signals replication streams to send a SafePoint immediately
 func (s *Database) TriggerSafePoint() {
+	atomic.AddUint64(&s.safePointSeq, 1)
 	select {
 	case s.safePointCh <- struct{}{}:
 	default:
@@ -1060,9 +1130,9 @@ func (s *Database) WaitForReplication(timeout time.Duration) error {
 
 // ResetReplicas clears all replica slots
 func (s *Database) ResetReplicas() {
+	s.RemoveAllReplicas()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.replicas = make(map[string]*ReplicaSlot)
 	if err := s.saveSlotsLocked(); err != nil {
 		s.logger.Error("Failed to save slots after reset", "err", err)
 	}

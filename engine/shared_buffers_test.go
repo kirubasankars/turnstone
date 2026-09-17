@@ -151,3 +151,62 @@ func TestSharedBuffers_ClockEvicts(t *testing.T) {
 	}
 	_ = pinned
 }
+
+func TestApplyLogRange_WriteThroughSharedBuffers(t *testing.T) {
+	leader, err := Open(t.TempDir(), Options{ValueCacheBytes: -1, SharedBuffersBytes: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer leader.Close()
+
+	tx := leader.NewTransaction(true)
+	if err := tx.Put([]byte("a"), []byte("one")); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	first, next, err := leader.ReadLogRange(0, 1<<20)
+	if err != nil || len(first) == 0 {
+		t.Fatalf("first range: len=%d err=%v", len(first), err)
+	}
+	tx = leader.NewTransaction(true)
+	if err := tx.Put([]byte("b"), []byte("two")); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	rest, _, err := leader.ReadLogRange(next, 1<<20)
+	if err != nil || len(rest) == 0 {
+		t.Fatalf("rest range: len=%d err=%v", len(rest), err)
+	}
+
+	follower, err := Open(t.TempDir(), Options{ValueCacheBytes: -1, SharedBuffersBytes: 128 << 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer follower.Close()
+	if follower.log.buffers == nil {
+		t.Fatal("expected shared buffers")
+	}
+	if _, err := follower.ApplyLogRange(first); err != nil {
+		t.Fatal(err)
+	}
+	rtx := follower.NewTransaction(false)
+	got, err := rtx.Get([]byte("a"))
+	rtx.Discard()
+	if err != nil || string(got) != "one" {
+		t.Fatalf("pin page: %v %q", err, got)
+	}
+
+	if _, err := follower.ApplyLogRange(rest); err != nil {
+		t.Fatal(err)
+	}
+	rtx = follower.NewTransaction(false)
+	defer rtx.Discard()
+	got, err = rtx.Get([]byte("b"))
+	if err != nil || string(got) != "two" {
+		t.Fatalf("GET after raw apply: %v %q", err, got)
+	}
+}

@@ -1012,11 +1012,12 @@ func TestStepDown_SafetySequence(t *testing.T) {
 	cTx.AssertStatus(protocol.OpCodeSet, pl, protocol.ResStatusOK)
 	cTx.AssertStatus(protocol.OpCodeCommit, nil, protocol.ResStatusOK)
 
-	// 7. StepDown should now complete
+	// 7. StepDown should now complete (WaitForReplication can take up to 5s,
+	// plus ResetReplicas / the OK write; keep margin for -race).
 	select {
 	case <-stepDownDone:
 		// Success
-	case <-time.After(5 * time.Second):
+	case <-time.After(15 * time.Second):
 		t.Fatal("StepDown failed to complete after draining tx")
 	}
 

@@ -7,7 +7,6 @@ package engine
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -36,9 +35,11 @@ type DB struct {
 	logger *slog.Logger
 
 	commitMu sync.Mutex
-	// walRewriteMu excludes write begins and replica apply from WAL copy-forward
-	// collect/remap. Lock order: commitMu, then walRewriteMu.
-	walRewriteMu sync.Mutex
+	// walRewriteMu excludes write begins, read begins, replica apply, and
+	// index compact from WAL copy-forward collect/remap. Lock order:
+	// walRewriteMu, then commitMu.
+	walRewriteMu sync.RWMutex
+	walMaintMu   sync.Mutex
 	shutdownMu   sync.RWMutex
 
 	transactionID   uint64
@@ -61,7 +62,8 @@ type DB struct {
 	beginOffsets map[uint64]int64
 	txTimeout    time.Duration
 
-	replImpact map[uint64]*replTxImpact
+	replImpact       map[uint64]*replTxImpact
+	appliedCommitted map[uint64]struct{}
 
 	closeCh chan struct{}
 	wg      sync.WaitGroup
@@ -162,6 +164,7 @@ func OpenContext(ctx context.Context, dir string, opts Options) (*DB, error) {
 		txStartTimes:              make(map[uint64]time.Time),
 		beginOffsets:              make(map[uint64]int64),
 		replImpact:                make(map[uint64]*replTxImpact),
+		appliedCommitted:          make(map[uint64]struct{}),
 		txTimeout:                 opts.TxTimeout,
 		closeCh:                   make(chan struct{}),
 		commitCh:                  make(chan commitRequest, 4096),
@@ -193,6 +196,9 @@ func OpenContext(ctx context.Context, dir string, opts Options) (*DB, error) {
 	if err := db.replayLog(ctx, opts.TruncateCorruptTail); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("replay log: %w", err)
+	}
+	if oldest := db.log.OldestSegmentBaseLSN(); oldest > 0 {
+		atomic.StoreInt64(&db.scanFloor, oldest)
 	}
 	db.index.SetEnforceLimit(true)
 	db.index.RecalcUsedBytes()
@@ -330,8 +336,8 @@ func (db *DB) OldestLogOffset() int64 {
 // InitLogAtLSN points an empty log at lsn so ApplyLogRange preserves primary
 // physical offsets. It is a no-op when lsn is 0. Refuses a non-empty log.
 func (db *DB) InitLogAtLSN(lsn int64) error {
-	if atomic.LoadInt32(&db.isCorrupt) == 1 {
-		return errors.New("database is corrupt")
+	if err := db.errIfCorrupt(); err != nil {
+		return err
 	}
 	db.walRewriteMu.Lock()
 	defer db.walRewriteMu.Unlock()
@@ -539,11 +545,23 @@ func (db *DB) VerifyChecksums() error {
 	return db.log.Replay(ctx, false, func(rec Record, span recordSpan) {})
 }
 
+func (db *DB) errIfCorrupt() error {
+	if atomic.LoadInt32(&db.isCorrupt) == 1 {
+		return ErrDatabaseCorrupt
+	}
+	return nil
+}
+
 func (db *DB) NewTransaction(update bool) *Transaction {
 	if atomic.LoadInt32(&db.closed) == 1 {
 		return &Transaction{db: db, update: update, beginErr: ErrDatabaseClosed, finished: true}
 	}
+	if err := db.errIfCorrupt(); err != nil {
+		return &Transaction{db: db, update: update, beginErr: err}
+	}
 	if !update {
+		db.walRewriteMu.RLock()
+		defer db.walRewriteMu.RUnlock()
 		db.activeTxnsMu.Lock()
 		db.txMu.Lock()
 		snap := db.buildSnapshotLocked()
@@ -613,8 +631,8 @@ func (db *DB) SetScanFloor(minOffset int64) error {
 // each statement to the in-memory index. Segments must be statement-aligned
 // (whole frames only); partial frames are rejected.
 func (db *DB) ApplyLogRange(data []byte) (int64, error) {
-	if atomic.LoadInt32(&db.isCorrupt) == 1 {
-		return 0, errors.New("database is corrupt")
+	if err := db.errIfCorrupt(); err != nil {
+		return 0, err
 	}
 	frames, err := validateFrames(data)
 	if err != nil {
@@ -639,17 +657,11 @@ func (db *DB) ApplyLogRange(data []byte) (int64, error) {
 		switch rec.Type {
 		case RecordBegin:
 			db.txMu.Lock()
-			db.activeXids[rec.XID] = nil
-			db.beginOffsets[rec.XID] = off
+			db.applyOpenXidLocked(rec.XID, off)
 			db.txMu.Unlock()
 		case RecordSet, RecordDelete:
 			db.txMu.Lock()
-			if _, ok := db.beginOffsets[rec.XID]; !ok {
-				db.beginOffsets[rec.XID] = off
-			}
-			if _, ok := db.activeXids[rec.XID]; !ok {
-				db.activeXids[rec.XID] = nil
-			}
+			db.applyOpenXidLocked(rec.XID, off)
 			db.txMu.Unlock()
 			isDelete := rec.Type == RecordDelete
 			if err := db.index.Put(rec.Key, indexVersion{
@@ -665,10 +677,7 @@ func (db *DB) ApplyLogRange(data []byte) (int64, error) {
 		case RecordCommit:
 			db.forgetClog(rec.XID)
 			db.txMu.Lock()
-			delete(db.activeXids, rec.XID)
-			delete(db.beginOffsets, rec.XID)
-			impact := db.replImpact[rec.XID]
-			delete(db.replImpact, rec.XID)
+			impact := db.applyCommitXidLocked(rec.XID)
 			db.txMu.Unlock()
 			db.applyReplicatedImpact(impact)
 		case RecordAbort:
@@ -700,8 +709,8 @@ func (db *DB) ReadLogRange(startOffset int64, maxBytes int64) ([]byte, int64, er
 }
 
 func (db *DB) ApplyRecord(rec Record) error {
-	if atomic.LoadInt32(&db.isCorrupt) == 1 {
-		return errors.New("database is corrupt")
+	if err := db.errIfCorrupt(); err != nil {
+		return err
 	}
 
 	db.walRewriteMu.Lock()
@@ -716,8 +725,7 @@ func (db *DB) ApplyRecord(rec Record) error {
 			return err
 		}
 		db.txMu.Lock()
-		db.activeXids[rec.XID] = nil
-		db.beginOffsets[rec.XID] = off
+		db.applyOpenXidLocked(rec.XID, off)
 		db.txMu.Unlock()
 		db.AdvanceXID(rec.XID)
 		return nil
@@ -729,12 +737,7 @@ func (db *DB) ApplyRecord(rec Record) error {
 			return err
 		}
 		db.txMu.Lock()
-		if _, ok := db.beginOffsets[rec.XID]; !ok {
-			db.beginOffsets[rec.XID] = off
-		}
-		if _, ok := db.activeXids[rec.XID]; !ok {
-			db.activeXids[rec.XID] = nil
-		}
+		db.applyOpenXidLocked(rec.XID, off)
 		db.txMu.Unlock()
 		isDelete := rec.Type == RecordDelete
 		if err := db.index.Put(rec.Key, indexVersion{
@@ -757,10 +760,7 @@ func (db *DB) ApplyRecord(rec Record) error {
 		}
 		db.forgetClog(rec.XID)
 		db.txMu.Lock()
-		delete(db.activeXids, rec.XID)
-		delete(db.beginOffsets, rec.XID)
-		impact := db.replImpact[rec.XID]
-		delete(db.replImpact, rec.XID)
+		impact := db.applyCommitXidLocked(rec.XID)
 		db.txMu.Unlock()
 		db.applyReplicatedImpact(impact)
 		db.AdvanceXID(rec.XID)
@@ -831,6 +831,33 @@ func (db *DB) applyReplicatedImpact(impact *replTxImpact) {
 	if impact.keyDelta != 0 {
 		atomic.AddInt64(&db.keyCount, impact.keyDelta)
 	}
+}
+
+// applyOpenXidLocked records an in-progress replicated xid. Caller holds txMu.
+// Copy-forwarded SET/DEL after COMMIT must not reopen a committed xid.
+func (db *DB) applyOpenXidLocked(xid uint64, off int64) {
+	if _, done := db.appliedCommitted[xid]; done {
+		return
+	}
+	if _, ok := db.beginOffsets[xid]; !ok {
+		db.beginOffsets[xid] = off
+	}
+	if _, ok := db.activeXids[xid]; !ok {
+		db.activeXids[xid] = nil
+	}
+}
+
+// applyCommitXidLocked marks xid committed for live apply. Caller holds txMu.
+func (db *DB) applyCommitXidLocked(xid uint64) *replTxImpact {
+	if db.appliedCommitted == nil {
+		db.appliedCommitted = make(map[uint64]struct{})
+	}
+	db.appliedCommitted[xid] = struct{}{}
+	delete(db.activeXids, xid)
+	delete(db.beginOffsets, xid)
+	impact := db.replImpact[xid]
+	delete(db.replImpact, xid)
+	return impact
 }
 
 func (db *DB) Close() error {

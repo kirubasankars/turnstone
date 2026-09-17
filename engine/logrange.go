@@ -163,6 +163,8 @@ func (l *DataLog) AppendRawFrames(data []byte, fsync bool) (int64, error) {
 			l.mu.Unlock()
 			return 0, io.ErrShortWrite
 		}
+		l.buffers.applyWrite(seg.id, localOff, raw[:n])
+		adviseWALRange(seg.mapping, localOff, int64(n), walAdviseWillneed())
 		l.writeOffset += fr.length
 		if l.writeOffset-seg.baseLSN >= l.usableSegmentSize() {
 			if err := l.rotateSegmentLocked(); err != nil {

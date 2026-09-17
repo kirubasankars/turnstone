@@ -6,7 +6,6 @@
 package engine
 
 import (
-	"errors"
 	"sync/atomic"
 )
 
@@ -48,7 +47,7 @@ func (db *DB) processCommitBatch(requests []commitRequest) {
 		}
 		if atomic.LoadInt32(&db.isCorrupt) == 1 {
 			for _, req := range requests {
-				outcomes = append(outcomes, outcome{req.tx, errors.New("database is corrupt"), false})
+				outcomes = append(outcomes, outcome{req.tx, ErrDatabaseCorrupt, false})
 			}
 			return
 		}
@@ -81,6 +80,10 @@ func (db *DB) processCommitBatch(requests []commitRequest) {
 		if err != nil {
 			atomic.StoreInt32(&db.isCorrupt, 1)
 			for _, tx := range valid {
+				if dropErr := db.index.DropXid(tx.xid); dropErr != nil {
+					db.logger.Error("commit failure DropXid", "xid", tx.xid, "err", dropErr)
+				}
+				db.setClog(tx.xid, TxAborted)
 				outcomes = append(outcomes, outcome{tx, err, true})
 			}
 			return

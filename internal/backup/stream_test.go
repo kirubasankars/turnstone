@@ -303,6 +303,31 @@ func TestStreamLogRange_RecordsRemappedBaseLSN(t *testing.T) {
 	}
 }
 
+func TestStreamLogRange_RejectsGappedRanges(t *testing.T) {
+	tlsConf := testTLSConfig(t)
+	wal := writeEngineWAL(t, "k")
+	addr, stop := startFakeBackupServer(t, tlsConf, func(conn net.Conn) {
+		defer conn.Close()
+		_ = readBackupHello(conn)
+		_ = writeBackupStatus(conn, protocol.ResStatusOK, "")
+		_ = writeBackupLogRange(conn, "1", 0, uint64(len(wal)), wal)
+		_ = writeBackupLogRange(conn, "1", uint64(len(wal))+10, uint64(len(wal))+10+uint64(len(wal)), wal)
+		time.Sleep(200 * time.Millisecond)
+	})
+	defer stop()
+
+	var out bytes.Buffer
+	_, err := StreamLogRange(context.Background(), StreamOptions{
+		Host:     addr,
+		DBName:   "1",
+		WaitIdle: 50 * time.Millisecond,
+		TLS:      tlsConf,
+	}, &out)
+	if err == nil {
+		t.Fatal("expected start mismatch error")
+	}
+}
+
 type failingWriter struct{}
 
 func (failingWriter) Write(p []byte) (int, error) {

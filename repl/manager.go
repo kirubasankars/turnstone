@@ -319,6 +319,7 @@ func (rm *Manager) spawnConnection(addr string) {
 
 func (rm *Manager) maintainConnection(ctx context.Context, addr string) {
 	peerLogger := rm.logger.With("peer_addr", addr)
+	retryWait := 100 * time.Millisecond
 
 	for {
 		if ctx.Err() != nil {
@@ -343,14 +344,21 @@ func (rm *Manager) maintainConnection(ctx context.Context, addr string) {
 			if ctx.Err() != nil {
 				return
 			}
-			// WARN: Failure to connect/sync
-			peerLogger.Warn("Replication sync failed, retrying in 3s", "err", err)
+			peerLogger.Warn("Replication sync failed, retrying", "err", err, "wait", retryWait)
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(3 * time.Second):
+			case <-time.After(retryWait):
 			}
+			if retryWait < 3*time.Second {
+				retryWait *= 2
+				if retryWait > 3*time.Second {
+					retryWait = 3 * time.Second
+				}
+			}
+			continue
 		}
+		retryWait = 100 * time.Millisecond
 	}
 }
 
@@ -380,12 +388,17 @@ func (rm *Manager) connectAndSync(ctx context.Context, addr string, dbs []Source
 	if err != nil {
 		return err
 	}
-
-	rm.safeGo("connCloser:"+addr, func() {
-		<-ctx.Done()
-		_ = conn.Close()
-	})
 	defer conn.Close()
+
+	connCtx, connCancel := context.WithCancel(ctx)
+	defer connCancel()
+	rm.safeGo("connCloser:"+addr, func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-connCtx.Done():
+		}
+	})
 
 	logger.Info("Connected to Leader", "db_count", len(dbs))
 

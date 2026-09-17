@@ -39,7 +39,7 @@ const (
 	RoleClient = "client"
 	RoleAdmin  = "admin"
 	RoleServer = "server" // usually implies admin-like privileges for internal replication
-	RoleBackup = "backup" // WAL backup stream consumer; does not pin retention or quorum
+	RoleBackup = "backup" // WAL backup stream consumer; pins retention while connected
 )
 
 type Server struct {

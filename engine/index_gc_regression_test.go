@@ -8,6 +8,7 @@ package engine
 import (
 	"fmt"
 	"testing"
+	"time"
 )
 
 func committedClog() func(uint64) TxStatus {
@@ -592,6 +593,58 @@ func TestIndexCompactOnRetention_RegressionOptOut(t *testing.T) {
 	defer db.Close()
 	if db.indexCompactOnRetention {
 		t.Fatal("expected compaction disabled when explicitly opted out")
+	}
+}
+
+func TestMaybeCompactIndex_FencesNewSnapshots(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := commitKeyValue(db, []byte("k"), "v1"); err != nil {
+		t.Fatal(err)
+	}
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	testingAfterIndexGCContext = func() {
+		close(started)
+		<-release
+	}
+	t.Cleanup(func() { testingAfterIndexGCContext = nil })
+
+	blocked := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		<-started
+		go func() {
+			tx := db.NewTransaction(false)
+			tx.Discard()
+			close(done)
+		}()
+		select {
+		case <-done:
+			close(blocked)
+		case <-time.After(80 * time.Millisecond):
+		}
+		close(release)
+	}()
+
+	if _, err := db.MaybeCompactIndex(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-blocked:
+		t.Fatal("RO begin completed during compact fence")
+	default:
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("RO begin still blocked after compact")
 	}
 }
 

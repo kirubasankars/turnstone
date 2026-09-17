@@ -485,7 +485,7 @@ func TestIsValidReplicationCursor_RejectsMidFrame(t *testing.T) {
 	}
 }
 
-func TestMinReplicaOffset_ExcludesBackupRole(t *testing.T) {
+func TestMinReplicaOffset_ConnectedBackupPins(t *testing.T) {
 	dir := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	s, err := Open(context.Background(), dir, logger, 0, "none", 90, 0)
@@ -498,8 +498,13 @@ func TestMinReplicaOffset_ExcludesBackupRole(t *testing.T) {
 	head := uint64(s.LastLogOffset())
 
 	s.RegisterReplica("backup", head/2, ReplicaRoleBackup)
+	if got := s.MinReplicaOffset(); got != head/2 {
+		t.Fatalf("connected backup should pin retention, got %d want %d", got, head/2)
+	}
+
+	s.UnregisterReplica("backup")
 	if got := s.MinReplicaOffset(); got != math.MaxUint64 {
-		t.Fatalf("backup role should not pin retention, got %d", got)
+		t.Fatalf("disconnected backup should not pin retention, got %d", got)
 	}
 
 	s.RegisterReplica("server", head/3, ReplicaRoleServer)
@@ -561,5 +566,31 @@ func TestDatabase_BasicInit(t *testing.T) {
 	}
 	if string(val) != "value" {
 		t.Errorf("Unexpected value: %s", val)
+	}
+}
+
+func TestRegisterReplica_ReRegisterPreservesConnected(t *testing.T) {
+	dir := t.TempDir()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	s, err := Open(context.Background(), dir, logger, 1, "none", 90, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	putKV(t, s, "k", "v")
+	head := uint64(s.LastLogOffset())
+
+	_, gen1 := s.RegisterReplicaHello("r1", head, ReplicaRoleServer)
+	_, gen2 := s.RegisterReplicaHello("r1", head, ReplicaRoleServer)
+	if gen2 == gen1 {
+		t.Fatalf("expected generation bump, gen1=%d gen2=%d", gen1, gen2)
+	}
+	s.UnregisterReplicaGen("r1", gen1)
+	if err := s.WaitForQuorum(head, time.Second, nil); err != nil {
+		t.Fatalf("live reconnect should still satisfy quorum: %v", err)
+	}
+	if !s.replicas["r1"].Connected {
+		t.Fatal("current generation should stay connected")
 	}
 }

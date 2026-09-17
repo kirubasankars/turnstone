@@ -159,6 +159,7 @@ func (tx *Transaction) write(key, value []byte, isDelete bool) error {
 		xmin: tx.xid, tombstone: isDelete,
 	}); err != nil {
 		rollbackImpact()
+		tx.markAborted()
 		return err
 	}
 	if !isDelete {
@@ -205,17 +206,32 @@ func (tx *Transaction) recordOwnImpact(keyStr string, isDelete bool) {
 }
 
 func (tx *Transaction) Get(key []byte) ([]byte, error) {
+	if tx.beginErr != nil {
+		return nil, tx.beginErr
+	}
 	if tx.finished {
 		return nil, ErrTxnFinished
 	}
 	if tx.isAborted() {
 		return nil, ErrWriteConflict
 	}
+	if err := tx.db.errIfCorrupt(); err != nil {
+		return nil, err
+	}
 	if tx.update {
 		tx.readSet[string(key)] = struct{}{}
 	}
 
+	return tx.getVisibleValue(key, true)
+}
+
+var testingAfterGetVisible func()
+
+func (tx *Transaction) getVisibleValue(key []byte, retry bool) ([]byte, error) {
 	ver, ok := tx.db.index.GetVisible(key, tx.snapshot, tx.xid, tx.update, tx.db.isVisible)
+	if testingAfterGetVisible != nil {
+		testingAfterGetVisible()
+	}
 	if !ok || ver == nil {
 		return nil, ErrKeyNotFound
 	}
@@ -226,6 +242,9 @@ func (tx *Transaction) Get(key []byte) ([]byte, error) {
 		return val, nil
 	}
 	val, err := tx.db.log.ReadValueAtCached(ver.offset, ver.valueLen)
+	if err != nil && retry && (errors.Is(err, ErrInvalidLogOffset) || errors.Is(err, ErrLogUnavailable)) {
+		return tx.getVisibleValue(key, false)
+	}
 	if err != nil {
 		return nil, err
 	}

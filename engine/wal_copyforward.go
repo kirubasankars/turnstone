@@ -20,7 +20,7 @@ func (l *DataLog) ReadFrameBytesAt(lsn int64) ([]byte, error) {
 func (l *DataLog) readFrameBytesAtLocked(lsn int64) ([]byte, error) {
 	seg, local, ok := l.resolveLSN(lsn)
 	if !ok {
-		return nil, fmt.Errorf("invalid log offset %d", lsn)
+		return nil, fmt.Errorf("%w: %d", ErrInvalidLogOffset, lsn)
 	}
 	_, _, span, err := l.readFrameAtSeg(seg, local, l.segmentScanLimit(seg, fileSizeOf(seg.path)))
 	if err != nil {
@@ -136,7 +136,7 @@ func (l *DataLog) deleteSegmentsThroughLocked(maxEndLSN int64) (int, int64, erro
 	}
 
 	var kept []walSegment
-	var deleted int
+	var doomed []walSegment
 	var reclaimed int64
 
 	for i, seg := range l.segments {
@@ -155,25 +155,20 @@ func (l *DataLog) deleteSegmentsThroughLocked(maxEndLSN int64) (int, int64, erro
 
 		info, err := os.Stat(seg.path)
 		if err != nil && !os.IsNotExist(err) {
-			return deleted, reclaimed, err
+			return 0, 0, err
 		}
 		if err == nil {
 			reclaimed += info.Size()
 		}
-		if l.buffers != nil {
-			l.buffers.invalidateSegment(seg.id)
-		}
-		closeSegmentFiles(&l.segments[i])
-		if _, err := l.recycleOrRemove(seg.path); err != nil {
-			return deleted, reclaimed, err
-		}
-		deleted++
+		doomed = append(doomed, l.segments[i])
 	}
 
-	if deleted == 0 {
+	if len(doomed) == 0 {
 		return 0, 0, nil
 	}
 
+	oldSegs := l.segments
+	oldActive := l.activeIndex
 	l.segments = kept
 	l.activeIndex = -1
 	for i, seg := range l.segments {
@@ -183,7 +178,31 @@ func (l *DataLog) deleteSegmentsThroughLocked(maxEndLSN int64) (int, int64, erro
 		}
 	}
 	if l.activeIndex < 0 {
-		return deleted, reclaimed, fmt.Errorf("wal: no active segment after delete")
+		l.segments = oldSegs
+		l.activeIndex = oldActive
+		return 0, 0, fmt.Errorf("wal: no active segment after delete")
 	}
-	return deleted, reclaimed, nil
+	if err := l.persistManifestLocked(); err != nil {
+		l.segments = oldSegs
+		l.activeIndex = oldActive
+		return 0, 0, err
+	}
+
+	var firstErr error
+	deleted := 0
+	for i := range doomed {
+		seg := &doomed[i]
+		if l.buffers != nil {
+			l.buffers.invalidateSegment(seg.id)
+		}
+		closeSegmentFiles(seg)
+		if _, err := l.recycleOrRemove(seg.path); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		deleted++
+	}
+	return deleted, reclaimed, firstErr
 }

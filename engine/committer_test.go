@@ -162,6 +162,13 @@ func TestProcessCommitBatch_LogFsyncFailure(t *testing.T) {
 	if atomic.LoadInt32(&db.isCorrupt) != 1 {
 		t.Error("expected DB to be marked corrupt after log commit-fsync failure")
 	}
+
+	rtx := db.NewTransaction(false)
+	defer rtx.Discard()
+	_, err = rtx.Get([]byte("k"))
+	if err != ErrDatabaseCorrupt {
+		t.Fatalf("Get after failed COMMIT: %v, want ErrDatabaseCorrupt", err)
+	}
 }
 
 // errTestSystemFailure is a distinct sentinel used by the testing hook tests.

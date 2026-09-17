@@ -155,9 +155,6 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 				_ = s.writeBinaryResponse(conn, protocol.ResStatusErr, []byte(fmt.Sprintf("Invalid replication cursor for DB '%s'", name)))
 				return
 			}
-			if offset == 0 {
-				offset = storePtr.OldestLogOffset()
-			}
 		}
 
 		// Check if this server is already a replica for this database.
@@ -167,14 +164,13 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 			return
 		}
 
-		subs = append(subs, subReq{name, offset})
-
 		if storePtr, ok := s.stores[name]; ok {
-			// RULE: Replica can't join non promoted/undefined server
-			// We only allow replication if we are PRIMARY.
-			if storePtr.GetState() != database.StatePrimary {
-				st.logger.Warn("Replica handshake rejected: Server is not PRIMARY for this DB", "db", name, "state", storePtr.GetState())
-				_ = s.writeBinaryResponse(conn, protocol.ResStatusErr, []byte(fmt.Sprintf("Replica handshake rejected: DB '%s' is %s (must be PRIMARY)", name, storePtr.GetState())))
+			// PRIMARY streams normally. STEPPING_DOWN must still accept Hello so a
+			// replica that blipped can catch up before WaitForReplication / ResetReplicas.
+			state := storePtr.GetState()
+			if state != database.StatePrimary && state != database.StateSteppingDown {
+				st.logger.Warn("Replica handshake rejected: Server is not PRIMARY for this DB", "db", name, "state", state)
+				_ = s.writeBinaryResponse(conn, protocol.ResStatusErr, []byte(fmt.Sprintf("Replica handshake rejected: DB '%s' is %s (must be PRIMARY)", name, state)))
 				return // Disconnect
 			}
 
@@ -183,20 +179,19 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 				slotRole = RoleBackup
 			}
 
-			// INFO: Replica Connected
+			startOff, gen := storePtr.RegisterReplicaHello(replicaID, offset, slotRole)
+			offset = startOff
 			st.logger.Info("Replica subscribed", "db", name, "start_seq", offset)
-			storePtr.RegisterReplica(replicaID, offset, slotRole)
 
-			// Capture the kill switch for this specific subscription
 			if ch := storePtr.GetReplicaSignalChannel(replicaID); ch != nil {
 				killChannels = append(killChannels, ch)
 			}
 
-			defer func(sp *database.Database, dbName string) {
-				// INFO: Replica Disconnected
+			defer func(sp *database.Database, dbName string, slotGen uint64) {
 				st.logger.Info("Replica disconnected", "db", dbName)
-				sp.UnregisterReplica(replicaID)
-			}(storePtr, name)
+				sp.UnregisterReplicaGen(replicaID, slotGen)
+			}(storePtr, name, gen)
+			subs = append(subs, subReq{name, offset})
 		} else {
 			st.logger.Warn("Replica requested unknown database", "db", name)
 			_ = s.writeBinaryResponse(conn, protocol.ResStatusErr, []byte(fmt.Sprintf("Unknown database: %s", name)))
@@ -392,6 +387,27 @@ func (s *Server) runLogStreamLoop(name string, st *database.Database, startOffse
 
 	safePointTicker := time.NewTicker(1 * time.Second)
 	defer safePointTicker.Stop()
+	lastSafeSeq := st.SafePointSeq()
+
+	sendSafePoint := func() bool {
+		minOffset := st.MinReplicaOffset()
+		if minOffset == 0 || minOffset == math.MaxUint64 {
+			return true
+		}
+		buf := make([]byte, 8)
+		binary.BigEndian.PutUint64(buf, minOffset)
+		select {
+		case outCh <- replPacket{
+			dbName: name,
+			opCode: protocol.OpCodeReplSafePoint,
+			data:   buf,
+			count:  0,
+		}:
+			return true
+		case <-done:
+			return false
+		}
+	}
 
 	for {
 		select {
@@ -399,40 +415,24 @@ func (s *Server) runLogStreamLoop(name string, st *database.Database, startOffse
 			return nil
 
 		case <-safePointTicker.C:
-			minOffset := st.MinReplicaOffset()
-			if minOffset > 0 {
-				buf := make([]byte, 8)
-				binary.BigEndian.PutUint64(buf, minOffset)
-				select {
-				case outCh <- replPacket{
-					dbName: name,
-					opCode: protocol.OpCodeReplSafePoint,
-					data:   buf,
-					count:  0,
-				}:
-				case <-done:
-					return nil
-				}
+			lastSafeSeq = st.SafePointSeq()
+			if !sendSafePoint() {
+				return nil
 			}
 
 		case <-st.SafePointSignal():
-			minOffset := st.MinReplicaOffset()
-			if minOffset > 0 && minOffset != math.MaxUint64 {
-				buf := make([]byte, 8)
-				binary.BigEndian.PutUint64(buf, minOffset)
-				select {
-				case outCh <- replPacket{
-					dbName: name,
-					opCode: protocol.OpCodeReplSafePoint,
-					data:   buf,
-					count:  0,
-				}:
-				case <-done:
-					return nil
-				}
+			lastSafeSeq = st.SafePointSeq()
+			if !sendSafePoint() {
+				return nil
 			}
 
 		case <-ticker.C:
+			if seq := st.SafePointSeq(); seq != lastSafeSeq {
+				lastSafeSeq = seq
+				if !sendSafePoint() {
+					return nil
+				}
+			}
 			head := st.DurableOffset()
 			if uint64(currentByteOffset) >= head {
 				continue

@@ -465,3 +465,146 @@ func TestDeleteWalSegments_ReopenPreservesData(t *testing.T) {
 	checkKey(t, db2, "k2", "k2-val")
 	checkKey(t, db2, "k3", "k3-val")
 }
+
+func TestValidateRemapCoverage_MissingOffsetZero(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, Options{IndexCompactOnRetention: indexCompactDisabled()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := commitKeyValue(db, []byte("k"), "v"); err != nil {
+		t.Fatal(err)
+	}
+	ctx := db.BuildIndexGCContext()
+	err = db.validateRemapCoverage(ctx, map[int64]int64{})
+	if err == nil {
+		t.Fatal("expected missing remap error for offset 0")
+	}
+}
+
+func TestDeleteWalSegments_OpenSurvivesRecycleFailure(t *testing.T) {
+	dir := t.TempDir()
+	const segSize = 256
+	db, err := Open(dir, Options{
+		WalSegmentSize:          segSize,
+		IndexCompactOnRetention: indexCompactDisabled(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	key := []byte("keep")
+	if err := commitKeyValue(db, key, "v0"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 40; i++ {
+		w := db.NewTransaction(true)
+		if err := w.Put(key, []byte("abort")); err != nil {
+			t.Fatal(err)
+		}
+		w.Discard()
+	}
+	if err := commitKeyValue(db, key, "v1"); err != nil {
+		t.Fatal(err)
+	}
+
+	_, floor, err := db.ReadLogRange(0, db.LastLogOffset()/2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetScanFloor(floor); err != nil {
+		t.Fatal(err)
+	}
+	ctx := db.BuildIndexGCContext()
+	if _, err := db.CompactIndex(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	calls := 0
+	testingRecycleOrRemoveHook = func(string) error {
+		calls++
+		if calls == 1 {
+			return fmt.Errorf("injected recycle failure")
+		}
+		return nil
+	}
+	t.Cleanup(func() { testingRecycleOrRemoveHook = nil })
+
+	_, delErr := db.DeleteWalSegments(db.ScanFloor())
+	if delErr == nil {
+		t.Fatal("expected recycle failure")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db2, err := Open(dir, Options{WalSegmentSize: segSize, IndexCompactOnRetention: indexCompactDisabled()})
+	if err != nil {
+		t.Fatalf("reopen after recycle failure: %v", err)
+	}
+	defer db2.Close()
+	checkKey(t, db2, "keep", "v1")
+}
+
+func TestScanLog_UnavailableBelowOldestBase(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, Options{
+		WalSegmentSize:          256,
+		IndexCompactOnRetention: indexCompactDisabled(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	key := []byte("keep")
+	if err := commitKeyValue(db, key, "v0"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 30; i++ {
+		w := db.NewTransaction(true)
+		if err := w.Put(key, []byte("abort")); err != nil {
+			t.Fatal(err)
+		}
+		w.Discard()
+	}
+	if err := commitKeyValue(db, key, "v1"); err != nil {
+		t.Fatal(err)
+	}
+	_, floor, err := db.ReadLogRange(0, db.LastLogOffset()/2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetScanFloor(floor); err != nil {
+		t.Fatal(err)
+	}
+	ctx := db.BuildIndexGCContext()
+	if _, err := db.CompactIndex(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DeleteWalSegments(db.ScanFloor()); err != nil {
+		t.Fatal(err)
+	}
+	oldest := db.log.OldestSegmentBaseLSN()
+	if oldest <= 0 {
+		t.Fatalf("expected purged oldest > 0, got %d", oldest)
+	}
+	if err := db.ScanLog(0, func([]Record) error { return nil }); err != ErrLogUnavailable {
+		t.Fatalf("ScanLog(0) after purge: %v", err)
+	}
+	if db.IsValidFrameOffset(0) {
+		t.Fatal("offset 0 should not be a frame boundary after purge")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db2, err := Open(dir, Options{WalSegmentSize: 256, IndexCompactOnRetention: indexCompactDisabled()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	if err := db2.ScanLog(0, func([]Record) error { return nil }); err != ErrLogUnavailable {
+		t.Fatalf("ScanLog(0) after reopen: %v", err)
+	}
+}

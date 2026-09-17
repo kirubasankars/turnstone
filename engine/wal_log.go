@@ -580,7 +580,7 @@ func (l *DataLog) ReadValueAtCached(offset int64, valLen uint32) ([]byte, error)
 func (l *DataLog) readValueAtLocked(offset int64, valLen uint32) ([]byte, error) {
 	seg, local, ok := l.resolveLSN(offset)
 	if !ok {
-		return nil, fmt.Errorf("invalid log offset %d", offset)
+		return nil, fmt.Errorf("%w: %d", ErrInvalidLogOffset, offset)
 	}
 	var header [LogFrameHeaderSize]byte
 	if err := l.readSegmentAt(seg, local, header[:]); err != nil {
@@ -604,7 +604,7 @@ func (l *DataLog) readValueAtLocked(offset int64, valLen uint32) ([]byte, error)
 func (l *DataLog) readValueViaBuffersLocked(offset int64, valLen uint32) ([]byte, error) {
 	seg, local, ok := l.resolveLSN(offset)
 	if !ok {
-		return nil, fmt.Errorf("invalid log offset %d", offset)
+		return nil, fmt.Errorf("%w: %d", ErrInvalidLogOffset, offset)
 	}
 	var pins []int
 	defer func() {
@@ -824,6 +824,9 @@ func (l *DataLog) readFrameAtSeg(seg *walSegment, offset, limit int64) (int64, R
 }
 
 func readFrameAtMapping(m []byte, offset, fileSize int64) (int64, Record, recordSpan, error) {
+	if offset < 0 {
+		return offset, Record{}, recordSpan{}, fmt.Errorf("%w: %d", ErrInvalidLogOffset, offset)
+	}
 	if offset+LogFrameHeaderSize > fileSize || offset+LogFrameHeaderSize > int64(len(m)) {
 		return offset, Record{}, recordSpan{}, io.ErrUnexpectedEOF
 	}
@@ -852,6 +855,9 @@ func readFrameAtMapping(m []byte, offset, fileSize int64) (int64, Record, record
 }
 
 func readFrameAtFile(f *os.File, offset, fileSize int64) (int64, Record, recordSpan, error) {
+	if offset < 0 {
+		return offset, Record{}, recordSpan{}, fmt.Errorf("%w: %d", ErrInvalidLogOffset, offset)
+	}
 	if offset+LogFrameHeaderSize > fileSize {
 		return offset, Record{}, recordSpan{}, io.ErrUnexpectedEOF
 	}
@@ -895,11 +901,7 @@ func (l *DataLog) Scan(startOffset int64, fn func([]Record) error) error {
 		return nil
 	}
 	if startIdx < 0 {
-		if startOffset == 0 && len(l.segments) > 0 {
-			startIdx = 0
-		} else {
-			return fmt.Errorf("invalid scan offset %d", startOffset)
-		}
+		return ErrLogUnavailable
 	}
 
 	for i := startIdx; i < len(l.segments); i++ {
@@ -946,13 +948,13 @@ func (l *DataLog) scanSegmentFile(seg *walSegment, localStart, localEnd int64, f
 }
 
 func (l *DataLog) IsFrameBoundary(offset int64) bool {
-	if offset == 0 {
-		return true
-	}
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	if offset == l.writeOffset {
 		return true
+	}
+	if offset < 0 {
+		return false
 	}
 	seg, local, ok := l.resolveLSN(offset)
 	if !ok {
@@ -1066,14 +1068,7 @@ func (l *DataLog) InitLogAtLSN(lsn int64) error {
 func (l *DataLog) deleteSegmentsThrough(maxEndLSN int64) (int, int64, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	deleted, reclaimed, err := l.deleteSegmentsThroughLocked(maxEndLSN)
-	if err != nil || deleted == 0 {
-		return deleted, reclaimed, err
-	}
-	if err := l.persistManifestLocked(); err != nil {
-		return deleted, reclaimed, err
-	}
-	return deleted, reclaimed, nil
+	return l.deleteSegmentsThroughLocked(maxEndLSN)
 }
 
 func (l *DataLog) Close() error {

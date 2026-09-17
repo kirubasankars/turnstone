@@ -89,6 +89,8 @@ func StreamLogRange(ctx context.Context, opts StreamOptions, writer io.Writer) (
 
 	result := StreamResult{BaseLSN: opts.StartLSN, EndLSN: opts.StartLSN}
 	lastDataTime := time.Now()
+	var expectOff uint64
+	haveExpect := false
 
 	for {
 		if ctx.Err() != nil {
@@ -141,12 +143,17 @@ func StreamLogRange(ctx context.Context, opts StreamOptions, writer io.Writer) (
 			}
 			if result.Bytes == 0 {
 				result.BaseLSN = startOff
+				expectOff = startOff
+				haveExpect = true
+			} else if haveExpect && startOff != expectOff {
+				return result, fmt.Errorf("log range start mismatch: got %d want %d", startOff, expectOff)
 			}
 			if _, err := writer.Write(segData); err != nil {
 				return result, fmt.Errorf("write backup data: %w", err)
 			}
 			result.Bytes += int64(len(segData))
 			result.EndLSN = endOff
+			expectOff = endOff
 			lastDataTime = time.Now()
 		}
 	}
