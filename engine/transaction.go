@@ -222,7 +222,7 @@ func (tx *Transaction) Get(key []byte) ([]byte, error) {
 	if val, ok := tx.db.cachedValue(ver.offset); ok {
 		return val, nil
 	}
-	val, err := tx.db.log.ReadValueAt(ver.offset, ver.valueLen)
+	val, err := tx.db.log.ReadValueAtCached(ver.offset, ver.valueLen)
 	if err != nil {
 		return nil, err
 	}

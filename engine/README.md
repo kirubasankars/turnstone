@@ -109,7 +109,8 @@ Notable tunables in `types.go` `Options`:
 
 - `TruncateCorruptTail` — recovery behavior on partial last frame
 - `CommitDelay` / `CommitSiblings` — optional gather window (default 0) plus drain-after-fsync batching
-- `ValueCacheBytes` — WAL-offset value cache (0 = 64 MiB, negative disables)
+- `ValueCacheBytes` — decoded WAL-offset value cache (0 = 64 MiB, negative disables)
+- `SharedBuffersBytes` — 8 KiB WAL page pool (0 = 64 MiB, negative disables)
 - `UnsafeDisableFsync` — tests only
 - `IndexCompactOnRetention`, `WalCopyForwardOnRetention` — maintenance toggles
 - `MaxDiskUsagePercent` — reject writes when disk full
@@ -136,9 +137,13 @@ Mixing these when reading code is a common source of confusion.
 
 Write transactions allocate an xid and pin `beginOffsets` at the current WAL head. Recovery treats `SET`/`DEL` without `COMMIT` as in-progress and drops those versions, unless a later `COMMIT` for that xid was already seen (copy-forwarded SET frames). Copy-forward appends a `COMMIT` record per copied xid so reopen does not treat compacted live data as a crash.
 
-### Value cache
+### WAL mmap, madvise, and shared buffers
 
-Hot `GET`s are served from a sharded in-memory map keyed by WAL offset, populated on write, replay, and cache-miss read. Copy-forward remaps clear the cache. This is the specialized equivalent of a warm `shared_buffers` without a btree probe.
+On Unix each WAL segment is `mmap(MAP_SHARED)` after open. Point reads copy from the mapping (no `pread`). `madvise` hints: `MADV_RANDOM` after map, `MADV_SEQUENTIAL` during replay, `MADV_WILLNEED` on the just-written range, `MADV_DONTNEED` before unmap, plus `MADV_DONTFORK`/`MADV_DONTDUMP` on Linux.
+
+`shared_buffers` is an 8 KiB page pool (clock sweep, pin counts) keyed by `(segment id, page)`. A GET that misses the decoded value cache pins the pages covering the frame, CRC-checks, and decodes. Writes write-through into resident pages so a neighbor key on the same page stays valid. Copy-forward and segment delete drop the matching buffers.
+
+The decoded value cache remains an L1 heap copy keyed by WAL offset. Copy-forward remaps clear both caches.
 
 Beating PostgreSQL on this KV shape: **[docs/performance.md](../docs/performance.md)**.
 
