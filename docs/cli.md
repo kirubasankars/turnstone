@@ -267,6 +267,9 @@ Write-heavy one-minute soak:
 turnstone bench --home tsdata --duration 1m --read-ratio 0.1 --concurrency 100
 ```
 
+Comparing durable KV throughput with PostgreSQL (engine microbench + optional
+`psql` side): [performance.md](performance.md) and `scripts/bench-vs-postgres.sh`.
+
 ---
 
 ## Typical workflows

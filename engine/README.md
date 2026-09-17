@@ -27,7 +27,7 @@ Everything on disk that matters lives here; the in-memory index is rebuilt from 
                     │    clog     │  xid → committed | aborted
                     └─────────────┘
 
-  COMMIT ──► committer goroutine ──► group fsync ──► setClog(committed)
+  COMMIT ──► committer goroutine ──► group fdatasync ──► setClog(committed)
 ```
 
 ## File map
@@ -67,7 +67,7 @@ Tests (`*_test.go`, `correctness_test.go`, `benchmark_test.go`) are extensive �
 | --- | --- |
 | Isolation | Snapshot isolation |
 | Writes | Eager log at `SET`/`DEL` time |
-| Durability | Group `fsync` on `COMMIT` |
+| Durability | Group `fdatasync` on `COMMIT` (Unix); optional `CommitDelay` gather window (default 0) |
 | Conflicts | First-writer-wins per key (`NOWAIT` lock) |
 | Read own writes | `xmin == myXid` visible before commit |
 | Stale reads | `checkReadSetConflicts` at commit |
@@ -94,7 +94,8 @@ Skips copy-forward while write transactions are already active. Once a copy star
 Notable tunables in `types.go` `Options`:
 
 - `TruncateCorruptTail` — recovery behavior on partial last frame
-- `CommitDelay` / `CommitSiblings` — group commit batching
+- `CommitDelay` / `CommitSiblings` — optional gather window (default 0) plus drain-after-fsync batching
+- `ValueCacheBytes` — WAL-offset value cache (0 = 64 MiB, negative disables)
 - `UnsafeDisableFsync` — tests only
 - `IndexCompactOnRetention`, `WalCopyForwardOnRetention` — maintenance toggles
 - `MaxDiskUsagePercent` — reject writes when disk full
@@ -115,7 +116,17 @@ Mixing these when reading code is a common source of confusion.
 
 ### Group commit
 
-`committer.go` batches concurrent `COMMIT` requests to amortize `fsync` cost — study `committer_test.go` for latency/throughput tradeoffs.
+`committer.go` batches concurrent `COMMIT` requests to amortize `fdatasync` cost — study `committer_test.go` for latency/throughput tradeoffs. Default `CommitDelay` is 0 (PostgreSQL-style: do not sleep; batch what queued during the previous flush).
+
+### Why no BEGIN record
+
+Write transactions allocate an xid and pin `beginOffsets` at the current WAL head. Recovery treats `SET`/`DEL` without `COMMIT` as in-progress and drops those versions. That removes one log frame per transaction versus PostgreSQL's heap + WAL insert.
+
+### Value cache
+
+Hot `GET`s are served from a sharded in-memory map keyed by WAL offset, populated on write, replay, and cache-miss read. Copy-forward remaps clear the cache. This is the specialized equivalent of a warm `shared_buffers` without a btree probe.
+
+Beating PostgreSQL on this KV shape: **[docs/performance.md](../docs/performance.md)**.
 
 ## Review checklist
 
@@ -137,4 +148,4 @@ Mixing these when reading code is a common source of confusion.
 
 - Formal on-disk format document generated from `encode.go`.
 - Optional `EXPLAIN`-style debug API for visibility decisions per key.
-- Pluggable `fsync` policy for NVMe vs remote disk.
+- Tunable `CommitDelay` for HDD vs NVMe (default 0 is correct for NVMe).

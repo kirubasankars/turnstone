@@ -22,11 +22,14 @@ func (db *DB) replayLog(ctx context.Context, truncateCorrupt bool) error {
 		case RecordBegin:
 			inProgress[rec.XID] = struct{}{}
 		case RecordSet:
+			inProgress[rec.XID] = struct{}{}
 			_ = db.index.Put(rec.Key, indexVersion{
 				offset: span.offset, valueLen: uint32(len(rec.Value)),
 				xmin: rec.XID, tombstone: false,
 			})
+			db.cacheValue(span.offset, rec.Value)
 		case RecordDelete:
+			inProgress[rec.XID] = struct{}{}
 			_ = db.index.Put(rec.Key, indexVersion{
 				offset: span.offset, valueLen: 0,
 				xmin: rec.XID, tombstone: true,

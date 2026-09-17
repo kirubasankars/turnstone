@@ -33,6 +33,7 @@ type Transaction struct {
 	decided   int32
 
 	currentSize int64
+	didWrite    bool
 }
 
 func (tx *Transaction) isAborted() bool {
@@ -148,6 +149,7 @@ func (tx *Transaction) write(key, value []byte, isDelete bool) error {
 		rollbackImpact()
 		return err
 	}
+	tx.didWrite = true
 
 	if err := db.index.Put(key, indexVersion{
 		offset: offset, valueLen: uint32(len(value)),
@@ -155,6 +157,9 @@ func (tx *Transaction) write(key, value []byte, isDelete bool) error {
 	}); err != nil {
 		rollbackImpact()
 		return err
+	}
+	if !isDelete {
+		db.cacheValue(offset, value)
 	}
 
 	ver := &indexVersion{offset: offset, valueLen: uint32(len(value)), xmin: tx.xid, tombstone: isDelete}
@@ -214,7 +219,15 @@ func (tx *Transaction) Get(key []byte) ([]byte, error) {
 	if ver.tombstone {
 		return nil, ErrKeyNotFound
 	}
-	return tx.db.log.ReadValueAt(ver.offset, ver.valueLen)
+	if val, ok := tx.db.cachedValue(ver.offset); ok {
+		return val, nil
+	}
+	val, err := tx.db.log.ReadValueAt(ver.offset, ver.valueLen)
+	if err != nil {
+		return nil, err
+	}
+	tx.db.cacheValue(ver.offset, val)
+	return val, nil
 }
 
 func (tx *Transaction) Commit() error {

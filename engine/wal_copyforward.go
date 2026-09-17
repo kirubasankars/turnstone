@@ -22,11 +22,13 @@ func (l *DataLog) readFrameBytesAtLocked(lsn int64) ([]byte, error) {
 	if !ok {
 		return nil, fmt.Errorf("invalid log offset %d", lsn)
 	}
-	f, err := os.Open(seg.path)
+	f, closeFn, err := segmentReadFile(seg)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	if closeFn != nil {
+		defer closeFn()
+	}
 
 	stat, err := f.Stat()
 	if err != nil {
@@ -173,6 +175,7 @@ func (l *DataLog) deleteSegmentsThroughLocked(maxEndLSN int64) (int, int64, erro
 		if err == nil {
 			reclaimed += info.Size()
 		}
+		closeSegmentFiles(&l.segments[i])
 		if err := os.Remove(seg.path); err != nil && !os.IsNotExist(err) {
 			return deleted, reclaimed, err
 		}

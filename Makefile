@@ -29,5 +29,10 @@ bench:
 bench-all:
 	go test -run='^$$' -bench=. -benchmem -count=1 ./... | tee bench-all.log
 
+# bench-vs-postgres runs engine parallel KV benches and, when psql can
+# connect, the same one-row-per-transaction shape against PostgreSQL.
+bench-vs-postgres:
+	scripts/bench-vs-postgres.sh
+
 ui-test:
 	cd console/e2e && npm ci && npx playwright install chromium --with-deps && npm test
