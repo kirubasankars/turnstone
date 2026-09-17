@@ -12,6 +12,7 @@ import (
 
 func (db *DB) replayLog(ctx context.Context, truncateCorrupt bool) error {
 	inProgress := make(map[uint64]struct{})
+	committed := make(map[uint64]struct{})
 
 	err := db.log.Replay(ctx, truncateCorrupt, func(rec Record, span recordSpan) {
 		if rec.XID > atomic.LoadUint64(&db.transactionID) {
@@ -20,22 +21,29 @@ func (db *DB) replayLog(ctx context.Context, truncateCorrupt bool) error {
 
 		switch rec.Type {
 		case RecordBegin:
-			inProgress[rec.XID] = struct{}{}
+			if _, done := committed[rec.XID]; !done {
+				inProgress[rec.XID] = struct{}{}
+			}
 		case RecordSet:
-			inProgress[rec.XID] = struct{}{}
+			if _, done := committed[rec.XID]; !done {
+				inProgress[rec.XID] = struct{}{}
+			}
 			_ = db.index.Put(rec.Key, indexVersion{
 				offset: span.offset, valueLen: uint32(len(rec.Value)),
 				xmin: rec.XID, tombstone: false,
 			})
 			db.cacheValue(span.offset, rec.Value)
 		case RecordDelete:
-			inProgress[rec.XID] = struct{}{}
+			if _, done := committed[rec.XID]; !done {
+				inProgress[rec.XID] = struct{}{}
+			}
 			_ = db.index.Put(rec.Key, indexVersion{
 				offset: span.offset, valueLen: 0,
 				xmin: rec.XID, tombstone: true,
 			})
 		case RecordCommit:
 			delete(inProgress, rec.XID)
+			committed[rec.XID] = struct{}{}
 			db.forgetClog(rec.XID)
 		case RecordAbort:
 			delete(inProgress, rec.XID)

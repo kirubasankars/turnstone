@@ -72,8 +72,14 @@ func TestDeleteWalSegments_RemovesSealedBelowFloor(t *testing.T) {
 		t.Fatalf("expected deleted segments, before=%d floor=%d oldest=%d",
 			beforeSegs, floor, db.log.OldestSegmentBaseLSN())
 	}
-	if db.log.OldestSegmentBaseLSN() < floor {
-		t.Fatalf("oldest segment base %d below floor %d", db.log.OldestSegmentBaseLSN(), floor)
+	for _, info := range db.log.SegmentInfos() {
+		if info.Active {
+			continue
+		}
+		if info.EndLSN > 0 && info.EndLSN <= floor {
+			t.Fatalf("sealed segment %s ends at %d, which is still <= floor %d",
+				info.File, info.EndLSN, floor)
+		}
 	}
 	logical, _ := db.StorageStats()
 	head := db.LastLogOffset()
