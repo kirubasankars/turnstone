@@ -120,7 +120,7 @@ Mixing these when reading code is a common source of confusion.
 
 ### Why no BEGIN record
 
-Write transactions allocate an xid and pin `beginOffsets` at the current WAL head. Recovery treats `SET`/`DEL` without `COMMIT` as in-progress and drops those versions. That removes one log frame per transaction versus PostgreSQL's heap + WAL insert.
+Write transactions allocate an xid and pin `beginOffsets` at the current WAL head. Recovery treats `SET`/`DEL` without `COMMIT` as in-progress and drops those versions, unless a later `COMMIT` for that xid was already seen (copy-forwarded SET frames). Copy-forward appends a `COMMIT` record per copied xid so reopen does not treat compacted live data as a crash.
 
 ### Value cache
 
