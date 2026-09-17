@@ -15,6 +15,7 @@ import (
 const (
 	walDirName         = "wal"
 	walManifestName    = "manifest.json"
+	walManifestTmpName = "manifest.json.tmp"
 	defaultWalSegSize  = 64 << 20 // 64 MiB
 	walManifestVersion = 1
 )
@@ -40,6 +41,34 @@ func walSegmentFileName(id uint32) string {
 }
 
 func loadWalManifest(path string) (*walManifest, error) {
+	m, err := readWalManifestFile(path)
+	if err == nil {
+		return m, nil
+	}
+	if !os.IsNotExist(err) {
+		return nil, err
+	}
+	// Crash after fsync(tmp) but before rename: dest is missing, tmp is complete.
+	tmp := walManifestTmpPath(path)
+	m, err = readWalManifestFile(tmp)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, err
+		}
+		// Torn tmp and no dest: treat as no manifest so Open can create fresh.
+		_ = os.Remove(tmp)
+		return nil, os.ErrNotExist
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return nil, err
+	}
+	if err := syncDir(filepath.Dir(path)); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func readWalManifestFile(path string) (*walManifest, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -57,16 +86,49 @@ func loadWalManifest(path string) (*walManifest, error) {
 	return &m, nil
 }
 
+func walManifestTmpPath(path string) string {
+	return filepath.Join(filepath.Dir(path), walManifestTmpName)
+}
+
 func saveWalManifest(path string, m *walManifest) error {
 	data, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, fileMode); err != nil {
+	data = append(data, '\n')
+	return writeFileAtomic(path, data)
+}
+
+// writeFileAtomic replaces path with data using the POSIX durable-rename
+// sequence: write sibling .tmp, fsync the file (full, not fdatasync — size
+// must persist), rename over dest, fsync the parent directory. Readers never
+// observe a torn manifest.json.
+func writeFileAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	tmp := walManifestTmpPath(path)
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, fileMode)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return syncDir(dir)
 }
 
 func createFreshWalManifest(walDir string, segmentSize int64) (*walManifest, error) {

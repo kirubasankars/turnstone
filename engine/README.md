@@ -61,7 +61,10 @@ Tests (`*_test.go`, `correctness_test.go`, `benchmark_test.go`) are extensive â€
 - Each frame: `Length(4) + CRC32(4) + payload`.
 - Log record header: `Type(1) + XID(8)` + key/value bodies for SET/DEL.
 
-`manifest.json` tracks active segment and sealed segment list.
+`manifest.json` tracks active segment and sealed segment list. Saves are
+atomic: write `manifest.json.tmp`, full `fsync`, rename over dest, `fsync`
+the `wal/` directory. A crash mid-write leaves the previous dest; a crash
+after the tmp fsync but before rename is recovered on the next `Open`.
 
 ## Corruption handling
 
