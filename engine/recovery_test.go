@@ -180,3 +180,32 @@ func TestRecovery_LargeReplay(t *testing.T) {
 		t.Fatalf("KeyCount after large replay: want %d, got %d err=%v", n, count, err)
 	}
 }
+
+func TestRecovery_UncommittedSetWithoutBegin(t *testing.T) {
+	dir := t.TempDir()
+	opts := Options{TruncateCorruptTail: true}
+
+	db, err := Open(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ApplyRecord(Record{
+		Type: RecordSet, XID: 42, Key: []byte("orphan"), Value: []byte("hidden"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	db.log.closeActiveFileForTest()
+	db.Close()
+
+	db2, err := Open(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+
+	rtx := db2.NewTransaction(false)
+	defer rtx.Discard()
+	if _, err := rtx.Get([]byte("orphan")); err != ErrKeyNotFound {
+		t.Fatalf("SET without COMMIT must not survive reopen, got %v", err)
+	}
+}

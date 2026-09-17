@@ -8,6 +8,7 @@ package engine
 import (
 	"fmt"
 	"math/rand"
+	"sync/atomic"
 	"testing"
 )
 
@@ -159,4 +160,108 @@ func BenchmarkDB_Mixed(b *testing.B) {
 			}
 		}
 	}
+}
+
+func BenchmarkDB_InsertParallel(b *testing.B) {
+	dir := b.TempDir()
+	db, err := Open(dir, Options{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+
+	val := []byte("benchmark_value_data_1234567890")
+	var seq uint64
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			n := atomic.AddUint64(&seq, 1)
+			key := []byte(fmt.Sprintf("p-ins-%d", n))
+			tx := db.NewTransaction(true)
+			if err := tx.Put(key, val); err != nil {
+				b.Fatal(err)
+			}
+			if err := tx.Commit(); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+func BenchmarkDB_ReadParallel(b *testing.B) {
+	dir := b.TempDir()
+	db, err := Open(dir, Options{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+
+	numKeys := 10000
+	val := []byte("benchmark_value_data_1234567890")
+	tx := db.NewTransaction(true)
+	for i := 0; i < numKeys; i++ {
+		if err := tx.Put([]byte(fmt.Sprintf("pread-%d", i)), val); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			key := []byte(fmt.Sprintf("pread-%d", i%numKeys))
+			rtx := db.NewTransaction(false)
+			if _, err := rtx.Get(key); err != nil {
+				b.Fatal(err)
+			}
+			rtx.Discard()
+			i++
+		}
+	})
+}
+
+func BenchmarkDB_UpdateParallel(b *testing.B) {
+	dir := b.TempDir()
+	db, err := Open(dir, Options{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+
+	numKeys := 10000
+	val := []byte("benchmark_value_data_1234567890")
+	seed := db.NewTransaction(true)
+	for i := 0; i < numKeys; i++ {
+		if err := seed.Put([]byte(fmt.Sprintf("pupd-%d", i)), val); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := seed.Commit(); err != nil {
+		b.Fatal(err)
+	}
+
+	var seq uint64
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			n := atomic.AddUint64(&seq, 1)
+			key := []byte(fmt.Sprintf("pupd-%d", n%uint64(numKeys)))
+			tx := db.NewTransaction(true)
+			if err := tx.Put(key, val); err != nil {
+				// First-writer-wins: retry once on conflict.
+				tx.Discard()
+				tx = db.NewTransaction(true)
+				if err := tx.Put(key, val); err != nil {
+					tx.Discard()
+					continue
+				}
+			}
+			if err := tx.Commit(); err != nil {
+				tx.Discard()
+			}
+		}
+	})
 }

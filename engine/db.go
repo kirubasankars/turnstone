@@ -71,6 +71,7 @@ type DB struct {
 	commitDelay        time.Duration
 	commitSiblings     int
 	unsafeDisableFsync bool
+	valueCache         *valueCache
 
 	checksumInterval    time.Duration
 	retentionInterval   time.Duration
@@ -103,14 +104,15 @@ func OpenContext(ctx context.Context, dir string, opts Options) (*DB, error) {
 	if opts.TxTimeout == 0 {
 		opts.TxTimeout = protocol.MaxTxDuration
 	}
-	switch {
-	case opts.CommitDelay < 0:
+	if opts.CommitDelay < 0 {
 		opts.CommitDelay = 0
-	case opts.CommitDelay == 0:
-		opts.CommitDelay = 2 * time.Millisecond
 	}
 	if opts.CommitSiblings <= 0 {
 		opts.CommitSiblings = 2
+	}
+	cacheBytes := opts.ValueCacheBytes
+	if cacheBytes == 0 {
+		cacheBytes = defaultValueCacheBytes
 	}
 	indexFrag := opts.IndexCompactFragmentation
 	if indexFrag <= 0 {
@@ -153,7 +155,7 @@ func OpenContext(ctx context.Context, dir string, opts Options) (*DB, error) {
 		replImpact:                make(map[uint64]*replTxImpact),
 		txTimeout:                 opts.TxTimeout,
 		closeCh:                   make(chan struct{}),
-		commitCh:                  make(chan commitRequest, 500),
+		commitCh:                  make(chan commitRequest, 4096),
 		commitDelay:               opts.CommitDelay,
 		commitSiblings:            opts.CommitSiblings,
 		unsafeDisableFsync:        opts.UnsafeDisableFsync,
@@ -165,6 +167,10 @@ func OpenContext(ctx context.Context, dir string, opts Options) (*DB, error) {
 		indexCompactOnRetention:   indexCompactOnRetentionEnabled(opts),
 		walCopyForwardRatio:       walCopyRatio,
 		walCopyForwardOnRetention: walCopyForwardOnRetentionEnabled(opts),
+	}
+
+	if cacheBytes > 0 {
+		db.valueCache = newValueCache(cacheBytes)
 	}
 
 	if opts.UnsafeDisableFsync {
@@ -335,7 +341,7 @@ func (db *DB) activeWriteTransactionCount() int {
 	return n
 }
 
-const maxCommitBatchSize = 128
+const maxCommitBatchSize = 1024
 const shutdownBackgroundWait = 2 * time.Second
 const shutdownCommitWait = 2 * time.Second
 
@@ -370,31 +376,52 @@ func (db *DB) shutdownGroupCommits(batch []commitRequest) {
 func (db *DB) runGroupCommits() {
 	defer db.wg.Done()
 	var batch []commitRequest
+	var gather *time.Timer
+	stopGather := func() {
+		if gather == nil {
+			return
+		}
+		if !gather.Stop() {
+			select {
+			case <-gather.C:
+			default:
+			}
+		}
+	}
 	for {
 		select {
 		case <-db.closeCh:
+			stopGather()
 			db.shutdownGroupCommits(batch)
 			return
 		case req := <-db.commitCh:
 			batch = append(batch, req)
 		}
 
-		if db.commitDelay > 0 && !db.unsafeDisableFsync && db.ActiveTransactionCount() >= db.commitSiblings {
-			timer := time.NewTimer(db.commitDelay)
+		// Optional gather window (off by default). PostgreSQL-style group
+		// commit still happens: commits that arrive during fsync sit on
+		// commitCh and are drained into the next batch below.
+		if db.commitDelay > 0 && !db.unsafeDisableFsync && len(batch) < db.commitSiblings {
+			if gather == nil {
+				gather = time.NewTimer(db.commitDelay)
+			} else {
+				stopGather()
+				gather.Reset(db.commitDelay)
+			}
 		DelayLoop:
 			for len(batch) < maxCommitBatchSize {
 				select {
 				case <-db.closeCh:
-					timer.Stop()
+					stopGather()
 					db.shutdownGroupCommits(batch)
 					return
 				case req := <-db.commitCh:
 					batch = append(batch, req)
-				case <-timer.C:
+				case <-gather.C:
 					break DelayLoop
 				}
 			}
-			timer.Stop()
+			stopGather()
 		}
 
 	Loop:
@@ -488,21 +515,14 @@ func (db *DB) NewTransaction(update bool) *Transaction {
 	}
 	db.activeXids[xid] = tx
 	db.txStartTimes[xid] = time.Now()
+	// Pin retention at the current WAL head without writing a BEGIN record.
+	// Recovery treats SET/DEL without COMMIT as in-progress (see replayLog).
+	db.beginOffsets[xid] = db.log.WriteOffset()
 	db.txMu.Unlock()
 
 	db.activeTxnsMu.Lock()
 	db.activeTxns[tx] = xid
 	db.activeTxnsMu.Unlock()
-
-	beginOff, err := db.appendRecord(RecordBegin, xid, nil, nil)
-	if err != nil {
-		tx.markAborted()
-		tx.beginErr = err
-	} else {
-		db.txMu.Lock()
-		db.beginOffsets[xid] = beginOff
-		db.txMu.Unlock()
-	}
 	return tx
 }
 
@@ -570,12 +590,23 @@ func (db *DB) ApplyLogRange(data []byte) (int64, error) {
 			db.beginOffsets[rec.XID] = off
 			db.txMu.Unlock()
 		case RecordSet, RecordDelete:
+			db.txMu.Lock()
+			if _, ok := db.beginOffsets[rec.XID]; !ok {
+				db.beginOffsets[rec.XID] = off
+			}
+			if _, ok := db.activeXids[rec.XID]; !ok {
+				db.activeXids[rec.XID] = nil
+			}
+			db.txMu.Unlock()
 			isDelete := rec.Type == RecordDelete
 			if err := db.index.Put(rec.Key, indexVersion{
 				offset: off, valueLen: uint32(len(rec.Value)),
 				xmin: rec.XID, tombstone: isDelete,
 			}); err != nil {
 				return 0, err
+			}
+			if !isDelete {
+				db.cacheValue(off, rec.Value)
 			}
 			db.accountReplicatedWrite(rec)
 		case RecordCommit:
@@ -644,6 +675,14 @@ func (db *DB) ApplyRecord(rec Record) error {
 			atomic.StoreInt32(&db.isCorrupt, 1)
 			return err
 		}
+		db.txMu.Lock()
+		if _, ok := db.beginOffsets[rec.XID]; !ok {
+			db.beginOffsets[rec.XID] = off
+		}
+		if _, ok := db.activeXids[rec.XID]; !ok {
+			db.activeXids[rec.XID] = nil
+		}
+		db.txMu.Unlock()
 		isDelete := rec.Type == RecordDelete
 		if err := db.index.Put(rec.Key, indexVersion{
 			offset: off, valueLen: uint32(len(rec.Value)),
@@ -651,6 +690,9 @@ func (db *DB) ApplyRecord(rec Record) error {
 		}); err != nil {
 			atomic.StoreInt32(&db.isCorrupt, 1)
 			return err
+		}
+		if !isDelete {
+			db.cacheValue(off, rec.Value)
 		}
 		db.accountReplicatedWrite(rec)
 		db.AdvanceXID(rec.XID)
