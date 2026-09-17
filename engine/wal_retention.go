@@ -259,7 +259,10 @@ func (db *DB) copyForwardPlan(ratio float64) (IndexGCContext, []int64, error) {
 	if len(oldOffsets) == 0 {
 		return ctx, nil, nil
 	}
-	allocated := db.log.AllocatedBytesOnDisk()
+	allocated := db.log.logicalUsedBytes()
+	if allocated == 0 {
+		allocated = db.log.AllocatedBytesOnDisk()
+	}
 	if float64(allocated) <= float64(liveBytes)*ratio {
 		return ctx, nil, nil
 	}

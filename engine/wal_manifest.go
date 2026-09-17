@@ -75,7 +75,7 @@ func createFreshWalManifest(walDir string, segmentSize int64) (*walManifest, err
 	}
 	segName := walSegmentFileName(1)
 	segPath := filepath.Join(walDir, segName)
-	f, err := os.OpenFile(segPath, os.O_CREATE|os.O_RDWR, fileMode)
+	f, err := createAllocatedWALFile(segPath, segmentSize)
 	if err != nil {
 		return nil, err
 	}

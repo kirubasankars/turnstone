@@ -107,7 +107,7 @@ func (l *DataLog) appendCopyForwardFrames(oldOffsets []int64, frames [][]byte) (
 		l.writeOffset += int64(n)
 		out.remap[oldOffsets[i]] = off
 
-		if l.writeOffset-seg.baseLSN >= l.segmentSize {
+		if l.writeOffset-seg.baseLSN >= l.usableSegmentSize() {
 			if err := l.rotateSegmentLocked(); err != nil {
 				return walCopyForwardOutcome{}, err
 			}
@@ -157,11 +157,7 @@ func (l *DataLog) deleteSegmentsThroughLocked(maxEndLSN int64) (int, int64, erro
 		}
 		end := seg.endLSN
 		if end == 0 {
-			info, err := os.Stat(seg.path)
-			if err != nil {
-				return deleted, reclaimed, err
-			}
-			end = seg.baseLSN + info.Size()
+			end = seg.baseLSN + l.logicalSizeFromFile(seg.path, fileSizeOf(seg.path))
 		}
 		if end > maxEndLSN {
 			kept = append(kept, seg)
@@ -176,7 +172,7 @@ func (l *DataLog) deleteSegmentsThroughLocked(maxEndLSN int64) (int, int64, erro
 			reclaimed += info.Size()
 		}
 		closeSegmentFiles(&l.segments[i])
-		if err := os.Remove(seg.path); err != nil && !os.IsNotExist(err) {
+		if _, err := l.recycleOrRemove(seg.path); err != nil {
 			return deleted, reclaimed, err
 		}
 		deleted++
