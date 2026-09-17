@@ -418,9 +418,13 @@ func (l *DataLog) ReadValueAt(offset int64, valLen uint32) ([]byte, error) {
 	if payloadLen > 1<<30 {
 		return nil, ErrCorruptData
 	}
+	checksum := binary.BigEndian.Uint32(header[4:])
 	payload := make([]byte, payloadLen)
 	if _, err := f.ReadAt(payload, local+LogFrameHeaderSize); err != nil {
 		return nil, err
+	}
+	if crc32.Checksum(payload, Crc32Table) != checksum {
+		return nil, ErrChecksum
 	}
 	return decodeValueAt(payload, valLen)
 }
@@ -467,14 +471,13 @@ func (l *DataLog) Replay(ctx context.Context, truncateCorrupt bool, onRecord fun
 	defer l.mu.Unlock()
 
 	var records uint64
-	for i, seg := range l.segments {
+	for i := range l.segments {
+		seg := &l.segments[i]
 		isActive := i == l.activeIndex
-		if err := l.replaySegmentFile(ctx, &seg, isActive, truncateCorrupt, &records, onRecord); err != nil {
+		if err := l.replaySegmentFile(ctx, seg, isActive, truncateCorrupt, &records, onRecord); err != nil {
 			if errors.Is(err, ErrTruncated) && isActive {
-				stat, statErr := seg.writer.Stat()
-				if statErr == nil {
-					l.writeOffset = seg.baseLSN + stat.Size()
-				}
+				// writeOffset is already the last valid frame (not the
+				// preallocated file size). Persist that logical head.
 				if persistErr := l.persistManifestLocked(); persistErr != nil {
 					return persistErr
 				}
