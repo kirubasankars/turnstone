@@ -9,6 +9,41 @@ import (
 	"testing"
 )
 
+func TestFilteredLiveBytes_RespectsVersionFilter(t *testing.T) {
+	idx := New()
+	defer idx.Close()
+
+	key := []byte("k")
+	for i := 1; i <= 4; i++ {
+		if err := idx.Put(key, Version{Offset: int64(i * 10), ValueLen: 1, Xmin: uint64(i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	shardIdx := int(hashKey(key) & 255)
+	keepNewest := func(_ []byte, chain []Version) []Version {
+		if len(chain) == 0 {
+			return nil
+		}
+		return chain[:1]
+	}
+	arena, filtered, keys := idx.FilteredLiveBytes(shardIdx, keepNewest)
+	_, linked, _ := idx.FilteredLiveBytes(shardIdx, nil)
+	if keys != 1 || arena == 0 || linked == 0 {
+		t.Fatalf("expected one key with arena and linked live, keys=%d arena=%d linked=%d", keys, arena, linked)
+	}
+	if filtered >= linked {
+		t.Fatalf("expected filtered live < linked live, filtered=%d linked=%d", filtered, linked)
+	}
+	if arena < linked {
+		t.Fatalf("expected arena at least linked live, arena=%d linked=%d", arena, linked)
+	}
+
+	a, l, k := idx.FilteredLiveBytes(-1, nil)
+	if a != 0 || l != 0 || k != 0 {
+		t.Fatalf("invalid shard should be zero, got %d %d %d", a, l, k)
+	}
+}
+
 func TestCompactShard_DropsOldVersionsAndShrinksArena(t *testing.T) {
 	idx := New()
 	defer idx.Close()

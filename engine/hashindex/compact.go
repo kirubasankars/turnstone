@@ -54,6 +54,35 @@ func (s *shard) stats(shardIndex uint32) ShardStats {
 	return st
 }
 
+// ShardCount is the fixed hash-index shard count.
+func (idx *Index) ShardCount() int {
+	return numShards
+}
+
+// FilteredLiveBytes returns bump-arena used bytes and the payload that would
+// remain after filter. A nil filter counts every linked version (same as
+// Stats LiveBytes). Invalid or closed shards return zeros.
+func (idx *Index) FilteredLiveBytes(shardIndex int, filter VersionFilter) (arenaUsed, liveBytes uint64, keyCount uint32) {
+	if shardIndex < 0 || shardIndex >= numShards {
+		return 0, 0, 0
+	}
+	seg := idx.shards[shardIndex]
+	if seg == nil {
+		return 0, 0, 0
+	}
+	seg.mu.RLock()
+	defer seg.mu.RUnlock()
+	if seg.isClosed() {
+		return 0, 0, 0
+	}
+	arenaUsed = seg.arenaUsed()
+	keyCount = seg.keyCount()
+	if keyCount > 0 {
+		liveBytes = seg.liveBytesLocked(filter)
+	}
+	return arenaUsed, liveBytes, keyCount
+}
+
 // VersionFilter returns the version chain to retain for key (newest first).
 type VersionFilter func(key []byte, chain []Version) []Version
 

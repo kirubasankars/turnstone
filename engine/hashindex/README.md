@@ -44,10 +44,13 @@ Each `shard` owns:
 
 ## Compaction (`compact.go`)
 
-Triggered from `engine.index_gc` when estimated fragmentation exceeds ratio thresholds:
+Triggered from `engine.index_gc` when arena used exceeds **MVCC-filtered** live
+bytes by the configured ratio (default 3×). `Stats().LiveBytes` stays unfiltered
+(every linked version) so overwrite chains that look “full” still compact once
+invisible versions are excluded.
 
 1. Walk all keys; drop versions invisible to current GC context.
-2. If arena live bytes ≪ allocated, copy live nodes to a fresh mmap arena and unmap the old mapping.
+2. If arena used ≫ filtered live, copy kept nodes to a fresh mmap arena and unmap the old mapping.
 3. Preserve offsets referenced by active snapshots / replication floor.
 
 Regression tests: `compact_regression_test.go`, `compact_test.go`.

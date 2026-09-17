@@ -354,6 +354,40 @@ func TestMaybeCopyForwardWal_ReopenPreservesRemappedData(t *testing.T) {
 	}
 }
 
+func TestMaybeCopyForwardWal_CopyForwardsCommittedOverwrites(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, Options{
+		WalSegmentSize:              256,
+		WalCopyForwardFragmentation: 2.0,
+		WalCopyForwardOnRetention:   walCopyForwardDisabled(),
+		IndexCompactOnRetention:     indexCompactDisabled(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	key := []byte("ow")
+	if err := commitKeyValue(db, key, "v0"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 20; i++ {
+		if err := commitKeyValue(db, key, "v1"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	allocatedBefore := db.log.AllocatedBytesOnDisk()
+	res, err := db.MaybeCopyForwardWal(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.FramesCopied == 0 {
+		t.Fatalf("expected copy-forward after overwrite generations, allocated=%d segments=%d", allocatedBefore, db.log.SegmentCount())
+	}
+	checkKey(t, db, "ow", "v1")
+}
+
 func TestRunWalMaintenance_IncludesCopyForward(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(dir, Options{
@@ -384,4 +418,120 @@ func TestRunWalMaintenance_IncludesCopyForward(t *testing.T) {
 		t.Fatalf("expected wal maintenance shrink, before=%d after=%d", before, after)
 	}
 	db.Close()
+}
+
+func TestRunWalMaintenance_ReclaimsOverwriteGenerations(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, Options{
+		WalSegmentSize:              4096,
+		WalCopyForwardFragmentation: 3.0,
+		IndexCompactFragmentation:   3.0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	const numKeys = 24
+	keys := make([][]byte, numKeys)
+	for i := 0; i < numKeys; i++ {
+		keys[i] = []byte{'k', '-', byte('A' + i)}
+		if err := commitKeyValue(db, keys[i], "g0"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for gen := 1; gen <= 6; gen++ {
+		for _, key := range keys {
+			if err := commitKeyValue(db, key, "g"); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	logicalBefore := db.log.logicalUsedBytes()
+	if err := db.RunWalMaintenance(); err != nil {
+		t.Fatal(err)
+	}
+	logicalAfter := db.log.logicalUsedBytes()
+	if logicalAfter >= logicalBefore {
+		t.Fatalf("expected overwrite generations to reclaim WAL, before=%d after=%d allocated=%d",
+			logicalBefore, logicalAfter, db.log.AllocatedBytesOnDisk())
+	}
+	// Live data is one generation; reclaimed log should be well under the
+	// pre-maintenance span (six extra overwrite passes).
+	if logicalAfter*2 >= logicalBefore {
+		t.Fatalf("expected reclaim toward one live generation, before=%d after=%d", logicalBefore, logicalAfter)
+	}
+	for _, key := range keys {
+		checkKey(t, db, string(key), "g")
+	}
+}
+
+func TestOverwriteCommitLatency_StableAfterMaintenance(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, Options{
+		WalSegmentSize:              1024,
+		WalCopyForwardFragmentation: 3.0,
+		IndexCompactFragmentation:   3.0,
+		UnsafeDisableFsync:          true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	const numKeys = 64
+	keys := make([][]byte, numKeys)
+	for i := 0; i < numKeys; i++ {
+		keys[i] = []byte{'k', byte('0' + i/10), byte('0' + i%10)}
+		if err := commitKeyValue(db, keys[i], "base"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	overwriteAll := func(tag string) error {
+		for _, key := range keys {
+			if err := commitKeyValue(db, key, tag); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	start := time.Now()
+	if err := overwriteAll("a"); err != nil {
+		t.Fatal(err)
+	}
+	first := time.Since(start)
+
+	for i := 0; i < 5; i++ {
+		if err := overwriteAll("b"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	logicalBefore := db.log.logicalUsedBytes()
+	if err := db.RunWalMaintenance(); err != nil {
+		t.Fatal(err)
+	}
+	logicalAfter := db.log.logicalUsedBytes()
+	if logicalAfter >= logicalBefore {
+		t.Fatalf("expected reclaim before latency check, before=%d after=%d", logicalBefore, logicalAfter)
+	}
+
+	start = time.Now()
+	if err := overwriteAll("c"); err != nil {
+		t.Fatal(err)
+	}
+	second := time.Since(start)
+
+	limit := first * 2
+	if limit < 20*time.Millisecond {
+		limit = 20 * time.Millisecond
+	}
+	if second > limit {
+		t.Fatalf("overwrite batch slowed after fragmentation: first=%s after=%s limit=%s", first, second, limit)
+	}
+	for _, key := range keys {
+		checkKey(t, db, string(key), "c")
+	}
 }

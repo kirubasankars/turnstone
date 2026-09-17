@@ -9,11 +9,19 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"time"
 
 	"turnstone/engine/hashindex"
 )
 
-const defaultWalCopyForwardRatio = 3.0
+const (
+	defaultWalCopyForwardRatio     = 3.0
+	defaultCopyForwardDrainTimeout = 50 * time.Millisecond
+)
+
+// copyForwardDrainTimeout waits for in-flight write transactions after
+// walRewriteMu is held. Tests may shorten it.
+var copyForwardDrainTimeout = defaultCopyForwardDrainTimeout
 
 // testingAfterCopyForwardCollect runs after the exclusive rewrite lock is held
 // and live offsets have been collected, before frames are copied. Tests only.
@@ -73,12 +81,14 @@ func (db *DB) DeleteWalSegments(minDeletableLSN int64) (WalRetentionResult, erro
 // MaybeCopyForwardWal copies MVCC-visible index frames into a fresh segment when
 // on-disk WAL bytes exceed live bytes by WalCopyForwardFragmentation (default 3×).
 //
-// Under commitMu: skips while write transactions are already active. Once
-// fragmentation warrants a copy, walRewriteMu excludes new write begins and
-// replica apply so index.Put cannot race collect/remap. Read-only snapshots
-// may still pin older frames. Pipeline is append → remap index → purge segments.
-// Segment purge respects scan floor for replication; unconstrained DBs purge through
-// the pre-copy write head for maximum reclaim.
+// Eligibility uses an index-only live-size estimate (no WAL reads). If the log
+// looks fragmented, walRewriteMu blocks new write begins and replica apply, then
+// in-flight writers are drained up to copyForwardDrainTimeout. A writer that is
+// still active after the drain skips this tick. commitMu is held only for append,
+// remap, and segment purge so COMMIT is not stalled during planning. Read-only
+// snapshots may still pin older frames. Pipeline is append → remap index → purge
+// segments. Segment purge respects scan floor for replication; unconstrained DBs
+// purge through the pre-copy write head for maximum reclaim.
 func (db *DB) MaybeCopyForwardWal(minDeletableLSN int64) (WalRetentionResult, error) {
 	if db.log == nil || db.index == nil || db.index.hash == nil {
 		return WalRetentionResult{}, nil
@@ -89,32 +99,18 @@ func (db *DB) MaybeCopyForwardWal(minDeletableLSN int64) (WalRetentionResult, er
 		ratio = defaultWalCopyForwardRatio
 	}
 
-	db.commitMu.Lock()
-	defer db.commitMu.Unlock()
-
-	if db.activeWriteTransactionCount() > 0 {
-		return WalRetentionResult{}, nil
-	}
-
-	_, oldOffsets, err := db.copyForwardPlan(ratio)
-	if err != nil {
-		return WalRetentionResult{}, err
-	}
-	if len(oldOffsets) == 0 {
+	if !db.copyForwardFragmented(ratio) {
 		return WalRetentionResult{}, nil
 	}
 
 	db.walRewriteMu.Lock()
 	defer db.walRewriteMu.Unlock()
 
-	if db.activeWriteTransactionCount() > 0 {
+	if !db.waitForWriteTransactions(copyForwardDrainTimeout) {
 		return WalRetentionResult{}, nil
 	}
 
-	ctx, oldOffsets, err := db.copyForwardPlan(ratio)
-	if err != nil {
-		return WalRetentionResult{}, err
-	}
+	ctx, oldOffsets := db.copyForwardPlan(ratio)
 	if len(oldOffsets) == 0 {
 		return WalRetentionResult{}, nil
 	}
@@ -131,6 +127,9 @@ func (db *DB) MaybeCopyForwardWal(minDeletableLSN int64) (WalRetentionResult, er
 		}
 		frames[i] = frame
 	}
+
+	db.commitMu.Lock()
+	defer db.commitMu.Unlock()
 
 	outcome, err := db.log.appendCopyForwardFrames(oldOffsets, frames)
 	if err != nil {
@@ -164,6 +163,23 @@ func (db *DB) MaybeCopyForwardWal(minDeletableLSN int64) (WalRetentionResult, er
 		FramesCopied:    len(oldOffsets),
 		DeleteThrough:   deleteThrough,
 	}, nil
+}
+
+func (db *DB) waitForWriteTransactions(timeout time.Duration) bool {
+	if db.activeWriteTransactionCount() == 0 {
+		return true
+	}
+	if timeout <= 0 {
+		return false
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+		if db.activeWriteTransactionCount() == 0 {
+			return true
+		}
+	}
+	return db.activeWriteTransactionCount() == 0
 }
 
 // MinDeletableLSN returns the byte offset below which sealed WAL segments may
@@ -248,61 +264,73 @@ func (db *DB) appendCopyForwardCommits(frames [][]byte) error {
 	return err
 }
 
-// copyForwardPlan collects live frame offsets when allocated WAL exceeds live
-// bytes by ratio. Empty offsets means skip (nothing live or not fragmented).
-func (db *DB) copyForwardPlan(ratio float64) (IndexGCContext, []int64, error) {
+// copyForwardFragmented reports whether logical WAL bytes exceed estimated
+// MVCC-live frame bytes by ratio. It walks the index only; it does not read WAL.
+func (db *DB) copyForwardFragmented(ratio float64) bool {
 	ctx := db.BuildIndexGCContext()
-	oldOffsets, liveBytes, err := db.collectLiveFrameOffsets(ctx)
-	if err != nil {
-		return ctx, nil, err
-	}
-	if len(oldOffsets) == 0 {
-		return ctx, nil, nil
+	return db.walExceedsLiveRatio(ratio, db.estimateLiveWalBytes(ctx))
+}
+
+func (db *DB) walExceedsLiveRatio(ratio float64, liveBytes int64) bool {
+	if liveBytes <= 0 {
+		return false
 	}
 	allocated := db.log.logicalUsedBytes()
 	if allocated == 0 {
 		allocated = db.log.AllocatedBytesOnDisk()
 	}
-	if float64(allocated) <= float64(liveBytes)*ratio {
-		return ctx, nil, nil
+	return float64(allocated) > float64(liveBytes)*ratio
+}
+
+func (db *DB) estimateLiveWalBytes(ctx IndexGCContext) int64 {
+	var live int64
+	db.forEachLiveWalVersion(ctx, func(key []byte, v indexVersion) {
+		live += estimatedWalFrameSize(key, v.tombstone, v.valueLen)
+	})
+	return live
+}
+
+// copyForwardPlan collects live frame offsets when allocated WAL exceeds live
+// bytes by ratio. Empty offsets means skip (nothing live or not fragmented).
+func (db *DB) copyForwardPlan(ratio float64) (IndexGCContext, []int64) {
+	ctx := db.BuildIndexGCContext()
+	oldOffsets, liveBytes := db.collectLiveFrameOffsets(ctx)
+	if len(oldOffsets) == 0 {
+		return ctx, nil
 	}
-	return ctx, oldOffsets, nil
+	if !db.walExceedsLiveRatio(ratio, liveBytes) {
+		return ctx, nil
+	}
+	return ctx, oldOffsets
 }
 
 // collectLiveFrameOffsets gathers deduplicated frame offsets for copy-forward.
 // Uses FilterVersionsForWalRetain (not FilterVersions) so snapshot-pinned frames
-// below scan floor are still copied.
-func (db *DB) collectLiveFrameOffsets(ctx IndexGCContext) ([]int64, int64, error) {
-	seen := make(map[int64]struct{})
+// below scan floor are still copied. Live bytes are estimated from index metadata
+// so planning does not read WAL frames.
+func (db *DB) collectLiveFrameOffsets(ctx IndexGCContext) ([]int64, int64) {
 	var offsets []int64
 	var liveBytes int64
+	db.forEachLiveWalVersion(ctx, func(key []byte, v indexVersion) {
+		offsets = append(offsets, v.offset)
+		liveBytes += estimatedWalFrameSize(key, v.tombstone, v.valueLen)
+	})
+	sort.Slice(offsets, func(i, j int) bool { return offsets[i] < offsets[j] })
+	return offsets, liveBytes
+}
 
-	var readErr error
+func (db *DB) forEachLiveWalVersion(ctx IndexGCContext, fn func(key []byte, v indexVersion)) {
+	seen := make(map[int64]struct{})
 	db.index.ForEachKey(func(key []byte, chain []indexVersion) {
-		if readErr != nil {
-			return
-		}
 		kept := ctx.FilterVersionsForWalRetain(key, chain)
 		for _, v := range kept {
 			if _, ok := seen[v.offset]; ok {
 				continue
 			}
 			seen[v.offset] = struct{}{}
-			frame, err := db.log.ReadFrameBytesAt(v.offset)
-			if err != nil {
-				readErr = err
-				return
-			}
-			offsets = append(offsets, v.offset)
-			liveBytes += int64(len(frame))
+			fn(key, v)
 		}
 	})
-	if readErr != nil {
-		return nil, 0, readErr
-	}
-
-	sort.Slice(offsets, func(i, j int) bool { return offsets[i] < offsets[j] })
-	return offsets, liveBytes, nil
 }
 
 func (db *DB) remapIndexOffsets(ctx IndexGCContext, remap map[int64]int64) error {

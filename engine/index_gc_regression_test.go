@@ -426,6 +426,92 @@ func TestMaybeCompactIndex_RegressionCompactsFragmentedShard(t *testing.T) {
 	checkKey(t, db, string(key), "keep")
 }
 
+func TestMaybeCompactIndex_CompactsCommittedOverwrites(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, Options{
+		IndexCompactOnRetention:   indexCompactDisabled(),
+		IndexCompactFragmentation: 2.0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	keys := make([][]byte, 16)
+	for i := range keys {
+		keys[i] = []byte(fmt.Sprintf("ow-%d", i))
+		if err := commitKeyValue(db, keys[i], "v0"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for gen := 1; gen <= 4; gen++ {
+		for _, key := range keys {
+			if err := commitKeyValue(db, key, fmt.Sprintf("v%d", gen)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	arenaBefore, liveBefore := db.IndexArenaStats()
+	if liveBefore == 0 {
+		t.Fatal("expected linked live bytes before compact")
+	}
+	// Committed overwrites prepend versions without holes, so unfiltered
+	// LiveBytes tracks ArenaUsed and the old compact gate would skip.
+	if arenaBefore > liveBefore+liveBefore/2 {
+		t.Fatalf("expected unfiltered live ≈ arena for overwrites, arena=%d live=%d", arenaBefore, liveBefore)
+	}
+
+	res, err := db.MaybeCompactIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ShardsCompacted == 0 {
+		t.Fatalf("expected compact on overwrite chains, arena=%d unfilteredLive=%d", arenaBefore, liveBefore)
+	}
+	if res.ArenaAfter >= res.ArenaBefore {
+		t.Fatalf("expected arena shrink, result=%+v", res)
+	}
+
+	for _, key := range keys {
+		checkKey(t, db, string(key), "v4")
+	}
+}
+
+func TestMaybeCompactIndex_KeepsLiveValueWhenScanFloorAtHead(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, Options{
+		IndexCompactOnRetention:   indexCompactDisabled(),
+		IndexCompactFragmentation: 2.0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	key := []byte("head-key")
+	if err := commitKeyValue(db, key, "keep"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 4; i++ {
+		if err := commitKeyValue(db, key, "keep"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.SetScanFloor(db.log.WriteOffset()); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := db.MaybeCompactIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ShardsCompacted == 0 {
+		t.Fatal("expected overwrite compact with scan floor at write head")
+	}
+	checkKey(t, db, "head-key", "keep")
+}
+
 func TestCompactIndex_RegressionMatchesGetVisibleAfterPrune(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(dir, Options{IndexCompactOnRetention: indexCompactDisabled()})
