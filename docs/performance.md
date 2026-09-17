@@ -61,7 +61,9 @@ foreign keys. Use PostgreSQL there.
    `fallocate`d to the configured size (default 64 MiB). Retention
    **renames** retired files into `wal/recycle/` and the next rotation
    reuses them — PostgreSQL's `wal_recycle` pattern, so commit does not
-   pay create/unlink/metadata growth.
+   pay create/unlink/metadata growth. If the disk cannot reserve the
+   segment (`ENOSPC` on a small tmpfs), Open still succeeds and the
+   file grows with writes.
 
 ## How to measure
 

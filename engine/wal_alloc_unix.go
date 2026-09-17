@@ -8,23 +8,25 @@
 package engine
 
 import (
+	"errors"
 	"os"
 
 	"golang.org/x/sys/unix"
 )
 
-// preallocateFile reserves size bytes so later WAL writes do not grow the
+func isQuotaExceeded(err error) bool {
+	return errors.Is(err, unix.EDQUOT)
+}
+
+// preallocateFileOS reserves size bytes so later WAL writes do not grow the
 // inode. fallocate matches PostgreSQL's fully-allocated WAL segments.
-func preallocateFile(f *os.File, size int64) error {
-	if size <= 0 {
+func preallocateFileOS(f *os.File, size int64) error {
+	err := unix.Fallocate(int(f.Fd()), 0, 0, size)
+	if err == nil {
 		return nil
 	}
-	err := unix.Fallocate(int(f.Fd()), 0, 0, size)
-	if err == nil || err == unix.EOPNOTSUPP || err == unix.ENOSYS {
-		if err != nil {
-			return f.Truncate(size)
-		}
-		return nil
+	if err == unix.EOPNOTSUPP || err == unix.ENOSYS {
+		return f.Truncate(size)
 	}
 	return err
 }

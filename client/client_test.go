@@ -76,7 +76,7 @@ func setupTestEnv(t *testing.T) (string, *server.Server, func()) {
 
 	// 4. Server
 	srv, err := server.NewServer(
-		"test-server", ":0", stores, logger, 10,
+		"test-server", "127.0.0.1:0", stores, logger, 10,
 		filepath.Join(certsDir, "server.crt"),
 		filepath.Join(certsDir, "server.key"),
 		filepath.Join(certsDir, "ca.crt"),
@@ -284,11 +284,17 @@ func TestClient_Transactions(t *testing.T) {
 	defer cleanup()
 
 	// 2 Clients
-	c1, _ := client.NewClient(client.Config{Address: srv.Addr().String(), TLSConfig: getClientTLS(t, dir)})
+	c1, err := client.NewClient(client.Config{Address: srv.Addr().String(), TLSConfig: getClientTLS(t, dir)})
+	if err != nil {
+		t.Fatalf("client 1: %v", err)
+	}
 	defer c1.Close()
 	c1.Select("1")
 
-	c2, _ := client.NewClient(client.Config{Address: srv.Addr().String(), TLSConfig: getClientTLS(t, dir)})
+	c2, err := client.NewClient(client.Config{Address: srv.Addr().String(), TLSConfig: getClientTLS(t, dir)})
+	if err != nil {
+		t.Fatalf("client 2: %v", err)
+	}
 	defer c2.Close()
 	c2.Select("1")
 

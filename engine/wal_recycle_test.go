@@ -144,3 +144,48 @@ func TestWal_ReopenUsesFooterNotFileSize(t *testing.T) {
 		t.Fatalf("read after reopen: err=%v val=%q", err, val)
 	}
 }
+
+func TestWal_GrowsWhenPreallocHasNoSpace(t *testing.T) {
+	testingPreallocErr = syscall.ENOSPC
+	t.Cleanup(func() { testingPreallocErr = nil })
+
+	dir := t.TempDir()
+	const segSize = 64 << 20
+	log, err := OpenDataLog(dir, nil, segSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+
+	info, err := os.Stat(log.activeSegmentPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() >= segSize {
+		t.Fatalf("grow-mode file size %d, want well under segment %d", info.Size(), segSize)
+	}
+	if len(log.segments[log.activeIndex].mapping) != 0 {
+		t.Fatal("grow-mode segment must not be mmap'd")
+	}
+
+	payload := encodeRecord(Record{Type: RecordSet, XID: 1, Key: []byte("k"), Value: []byte("v")})
+	off, err := log.AppendEncoded(payload, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	val, err := log.ReadValueAt(off, 1)
+	if err != nil || string(val) != "v" {
+		t.Fatalf("ReadValueAt in grow mode: %v %q", err, val)
+	}
+
+	head := log.WriteOffset()
+	log.Close()
+	log2, err := OpenDataLog(dir, nil, segSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log2.Close()
+	if log2.WriteOffset() != head {
+		t.Fatalf("reopen write offset %d, want %d (file size, no footer)", log2.WriteOffset(), head)
+	}
+}
