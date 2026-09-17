@@ -100,8 +100,8 @@ func StreamLogRange(ctx context.Context, opts StreamOptions, writer io.Writer) (
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				break
 			}
-			if err == io.EOF {
-				break
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				return result, fmt.Errorf("replication stream closed unexpectedly: %w", err)
 			}
 			return result, fmt.Errorf("read header: %w", err)
 		}
