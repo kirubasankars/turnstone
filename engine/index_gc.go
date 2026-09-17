@@ -192,7 +192,8 @@ func numHashShards(stats hashindex.IndexStats) int {
 	return n
 }
 
-// MaybeCompactIndex compacts shards whose arena is substantially larger than live data.
+// MaybeCompactIndex compacts shards whose arena is substantially larger than
+// MVCC-filtered live data (not unfiltered linked version bytes).
 func (db *DB) MaybeCompactIndex() (IndexCompactResult, error) {
 	if db.index == nil || db.index.hash == nil {
 		return IndexCompactResult{}, nil
@@ -203,21 +204,29 @@ func (db *DB) MaybeCompactIndex() (IndexCompactResult, error) {
 		ratio = defaultIndexFragmentationRatio
 	}
 
-	statsBefore := db.index.hash.Stats()
 	ctx := db.BuildIndexGCContext()
-	filter := db.indexVersionFilter(ctx)
+	// Retention may raise scan floor to the write head (after COMMIT). FilterVersions
+	// would then treat the live SET (offset < floor) as dead. Use WAL-retain
+	// visibility so overwrite garbage compact cannot drop the current value.
+	filter := db.indexWalRetainFilter(ctx)
 
 	var before, after uint64
 	compacted := 0
-	for i := range statsBefore.Shards {
-		st := statsBefore.Shards[i]
-		before += st.ArenaUsed
-		if st.KeyCount == 0 || st.LiveBytes == 0 {
-			after += st.ArenaUsed
+	n := db.index.hash.ShardCount()
+	for i := 0; i < n; i++ {
+		arena, live, keys := db.index.hash.FilteredLiveBytes(i, filter)
+		before += arena
+		if keys == 0 {
+			after += arena
 			continue
 		}
-		if float64(st.ArenaUsed) <= float64(st.LiveBytes)*ratio {
-			after += st.ArenaUsed
+		// Compare arena to MVCC-filtered live bytes. Unfiltered Stats.LiveBytes
+		// counts every linked version, so committed overwrites never look
+		// fragmented (ArenaUsed ≈ linked live) even though old versions are
+		// invisible. live==0 with keys remaining means the filter dropped the
+		// whole shard and compact should reclaim it.
+		if live > 0 && float64(arena) <= float64(live)*ratio {
+			after += arena
 			continue
 		}
 		afterStats, err := db.index.hash.CompactShard(i, filter)
@@ -252,12 +261,20 @@ func (db *DB) recordIndexCompact(res IndexCompactResult) {
 }
 
 func (db *DB) indexVersionFilter(ctx IndexGCContext) hashindex.VersionFilter {
+	return db.hashVersionFilter(ctx.FilterVersions)
+}
+
+func (db *DB) indexWalRetainFilter(ctx IndexGCContext) hashindex.VersionFilter {
+	return db.hashVersionFilter(ctx.FilterVersionsForWalRetain)
+}
+
+func (db *DB) hashVersionFilter(fn func([]byte, []indexVersion) []indexVersion) hashindex.VersionFilter {
 	return func(key []byte, chain []hashindex.Version) []hashindex.Version {
 		in := make([]indexVersion, len(chain))
 		for i, v := range chain {
 			in[i] = fromHashVersion(v)
 		}
-		out := ctx.FilterVersions(key, in)
+		out := fn(key, in)
 		if len(out) == 0 {
 			return nil
 		}

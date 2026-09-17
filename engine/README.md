@@ -100,11 +100,11 @@ Only **committed** versions are visible to other transactions; aborted versions 
 
 Executed when retention policy allows (from `database.EnforceRetentionPolicy`):
 
-1. **Index compaction** — prune stale chains; reclaim arena when fragmentation > ~3× live bytes.
-2. **WAL copy-forward** — copy MVCC-visible frames to new segment when allocated WAL > ~3× live; remap index offsets.
+1. **Index compaction** — prune stale chains; reclaim arena when used bytes exceed ~3× **MVCC-filtered** live bytes (unfiltered linked bytes do not count overwrite garbage as live).
+2. **WAL copy-forward** — copy MVCC-visible frames to a new segment when allocated WAL > ~3× live; remap index offsets.
 3. **Segment delete** — remove sealed segments ≤ `min(scanFloor, mvccFloor)`.
 
-Skips copy-forward while write transactions are already active. Once a copy starts, new write begins and replica apply wait so index offsets cannot race remap. Read-only snapshots pin older frames.
+Copy-forward eligibility is an index-only size estimate (no WAL reads). If the log is fragmented, `walRewriteMu` blocks new write begins while in-flight writers drain (short timeout); a still-busy writer skips the tick. `commitMu` is held only for append, index remap, and segment purge. Read-only snapshots pin older frames.
 
 ## `Options` (engine open)
 
