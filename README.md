@@ -48,7 +48,7 @@ flowchart LR
     engine --> index
 ```
 
-On Unix the hash index lives in anonymous mmap arenas (heap fallback elsewhere) and is **rebuilt from the WAL on every open**. WAL retention can compact fragmented shards, copy live frames forward, and drop sealed segments. Cap index memory with `max_index_arena_bytes`.
+On Unix the hash index lives in anonymous mmap arenas (heap fallback elsewhere) and is **rebuilt from the WAL on every open**. WAL segments are file-backed `mmap` with `madvise`; values are assembled from an 8 KiB `shared_buffers` page pool. WAL retention can compact fragmented shards, copy live frames forward, and drop sealed segments. Cap index memory with `max_index_arena_bytes`.
 
 ---
 
@@ -301,6 +301,21 @@ Retry `ErrTxConflict` and `ErrServerBusy` with backoff. The engine does not wait
 | `stat` | CLI | JSON replication state, offsets, replica lag |
 
 ---
+
+## Faster than PostgreSQL (on KV)
+
+Turnstone is not a SQL database. On durable point GET/SET it can outrun
+PostgreSQL because the hot path is a hash probe + group `fdatasync`, not
+parse/plan/btree. The engine defaults match a fair comparison: no commit
+sleep, Unix `fdatasync`, no `BEGIN` WAL record, open WAL file descriptors,
+and a 64 MiB value cache.
+
+How to measure and what not to compare: **[docs/performance.md](docs/performance.md)**.
+
+```bash
+make bench
+scripts/bench-vs-postgres.sh   # Postgres side runs only if psql can connect
+```
 
 ## Limitations
 

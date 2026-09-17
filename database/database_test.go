@@ -7,6 +7,8 @@ package database
 
 import (
 	"context"
+	"encoding/binary"
+	"hash/crc32"
 	"io"
 	"log/slog"
 	"math"
@@ -17,6 +19,25 @@ import (
 
 	"turnstone/protocol"
 )
+
+func walLogicalUsed(t *testing.T, f *os.File) int64 {
+	t.Helper()
+	stat, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stat.Size() < 16 {
+		return stat.Size()
+	}
+	buf := make([]byte, 16)
+	if _, err := f.ReadAt(buf, stat.Size()-16); err != nil {
+		t.Fatal(err)
+	}
+	if binary.BigEndian.Uint32(buf[0:4]) != 0x54534631 {
+		return stat.Size()
+	}
+	return int64(binary.BigEndian.Uint64(buf[4:12]))
+}
 
 func putKV(t *testing.T, db *Database, key, val string) {
 	t.Helper()
@@ -89,15 +110,16 @@ func TestDatabase_Recover_CRC_Corruption(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	stat, _ := f.Stat()
-	size := stat.Size()
-
+	used := walLogicalUsed(t, f)
+	if used < 2 {
+		t.Fatalf("expected WAL used bytes, got %d", used)
+	}
 	b := make([]byte, 1)
-	if _, err := f.ReadAt(b, size-1); err != nil {
+	if _, err := f.ReadAt(b, used-1); err != nil {
 		t.Fatal(err)
 	}
 	b[0] ^= 0xFF
-	if _, err := f.WriteAt(b, size-1); err != nil {
+	if _, err := f.WriteAt(b, used-1); err != nil {
 		t.Fatal(err)
 	}
 	f.Close()
@@ -136,11 +158,23 @@ func TestDatabase_Recover_PartialWrite(t *testing.T) {
 	s1.Close()
 
 	logPath := filepath.Join(dir, "wal", "seg-000001.wal")
-	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(logPath, os.O_RDWR, 0o644)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.Write([]byte{0xFF, 0xFF, 0xFF, 0xFF}); err != nil {
+	used := walLogicalUsed(t, f)
+	if _, err := f.WriteAt([]byte{0xFF, 0xFF, 0xFF, 0xFF}, used); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 16)
+	binary.BigEndian.PutUint32(buf[0:4], 0x54534631)
+	binary.BigEndian.PutUint64(buf[4:12], uint64(used+4))
+	binary.BigEndian.PutUint32(buf[12:16], crc32.Checksum(buf[:12], crc32.MakeTable(crc32.Castagnoli)))
+	stat, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt(buf, stat.Size()-16); err != nil {
 		t.Fatal(err)
 	}
 	f.Close()

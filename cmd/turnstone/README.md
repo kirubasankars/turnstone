@@ -73,7 +73,7 @@ Subcommands map cleanly to operator workflows (`init` once, `server` always-on, 
 
 ### Benchmark subcommand
 
-`bench` exists to exercise the **client → server → engine** path without writing a separate tool. Default is a fixed `--ops` count; `--duration` soaks until a wall-clock timer expires. Review `bench.go` when investigating latency outliers or connection pool behavior.
+`bench` exists to exercise the **client → server → engine** path without writing a separate tool. Default is a fixed `--ops` count; `--duration` soaks until a wall-clock timer expires. Review `bench.go` when investigating latency outliers or connection pool behavior. For in-process engine vs PostgreSQL KV, see [docs/performance.md](../../docs/performance.md).
 
 ## Review checklist
 
