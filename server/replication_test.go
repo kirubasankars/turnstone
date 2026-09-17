@@ -90,7 +90,7 @@ func startServerNode(t *testing.T, baseDir, name string, sharedTLS *tls.Config) 
 
 	srv, err := NewServer(
 		name, // Use node name as Server ID
-		":0", stores, logger, 10,
+		"127.0.0.1:0", stores, logger, 10,
 		filepath.Join(certsDir, "server.crt"),
 		filepath.Join(certsDir, "server.key"),
 		filepath.Join(certsDir, "ca.crt"),
@@ -753,7 +753,7 @@ func startServerNodeWithReplicas(t *testing.T, baseDir, name string, sharedTLS *
 
 	srv, err := NewServer(
 		name,
-		":0", stores, logger, 10,
+		"127.0.0.1:0", stores, logger, 10,
 		filepath.Join(certsDir, "server.crt"),
 		filepath.Join(certsDir, "server.key"),
 		filepath.Join(certsDir, "ca.crt"),

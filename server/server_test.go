@@ -102,7 +102,7 @@ func setupTestEnv(t *testing.T) (string, map[string]*database.Database, *Server,
 	// 4. Init Server (Port 0 for random free port)
 	srv, err := NewServer(
 		"test-server",
-		":0", stores, logger,
+		"127.0.0.1:0", stores, logger,
 		10, // MaxConns
 		filepath.Join(certsDir, "server.crt"),
 		filepath.Join(certsDir, "server.key"),
@@ -623,7 +623,7 @@ func TestServer_Backpressure(t *testing.T) {
 	// Note: It reuses the same 'stores' map.
 	srv, err := NewServer(
 		"backpressure-server",
-		":0", stores, logger,
+		"127.0.0.1:0", stores, logger,
 		1, // MaxConns = 1
 		filepath.Join(certsDir, "server.crt"),
 		filepath.Join(certsDir, "server.key"),

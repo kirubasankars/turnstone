@@ -60,6 +60,23 @@ func writeSegmentFooter(f *os.File, segmentSize, used int64) error {
 	return err
 }
 
+// writeSegmentFooterIfAllocated writes the TSF1 footer only when the file is
+// already segment-sized. Extending a grow-as-you-write file to 64 MiB just to
+// store the footer would hit ENOSPC on a tight tmpfs the same way fallocate did.
+func writeSegmentFooterIfAllocated(f *os.File, segmentSize, used int64) error {
+	if f == nil {
+		return nil
+	}
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if info.Size() < segmentSize {
+		return nil
+	}
+	return writeSegmentFooter(f, segmentSize, used)
+}
+
 func readSegmentFooter(f *os.File, segmentSize int64) (used int64, ok bool) {
 	if f == nil || segmentSize < walSegFooterSize {
 		return 0, false
@@ -87,11 +104,19 @@ func createAllocatedWALFile(path string, segmentSize int64) (*os.File, error) {
 		return nil, err
 	}
 	if err := preallocateFile(f, segmentSize); err != nil {
+		if isNoSpace(err) {
+			// Grow as we write. File size is the logical head; no end-of-file footer.
+			return f, nil
+		}
 		_ = f.Close()
 		_ = os.Remove(path)
 		return nil, err
 	}
 	if err := writeSegmentFooter(f, segmentSize, 0); err != nil {
+		if isNoSpace(err) {
+			_ = f.Truncate(0)
+			return f, nil
+		}
 		_ = f.Close()
 		_ = os.Remove(path)
 		return nil, err
@@ -111,9 +136,15 @@ func resetAllocatedWALFile(path string, segmentSize int64) error {
 	}
 	defer f.Close()
 	if err := preallocateFile(f, segmentSize); err != nil {
+		if isNoSpace(err) {
+			return f.Truncate(0)
+		}
 		return err
 	}
 	if err := writeSegmentFooter(f, segmentSize, 0); err != nil {
+		if isNoSpace(err) {
+			return f.Truncate(0)
+		}
 		return err
 	}
 	return syncFile(f)
