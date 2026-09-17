@@ -156,6 +156,11 @@ func (l *DataLog) mapSegment(seg *walSegment) {
 	if f == nil {
 		return
 	}
+	if info, err := f.Stat(); err != nil || info.Size() < l.segmentSize {
+		// Short/grow-mode files are not mapped: a MAP_SHARED of segmentSize
+		// would SIGBUS on reads past EOF.
+		return
+	}
 	mapped, err := mmapWALFile(f, l.segmentSize)
 	if err != nil {
 		l.logger.Warn("wal mmap failed", "segment", seg.file, "err", err)
@@ -210,6 +215,9 @@ func (l *DataLog) ensureAllocated(f *os.File) error {
 		return nil
 	}
 	if err := preallocateFile(f, l.segmentSize); err != nil {
+		if isNoSpace(err) {
+			return nil
+		}
 		return err
 	}
 	return writeSegmentFooter(f, l.segmentSize, info.Size())
@@ -285,7 +293,7 @@ func (l *DataLog) strictSyncLocked() {
 	if seg.writer == nil {
 		return
 	}
-	_ = writeSegmentFooter(seg.writer, l.segmentSize, l.writeOffset-seg.baseLSN)
+	_ = writeSegmentFooterIfAllocated(seg.writer, l.segmentSize, l.writeOffset-seg.baseLSN)
 	err := syncFile(seg.writer)
 	if err != nil {
 		if errors.Is(err, syscall.EINTR) {
@@ -384,7 +392,7 @@ func (l *DataLog) writeFrameLocked(payload []byte) error {
 
 func (l *DataLog) rotateSegmentLocked() error {
 	active := &l.segments[l.activeIndex]
-	if err := writeSegmentFooter(active.writer, l.segmentSize, l.writeOffset-active.baseLSN); err != nil {
+	if err := writeSegmentFooterIfAllocated(active.writer, l.segmentSize, l.writeOffset-active.baseLSN); err != nil {
 		return err
 	}
 	if err := syncFile(active.writer); err != nil {
@@ -653,7 +661,7 @@ func (l *DataLog) replaySegmentFile(ctx context.Context, seg *walSegment, isActi
 			if (rerr == io.ErrUnexpectedEOF || rerr == ErrChecksum || rerr == ErrCorruptData) && truncateCorrupt && isActive {
 				l.logger.Warn("Truncating corrupt wal tail", "segment", seg.file, "offset", seg.baseLSN+pos, "err", rerr)
 				if seg.writer != nil {
-					_ = writeSegmentFooter(seg.writer, l.segmentSize, pos)
+					_ = writeSegmentFooterIfAllocated(seg.writer, l.segmentSize, pos)
 				}
 				l.writeOffset = seg.baseLSN + pos
 				return ErrTruncated
