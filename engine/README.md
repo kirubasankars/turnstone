@@ -63,6 +63,18 @@ Tests (`*_test.go`, `correctness_test.go`, `benchmark_test.go`) are extensive â€
 
 `manifest.json` tracks active segment and sealed segment list.
 
+## Corruption handling
+
+| Damage | `TruncateCorruptTail` | Result |
+| --- | --- | --- |
+| Active-segment tail (short frame, bad CRC, garbage, huge length) | on | Rewind logical end to last valid frame; prefix kept; file not shrunk |
+| Same tail errors | off | `Open` fails |
+| Sealed-segment CRC / missing file / bad `manifest.json` | either | `Open` fails |
+| Recycled unused bytes | n/a | Ignored (`used=0` footer) |
+| Live `GET` / `VerifyChecksums` | n/a | Return checksum/corrupt error; no silent repair |
+
+Executable cases: `corruption_test.go`.
+
 ## Transaction semantics
 
 | Property | Implementation |
