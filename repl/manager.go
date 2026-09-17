@@ -517,7 +517,14 @@ func (rm *Manager) connectAndSync(ctx context.Context, addr string, dbs []Source
 							exp = st.LastLogOffset()
 						}
 						if startOff != exp {
-							return fmt.Errorf("log range start mismatch for db %s: got %d want %d", localDBName, startOff, exp)
+							if exp == 0 && startOff > 0 && st.LastLogOffset() == 0 && len(segData) > 0 {
+								if err := st.InitLogAtLSN(startOff); err != nil {
+									return fmt.Errorf("adopt log origin %d for db %s: %w", startOff, localDBName, err)
+								}
+								exp = startOff
+							} else {
+								return fmt.Errorf("log range start mismatch for db %s: got %d want %d", localDBName, startOff, exp)
+							}
 						}
 						if _, err := st.ApplyLogRange(segData); err != nil {
 							logger.Error("Failed to apply log segment", "db", localDBName, "err", err)

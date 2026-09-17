@@ -132,12 +132,15 @@ func StreamLogRange(ctx context.Context, opts StreamOptions, writer io.Writer) (
 		switch opCode {
 		case protocol.OpCodeReplSafePoint:
 		case protocol.OpCodeReplLogRange:
-			endOff, segData, err := parseLogRangePayload(rawBody, opts.DBName)
+			startOff, endOff, segData, err := parseLogRangePayload(rawBody, opts.DBName)
 			if err != nil {
 				return result, err
 			}
 			if len(segData) == 0 {
 				continue
+			}
+			if result.Bytes == 0 {
+				result.BaseLSN = startOff
 			}
 			if _, err := writer.Write(segData); err != nil {
 				return result, fmt.Errorf("write backup data: %w", err)
@@ -155,29 +158,29 @@ func StreamLogRange(ctx context.Context, opts StreamOptions, writer io.Writer) (
 	return result, nil
 }
 
-func parseLogRangePayload(rawBody []byte, wantDB string) (endOff uint64, segData []byte, err error) {
+func parseLogRangePayload(rawBody []byte, wantDB string) (startOff, endOff uint64, segData []byte, err error) {
 	cursor := 0
 	if cursor+4 > len(rawBody) {
-		return 0, nil, fmt.Errorf("malformed log range packet")
+		return 0, 0, nil, fmt.Errorf("malformed log range packet")
 	}
 	nLen := int(binary.BigEndian.Uint32(rawBody[cursor : cursor+4]))
 	cursor += 4
 	if cursor+nLen+4+16 > len(rawBody) {
-		return 0, nil, fmt.Errorf("malformed log range db name")
+		return 0, 0, nil, fmt.Errorf("malformed log range db name")
 	}
 	dbName := string(rawBody[cursor : cursor+nLen])
 	cursor += nLen + 4
 	if dbName != wantDB {
-		return 0, nil, fmt.Errorf("unexpected database in stream: %s", dbName)
+		return 0, 0, nil, fmt.Errorf("unexpected database in stream: %s", dbName)
 	}
-	startOff := binary.BigEndian.Uint64(rawBody[cursor : cursor+8])
+	startOff = binary.BigEndian.Uint64(rawBody[cursor : cursor+8])
 	endOff = binary.BigEndian.Uint64(rawBody[cursor+8 : cursor+16])
 	cursor += 16
 	segData = rawBody[cursor:]
 	if endOff < startOff || int(endOff-startOff) != len(segData) {
-		return 0, nil, fmt.Errorf("log range offset mismatch")
+		return 0, 0, nil, fmt.Errorf("log range offset mismatch")
 	}
-	return endOff, segData, nil
+	return startOff, endOff, segData, nil
 }
 
 func sendHello(conn net.Conn, clientID, dbName string, startLSN uint64) error {

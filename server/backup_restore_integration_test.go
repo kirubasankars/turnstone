@@ -153,3 +153,69 @@ func TestBackupRestore_DifferentialChainIntegration(t *testing.T) {
 		return string(base) == "base-value" && string(delta) == "delta-value"
 	}, "restored database missing keys from full+differential chain")
 }
+
+func TestBackupRestore_FullAfterWALPurge(t *testing.T) {
+	t.Setenv("TS_TEST_WAL_SEGMENT_SIZE", "4096")
+	baseDir, clientTLS := setupSharedCertEnv(t)
+	adminTLS := getRoleTLS(t, baseDir, "admin")
+
+	primarySrv, primaryAddr, cancelPrimary := startServerNode(t, baseDir, "primary_purge_bk", clientTLS)
+	defer cancelPrimary()
+	promoteNode(t, baseDir, primaryAddr, "1")
+
+	client := connectClient(t, primaryAddr, clientTLS)
+	defer client.Close()
+	selectDatabase(t, client, "1")
+	writeKeyVal(t, client, "backup-key", "backup-value")
+	for i := 0; i < 80; i++ {
+		writeKeyVal(t, client, "pad", "x")
+	}
+	writeKeyVal(t, client, "backup-key", "backup-value")
+
+	st := primarySrv.stores["1"]
+	if err := st.DB.RunWalMaintenance(); err != nil {
+		t.Fatalf("RunWalMaintenance: %v", err)
+	}
+	floor := st.OldestLogOffset()
+	if floor == 0 {
+		t.Fatal("expected oldest retained WAL LSN > 0 after purge")
+	}
+
+	ctx := context.Background()
+	fullDir := filepath.Join(baseDir, "backup_purged")
+	fullMeta, err := backup.RunBackup(ctx, backup.BackupOptions{
+		Host:     primaryAddr,
+		DBName:   "1",
+		OutDir:   fullDir,
+		Type:     backup.TypeFull,
+		Compress: false,
+		WaitIdle: 300 * time.Millisecond,
+		TLS:      adminTLS,
+	})
+	if err != nil {
+		t.Fatalf("full backup failed: %v", err)
+	}
+	if fullMeta.BaseLSN != floor {
+		t.Fatalf("base_lsn %d want oldest retained %d", fullMeta.BaseLSN, floor)
+	}
+
+	restoredNode := filepath.Join(baseDir, "restored_purged")
+	if _, err := backup.RunRestore(ctx, backup.RestoreOptions{
+		BackupDirs: []string{fullDir},
+		OutHome:    restoredNode,
+		Verify:     true,
+	}); err != nil {
+		t.Fatalf("restore failed: %v", err)
+	}
+
+	_, restoredAddr, cancelRestored := startServerNode(t, baseDir, "restored_purged", clientTLS)
+	defer cancelRestored()
+	promoteNode(t, baseDir, restoredAddr, "1")
+
+	restoredClient := connectClient(t, restoredAddr, clientTLS)
+	defer restoredClient.Close()
+	selectDatabase(t, restoredClient, "1")
+	waitForConditionOrTimeout(t, 5*time.Second, func() bool {
+		return string(readKey(t, restoredClient, "backup-key")) == "backup-value"
+	}, "restored database missing backup-key after purged-prefix full backup")
+}

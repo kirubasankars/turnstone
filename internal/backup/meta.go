@@ -115,9 +115,6 @@ func ValidateRestoreChain(metas []Meta) error {
 	if metas[0].Type != TypeFull {
 		return fmt.Errorf("first backup must be type full, got %q", metas[0].Type)
 	}
-	if metas[0].BaseLSN != 0 {
-		return fmt.Errorf("full backup must start at LSN 0, got %d", metas[0].BaseLSN)
-	}
 
 	prevEnd := metas[0].EndLSN
 	prevSHA := metas[0].SHA256

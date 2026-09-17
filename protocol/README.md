@@ -29,7 +29,7 @@ Payload structure is opcode-specific; see `protocol.go` comments and server hand
 | `OpCodeReplicaOf` | 0x32 | admin | Follow remote primary |
 | `OpCodePromote` | 0x34 | admin | Become primary |
 | `OpCodeStepDown` | 0x35 | admin | Drain and relinquish primary |
-| `OpCodeReplHello` | 0x50 | replication | Handshake with start offset |
+| `OpCodeReplHello` | 0x50 | replication | Handshake; start offset 0 means oldest retained WAL LSN |
 | `OpCodeReplLogRange` | 0x57 | replication | Raw WAL byte range |
 | `OpCodeReplSafePoint` | 0x55 | replication | Cluster-wide retention hint |
 
@@ -65,7 +65,7 @@ Changing limits requires coordinated updates in server enforcement, client valid
 
 ## CRC and replication
 
-Replication streams **physical WAL frames** (`OpCodeReplLogRange`), not logical records. Frame integrity uses CRC32 (Castagnoli) at the engine layer; `protocol` defines how byte ranges are addressed (global LSN, exclusive end offset).
+Replication streams **physical WAL frames** (`OpCodeReplLogRange`), not logical records. Frame integrity uses CRC32 (Castagnoli) at the engine layer; `protocol` defines how byte ranges are addressed (global LSN, exclusive end offset). Hello cursor 0 is remapped by the primary to the oldest retained WAL byte (not `ScanFloor`); `ReadLogRange(0)` still fails if that prefix has been purged.
 
 ## Educational focus
 

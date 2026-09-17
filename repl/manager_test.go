@@ -217,6 +217,59 @@ func TestManager_ApplyLogRange_ValidSegment(t *testing.T) {
 	waitForKey(t, stores["0"], "repl-key", "repl-val")
 }
 
+func TestManager_ApplyLogRange_AdoptsNonZeroOrigin(t *testing.T) {
+	leaderDir := t.TempDir()
+	leaderDB, err := database.Open(context.Background(), filepath.Join(leaderDir, "data"), slog.New(slog.NewTextHandler(io.Discard, nil)), 0, "none", 90, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx := leaderDB.NewTransaction(true)
+	tx.Put([]byte("origin-key"), []byte("origin-val"))
+	tx.Commit()
+	seg, endOff, err := leaderDB.ReadLogRange(0, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaderDB.Close()
+
+	const origin uint64 = 4000
+	shiftedEnd := origin + uint64(endOff)
+
+	_, stores, tlsConf := setupReplTestEnv(t)
+	defer stores["0"].Close()
+
+	addr, stop := startFakeLeader(t, tlsConf, func(conn net.Conn) {
+		defer conn.Close()
+		_ = readReplHello(conn)
+		_ = writeStatusOK(conn)
+
+		body := new(bytes.Buffer)
+		binary.Write(body, binary.BigEndian, uint32(len("0")))
+		body.WriteString("0")
+		binary.Write(body, binary.BigEndian, uint32(0))
+		binary.Write(body, binary.BigEndian, origin)
+		binary.Write(body, binary.BigEndian, shiftedEnd)
+		body.Write(seg)
+		_ = writeReplFrame(conn, protocol.OpCodeReplLogRange, body.Bytes())
+		<-time.After(2 * time.Second)
+	})
+	defer stop()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	rm := NewManager("follower", stores, tlsConf, logger)
+	if err := rm.Follow("0", addr, "0"); err != nil {
+		t.Fatalf("Follow failed: %v", err)
+	}
+
+	waitForKey(t, stores["0"], "origin-key", "origin-val")
+	if stores["0"].OldestLogOffset() != origin {
+		t.Fatalf("OldestLogOffset=%d want %d", stores["0"].OldestLogOffset(), origin)
+	}
+	if stores["0"].LastLogOffset() != shiftedEnd {
+		t.Fatalf("LastLogOffset=%d want %d", stores["0"].LastLogOffset(), shiftedEnd)
+	}
+}
+
 func writeStatusOK(conn net.Conn) error {
 	header := make([]byte, 5)
 	header[0] = protocol.ResStatusOK

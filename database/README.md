@@ -46,7 +46,7 @@ type Database struct {
 | Retention | `EnforceRetentionPolicy`, `runRetentionManager` | Computes scan floor from local mark, replica lag, leader safe point; calls `engine.RunWalMaintenance` |
 | Replica registry | `RegisterReplica`, `UpdateReplicaOffset`, `UnregisterReplica` | Persists slots to `repl.slots` JSON |
 | Quorum | `WaitForQuorum`, `SetMinReplicas` | Sync replication: commit waits for N followers to ack offset |
-| Replication apply | `ApplyLogRange` | Follower ingests raw WAL frames from leader |
+| Replication apply | `ApplyLogRange`, `InitLogAtLSN` | Follower ingests raw WAL frames. Hello cursor 0 is the oldest retained LSN; an empty replica/restore calls `InitLogAtLSN` so offsets match the primary. |
 | Admin | `Promote`, `StepDown`, role checks | Coordinates with `server` handlers |
 | Stats | `Stats`, `StorageDetail`, `IndexHashMetrics` | Cheap scrape stats; Console WAL live/garbage; hash shard arena/allocated/live for Console and Prometheus |
 

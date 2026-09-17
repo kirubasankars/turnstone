@@ -34,8 +34,8 @@ func newBackupCmd() *cobra.Command {
 		Use:   "backup",
 		Short: "Stream a physical WAL backup from a primary database",
 		Long: `Connect to a running primary and stream raw WAL frames using the replication
-protocol. Full backups start at WAL LSN 0; differential backups resume from a
-previous backup's end_lsn (stored in backup.meta).`,
+protocol. Full backups start at the oldest retained WAL LSN (cursor 0); differential
+backups resume from a previous backup's end_lsn (stored in backup.meta).`,
 		Run: func(cmd *cobra.Command, args []string) {
 			ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 			defer cancel()

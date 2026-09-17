@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -142,6 +143,11 @@ func Open(ctx context.Context, dir string, logger *slog.Logger, minReplicas int,
 		MaxIndexArenaBytes:  maxIndexArenaBytes,
 		Logger:              logger,
 		UnsafeDisableFsync:  os.Getenv("TS_UNSAFE_DISABLE_FSYNC") == "true",
+	}
+	if v := os.Getenv("TS_TEST_WAL_SEGMENT_SIZE"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			opts.WalSegmentSize = n
+		}
 	}
 
 	s := &Database{
@@ -491,6 +497,31 @@ func (s *Database) LastLogOffset() uint64 {
 		return 0
 	}
 	return uint64(s.DB.LastLogOffset())
+}
+
+// OldestLogOffset is the base LSN of the earliest retained WAL segment.
+func (s *Database) OldestLogOffset() uint64 {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	if s.DB == nil {
+		return 0
+	}
+	off := s.DB.OldestLogOffset()
+	if off < 0 {
+		return 0
+	}
+	return uint64(off)
+}
+
+// InitLogAtLSN points an empty log at lsn so replicated frames keep primary
+// physical offsets. Safe to call with lsn 0 (no-op).
+func (s *Database) InitLogAtLSN(lsn uint64) error {
+	s.dbMu.Lock()
+	defer s.dbMu.Unlock()
+	if s.DB == nil {
+		return fmt.Errorf("database is not open")
+	}
+	return s.DB.InitLogAtLSN(int64(lsn))
 }
 
 // Stats returns usage statistics.

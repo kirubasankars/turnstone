@@ -106,7 +106,7 @@ func RunBackup(ctx context.Context, opts BackupOptions) (Meta, error) {
 		Timestamp:    time.Now(),
 		Database:     opts.DBName,
 		Type:         opts.Type,
-		BaseLSN:      startLSN,
+		BaseLSN:      streamRes.BaseLSN,
 		EndLSN:       streamRes.EndLSN,
 		ParentSHA256: parentSHA,
 		Compressed:   opts.Compress,
