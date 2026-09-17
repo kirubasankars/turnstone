@@ -55,10 +55,14 @@ func TestValidateRestoreChain(t *testing.T) {
 		t.Fatal("expected empty chain error")
 	}
 
-	badFullBase := full
-	badFullBase.BaseLSN = 10
-	if err := ValidateRestoreChain([]Meta{badFullBase}); err == nil {
-		t.Fatal("expected full non-zero base_lsn error")
+	floorFull := full
+	floorFull.BaseLSN = 10
+	if err := ValidateRestoreChain([]Meta{floorFull}); err != nil {
+		t.Fatalf("full at retained floor: %v", err)
+	}
+	floorDiff := diff
+	if err := ValidateRestoreChain([]Meta{floorFull, floorDiff}); err != nil {
+		t.Fatalf("full-at-floor+diff: %v", err)
 	}
 
 	badSecondType := full
@@ -148,11 +152,11 @@ func TestParseLogRangePayload(t *testing.T) {
 		0, 0, 0, 0, 0, 0, 0, 3,
 		0x01, 0x02, 0x03,
 	}
-	end, data, err := parseLogRangePayload(payload, "1")
+	start, end, data, err := parseLogRangePayload(payload, "1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if end != 3 || len(data) != 3 {
-		t.Fatalf("got end=%d len=%d", end, len(data))
+	if start != 0 || end != 3 || len(data) != 3 {
+		t.Fatalf("got start=%d end=%d len=%d", start, end, len(data))
 	}
 }

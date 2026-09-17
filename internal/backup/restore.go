@@ -68,6 +68,10 @@ func RunRestore(ctx context.Context, opts RestoreOptions) (Meta, error) {
 	}
 	defer db.Close()
 
+	if err := db.InitLogAtLSN(int64(metas[0].BaseLSN)); err != nil {
+		return Meta{}, fmt.Errorf("init log at lsn %d: %w", metas[0].BaseLSN, err)
+	}
+
 	for i, dir := range opts.BackupDirs {
 		meta := metas[i]
 		bkPath, _, err := ResolveWALInputFile(dir, opts.File)

@@ -1110,7 +1110,7 @@ func (s *Server) handleReplicaOf(w io.Writer, payload []byte, st *connState) {
 	// INFO: Significant role change
 	st.logger.Info("Starting replication (Transition to REPLICA)", "db", st.dbName, "source", addr, "remote_db", remoteDB)
 
-	// Wipe local state so physical catch-up streams from offset 0 with a clean log.
+	// Wipe local state so catch-up Hellos at cursor 0 (oldest retained WAL).
 	if err := st.db.Reset(); err != nil {
 		st.logger.Error("Failed to reset database before replication", "err", err)
 		_ = s.writeBinaryResponse(w, protocol.ResStatusErr, []byte(fmt.Sprintf("reset failed: %v", err)))

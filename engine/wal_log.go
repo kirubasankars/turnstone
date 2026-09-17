@@ -897,6 +897,42 @@ func (l *DataLog) OldestSegmentBaseLSN() int64 {
 	return l.segments[0].baseLSN
 }
 
+// InitLogAtLSN sets the empty log's origin to lsn so replicated/restored frames
+// keep the primary's global byte addresses. The on-disk file still starts at
+// offset 0; only the manifest BaseLSN and write head change.
+func (l *DataLog) InitLogAtLSN(lsn int64) error {
+	if lsn < 0 {
+		return fmt.Errorf("init log at lsn: negative lsn %d", lsn)
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.writeOffset == lsn && len(l.segments) > 0 && l.segments[l.activeIndex].baseLSN == lsn {
+		return nil
+	}
+	if l.writeOffset != 0 {
+		return fmt.Errorf("init log at lsn: log is not empty (writeOffset=%d)", l.writeOffset)
+	}
+	if lsn == 0 {
+		return nil
+	}
+	if l.activeIndex < 0 || len(l.segments) != 1 {
+		return fmt.Errorf("init log at lsn: expected a single empty segment")
+	}
+	seg := &l.segments[l.activeIndex]
+	if seg.baseLSN != 0 {
+		return fmt.Errorf("init log at lsn: unexpected base lsn %d", seg.baseLSN)
+	}
+	oldBase := seg.baseLSN
+	seg.baseLSN = lsn
+	l.writeOffset = lsn
+	if err := l.persistManifestLocked(); err != nil {
+		seg.baseLSN = oldBase
+		l.writeOffset = 0
+		return err
+	}
+	return nil
+}
+
 // deleteSegmentsThrough removes sealed segments whose exclusive end LSN is at or
 // below maxEndLSN. The active segment is never deleted.
 func (l *DataLog) deleteSegmentsThrough(maxEndLSN int64) (int, int64, error) {

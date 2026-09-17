@@ -617,6 +617,62 @@ func TestReplication_FullSync_Integration(t *testing.T) {
 	}, "Replica failed to receive live stream data (liveKey) after catch-up")
 }
 
+func TestReplication_FullSync_AfterWALPurge(t *testing.T) {
+	t.Setenv("TS_TEST_WAL_SEGMENT_SIZE", "4096")
+	baseDir, clientTLS := setupSharedCertEnv(t)
+	adminTLS := getRoleTLS(t, baseDir, "admin")
+
+	primarySrv, primaryAddr, cancelPrimary := startServerNode(t, baseDir, "primary_purge", clientTLS)
+	defer cancelPrimary()
+	promoteNode(t, baseDir, primaryAddr, "1")
+
+	clientPrimary := connectClient(t, primaryAddr, clientTLS)
+	defer clientPrimary.Close()
+	selectDatabase(t, clientPrimary, "1")
+
+	writeKeyVal(t, clientPrimary, "snapKey", "snapVal")
+	for i := 0; i < 80; i++ {
+		writeKeyVal(t, clientPrimary, "pad", fmt.Sprintf("v-%d", i))
+	}
+	writeKeyVal(t, clientPrimary, "snapKey", "snapVal")
+
+	st1 := primarySrv.stores["1"]
+	if err := st1.DB.RunWalMaintenance(); err != nil {
+		t.Fatalf("RunWalMaintenance: %v", err)
+	}
+	floor := st1.OldestLogOffset()
+	if floor == 0 {
+		t.Fatal("expected oldest retained WAL LSN > 0 after purge")
+	}
+	if _, _, err := st1.ReadLogRange(0, 1<<20); err != engine.ErrLogUnavailable {
+		t.Fatalf("ReadLogRange(0) got %v want ErrLogUnavailable", err)
+	}
+	if got := readKey(t, clientPrimary, "snapKey"); string(got) != "snapVal" {
+		t.Fatalf("primary snapKey=%q", got)
+	}
+
+	_, replicaAddr, cancelReplica := startServerNode(t, baseDir, "replica_purge", clientTLS)
+	defer cancelReplica()
+
+	clientReplica := connectClient(t, replicaAddr, clientTLS)
+	defer clientReplica.Close()
+	selectDatabase(t, clientReplica, "1")
+
+	adminReplica := connectClient(t, replicaAddr, adminTLS)
+	defer adminReplica.Close()
+	selectDatabase(t, adminReplica, "1")
+	configureReplication(t, adminReplica, primaryAddr, "1")
+
+	waitForConditionOrTimeout(t, 8*time.Second, func() bool {
+		return string(readKey(t, clientReplica, "snapKey")) == "snapVal"
+	}, "Replica failed to catch up from oldest retained WAL LSN")
+
+	writeKeyVal(t, clientPrimary, "liveKey", "liveVal")
+	waitForConditionOrTimeout(t, 5*time.Second, func() bool {
+		return string(readKey(t, clientReplica, "liveKey")) == "liveVal"
+	}, "Replica failed to receive live stream after purged-prefix catch-up")
+}
+
 func TestReplication_KeyCount_Match(t *testing.T) {
 	baseDir, clientTLS := setupSharedCertEnv(t)
 	adminTLS := getRoleTLS(t, baseDir, "admin")

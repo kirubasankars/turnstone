@@ -358,7 +358,7 @@ Stream raw WAL frames from a running **primary** database using the replication 
 
 | Type | Start LSN | Output | Use case |
 | --- | --- | --- | --- |
-| `full` | `0` | Complete WAL from the beginning | Base backup, disaster recovery baseline |
+| `full` | oldest retained WAL LSN (Hello cursor `0`) | Complete retained WAL | Base backup, disaster recovery baseline |
 | `differential` | previous `end_lsn` | WAL delta since last backup | Smaller incremental captures between full backups |
 
 Differential backups require either `--base-meta` (reads `end_lsn` from a prior `backup.meta`) or an explicit `--from-lsn`.
@@ -366,7 +366,7 @@ Differential backups require either `--base-meta` (reads `end_lsn` from a prior 
 ### Usage
 
 ```bash
-# Full backup (starts at LSN 0)
+# Full backup (starts at the oldest retained WAL LSN)
 turnstone backup --home tsdata --host localhost:6379 --db 1 --out backup_full
 
 # Differential backup (resume from a previous backup.meta end_lsn)

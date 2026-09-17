@@ -43,7 +43,7 @@ const (
 	OpCodeStepDown  uint8 = 0x35
 	OpCodeFlushDB   uint8 = 0x37 // Wipe Database
 
-	OpCodeReplHello uint8 = 0x50
+	OpCodeReplHello uint8 = 0x50 // cursor 0 means oldest retained WAL LSN, not ScanFloor
 	OpCodeReplAck   uint8 = 0x52
 
 	// --- SAFE POINT PROPAGATION ---

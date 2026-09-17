@@ -130,6 +130,7 @@ The hash index is **not** durable. Crash recovery = replay WAL. This simplifies 
 
 - **xid**: monotonic transaction identifier in log records.
 - **LSN / offset**: byte position in combined WAL — used for replication and retention.
+- Hello cursor **0** means `OldestLogOffset` (earliest retained segment base), not `ScanFloor` and not always byte 0. `InitLogAtLSN` sets that origin on an empty replica/restore so `ApplyLogRange` keeps primary physical offsets.
 
 Mixing these when reading code is a common source of confusion.
 

@@ -41,9 +41,9 @@ Implementation is concentrated in `server.go`; replication streaming in `replica
 
 When a follower connects:
 
-1. `ReplHello` carries database name and starting **byte offset**.
+1. `ReplHello` carries database name and starting **byte offset**. Cursor **0** means the oldest retained WAL LSN (`OldestLogOffset`), not `ScanFloor` and not necessarily byte 0 after segment purge.
 2. Leader validates cursor via `Database.IsValidReplicationCursor`.
-3. `streamDB` / `runLogStreamLoop` reads WAL ranges via `ReadLogRange` and sends `ReplLogRange` packets.
+3. `streamDB` / `runLogStreamLoop` reads WAL ranges via `ReadLogRange` and sends `ReplLogRange` packets. An empty replica adopts a non-zero first `startOff` via `InitLogAtLSN` so physical offsets match the primary.
 4. Follower acks advance `ReplicaSlot.Offset`; leader broadcasts `ReplSafePoint` for cluster retention.
 
 Only **server-role** replica slots pin WAL retention and count toward sync-replication quorum. Backup streams (`turnstone-backup`) register as `backup` role: they receive WAL ranges but do not block `MinReplicaOffset` or quorum.

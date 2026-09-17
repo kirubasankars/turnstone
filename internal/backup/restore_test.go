@@ -11,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"turnstone/engine"
 )
 
 func TestRunRestore_NoBackupDirs(t *testing.T) {
@@ -210,6 +212,44 @@ func TestRunRestore_SuccessWithoutVerify(t *testing.T) {
 	}
 	if got.EndLSN != meta.EndLSN {
 		t.Fatalf("end_lsn %d != meta %d", got.EndLSN, meta.EndLSN)
+	}
+}
+
+func TestRunRestore_NonZeroBaseLSN(t *testing.T) {
+	backupDir := t.TempDir()
+	wal := writeEngineWAL(t, "keep")
+	const origin uint64 = 5000
+	writeBackupArtifact(t, backupDir, "1", TypeFull, origin, origin+uint64(len(wal)), wal, false, "")
+
+	outHome := filepath.Join(t.TempDir(), "restored")
+	got, err := RunRestore(context.Background(), RestoreOptions{
+		BackupDirs: []string{backupDir},
+		OutHome:    outHome,
+		Verify:     false,
+	})
+	if err != nil {
+		t.Fatalf("restore failed: %v", err)
+	}
+	if got.BaseLSN != origin {
+		t.Fatalf("base_lsn %d want %d", got.BaseLSN, origin)
+	}
+
+	db, err := engine.Open(filepath.Join(outHome, "data", "1"), engine.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if db.OldestLogOffset() != int64(origin) {
+		t.Fatalf("OldestLogOffset=%d want %d", db.OldestLogOffset(), origin)
+	}
+	if db.LastLogOffset() != int64(origin)+int64(len(wal)) {
+		t.Fatalf("LastLogOffset=%d want %d", db.LastLogOffset(), int64(origin)+int64(len(wal)))
+	}
+	tx := db.NewTransaction(false)
+	defer tx.Discard()
+	val, err := tx.Get([]byte("keep"))
+	if err != nil || string(val) != "v-keep" {
+		t.Fatalf("get keep: %v %q", err, val)
 	}
 }
 

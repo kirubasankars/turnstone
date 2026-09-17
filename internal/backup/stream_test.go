@@ -268,6 +268,41 @@ func TestStreamLogRange_WriterFailure(t *testing.T) {
 	}
 }
 
+func TestStreamLogRange_RecordsRemappedBaseLSN(t *testing.T) {
+	tlsConf := testTLSConfig(t)
+	wal := writeEngineWAL(t, "k")
+	const origin uint64 = 1000
+	endOff := origin + uint64(len(wal))
+	addr, stop := startFakeBackupServer(t, tlsConf, func(conn net.Conn) {
+		defer conn.Close()
+		_ = readBackupHello(conn)
+		_ = writeBackupStatus(conn, protocol.ResStatusOK, "")
+		_ = writeBackupLogRange(conn, "1", origin, endOff, wal)
+		time.Sleep(200 * time.Millisecond)
+	})
+	defer stop()
+
+	var out bytes.Buffer
+	res, err := StreamLogRange(context.Background(), StreamOptions{
+		Host:     addr,
+		DBName:   "1",
+		WaitIdle: 50 * time.Millisecond,
+		TLS:      tlsConf,
+	}, &out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.BaseLSN != origin {
+		t.Fatalf("BaseLSN=%d want %d", res.BaseLSN, origin)
+	}
+	if res.EndLSN != endOff {
+		t.Fatalf("EndLSN=%d want %d", res.EndLSN, endOff)
+	}
+	if !bytes.Equal(out.Bytes(), wal) {
+		t.Fatalf("wrote %d bytes, want %d", out.Len(), len(wal))
+	}
+}
+
 type failingWriter struct{}
 
 func (failingWriter) Write(p []byte) (int, error) {
@@ -275,10 +310,10 @@ func (failingWriter) Write(p []byte) (int, error) {
 }
 
 func TestParseLogRangePayload_Errors(t *testing.T) {
-	if _, _, err := parseLogRangePayload(nil, "1"); err == nil {
+	if _, _, _, err := parseLogRangePayload(nil, "1"); err == nil {
 		t.Fatal("expected malformed packet error")
 	}
-	if _, _, err := parseLogRangePayload([]byte{0, 0, 0, 1, '2', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3}, "1"); err == nil {
+	if _, _, _, err := parseLogRangePayload([]byte{0, 0, 0, 1, '2', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3}, "1"); err == nil {
 		t.Fatal("expected unexpected database error")
 	}
 }

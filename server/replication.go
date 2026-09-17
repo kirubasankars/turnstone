@@ -155,6 +155,9 @@ func (s *Server) HandleReplicaConnection(conn net.Conn, r io.Reader, payload []b
 				_ = s.writeBinaryResponse(conn, protocol.ResStatusErr, []byte(fmt.Sprintf("Invalid replication cursor for DB '%s'", name)))
 				return
 			}
+			if offset == 0 {
+				offset = storePtr.OldestLogOffset()
+			}
 		}
 
 		// Check if this server is already a replica for this database.

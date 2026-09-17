@@ -181,3 +181,146 @@ func TestReadLogRange_MissingSegment(t *testing.T) {
 	}
 	db.Close()
 }
+
+func TestInitLogAtLSN_ApplyPreservesPrimaryOffsets(t *testing.T) {
+	const origin int64 = 5_000
+	leader := mustOpen(t, t.TempDir(), Options{})
+	defer leader.Close()
+
+	tx := leader.NewTransaction(true)
+	if err := tx.Put([]byte("k"), []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	seg, endOff, err := leader.ReadLogRange(0, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	follower := mustOpen(t, t.TempDir(), Options{})
+	defer follower.Close()
+	if err := follower.InitLogAtLSN(origin); err != nil {
+		t.Fatal(err)
+	}
+	if follower.LastLogOffset() != origin {
+		t.Fatalf("LastLogOffset=%d want %d", follower.LastLogOffset(), origin)
+	}
+	if follower.OldestLogOffset() != origin {
+		t.Fatalf("OldestLogOffset=%d want %d", follower.OldestLogOffset(), origin)
+	}
+	if err := follower.InitLogAtLSN(origin); err != nil {
+		t.Fatal(err)
+	}
+
+	applied, err := follower.ApplyLogRange(seg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantEnd := origin + endOff
+	if applied != wantEnd {
+		t.Fatalf("applied end %d want %d", applied, wantEnd)
+	}
+
+	readTx := follower.NewTransaction(false)
+	defer readTx.Discard()
+	got, err := readTx.Get([]byte("k"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "v" {
+		t.Fatalf("got %q want v", got)
+	}
+}
+
+func TestInitLogAtLSN_RejectsNonEmpty(t *testing.T) {
+	db := mustOpen(t, t.TempDir(), Options{})
+	defer db.Close()
+	tx := db.NewTransaction(true)
+	if err := tx.Put([]byte("k"), []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InitLogAtLSN(100); err == nil {
+		t.Fatal("expected error on non-empty log")
+	}
+}
+
+func TestReadLogRange_AfterPurgeOldestRetained(t *testing.T) {
+	db := mustOpen(t, t.TempDir(), Options{
+		WalSegmentSize:            256,
+		IndexCompactOnRetention:   indexCompactDisabled(),
+		WalCopyForwardOnRetention: walCopyForwardDisabled(),
+	})
+	defer db.Close()
+
+	for i := 0; i < 40; i++ {
+		if err := commitKeyValue(db, []byte(fmt.Sprintf("pad-%d", i)), "x"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if db.log.SegmentCount() < 2 {
+		t.Fatalf("expected multiple segments, got %d", db.log.SegmentCount())
+	}
+	if err := commitKeyValue(db, []byte("keep"), "live"); err != nil {
+		t.Fatal(err)
+	}
+
+	var deleteThrough int64
+	for _, info := range db.log.SegmentInfos() {
+		if info.Active {
+			continue
+		}
+		deleteThrough = info.EndLSN
+		break
+	}
+	if deleteThrough <= 0 {
+		t.Fatal("expected a sealed segment to delete")
+	}
+	if _, _, err := db.log.deleteSegmentsThrough(deleteThrough); err != nil {
+		t.Fatal(err)
+	}
+	floor := db.OldestLogOffset()
+	if floor <= 0 {
+		t.Fatalf("expected oldest LSN > 0 after purge, got %d", floor)
+	}
+	if _, _, err := db.ReadLogRange(0, 1<<20); err != ErrLogUnavailable {
+		t.Fatalf("ReadLogRange(0) got %v want ErrLogUnavailable", err)
+	}
+	seg, endOff, err := db.ReadLogRange(floor, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(seg) == 0 {
+		t.Fatal("expected retained frames")
+	}
+
+	readTx := db.NewTransaction(false)
+	got, err := readTx.Get([]byte("keep"))
+	readTx.Discard()
+	if err != nil || string(got) != "live" {
+		t.Fatalf("primary keep: %v %q", err, got)
+	}
+
+	follower := mustOpen(t, t.TempDir(), Options{})
+	defer follower.Close()
+	if err := follower.InitLogAtLSN(floor); err != nil {
+		t.Fatal(err)
+	}
+	applied, err := follower.ApplyLogRange(seg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applied != endOff {
+		t.Fatalf("applied %d want %d", applied, endOff)
+	}
+	readTx = follower.NewTransaction(false)
+	got, err = readTx.Get([]byte("keep"))
+	readTx.Discard()
+	if err != nil || string(got) != "live" {
+		t.Fatalf("follower keep: %v %q", err, got)
+	}
+}

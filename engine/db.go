@@ -296,6 +296,33 @@ func (db *DB) LastLogOffset() int64 {
 	return db.log.WriteOffset()
 }
 
+// OldestLogOffset is the base LSN of the earliest retained WAL segment.
+// Hello cursor 0 is remapped to this value; it is not ScanFloor.
+func (db *DB) OldestLogOffset() int64 {
+	if db.log == nil {
+		return 0
+	}
+	return db.log.OldestSegmentBaseLSN()
+}
+
+// InitLogAtLSN points an empty log at lsn so ApplyLogRange preserves primary
+// physical offsets. It is a no-op when lsn is 0. Refuses a non-empty log.
+func (db *DB) InitLogAtLSN(lsn int64) error {
+	if atomic.LoadInt32(&db.isCorrupt) == 1 {
+		return errors.New("database is corrupt")
+	}
+	db.walRewriteMu.Lock()
+	defer db.walRewriteMu.Unlock()
+	if err := db.log.InitLogAtLSN(lsn); err != nil {
+		return err
+	}
+	if lsn > 0 {
+		atomic.StoreInt64(&db.scanFloor, lsn)
+		atomic.StoreInt64(&db.retentionOffset, lsn)
+	}
+	return nil
+}
+
 func (db *DB) RetentionOffset() int64 {
 	return atomic.LoadInt64(&db.retentionOffset)
 }
