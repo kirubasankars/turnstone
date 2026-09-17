@@ -42,7 +42,8 @@ foreign keys. Use PostgreSQL there.
 4. **`fdatasync` on Unix.** Same durable-write shortcut PostgreSQL uses:
    flush file data, skip inode metadata that `fsync` would write.
 5. **No `BEGIN` WAL record.** Recovery treats `SET`/`DEL` without `COMMIT`
-   as in-progress. That cuts one log frame per write transaction.
+   as in-progress, unless that xid already committed. Copy-forward writes
+   a `COMMIT` per copied xid. That cuts one log frame per write transaction.
 6. **Keep WAL files open.** GET used to `open` + `close` the segment on
    every read. Sealed segments now keep a reader FD; the active segment
    reuses the writer.
@@ -52,6 +53,11 @@ foreign keys. Use PostgreSQL there.
 8. **Batch writes in one transaction.** `--batch N` on `turnstone bench`
    amortizes one group fsync across N keys — the same advice as
    multi-row `INSERT` in PostgreSQL.
+9. **Fully allocated, recycled WAL segments.** New segments are
+   `fallocate`d to the configured size (default 64 MiB). Retention
+   **renames** retired files into `wal/recycle/` and the next rotation
+   reuses them — PostgreSQL's `wal_recycle` pattern, so commit does not
+   pay create/unlink/metadata growth.
 
 ## How to measure
 
