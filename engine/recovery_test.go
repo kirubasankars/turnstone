@@ -209,3 +209,37 @@ func TestRecovery_UncommittedSetWithoutBegin(t *testing.T) {
 		t.Fatalf("SET without COMMIT must not survive reopen, got %v", err)
 	}
 }
+
+func TestRecovery_CopyForwardedSetAfterCommitStaysVisible(t *testing.T) {
+	dir := t.TempDir()
+	opts := Options{TruncateCorruptTail: true}
+
+	db, err := Open(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ApplyRecord(Record{Type: RecordSet, XID: 7, Key: []byte("k"), Value: []byte("v")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ApplyRecord(Record{Type: RecordCommit, XID: 7}); err != nil {
+		t.Fatal(err)
+	}
+	// Copy-forward appends the live SET frame again without a second COMMIT.
+	if err := db.ApplyRecord(Record{Type: RecordSet, XID: 7, Key: []byte("k"), Value: []byte("v")}); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	db2, err := Open(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+
+	rtx := db2.NewTransaction(false)
+	defer rtx.Discard()
+	val, err := rtx.Get([]byte("k"))
+	if err != nil || string(val) != "v" {
+		t.Fatalf("copy-forwarded SET after COMMIT must stay visible, got %v %q", err, val)
+	}
+}
