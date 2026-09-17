@@ -82,6 +82,13 @@ func (l *DataLog) ReadLogRange(startOffset int64, maxBytes int64) ([]byte, int64
 			continue
 		}
 
+		if _, err := os.Stat(seg.path); err != nil {
+			if os.IsNotExist(err) {
+				return nil, startOffset, ErrLogUnavailable
+			}
+			return nil, startOffset, err
+		}
+
 		fileSize := l.segmentScanLimit(seg, fileSizeOf(seg.path))
 		localPos := pos - seg.baseLSN
 
