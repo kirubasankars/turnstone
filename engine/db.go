@@ -172,6 +172,7 @@ func OpenContext(ctx context.Context, dir string, opts Options) (*DB, error) {
 	if cacheBytes > 0 {
 		db.valueCache = newValueCache(cacheBytes)
 	}
+	logFile.EnableSharedBuffers(opts.SharedBuffersBytes)
 
 	if opts.UnsafeDisableFsync {
 		logger.Warn("UnsafeDisableFsync enabled")

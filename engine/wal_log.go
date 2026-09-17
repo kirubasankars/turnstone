@@ -27,6 +27,7 @@ type walSegment struct {
 	endLSN  int64 // exclusive global end; 0 means active/growing
 	writer  *os.File
 	reader  *os.File // sealed segments keep an FD so GET does not open/close per read
+	mapping []byte   // MAP_SHARED mmap of the preallocated file; nil if unavailable
 }
 
 // DataLog is a segmented append-only WAL addressed by a global byte LSN.
@@ -43,6 +44,7 @@ type DataLog struct {
 	writeOffset  int64
 	recycle      []string
 	recycleSeq   uint32
+	buffers      *sharedBuffers
 }
 
 // OpenDataLog opens or creates wal/manifest.json and segment files under dir/wal/.
@@ -124,6 +126,7 @@ func (l *DataLog) loadSegments(m *walManifest) error {
 		if seg.ID != m.ActiveID {
 			if rf, openErr := os.Open(path); openErr == nil {
 				l.segments[i].reader = rf
+				l.mapSegment(&l.segments[i])
 			}
 		}
 	}
@@ -144,9 +147,40 @@ func (l *DataLog) loadSegments(m *walManifest) error {
 	}
 	l.segments[activeIdx].writer = f
 	l.segments[activeIdx].endLSN = 0
+	l.mapSegment(&l.segments[activeIdx])
 	l.activeIndex = activeIdx
 	l.writeOffset = l.segments[activeIdx].baseLSN + used
 	return nil
+}
+
+func (l *DataLog) mapSegment(seg *walSegment) {
+	if seg == nil || len(seg.mapping) > 0 {
+		return
+	}
+	f := seg.writer
+	if f == nil {
+		f = seg.reader
+	}
+	if f == nil {
+		return
+	}
+	mapped, err := mmapWALFile(f, l.segmentSize)
+	if err != nil {
+		l.logger.Warn("wal mmap failed", "segment", seg.file, "err", err)
+		return
+	}
+	seg.mapping = mapped
+}
+
+func (l *DataLog) EnableSharedBuffers(bytes int64) {
+	if bytes < 0 {
+		l.buffers = nil
+		return
+	}
+	if bytes == 0 {
+		bytes = defaultSharedBuffersBytes
+	}
+	l.buffers = newSharedBuffers(bytes)
 }
 
 func fileSizeOf(path string) int64 {
@@ -338,6 +372,10 @@ func (l *DataLog) writeFrameLocked(payload []byte) error {
 	seg := &l.segments[l.activeIndex]
 	localOff := l.writeOffset - seg.baseLSN
 	n, err := seg.writer.WriteAt(buf, localOff)
+	if err == nil {
+		l.buffers.applyWrite(seg.id, localOff, buf[:n])
+		adviseWALRange(seg.mapping, localOff, int64(n), walAdviseWillneed())
+	}
 	if cap(buf) <= maxPooledFrameCap {
 		frameBufPool.Put(buf[:0])
 	}
@@ -391,27 +429,36 @@ func (l *DataLog) rotateSegmentLocked() error {
 		writer:  f,
 	})
 	l.activeIndex = len(l.segments) - 1
+	l.mapSegment(&l.segments[l.activeIndex])
 	return l.persistManifestLocked()
 }
 
 func (l *DataLog) ReadValueAt(offset int64, valLen uint32) ([]byte, error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
+	return l.readValueAtLocked(offset, valLen)
+}
 
+// ReadValueAtCached is ReadValueAt through shared_buffers, then mmap/pread.
+func (l *DataLog) ReadValueAtCached(offset int64, valLen uint32) ([]byte, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	if l.buffers != nil {
+		val, err := l.readValueViaBuffersLocked(offset, valLen)
+		if err == nil {
+			return val, nil
+		}
+	}
+	return l.readValueAtLocked(offset, valLen)
+}
+
+func (l *DataLog) readValueAtLocked(offset int64, valLen uint32) ([]byte, error) {
 	seg, local, ok := l.resolveLSN(offset)
 	if !ok {
 		return nil, fmt.Errorf("invalid log offset %d", offset)
 	}
-	f, closeFn, err := segmentReadFile(seg)
-	if err != nil {
-		return nil, err
-	}
-	if closeFn != nil {
-		defer closeFn()
-	}
-
 	var header [LogFrameHeaderSize]byte
-	if _, err := f.ReadAt(header[:], local); err != nil {
+	if err := l.readSegmentAt(seg, local, header[:]); err != nil {
 		return nil, err
 	}
 	payloadLen := binary.BigEndian.Uint32(header[0:])
@@ -420,13 +467,112 @@ func (l *DataLog) ReadValueAt(offset int64, valLen uint32) ([]byte, error) {
 	}
 	checksum := binary.BigEndian.Uint32(header[4:])
 	payload := make([]byte, payloadLen)
-	if _, err := f.ReadAt(payload, local+LogFrameHeaderSize); err != nil {
+	if err := l.readSegmentAt(seg, local+LogFrameHeaderSize, payload); err != nil {
 		return nil, err
 	}
 	if crc32.Checksum(payload, Crc32Table) != checksum {
 		return nil, ErrChecksum
 	}
 	return decodeValueAt(payload, valLen)
+}
+
+func (l *DataLog) readValueViaBuffersLocked(offset int64, valLen uint32) ([]byte, error) {
+	seg, local, ok := l.resolveLSN(offset)
+	if !ok {
+		return nil, fmt.Errorf("invalid log offset %d", offset)
+	}
+	var pins []int
+	defer func() {
+		for _, i := range pins {
+			l.buffers.unpin(i)
+		}
+	}()
+	header, err := l.gatherFromBuffers(seg, local, LogFrameHeaderSize, &pins)
+	if err != nil {
+		return nil, err
+	}
+	payloadLen := binary.BigEndian.Uint32(header[0:])
+	if payloadLen > 1<<30 {
+		return nil, ErrCorruptData
+	}
+	checksum := binary.BigEndian.Uint32(header[4:])
+	payload, err := l.gatherFromBuffers(seg, local+LogFrameHeaderSize, int64(payloadLen), &pins)
+	if err != nil {
+		return nil, err
+	}
+	if crc32.Checksum(payload, Crc32Table) != checksum {
+		return nil, ErrChecksum
+	}
+	return decodeValueAt(payload, valLen)
+}
+
+func (l *DataLog) gatherFromBuffers(seg *walSegment, local, n int64, pins *[]int) ([]byte, error) {
+	if n <= 0 {
+		return nil, nil
+	}
+	out := make([]byte, n)
+	copied := int64(0)
+	for copied < n {
+		pos := local + copied
+		pageNo := uint32(pos / sharedBufferPageSize)
+		pageOff := pos % sharedBufferPageSize
+		tag := bufferTag{id: seg.id, page: pageNo}
+		idx, page, err := l.buffers.pin(tag, func(dst []byte) error {
+			return l.copyPageLocked(seg, int64(pageNo)*sharedBufferPageSize, dst)
+		})
+		if err != nil {
+			return nil, err
+		}
+		*pins = append(*pins, idx)
+		chunk := int64(len(page)) - pageOff
+		if chunk > n-copied {
+			chunk = n - copied
+		}
+		if chunk <= 0 {
+			return nil, io.ErrUnexpectedEOF
+		}
+		copy(out[copied:], page[pageOff:pageOff+chunk])
+		copied += chunk
+	}
+	return out, nil
+}
+
+func (l *DataLog) copyPageLocked(seg *walSegment, pageOff int64, dst []byte) error {
+	if pageOff < 0 || len(dst) == 0 {
+		return nil
+	}
+	n := int64(len(dst))
+	if rem := l.segmentSize - pageOff; rem < n {
+		if rem <= 0 {
+			return io.ErrUnexpectedEOF
+		}
+		clear(dst[rem:])
+		return l.readSegmentAt(seg, pageOff, dst[:rem])
+	}
+	return l.readSegmentAt(seg, pageOff, dst)
+}
+
+func (l *DataLog) readSegmentAt(seg *walSegment, local int64, dst []byte) error {
+	if len(dst) == 0 {
+		return nil
+	}
+	n := int64(len(dst))
+	if m := seg.mapping; len(m) > 0 {
+		if local < 0 || local+n > int64(len(m)) {
+			return io.ErrUnexpectedEOF
+		}
+		copy(dst, m[local:local+n])
+		return nil
+	}
+	f, closeFn, err := segmentReadFile(seg)
+	if err != nil {
+		return err
+	}
+	if closeFn != nil {
+		defer closeFn()
+	}
+	_, err = f.ReadAt(dst, local)
+	return err
 }
 
 func segmentReadFile(seg *walSegment) (*os.File, func(), error) {
@@ -454,6 +600,10 @@ func (l *DataLog) readAtSegmentFile(path string, buf []byte, off int64) error {
 }
 
 func closeSegmentFiles(seg *walSegment) {
+	if len(seg.mapping) > 0 {
+		unmapWAL(seg.mapping)
+		seg.mapping = nil
+	}
 	if seg.writer != nil {
 		_ = seg.writer.Close()
 		seg.writer = nil
@@ -489,20 +639,13 @@ func (l *DataLog) Replay(ctx context.Context, truncateCorrupt bool, onRecord fun
 }
 
 func (l *DataLog) replaySegmentFile(ctx context.Context, seg *walSegment, isActive bool, truncateCorrupt bool, records *uint64, onRecord func(rec Record, span recordSpan)) error {
-	f, err := os.Open(seg.path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	stat, err := f.Stat()
-	if err != nil {
-		return err
-	}
-	fileSize := stat.Size()
-	limit := l.segmentScanLimit(seg, fileSize)
+	limit := l.segmentScanLimit(seg, fileSizeOf(seg.path))
 	if limit <= 0 {
 		return nil
+	}
+	if len(seg.mapping) > 0 {
+		adviseWALRange(seg.mapping, 0, limit, walAdviseSequential())
+		defer adviseWALRange(seg.mapping, 0, limit, walAdviseRandom())
 	}
 
 	pos := int64(0)
@@ -513,7 +656,7 @@ func (l *DataLog) replaySegmentFile(ctx context.Context, seg *walSegment, isActi
 			}
 		}
 
-		validEnd, rec, span, rerr := readFrameAtFile(f, pos, limit)
+		validEnd, rec, span, rerr := l.readFrameAtSeg(seg, pos, limit)
 		if rerr != nil {
 			if (rerr == io.ErrUnexpectedEOF || rerr == ErrChecksum || rerr == ErrCorruptData) && truncateCorrupt && isActive {
 				l.logger.Warn("Truncating corrupt wal tail", "segment", seg.file, "offset", seg.baseLSN+pos, "err", rerr)
@@ -536,6 +679,51 @@ func (l *DataLog) replaySegmentFile(ctx context.Context, seg *walSegment, isActi
 		pos = validEnd
 	}
 	return nil
+}
+
+func (l *DataLog) readFrameAtSeg(seg *walSegment, offset, limit int64) (int64, Record, recordSpan, error) {
+	if m := seg.mapping; len(m) > 0 {
+		if limit > int64(len(m)) {
+			limit = int64(len(m))
+		}
+		return readFrameAtMapping(m, offset, limit)
+	}
+	f, closeFn, err := segmentReadFile(seg)
+	if err != nil {
+		return offset, Record{}, recordSpan{}, err
+	}
+	if closeFn != nil {
+		defer closeFn()
+	}
+	return readFrameAtFile(f, offset, limit)
+}
+
+func readFrameAtMapping(m []byte, offset, fileSize int64) (int64, Record, recordSpan, error) {
+	if offset+LogFrameHeaderSize > fileSize || offset+LogFrameHeaderSize > int64(len(m)) {
+		return offset, Record{}, recordSpan{}, io.ErrUnexpectedEOF
+	}
+	length := binary.BigEndian.Uint32(m[offset:])
+	checksum := binary.BigEndian.Uint32(m[offset+4:])
+	if length > 1<<30 {
+		return offset, Record{}, recordSpan{}, ErrCorruptData
+	}
+	total := frameSize(int(length))
+	if offset+total > fileSize || offset+total > int64(len(m)) {
+		return offset, Record{}, recordSpan{}, io.ErrUnexpectedEOF
+	}
+	payload := m[offset+LogFrameHeaderSize : offset+LogFrameHeaderSize+int64(length)]
+	if crc32.Checksum(payload, Crc32Table) != checksum {
+		return offset, Record{}, recordSpan{}, ErrChecksum
+	}
+	rec, err := decodeRecord(payload)
+	if err != nil {
+		return offset, Record{}, recordSpan{}, err
+	}
+	span := recordSpan{
+		offset: offset,
+		length: total,
+	}
+	return offset + total, rec, span, nil
 }
 
 func readFrameAtFile(f *os.File, offset, fileSize int64) (int64, Record, recordSpan, error) {
@@ -607,18 +795,7 @@ func (l *DataLog) Scan(startOffset int64, fn func([]Record) error) error {
 }
 
 func (l *DataLog) scanSegmentFile(seg *walSegment, localStart, localEnd int64, fn func([]Record) error) error {
-	f, err := os.Open(seg.path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	stat, err := f.Stat()
-	if err != nil {
-		return err
-	}
-	fileSize := stat.Size()
-	limit := l.segmentScanLimit(seg, fileSize)
+	limit := l.segmentScanLimit(seg, fileSizeOf(seg.path))
 	if localEnd > limit {
 		localEnd = limit
 	}
@@ -628,7 +805,7 @@ func (l *DataLog) scanSegmentFile(seg *walSegment, localStart, localEnd int64, f
 
 	pos := localStart
 	for pos < localEnd {
-		validEnd, rec, _, rerr := readFrameAtFile(f, pos, localEnd)
+		validEnd, rec, _, rerr := l.readFrameAtSeg(seg, pos, localEnd)
 		if rerr != nil {
 			if rerr == io.EOF {
 				break
@@ -656,16 +833,7 @@ func (l *DataLog) IsFrameBoundary(offset int64) bool {
 	if !ok {
 		return false
 	}
-	f, err := os.Open(seg.path)
-	if err != nil {
-		return false
-	}
-	defer f.Close()
-	stat, err := f.Stat()
-	if err != nil {
-		return false
-	}
-	_, _, _, err = readFrameAtFile(f, local, l.segmentScanLimit(seg, stat.Size()))
+	_, _, _, err := l.readFrameAtSeg(seg, local, l.segmentScanLimit(seg, fileSizeOf(seg.path)))
 	return err == nil
 }
 
@@ -749,6 +917,10 @@ func (l *DataLog) Close() error {
 	defer l.mu.Unlock()
 	var firstErr error
 	for i := range l.segments {
+		if len(l.segments[i].mapping) > 0 {
+			unmapWAL(l.segments[i].mapping)
+			l.segments[i].mapping = nil
+		}
 		if l.segments[i].writer != nil {
 			if err := l.segments[i].writer.Close(); err != nil && firstErr == nil {
 				firstErr = err

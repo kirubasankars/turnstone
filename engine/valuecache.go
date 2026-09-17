@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 )
 
+// Decoded-value L1 in front of shared_buffers / WAL mmap.
 const (
 	valueCacheShards       = 64
 	defaultValueCacheBytes = 64 << 20
