@@ -22,6 +22,7 @@ Then branch by interest:
 | Topic | Path |
 | --- | --- |
 | CLI reference (`init`, `server`, `cli`, `bench`, `backup`, `restore`) | [cli.md](cli.md) |
+| Beating PostgreSQL on KV (group commit, cache, how to measure) | [performance.md](performance.md) |
 
 ## Package documentation
 

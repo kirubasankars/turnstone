@@ -302,6 +302,21 @@ Retry `ErrTxConflict` and `ErrServerBusy` with backoff. The engine does not wait
 
 ---
 
+## Faster than PostgreSQL (on KV)
+
+Turnstone is not a SQL database. On durable point GET/SET it can outrun
+PostgreSQL because the hot path is a hash probe + group `fdatasync`, not
+parse/plan/btree. The engine defaults match a fair comparison: no commit
+sleep, Unix `fdatasync`, no `BEGIN` WAL record, open WAL file descriptors,
+and a 64 MiB value cache.
+
+How to measure and what not to compare: **[docs/performance.md](docs/performance.md)**.
+
+```bash
+make bench
+scripts/bench-vs-postgres.sh   # Postgres side runs only if psql can connect
+```
+
 ## Limitations
 
 1. **Single node** — one process, local disk; scale-out is application sharding.

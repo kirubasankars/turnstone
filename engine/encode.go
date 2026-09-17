@@ -86,3 +86,21 @@ func decodeRecord(payload []byte) (Record, error) {
 func frameSize(payloadLen int) int64 {
 	return int64(LogFrameHeaderSize + payloadLen)
 }
+
+// decodeValueAt extracts the SET value from a log payload without copying the key.
+func decodeValueAt(payload []byte, valLen uint32) ([]byte, error) {
+	if len(payload) < LogRecordHeaderSize+8 || RecordType(payload[0]) != RecordSet {
+		return nil, ErrCorruptData
+	}
+	klen := int(binary.BigEndian.Uint32(payload[LogRecordHeaderSize:]))
+	off := LogRecordHeaderSize + 4 + klen
+	if klen < 0 || off+4 > len(payload) {
+		return nil, ErrCorruptData
+	}
+	vlen := int(binary.BigEndian.Uint32(payload[off:]))
+	off += 4
+	if vlen != int(valLen) || off+vlen > len(payload) {
+		return nil, ErrCorruptData
+	}
+	return append([]byte(nil), payload[off:off+vlen]...), nil
+}

@@ -8,7 +8,6 @@ package engine
 import (
 	"errors"
 	"sync/atomic"
-	"time"
 )
 
 var testingProcessCommitBatchErr error
@@ -101,10 +100,6 @@ func (db *DB) processCommitBatch(requests []commitRequest) {
 
 		for _, tx := range valid {
 			outcomes = append(outcomes, outcome{tx, nil, true})
-		}
-
-		if d := time.Since(time.Now()); d > 100*time.Millisecond {
-			_ = d
 		}
 	}()
 

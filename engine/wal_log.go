@@ -26,6 +26,7 @@ type walSegment struct {
 	baseLSN int64
 	endLSN  int64 // exclusive global end; 0 means active/growing
 	writer  *os.File
+	reader  *os.File // sealed segments keep an FD so GET does not open/close per read
 }
 
 // DataLog is a segmented append-only WAL addressed by a global byte LSN.
@@ -115,6 +116,11 @@ func (l *DataLog) loadSegments(m *walManifest) error {
 			baseLSN: seg.BaseLSN,
 			endLSN:  endLSN,
 		}
+		if seg.ID != m.ActiveID {
+			if rf, openErr := os.Open(path); openErr == nil {
+				l.segments[i].reader = rf
+			}
+		}
 		if endLSN > head {
 			head = endLSN
 		}
@@ -203,7 +209,7 @@ func (l *DataLog) strictSyncLocked() {
 	if seg.writer == nil {
 		return
 	}
-	err := seg.writer.Sync()
+	err := syncFile(seg.writer)
 	if err != nil {
 		if errors.Is(err, syscall.EINTR) {
 			l.strictSyncLocked()
@@ -251,12 +257,23 @@ func (l *DataLog) AppendEncoded(payload []byte, sync bool) (int64, error) {
 	return off, nil
 }
 
+var frameBufPool = sync.Pool{
+	New: func() any { return make([]byte, 0, 512) },
+}
+
+const maxPooledFrameCap = 64 << 10
+
 func (l *DataLog) writeFrameLocked(payload []byte) error {
 	length := uint32(len(payload))
 	checksum := crc32.Checksum(payload, Crc32Table)
 	totalLen := LogFrameHeaderSize + int(length)
 
-	buf := make([]byte, totalLen)
+	buf := frameBufPool.Get().([]byte)
+	if cap(buf) < totalLen {
+		buf = make([]byte, totalLen)
+	} else {
+		buf = buf[:totalLen]
+	}
 	binary.BigEndian.PutUint32(buf[0:], length)
 	binary.BigEndian.PutUint32(buf[4:], checksum)
 	copy(buf[8:], payload)
@@ -264,6 +281,9 @@ func (l *DataLog) writeFrameLocked(payload []byte) error {
 	seg := &l.segments[l.activeIndex]
 	localOff := l.writeOffset - seg.baseLSN
 	n, err := seg.writer.WriteAt(buf, localOff)
+	if cap(buf) <= maxPooledFrameCap {
+		frameBufPool.Put(buf[:0])
+	}
 	if err != nil {
 		return err
 	}
@@ -277,7 +297,7 @@ func (l *DataLog) writeFrameLocked(payload []byte) error {
 
 func (l *DataLog) rotateSegmentLocked() error {
 	active := &l.segments[l.activeIndex]
-	if err := active.writer.Sync(); err != nil {
+	if err := syncFile(active.writer); err != nil {
 		return err
 	}
 	active.endLSN = l.writeOffset
@@ -285,6 +305,9 @@ func (l *DataLog) rotateSegmentLocked() error {
 		return err
 	}
 	active.writer = nil
+	if rf, openErr := os.Open(active.path); openErr == nil {
+		active.reader = rf
+	}
 
 	nextID := active.id + 1
 	nextName := walSegmentFileName(nextID)
@@ -313,24 +336,41 @@ func (l *DataLog) ReadValueAt(offset int64, valLen uint32) ([]byte, error) {
 	if !ok {
 		return nil, fmt.Errorf("invalid log offset %d", offset)
 	}
-	header := make([]byte, LogFrameHeaderSize)
-	if err := l.readAtSegmentFile(seg.path, header, local); err != nil {
-		return nil, err
-	}
-	payloadLen := binary.BigEndian.Uint32(header[0:])
-	payload := make([]byte, payloadLen)
-	if err := l.readAtSegmentFile(seg.path, payload, local+LogFrameHeaderSize); err != nil {
-		return nil, err
-	}
-
-	rec, err := decodeRecord(payload)
+	f, closeFn, err := segmentReadFile(seg)
 	if err != nil {
 		return nil, err
 	}
-	if len(rec.Value) != int(valLen) {
-		return nil, fmt.Errorf("value length mismatch at offset %d", offset)
+	if closeFn != nil {
+		defer closeFn()
 	}
-	return append([]byte(nil), rec.Value...), nil
+
+	var header [LogFrameHeaderSize]byte
+	if _, err := f.ReadAt(header[:], local); err != nil {
+		return nil, err
+	}
+	payloadLen := binary.BigEndian.Uint32(header[0:])
+	if payloadLen > 1<<30 {
+		return nil, ErrCorruptData
+	}
+	payload := make([]byte, payloadLen)
+	if _, err := f.ReadAt(payload, local+LogFrameHeaderSize); err != nil {
+		return nil, err
+	}
+	return decodeValueAt(payload, valLen)
+}
+
+func segmentReadFile(seg *walSegment) (*os.File, func(), error) {
+	if seg.writer != nil {
+		return seg.writer, nil, nil
+	}
+	if seg.reader != nil {
+		return seg.reader, nil, nil
+	}
+	f, err := os.Open(seg.path)
+	if err != nil {
+		return nil, nil, err
+	}
+	return f, func() { _ = f.Close() }, nil
 }
 
 func (l *DataLog) readAtSegmentFile(path string, buf []byte, off int64) error {
@@ -341,6 +381,17 @@ func (l *DataLog) readAtSegmentFile(path string, buf []byte, off int64) error {
 	defer f.Close()
 	_, err = f.ReadAt(buf, off)
 	return err
+}
+
+func closeSegmentFiles(seg *walSegment) {
+	if seg.writer != nil {
+		_ = seg.writer.Close()
+		seg.writer = nil
+	}
+	if seg.reader != nil {
+		_ = seg.reader.Close()
+		seg.reader = nil
+	}
 }
 
 const replayCancelCheckInterval = 1024
@@ -643,6 +694,12 @@ func (l *DataLog) Close() error {
 				firstErr = err
 			}
 			l.segments[i].writer = nil
+		}
+		if l.segments[i].reader != nil {
+			if err := l.segments[i].reader.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+			l.segments[i].reader = nil
 		}
 	}
 	return firstErr
