@@ -87,11 +87,15 @@ func TestRecovery_TruncateCorruptTail(t *testing.T) {
 	db.Close()
 
 	logPath := db.log.activeSegmentPath()
-	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0o644)
+	logicalEnd := db.log.WriteOffset() - db.log.segments[db.log.activeIndex].baseLSN
+	f, err := os.OpenFile(logPath, os.O_RDWR, 0o644)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.Write([]byte{0xFF, 0xFF, 0xFF}); err != nil {
+	if _, err := f.WriteAt([]byte{0xFF, 0xFF, 0xFF}, logicalEnd); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeSegmentFooter(f, db.log.segmentSize, logicalEnd+3); err != nil {
 		t.Fatal(err)
 	}
 	f.Close()
