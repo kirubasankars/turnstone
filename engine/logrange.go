@@ -10,6 +10,7 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
+	"sync/atomic"
 )
 
 type logFrame struct {
@@ -60,7 +61,11 @@ func (l *DataLog) ReadLogRange(startOffset int64, maxBytes int64) ([]byte, int64
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
-	if startOffset >= l.writeOffset {
+	durable := atomic.LoadInt64(&l.durableOffset)
+	if durable > l.writeOffset {
+		durable = l.writeOffset
+	}
+	if startOffset >= durable {
 		return nil, startOffset, nil
 	}
 
@@ -77,6 +82,9 @@ func (l *DataLog) ReadLogRange(startOffset int64, maxBytes int64) ([]byte, int64
 		segEnd := seg.endLSN
 		if segEnd == 0 {
 			segEnd = l.writeOffset
+		}
+		if segEnd > durable {
+			segEnd = durable
 		}
 		if pos >= segEnd {
 			continue
@@ -164,10 +172,20 @@ func (l *DataLog) AppendRawFrames(data []byte, fsync bool) (int64, error) {
 		}
 	}
 	var syncF *os.File
+	var flushed int64
 	if fsync {
-		syncF = l.beginSyncLocked()
+		var err error
+		syncF, flushed, err = l.beginSyncLocked()
+		if err != nil {
+			l.mu.Unlock()
+			return 0, err
+		}
+	} else {
+		l.publishAppendLocked()
 	}
 	l.mu.Unlock()
-	l.completeSync(syncF)
+	if fsync {
+		l.completeSync(syncF, flushed)
+	}
 	return startOff, nil
 }

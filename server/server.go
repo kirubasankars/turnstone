@@ -660,7 +660,7 @@ func (s *Server) handleCommit(w net.Conn, st *connState) {
 	// Wait for Quorum if required
 	if st.db.MinReplicas() > 0 {
 		// Wait for replicas to ack the commit's end byte offset.
-		commitEndOffset := st.db.LastLogOffset()
+		commitEndOffset := st.db.DurableOffset()
 		if err := s.waitForQuorumOrDisconnect(w, st.db, commitEndOffset); err != nil {
 			s.logger.Warn("Commit succeeded locally but quorum wait failed", "err", err)
 			_ = s.writeBinaryResponse(w, protocol.ResStatusServerBusy, []byte(err.Error()))

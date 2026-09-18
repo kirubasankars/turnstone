@@ -499,6 +499,16 @@ func (s *Database) LastLogOffset() uint64 {
 	return uint64(s.DB.LastLogOffset())
 }
 
+// DurableOffset is the exclusive end of WAL known durable on this node.
+func (s *Database) DurableOffset() uint64 {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	if s.DB == nil {
+		return 0
+	}
+	return uint64(s.DB.DurableOffset())
+}
+
 // OldestLogOffset is the base LSN of the earliest retained WAL segment.
 func (s *Database) OldestLogOffset() uint64 {
 	s.dbMu.RLock()
