@@ -273,12 +273,12 @@ func (tx *Transaction) Commit() error {
 
 	tx.db.shutdownMu.RLock()
 	if atomic.LoadInt32(&tx.db.closed) == 1 {
-		tx.db.shutdownMu.RUnlock()
 		tx.finished = true
 		tx.db.activeTxnsMu.Lock()
 		delete(tx.db.activeTxns, tx)
 		tx.db.activeTxnsMu.Unlock()
 		tx.db.abortTransaction(tx)
+		tx.db.shutdownMu.RUnlock()
 		return ErrDatabaseClosed
 	}
 

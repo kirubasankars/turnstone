@@ -6,12 +6,15 @@
 package engine
 
 import (
+	"sync"
+
 	"turnstone/engine/hashindex"
 )
 
 // Index is an MVCC index backed by a sharded in-memory hash arena.
 // The index is ephemeral: rebuilt from WAL replay on open and dropped on close.
 type Index struct {
+	mu   sync.RWMutex
 	hash *hashindex.Index
 }
 
@@ -22,6 +25,8 @@ func NewIndex() *Index {
 
 // Close drops the in-memory index and frees shard buffers.
 func (idx *Index) Close() error {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
 	if idx.hash == nil {
 		return nil
 	}
@@ -31,6 +36,8 @@ func (idx *Index) Close() error {
 }
 
 func (idx *Index) Put(key []byte, v indexVersion) error {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
 	if idx.hash == nil {
 		return ErrDatabaseClosed
 	}
@@ -38,6 +45,8 @@ func (idx *Index) Put(key []byte, v indexVersion) error {
 }
 
 func (idx *Index) DropXid(xid uint64) error {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
 	if idx.hash == nil {
 		return nil
 	}
@@ -102,6 +111,8 @@ func (idx *Index) HasNewerCommitted(key []byte, excludeXid uint64, snap Snapshot
 }
 
 func (idx *Index) ForEachKey(fn func(key []byte, chain []indexVersion)) {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
 	if idx.hash == nil {
 		return
 	}
@@ -128,6 +139,8 @@ func (idx *Index) LiveKeyCount(clog func(uint64) TxStatus) int64 {
 }
 
 func (idx *Index) walkKeyVersions(key []byte, fn func(indexVersion) bool) {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
 	if idx.hash == nil {
 		return
 	}

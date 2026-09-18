@@ -75,11 +75,16 @@ func (db *DB) abortTransaction(tx *Transaction) {
 
 		if tx.didWrite {
 			if _, err := db.appendRecord(RecordAbort, tx.xid, nil, nil); err != nil {
-				panic("CRITICAL: ABORT record append failed: " + err.Error())
+				if atomic.LoadInt32(&db.closed) == 0 {
+					panic("CRITICAL: ABORT record append failed: " + err.Error())
+				}
+			} else {
+				db.setClog(tx.xid, TxAborted)
 			}
-			db.setClog(tx.xid, TxAborted)
-			if err := db.index.DropXid(tx.xid); err != nil {
-				panic("CRITICAL: index DropXid failed: " + err.Error())
+			if db.index != nil {
+				if err := db.index.DropXid(tx.xid); err != nil && atomic.LoadInt32(&db.closed) == 0 {
+					panic("CRITICAL: index DropXid failed: " + err.Error())
+				}
 			}
 		}
 
