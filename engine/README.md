@@ -138,7 +138,9 @@ Mixing these when reading code is a common source of confusion.
 
 `committer.go` batches concurrent `COMMIT` requests to amortize `fdatasync` cost — study `committer_test.go` for latency/throughput tradeoffs. Default `CommitDelay` is 0 (PostgreSQL-style: do not sleep; batch what queued during the previous flush).
 
-WAL insert (`log.mu`) is released before `fdatasync`. Concurrent `SET`s append while a group flush is in flight so the next batch already has its frames written. Rotation and `Close` wait for in-flight syncs so they never `close` a file that is still flushing. The TSF1 footer is written from the in-memory `allocated` flag (no `stat` on the commit path).
+WAL insert (`log.mu`) is released before `fdatasync`. Concurrent `SET`s append while a group flush is in flight so the next batch already has its frames written. Rotation and `Close` wait for in-flight syncs so they never `close` a file that is still flushing. The TSF1 footer is written from the in-memory `allocated` flag (no `stat` on the commit path). A failed footer write fails the commit.
+
+`writeOffset` is the append head. `durableOffset` is the last LSN `fdatasync` has promised (snapshotted at persist-head, not the live write head — concurrent `pwrite`s during flush are not guaranteed durable). `ReadLogRange`, replica streaming, and `promote N` quorum use `durableOffset`. Local GET/visibility still uses the index + clog, which is updated only after the flush returns.
 
 ### Why no BEGIN record
 

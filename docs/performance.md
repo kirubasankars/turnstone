@@ -43,7 +43,9 @@ foreign keys. Use PostgreSQL there.
    after the COMMIT record (and TSF1 footer) hit the page cache. Concurrent
    `SET`s keep appending so the next group already has frames ready. The
    commit path also skips `stat` — preallocated segments remember they have
-   a footer slot.
+   a footer slot. Replication and sync quorum still wait for `durableOffset`
+   (the fsync snapshot), not the live write head: a concurrent `pwrite`
+   during flush is not crash-safe.
 5. **`fdatasync` on Unix.** Same durable-write shortcut PostgreSQL uses:
    flush file data, skip inode metadata that `fsync` would write.
 6. **No `BEGIN` WAL record.** Recovery treats `SET`/`DEL` without `COMMIT`

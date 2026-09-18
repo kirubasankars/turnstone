@@ -433,7 +433,7 @@ func (s *Server) runLogStreamLoop(name string, st *database.Database, startOffse
 			}
 
 		case <-ticker.C:
-			head := st.LastLogOffset()
+			head := st.DurableOffset()
 			if uint64(currentByteOffset) >= head {
 				continue
 			}

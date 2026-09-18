@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"syscall"
 )
 
@@ -44,6 +45,8 @@ type DataLog struct {
 	segments      []walSegment
 	activeIndex   int
 	writeOffset   int64
+	durableOffset int64 // last LSN known durable; updated without holding mu
+	syncing       int32 // in-flight fdatasyncs that released mu
 	recycle       []string
 	recycleSeq    uint32
 	buffers       *sharedBuffers
@@ -90,6 +93,7 @@ func OpenDataLog(dir string, logger *slog.Logger, segmentSize int64) (*DataLog, 
 	if err := l.loadSegments(manifest); err != nil {
 		return nil, err
 	}
+	atomic.StoreInt64(&l.durableOffset, l.writeOffset)
 	if err := l.loadRecyclePool(); err != nil {
 		_ = l.Close()
 		return nil, fmt.Errorf("wal recycle pool: %w", err)
@@ -304,35 +308,72 @@ func (l *DataLog) WriteOffset() int64 {
 	return l.writeOffset
 }
 
-func (l *DataLog) persistHeadLocked() {
+// DurableOffset is the exclusive end of WAL known to have been fdatasync'd.
+// ReadLogRange and sync-replication quorum must not go past this; writeOffset
+// can race ahead while a flush is in flight.
+func (l *DataLog) DurableOffset() int64 {
+	return atomic.LoadInt64(&l.durableOffset)
+}
+
+func (l *DataLog) publishDurable(off int64) {
+	for {
+		cur := atomic.LoadInt64(&l.durableOffset)
+		if off <= cur {
+			return
+		}
+		if atomic.CompareAndSwapInt64(&l.durableOffset, cur, off) {
+			return
+		}
+	}
+}
+
+func (l *DataLog) persistHeadLocked() error {
 	seg := &l.segments[l.activeIndex]
 	if seg.writer == nil || !seg.allocated {
-		return
+		return nil
 	}
-	_ = writeSegmentFooter(seg.writer, l.segmentSize, l.writeOffset-seg.baseLSN)
+	return writeSegmentFooter(seg.writer, l.segmentSize, l.writeOffset-seg.baseLSN)
 }
 
 // beginSyncLocked records the write head and returns the active writer for
 // fdatasync outside l.mu. The caller must invoke completeSync.
-func (l *DataLog) beginSyncLocked() *os.File {
-	l.persistHeadLocked()
+// completeSync must not take l.mu: rotate waits for inflightSyncs while
+// holding that lock.
+func (l *DataLog) beginSyncLocked() (*os.File, int64, error) {
+	if err := l.persistHeadLocked(); err != nil {
+		return nil, 0, err
+	}
+	flushed := l.writeOffset
 	f := l.segments[l.activeIndex].writer
 	if f == nil {
-		return nil
+		return nil, flushed, nil
 	}
+	atomic.AddInt32(&l.syncing, 1)
 	l.inflightSyncs.Add(1)
-	return f
+	return f, flushed, nil
 }
 
-func (l *DataLog) completeSync(f *os.File) {
+func (l *DataLog) completeSync(f *os.File, flushed int64) {
 	if f == nil {
+		l.publishDurable(flushed)
 		return
 	}
 	defer l.inflightSyncs.Done()
+	defer atomic.AddInt32(&l.syncing, -1)
 	if hook := testingBeforeSync; hook != nil {
 		hook()
 	}
 	l.syncWriter(f)
+	// Publish only the snapshotted head. Concurrent WriteAts during
+	// fdatasync are not guaranteed durable when this returns.
+	l.publishDurable(flushed)
+}
+
+func (l *DataLog) publishAppendLocked() {
+	if atomic.LoadInt32(&l.syncing) != 0 {
+		return
+	}
+	l.publishDurable(l.writeOffset)
 }
 
 func (l *DataLog) syncWriter(f *os.File) {
@@ -367,11 +408,21 @@ func (l *DataLog) AppendRecords(builders []func() []byte, sync bool) ([]int64, e
 		offsets[i] = off
 	}
 	var syncF *os.File
+	var flushed int64
 	if sync {
-		syncF = l.beginSyncLocked()
+		var err error
+		syncF, flushed, err = l.beginSyncLocked()
+		if err != nil {
+			l.mu.Unlock()
+			return nil, err
+		}
+	} else {
+		l.publishAppendLocked()
 	}
 	l.mu.Unlock()
-	l.completeSync(syncF)
+	if sync {
+		l.completeSync(syncF, flushed)
+	}
 	return offsets, nil
 }
 
@@ -383,11 +434,21 @@ func (l *DataLog) AppendEncoded(payload []byte, sync bool) (int64, error) {
 		return 0, err
 	}
 	var syncF *os.File
+	var flushed int64
 	if sync {
-		syncF = l.beginSyncLocked()
+		var err error
+		syncF, flushed, err = l.beginSyncLocked()
+		if err != nil {
+			l.mu.Unlock()
+			return 0, err
+		}
+	} else {
+		l.publishAppendLocked()
 	}
 	l.mu.Unlock()
-	l.completeSync(syncF)
+	if sync {
+		l.completeSync(syncF, flushed)
+	}
 	return off, nil
 }
 
@@ -451,6 +512,7 @@ func (l *DataLog) rotateSegmentLocked() error {
 	if err := syncFile(active.writer); err != nil {
 		return err
 	}
+	l.publishDurable(l.writeOffset)
 	active.endLSN = l.writeOffset
 	if err := active.writer.Close(); err != nil {
 		return err
@@ -977,11 +1039,14 @@ func (l *DataLog) InitLogAtLSN(lsn int64) error {
 		return fmt.Errorf("init log at lsn: unexpected base lsn %d", seg.baseLSN)
 	}
 	oldBase := seg.baseLSN
+	oldDurable := atomic.LoadInt64(&l.durableOffset)
 	seg.baseLSN = lsn
 	l.writeOffset = lsn
+	atomic.StoreInt64(&l.durableOffset, lsn)
 	if err := l.persistManifestLocked(); err != nil {
 		seg.baseLSN = oldBase
 		l.writeOffset = 0
+		atomic.StoreInt64(&l.durableOffset, oldDurable)
 		return err
 	}
 	return nil
