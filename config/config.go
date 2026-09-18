@@ -39,6 +39,7 @@ type Config struct {
 	MaxIndexArenaBytes  int64  `json:"max_index_arena_bytes"`
 	SharedBuffersBytes  int64  `json:"shared_buffers_bytes"`
 	ValueCacheBytes     int64  `json:"value_cache_bytes"`
+	Mlock               bool   `json:"mlock"`
 }
 
 // DatabaseCount is the number of isolated keyspaces 0 … N-1.

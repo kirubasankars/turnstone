@@ -20,7 +20,19 @@ type Index struct {
 
 // NewIndex creates a fresh in-memory index. Log replay on DB open rebuilds contents.
 func NewIndex() *Index {
-	return &Index{hash: hashindex.New()}
+	idx, err := newIndex(false)
+	if err != nil {
+		panic(err)
+	}
+	return idx
+}
+
+func newIndex(lock bool) (*Index, error) {
+	h, err := hashindex.Open(lock)
+	if err != nil {
+		return nil, err
+	}
+	return &Index{hash: h}, nil
 }
 
 func (idx *Index) SetSharedBudget(b *hashindex.SharedBudget) error {

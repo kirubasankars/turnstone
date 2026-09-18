@@ -110,6 +110,9 @@ type Options struct {
 	// This is the PostgreSQL shared_buffers analog: concurrent GETs share
 	// resident pages instead of each pread'ing the file.
 	SharedBuffersBytes int64
+	// Mlock pins the page pool and hash-index arenas in RAM (Unix mlock).
+	// WAL file mappings are not locked. Open fails if the lock is denied.
+	Mlock bool
 
 	// WalSegmentSize rotates the active WAL segment at this many bytes (0 = default 64MB).
 	WalSegmentSize int64

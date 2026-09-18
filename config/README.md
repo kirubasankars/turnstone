@@ -22,6 +22,7 @@ The `config` package owns **on-disk configuration** for a TurnstoneDB node: JSON
 | `MaxIndexArenaBytes` | `max_index_arena_bytes` | `0` | Process-wide index shard buffer cap shared by every database; `0` disables |
 | `SharedBuffersBytes` | `shared_buffers_bytes` | `0` (64 MiB) | Process-wide WAL page-pool total, split evenly across databases; negative disables |
 | `ValueCacheBytes` | `value_cache_bytes` | `0` (64 MiB) | Process-wide decoded-value cache total, split evenly across databases; negative disables |
+| `Mlock` | `mlock` | `false` | Pin the page pool and hash-index arenas with `mlock` (Unix). Open fails if the lock is denied. WAL file mappings are not locked. |
 
 Paths in JSON are **relative to `--home`** unless absolute; use `ResolvePath(home, path)` consistently.
 

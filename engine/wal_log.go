@@ -190,14 +190,23 @@ func (l *DataLog) mapSegment(seg *walSegment) {
 }
 
 func (l *DataLog) EnableSharedBuffers(bytes int64) {
+	_ = l.EnableSharedBuffersLocked(bytes, false)
+}
+
+func (l *DataLog) EnableSharedBuffersLocked(bytes int64, lock bool) error {
 	if bytes < 0 {
 		l.buffers = nil
-		return
+		return nil
 	}
 	if bytes == 0 {
 		bytes = defaultSharedBuffersBytes
 	}
-	l.buffers = newSharedBuffers(bytes)
+	b, err := newSharedBuffersLocked(bytes, lock)
+	if err != nil {
+		return err
+	}
+	l.buffers = b
+	return nil
 }
 
 func fileSizeOf(path string) int64 {
@@ -1071,6 +1080,10 @@ func (l *DataLog) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.inflightSyncs.Wait()
+	if l.buffers != nil {
+		l.buffers.close()
+		l.buffers = nil
+	}
 	var firstErr error
 	for i := range l.segments {
 		if len(l.segments[i].mapping) > 0 {

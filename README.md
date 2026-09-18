@@ -223,6 +223,7 @@ Highlights in `turnstone.json` (all fields: [config/README.md](config/README.md)
 | `max_index_arena_bytes` | `0` | Process-wide index arena cap shared by every database; `0` disables |
 | `shared_buffers_bytes` | `0` (64 MiB) | Process-wide WAL page pool, split across databases |
 | `value_cache_bytes` | `0` (64 MiB) | Process-wide decoded-value cache, split across databases |
+| `mlock` | `false` | Pin page pool and index arenas in RAM (`mlock`). Requires a sufficient `ulimit -l`. |
 | `metrics_addr` | `:9090` | Prometheus scrape address |
 
 Every connection is **mTLS**. Role is the certificate **Organization** field:

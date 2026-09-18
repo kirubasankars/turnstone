@@ -138,7 +138,11 @@ func OpenContext(ctx context.Context, dir string, opts Options) (*DB, error) {
 		_ = logFile.Close()
 		return nil, fmt.Errorf("remove leftover index dir: %w", err)
 	}
-	index := NewIndex()
+	index, err := newIndex(opts.Mlock)
+	if err != nil {
+		_ = logFile.Close()
+		return nil, fmt.Errorf("index: %w", err)
+	}
 	if err := index.SetSharedBudget(opts.IndexArenaBudget); err != nil {
 		_ = logFile.Close()
 		_ = index.Close()
@@ -177,7 +181,10 @@ func OpenContext(ctx context.Context, dir string, opts Options) (*DB, error) {
 	if cacheBytes > 0 {
 		db.valueCache = newValueCache(cacheBytes)
 	}
-	logFile.EnableSharedBuffers(opts.SharedBuffersBytes)
+	if err := logFile.EnableSharedBuffersLocked(opts.SharedBuffersBytes, opts.Mlock); err != nil {
+		db.Close()
+		return nil, err
+	}
 
 	if opts.UnsafeDisableFsync {
 		logger.Warn("UnsafeDisableFsync enabled")

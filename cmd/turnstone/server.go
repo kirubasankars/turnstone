@@ -130,6 +130,7 @@ func runServer(logger *slog.Logger, devMode bool, consoleAddr string) {
 		"value_cache_bytes", cacheTotal,
 		"value_cache_bytes_per_db", perCache,
 		"max_index_arena_bytes", cfg.MaxIndexArenaBytes,
+		"mlock", cfg.Mlock,
 	)
 
 	for i := 0; i < nDB; i++ {
@@ -147,6 +148,7 @@ func runServer(logger *slog.Logger, devMode bool, consoleAddr string) {
 				IndexArenaBudget:   arenaBudget,
 				SharedBuffersBytes: perBuf,
 				ValueCacheBytes:    perCache,
+				Mlock:              cfg.Mlock,
 			})
 			if err != nil {
 				return fmt.Errorf("db %s: %w", name, err)

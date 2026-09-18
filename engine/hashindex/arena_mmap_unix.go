@@ -10,6 +10,8 @@ package hashindex
 import (
 	"fmt"
 	"syscall"
+
+	"turnstone/internal/mlock"
 )
 
 var shardBufferPageSize = syscall.Getpagesize()
@@ -22,16 +24,23 @@ func alignShardBufferSize(n int64) int64 {
 	return (n + ps - 1) &^ (ps - 1)
 }
 
-func mmapNewShardBuffer(size int64) (*shardBuffer, error) {
+func mmapNewShardBuffer(size int64, lock bool) (*shardBuffer, error) {
 	mappedSize := alignShardBufferSize(size)
 	mapped, err := syscall.Mmap(-1, 0, int(mappedSize), syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_ANON|syscall.MAP_PRIVATE)
 	if err != nil {
 		return nil, fmt.Errorf("mmap shard buffer: %w", err)
 	}
 	slice := mapped[:mappedSize]
+	if lock {
+		if err := mlock.Lock(slice); err != nil {
+			_ = syscall.Munmap(mapped)
+			return nil, fmt.Errorf("mlock shard buffer: %w", err)
+		}
+	}
 	return &shardBuffer{
 		data:        slice,
 		mmapBacking: slice,
+		locked:      lock,
 	}, nil
 }
 
@@ -49,7 +58,7 @@ func mmapGrowShardBuffer(b *shardBuffer, minSize int64) error {
 	for int64(n) < minSize {
 		n *= 2
 	}
-	next, err := mmapNewShardBuffer(int64(n))
+	next, err := mmapNewShardBuffer(int64(n), b.locked)
 	if err != nil {
 		return err
 	}
@@ -57,6 +66,7 @@ func mmapGrowShardBuffer(b *shardBuffer, minSize int64) error {
 	mmapReleaseShardBuffer(b)
 	b.data = next.data
 	b.mmapBacking = next.mmapBacking
+	b.locked = next.locked
 	next.data = nil
 	next.mmapBacking = nil
 	return nil
@@ -65,6 +75,10 @@ func mmapGrowShardBuffer(b *shardBuffer, minSize int64) error {
 func mmapReleaseShardBuffer(b *shardBuffer) {
 	if b == nil || b.mmapBacking == nil {
 		return
+	}
+	if b.locked {
+		mlock.Unlock(b.mmapBacking)
+		b.locked = false
 	}
 	_ = syscall.Munmap(b.mmapBacking)
 	b.mmapBacking = nil
