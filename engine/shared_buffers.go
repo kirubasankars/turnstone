@@ -14,8 +14,11 @@ import (
 var errSharedBuffersBusy = errors.New("shared buffers: no unpinned page")
 
 const (
-	sharedBufferPageSize      = 8192
-	defaultSharedBuffersBytes = 64 << 20
+	sharedBufferPageSize = 8192
+	// DefaultSharedBuffersBytes is the process-wide WAL page-pool default
+	// (split across databases at server start).
+	DefaultSharedBuffersBytes = 64 << 20
+	defaultSharedBuffersBytes = DefaultSharedBuffersBytes
 	sharedBufferMinPages      = 16
 	sharedBufferClockMaxUsage = 5
 )

@@ -23,6 +23,15 @@ func NewIndex() *Index {
 	return &Index{hash: hashindex.New()}
 }
 
+func (idx *Index) SetSharedBudget(b *hashindex.SharedBudget) error {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	if idx.hash == nil {
+		return ErrDatabaseClosed
+	}
+	return idx.hash.SetSharedBudget(b)
+}
+
 // Close drops the in-memory index and frees shard buffers.
 func (idx *Index) Close() error {
 	idx.mu.Lock()

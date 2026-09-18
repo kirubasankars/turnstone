@@ -38,6 +38,7 @@ type Index struct {
 	maxArenaBytes int64
 	usedBytes     int64
 	enforceLimit  int32
+	shared        *SharedBudget
 }
 
 // New creates numShards mmap-backed index shards (heap fallback on non-Unix).

@@ -10,6 +10,8 @@ import (
 	"hash/crc32"
 	"log/slog"
 	"time"
+
+	"turnstone/engine/hashindex"
 )
 
 const (
@@ -83,11 +85,15 @@ type Options struct {
 	ChecksumInterval    time.Duration
 	RetentionInterval   time.Duration
 	MaxDiskUsagePercent int
-	// MaxIndexArenaBytes rejects writes when total index shard buffer bytes
-	// would exceed this limit (0 disables).
+	// MaxIndexArenaBytes rejects writes when this index's shard buffer
+	// bytes would exceed the limit (0 disables). For a process-wide cap
+	// across several databases, set IndexArenaBudget instead.
 	MaxIndexArenaBytes int64
-	Logger             *slog.Logger
-	TxTimeout          time.Duration
+	// IndexArenaBudget is an optional process-wide cap shared by every
+	// index that attaches to the same budget.
+	IndexArenaBudget *hashindex.SharedBudget
+	Logger           *slog.Logger
+	TxTimeout        time.Duration
 	// CommitDelay is an optional gather window before fsync. Zero (the default)
 	// matches PostgreSQL: do not sleep; batch whatever is already queued and
 	// whatever arrives during the previous group's fsync. Negative is treated

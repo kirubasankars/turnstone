@@ -72,7 +72,7 @@ func TestGenerateConfigArtifacts(t *testing.T) {
 		TLSCertFile:       "certs/server.crt", // Relative paths
 		TLSKeyFile:        "certs/server.key",
 		TLSCAFile:         "certs/ca.crt",
-		NumberOfDatabases: 1, // Should create database 0 and 1
+		NumberOfDatabases: 1, // databases 0 … N-1
 	}
 
 	// Execute
@@ -81,13 +81,11 @@ func TestGenerateConfigArtifacts(t *testing.T) {
 	}
 
 	// 1. Verify Directories
-	// Database 0 (Internal)
 	if _, err := os.Stat(filepath.Join(tmpDir, "data", "0")); os.IsNotExist(err) {
 		t.Error("Data directory for database '0' not created")
 	}
-	// Database 1 (User)
-	if _, err := os.Stat(filepath.Join(tmpDir, "data", "1")); os.IsNotExist(err) {
-		t.Error("Data directory for database '1' not created")
+	if _, err := os.Stat(filepath.Join(tmpDir, "data", "1")); !os.IsNotExist(err) {
+		t.Error("NumberOfDatabases=1 must not create database '1'")
 	}
 
 	if _, err := os.Stat(filepath.Join(tmpDir, "certs")); os.IsNotExist(err) {
@@ -223,5 +221,26 @@ func TestValidateConfig(t *testing.T) {
 				t.Errorf("expected no error for pct=%d arena=%d, got %v", tc.pct, tc.arena, err)
 			}
 		})
+	}
+}
+
+func TestDatabaseCount(t *testing.T) {
+	if DatabaseCount(4) != 4 {
+		t.Fatalf("DatabaseCount(4)=%d", DatabaseCount(4))
+	}
+	if DatabaseCount(0) != 1 || DatabaseCount(-1) != 1 {
+		t.Fatal("DatabaseCount <= 0 should be 1")
+	}
+}
+
+func TestShareBytes(t *testing.T) {
+	if got := ShareBytes(64<<20, 4); got != 16<<20 {
+		t.Fatalf("ShareBytes(64MiB, 4)=%d", got)
+	}
+	if got := ShareBytes(-1, 4); got != -1 {
+		t.Fatalf("disabled pass-through: %d", got)
+	}
+	if got := ShareBytes(3, 4); got != 1 {
+		t.Fatalf("ShareBytes(3, 4)=%d want 1", got)
 	}
 }

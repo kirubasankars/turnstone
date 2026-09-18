@@ -132,21 +132,27 @@ func (s *Database) UnlockAdmin() {
 }
 
 func Open(ctx context.Context, dir string, logger *slog.Logger, minReplicas int, retentionStrategy string, maxDiskUsage int, maxIndexArenaBytes int64) (*Database, error) {
-	truncateTail := false
-	if os.Getenv("TS_TEST_LOG_TRUNCATE") == "true" {
-		truncateTail = true
-	}
+	return OpenWithEngineOpts(ctx, dir, logger, minReplicas, retentionStrategy, maxDiskUsage, engine.Options{
+		MaxIndexArenaBytes: maxIndexArenaBytes,
+	})
+}
 
-	opts := engine.Options{
-		TruncateCorruptTail: truncateTail,
-		MaxDiskUsagePercent: maxDiskUsage,
-		MaxIndexArenaBytes:  maxIndexArenaBytes,
-		Logger:              logger,
-		UnsafeDisableFsync:  os.Getenv("TS_UNSAFE_DISABLE_FSYNC") == "true",
+func OpenWithEngineOpts(ctx context.Context, dir string, logger *slog.Logger, minReplicas int, retentionStrategy string, maxDiskUsage int, opts engine.Options) (*Database, error) {
+	if os.Getenv("TS_TEST_LOG_TRUNCATE") == "true" {
+		opts.TruncateCorruptTail = true
 	}
-	if v := os.Getenv("TS_TEST_WAL_SEGMENT_SIZE"); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
-			opts.WalSegmentSize = n
+	opts.MaxDiskUsagePercent = maxDiskUsage
+	if opts.Logger == nil {
+		opts.Logger = logger
+	}
+	if os.Getenv("TS_UNSAFE_DISABLE_FSYNC") == "true" {
+		opts.UnsafeDisableFsync = true
+	}
+	if opts.WalSegmentSize == 0 {
+		if v := os.Getenv("TS_TEST_WAL_SEGMENT_SIZE"); v != "" {
+			if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+				opts.WalSegmentSize = n
+			}
 		}
 	}
 

@@ -139,6 +139,11 @@ func OpenContext(ctx context.Context, dir string, opts Options) (*DB, error) {
 		return nil, fmt.Errorf("remove leftover index dir: %w", err)
 	}
 	index := NewIndex()
+	if err := index.SetSharedBudget(opts.IndexArenaBudget); err != nil {
+		_ = logFile.Close()
+		_ = index.Close()
+		return nil, fmt.Errorf("index arena budget: %w", err)
+	}
 	index.SetMaxArenaBytes(opts.MaxIndexArenaBytes)
 	index.SetEnforceLimit(false)
 

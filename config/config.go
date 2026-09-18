@@ -37,6 +37,34 @@ type Config struct {
 	LogRetention        string `json:"log_retention"` // "replication" or "none"
 	MaxDiskUsagePercent int    `json:"max_disk_usage_percent"`
 	MaxIndexArenaBytes  int64  `json:"max_index_arena_bytes"`
+	SharedBuffersBytes  int64  `json:"shared_buffers_bytes"`
+	ValueCacheBytes     int64  `json:"value_cache_bytes"`
+}
+
+// DatabaseCount is the number of isolated keyspaces 0 … N-1.
+// n <= 0 is treated as a single database.
+func DatabaseCount(n int) int {
+	if n <= 0 {
+		return 1
+	}
+	return n
+}
+
+// ShareBytes splits an instance-wide byte budget across n databases.
+// Negative totals (disabled) are passed through. A positive total smaller
+// than n still yields at least 1 byte per database.
+func ShareBytes(total int64, n int) int64 {
+	if n < 1 {
+		n = 1
+	}
+	if total < 0 {
+		return total
+	}
+	per := total / int64(n)
+	if per == 0 && total > 0 {
+		return 1
+	}
+	return per
 }
 
 // ResolvePath returns an absolute path relative to the home directory if strictly necessary.
@@ -81,10 +109,8 @@ func GenerateConfigArtifacts(homeDir string, defaultCfg Config, configPath strin
 		}
 	}
 
-	// Create data directories for databases.
-	// DB 0 is a normal database now.
-	// If NumberOfDatabases is N, we create databases 0, 1, ..., N.
-	for i := 0; i <= defaultCfg.NumberOfDatabases; i++ {
+	// Create data directories for databases 0 … N-1.
+	for i := 0; i < DatabaseCount(defaultCfg.NumberOfDatabases); i++ {
 		dbID := strconv.Itoa(i)
 		dbPath := filepath.Join(homeDir, "data", dbID)
 		if err := os.MkdirAll(dbPath, 0o755); err != nil {

@@ -113,12 +113,13 @@ Notable tunables in `types.go` `Options`:
 
 - `TruncateCorruptTail` — recovery behavior on partial last frame
 - `CommitDelay` / `CommitSiblings` — optional gather window (default 0) plus drain-after-fsync batching
-- `ValueCacheBytes` — decoded WAL-offset value cache (0 = 64 MiB, negative disables)
-- `SharedBuffersBytes` — 8 KiB WAL page pool (0 = 64 MiB, negative disables)
+- `ValueCacheBytes` — decoded WAL-offset value cache (0 = 64 MiB, negative disables). The server splits the process-wide default across databases.
+- `SharedBuffersBytes` — 8 KiB WAL page pool (0 = 64 MiB, negative disables). The server splits the process-wide default across databases.
 - `UnsafeDisableFsync` — tests only
 - `IndexCompactOnRetention`, `WalCopyForwardOnRetention` — maintenance toggles
 - `MaxDiskUsagePercent` — reject writes when disk full
-- `MaxIndexArenaBytes` — reject writes when total index shard buffers would exceed cap (0 disables)
+- `MaxIndexArenaBytes` — reject writes when this index's shard buffers exceed the cap (0 disables)
+- `IndexArenaBudget` — optional process-wide arena cap shared by every open database
 
 ## Educational focus
 
