@@ -6,8 +6,9 @@
   var sparkHistory = { replica_lag: [], log_bytes: [], key_count: [] };
   var SPARK_MAX = 24;
   var seriesHistory = {};
-  var CHART_MAX = 72;
-  var CHART_H = 140;
+  var CHART_MAX = 120;
+  var CHART_H = 248;
+  var CHART_INTERVAL_MS = 5000;
 
   var els = {
     dbSelect: document.getElementById('db-select'),
@@ -87,6 +88,21 @@
     return isByteMetric(label, name) ? fmtBytes(n) : fmtCount(n);
   }
 
+  function fmtAxis(n, label, name) {
+    if (typeof n !== 'number' || !isFinite(n)) return String(n);
+    if (isTimestampMetric(label, name)) return String(Math.round(n));
+    if (isByteMetric(label, name)) return fmtBytes(n);
+    if (Math.abs(n) >= 1e4) return fmtCount(n);
+    if (Math.abs(n - Math.round(n)) < 1e-6) return String(Math.round(n));
+    return String(Math.round(n * 10) / 10);
+  }
+
+  function displayTitle(label) {
+    return String(label || '').replace(/_/g, ' ').replace(/\b[a-z]/g, function (ch) {
+      return ch.toUpperCase();
+    });
+  }
+
   function escapeHtml(str) {
     return String(str)
       .replace(/&/g, '&amp;')
@@ -114,8 +130,8 @@
       if (values[i] < min) min = values[i];
     }
     if (max === min) max = min + 1;
-    ctx.strokeStyle = '#fbbf24';
-    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = '#f87171';
+    ctx.lineWidth = 1;
     ctx.beginPath();
     for (var j = 0; j < values.length; j++) {
       var x = (j / (values.length - 1)) * (w - 4) + 2;
@@ -143,10 +159,16 @@
     if (seriesHistory[key].length > CHART_MAX) seriesHistory[key].shift();
   }
 
-  function chartColor(label) {
-    if (/active|tx|conflict|compact/i.test(label)) return '#f59e0b';
-    if (/lag/i.test(label)) return '#fbbf24';
-    return '#2dd4bf';
+  function chartColor() {
+    return '#f87171';
+  }
+
+  function axisTime(ageMs) {
+    var d = new Date(Date.now() - ageMs);
+    var hh = String(d.getHours()).padStart(2, '0');
+    var mm = String(d.getMinutes()).padStart(2, '0');
+    var ss = String(d.getSeconds()).padStart(2, '0');
+    return hh + ':' + mm + ':' + ss;
   }
 
   function drawLineChart(canvas, values, color, label, name) {
@@ -155,9 +177,9 @@
     var cssW = canvas.clientWidth || canvas.parentElement && canvas.parentElement.clientWidth || 0;
     if (cssW < 40) return;
     var dpr = window.devicePixelRatio || 1;
-    var padR = 8;
-    var padT = 10;
-    var padB = 8;
+    var padR = 12;
+    var padT = 8;
+    var padB = 28;
     canvas.width = Math.max(1, Math.floor(cssW * dpr));
     canvas.height = Math.floor(CHART_H * dpr);
     canvas.style.width = cssW + 'px';
@@ -179,6 +201,7 @@
     if (max === min) {
       if (max === 0) {
         max = 1;
+        min = 0;
       } else if (asBytes) {
         min = min * 0.95;
         max = max * 1.05;
@@ -187,28 +210,40 @@
         max = max + 1;
       }
     } else if (!asBytes) {
-      min = Math.floor(min);
+      min = Math.min(0, Math.floor(min));
       max = Math.ceil(max);
       if (min === max) max = min + 1;
     }
 
-    ctx.font = '10px ui-monospace, SFMono-Regular, Menlo, monospace';
-    var maxLabel = fmt(max, label, name);
-    var minLabel = fmt(min, label, name);
-    var padL = Math.ceil(Math.max(ctx.measureText(maxLabel).width, ctx.measureText(minLabel).width)) + 10;
-    if (padL < 28) padL = 28;
-    if (padL > cssW * 0.42) padL = Math.floor(cssW * 0.42);
+    ctx.font = '11px ui-sans-serif, system-ui, sans-serif';
+    var mid = min + (max - min) / 2;
+    var maxLabel = fmtAxis(max, label, name);
+    var midLabel = fmtAxis(mid, label, name);
+    var minLabel = fmtAxis(min, label, name);
+    var padL = Math.ceil(Math.max(
+      ctx.measureText(maxLabel).width,
+      ctx.measureText(midLabel).width,
+      ctx.measureText(minLabel).width
+    )) + 12;
+    if (padL < 36) padL = 36;
+    if (padL > cssW * 0.28) padL = Math.floor(cssW * 0.28);
 
     var plotW = cssW - padL - padR;
     var plotH = CHART_H - padT - padB;
     if (plotW < 8) return;
-    ctx.strokeStyle = 'rgba(148, 163, 184, 0.16)';
+
+    ctx.strokeStyle = 'rgba(148, 163, 184, 0.14)';
     ctx.lineWidth = 1;
     ctx.beginPath();
-    for (var g = 0; g < 3; g++) {
-      var gy = padT + (plotH * g) / 2;
+    for (var g = 0; g < 5; g++) {
+      var gy = padT + (plotH * g) / 4;
       ctx.moveTo(padL, gy);
       ctx.lineTo(cssW - padR, gy);
+    }
+    for (var vx = 0; vx < 7; vx++) {
+      var gx = padL + (plotW * vx) / 6;
+      ctx.moveTo(gx, padT);
+      ctx.lineTo(gx, padT + plotH);
     }
     ctx.stroke();
 
@@ -216,8 +251,8 @@
     ctx.textAlign = 'right';
     ctx.textBaseline = 'middle';
     ctx.fillText(maxLabel, padL - 6, padT);
+    ctx.fillText(midLabel, padL - 6, padT + plotH / 2);
     ctx.fillText(minLabel, padL - 6, padT + plotH);
-    ctx.textAlign = 'left';
 
     ctx.beginPath();
     for (var j = 0; j < pts.length; j++) {
@@ -226,11 +261,36 @@
       if (j === 0) ctx.moveTo(x, y);
       else ctx.lineTo(x, y);
     }
-    ctx.strokeStyle = color || '#2dd4bf';
-    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = color || '#f87171';
+    ctx.lineWidth = 1.15;
     ctx.lineJoin = 'miter';
-    ctx.lineCap = 'square';
+    ctx.lineCap = 'butt';
     ctx.stroke();
+    ctx.lineTo(padL + plotW, padT + plotH);
+    ctx.lineTo(padL, padT + plotH);
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(248, 113, 113, 0.12)';
+    ctx.fill();
+
+    ctx.beginPath();
+    for (var k = 0; k < pts.length; k++) {
+      var x2 = padL + (k / (pts.length - 1)) * plotW;
+      var y2 = padT + plotH - ((pts[k] - min) / (max - min)) * plotH;
+      if (k === 0) ctx.moveTo(x2, y2);
+      else ctx.lineTo(x2, y2);
+    }
+    ctx.strokeStyle = color || '#f87171';
+    ctx.stroke();
+
+    var span = (pts.length - 1) * CHART_INTERVAL_MS;
+    ctx.fillStyle = '#8b98a8';
+    ctx.textBaseline = 'top';
+    ctx.textAlign = 'left';
+    ctx.fillText(axisTime(span), padL, padT + plotH + 8);
+    ctx.textAlign = 'center';
+    ctx.fillText(axisTime(span / 2), padL + plotW / 2, padT + plotH + 8);
+    ctx.textAlign = 'right';
+    ctx.fillText(axisTime(0), padL + plotW, padT + plotH + 8);
   }
 
   function metricGroupSlug(title) {
@@ -245,8 +305,8 @@
       var color = chartColor(label);
       html += '<div class="chart-card">' +
         '<div class="chart-head">' +
-        '<span class="chart-label">' + escapeHtml(label) + '</span>' +
-        '<span class="chart-value">' + escapeHtml(fmt(s.value, label, s.name)) + '</span>' +
+        '<span class="chart-label">' + escapeHtml(displayTitle(label)) + '</span>' +
+        '<span class="chart-value">' + escapeHtml(s.display || fmt(s.value, label, s.name)) + '</span>' +
         '</div>' +
         '<canvas class="metric-chart" data-series="' + escapeHtml(seriesKey(s)) +
         '" data-color="' + color +
@@ -300,8 +360,7 @@
   }
 
   function redrawMetricCharts() {
-    if (!els.dbMetricsProm) return;
-    var canvases = els.dbMetricsProm.querySelectorAll('canvas.metric-chart');
+    var canvases = document.querySelectorAll('canvas.metric-chart');
     for (var i = 0; i < canvases.length; i++) {
       var c = canvases[i];
       var key = c.getAttribute('data-series');
@@ -335,45 +394,19 @@
     return 'teal';
   }
 
-  function renderMetrics(container, samples, labelFn, highlights, sparkKeys) {
-    highlights = highlights || [];
-    sparkKeys = sparkKeys || {};
+  function paintChartCards(container, samples, labelFn) {
     if (!samples || samples.length === 0) {
       container.innerHTML = '<p class="empty-state"><span class="empty-title">No metrics available</span></p>';
       return;
     }
-    var html = '<div class="metrics-grid">';
-    for (var i = 0; i < samples.length; i++) {
-      var s = samples[i];
-      var label = labelFn ? labelFn(s) : s.name.replace('turnstone_', '').replace(/_/g, ' ');
-      var cls = highlights.indexOf(label) !== -1 ? ' highlight' : '';
-      if (/active tx/i.test(label)) cls += ' warn-tile';
-      var valueCls = (s.name.indexOf('conflict') !== -1 && s.value > 0) ||
-        (s.name.indexOf('lag') !== -1 && s.value > 0) ? ' warn' : '';
-      var iconCls = metricIconClass(label);
-      var sparkId = 'spark-' + container.id + '-' + i;
-      var sparkHtml = '';
-      var sparkKey = sparkKeys[label] || sparkKeys[s.name];
-      if (sparkKey && sparkHistory[sparkKey] && sparkHistory[sparkKey].length > 1) {
-        sparkHtml = '<div class="metric-sparkline"><canvas id="' + sparkId + '" height="28"></canvas></div>';
-      }
-      html += '<div class="metric' + cls + '"><div class="label">' +
-        '<span class="metric-icon ' + iconCls + '"></span>' + escapeHtml(label) +
-        '</div><div class="value' + valueCls + '">' + escapeHtml(fmt(s.value, label, s.name)) + '</div>' +
-        sparkHtml + '</div>';
-    }
-    html += '</div>';
-    container.innerHTML = html;
+    container.innerHTML = renderChartCards(samples, labelFn);
+    redrawMetricCharts();
+  }
 
-    for (var j = 0; j < samples.length; j++) {
-      var s2 = samples[j];
-      var lbl = labelFn ? labelFn(s2) : s2.name.replace('turnstone_', '').replace(/_/g, ' ');
-      var sk = sparkKeys[lbl] || sparkKeys[s2.name];
-      if (sk && sparkHistory[sk] && sparkHistory[sk].length > 1) {
-        var canvas = document.getElementById('spark-' + container.id + '-' + j);
-        drawSparkline(canvas, sparkHistory[sk]);
-      }
-    }
+  function renderMetrics(container, samples, labelFn) {
+    paintChartCards(container, samples, labelFn || function (s) {
+      return s.name.replace('turnstone_', '').replace(/_/g, ' ');
+    });
   }
 
   function renderStateBadge(state) {
@@ -402,17 +435,25 @@
     });
   }
 
-  function renderMetricTiles(items) {
-    var html = '<div class="metrics-grid">';
+  function renderStatCharts(container, items) {
+    var samples = [];
     for (var i = 0; i < items.length; i++) {
-      var val = typeof items[i][1] === 'number' ? fmt(items[i][1], items[i][0]) : items[i][1];
-      var hl = items[i][2] ? ' highlight' : '';
-      html += '<div class="metric' + hl + '"><div class="label">' +
-        '<span class="metric-icon teal"></span>' + escapeHtml(items[i][0]) +
-        '</div><div class="value">' + escapeHtml(val) + '</div></div>';
+      var label = items[i][0];
+      var raw = items[i][1];
+      if (raw == null) raw = 0;
+      var numeric = typeof raw === 'number' && isFinite(raw);
+      var sample = {
+        name: 'stat_' + String(label).toLowerCase().replace(/[^a-z0-9]+/g, '_'),
+        value: numeric ? raw : 0,
+        labels: { panel: container.id, label: label },
+        display: numeric ? undefined : String(raw)
+      };
+      recordSeries(sample);
+      samples.push(sample);
     }
-    html += '</div>';
-    return html;
+    container.innerHTML = renderChartCards(samples, function (s) {
+      return (s.labels && s.labels.label) || s.name;
+    });
   }
 
   function fmtAgo(unix) {
@@ -429,18 +470,18 @@
     var indexLive = stats.index_live_bytes || 0;
     var indexGarbage = arena > indexLive ? arena - indexLive : 0;
     var lastCompact = stats.hash_compact_unix ? fmtAgo(stats.hash_compact_unix) : 'never';
-    els.gcStats.innerHTML = renderMetricTiles([
-      ['WAL segments', stats.wal_segments || 0, false],
-      ['Hash segments', stats.hash_shards || 0, false],
-      ['Hash compacted', stats.hash_shards_compacted || 0, true],
-      ['Hash reclaimed', stats.hash_compact_bytes_reclaimed || 0, false],
-      ['Last compact', lastCompact, false],
-      ['Index arena', arena, false],
-      ['Index allocated', stats.index_allocated_bytes || 0, false],
-      ['Index live', indexLive, true],
-      ['WAL live', stats.wal_live_bytes || 0, true],
-      ['WAL garbage', stats.wal_garbage_bytes || 0, false],
-      ['Index garbage', indexGarbage, false]
+    renderStatCharts(els.gcStats, [
+      ['WAL segments', stats.wal_segments || 0],
+      ['Hash segments', stats.hash_shards || 0],
+      ['Hash compacted', stats.hash_shards_compacted || 0],
+      ['Hash reclaimed', stats.hash_compact_bytes_reclaimed || 0],
+      ['Last compact', lastCompact],
+      ['Index arena', arena],
+      ['Index allocated', stats.index_allocated_bytes || 0],
+      ['Index live', indexLive],
+      ['WAL live', stats.wal_live_bytes || 0],
+      ['WAL garbage', stats.wal_garbage_bytes || 0],
+      ['Index garbage', indexGarbage]
     ]);
   }
 
@@ -452,43 +493,19 @@
       pushSpark('replica_lag', stats.replica_lag || 0);
       pushSpark('log_bytes', stats.log_bytes || 0);
 
-      var items = [
-        ['Keys', stats.key_count, true, 'key_count'],
-        ['Active Txs', stats.active_txs, true, null],
-        ['Connections', stats.active_connections, false, null],
-        ['Conflicts', stats.conflicts, false, null],
-        ['Log Size', stats.log_bytes, false, 'log_bytes'],
-        ['Log Allocated', stats.log_allocated_bytes, false, null],
-        ['Replica Lag', stats.replica_lag, false, 'replica_lag'],
-        ['Uptime', stats.uptime, false, null],
-        ['Min Replicas', stats.min_replicas, false, null]
-      ];
-
-      var html = '<div class="metrics-grid">';
-      for (var i = 0; i < items.length; i++) {
-        var val = typeof items[i][1] === 'number' ? fmt(items[i][1], items[i][0]) : items[i][1];
-        var hl = items[i][2] ? ' highlight' : '';
-        if (items[i][0] === 'Active Txs') hl += ' warn-tile';
-        var iconCls = items[i][0] === 'Active Txs' ? 'orange' : 'teal';
-        var sparkHtml = '';
-        if (items[i][3] && sparkHistory[items[i][3]] && sparkHistory[items[i][3]].length > 1) {
-          sparkHtml = '<div class="metric-sparkline"><canvas class="db-spark" data-spark="' +
-            items[i][3] + '" height="28"></canvas></div>';
-        }
-        html += '<div class="metric' + hl + '"><div class="label">' +
-          '<span class="metric-icon ' + iconCls + '"></span>' + escapeHtml(items[i][0]) +
-          '</div><div class="value">' + escapeHtml(val) + '</div>' + sparkHtml + '</div>';
-      }
-      html += '</div>';
-      els.dbStats.innerHTML = html;
+      renderStatCharts(els.dbStats, [
+        ['Keys', stats.key_count],
+        ['Active Txs', stats.active_txs],
+        ['Connections', stats.active_connections],
+        ['Conflicts', stats.conflicts],
+        ['Log Size', stats.log_bytes],
+        ['Log Allocated', stats.log_allocated_bytes],
+        ['Replica Lag', stats.replica_lag],
+        ['Uptime', stats.uptime],
+        ['Min Replicas', stats.min_replicas]
+      ]);
       renderGcStats(stats);
-
-      var sparks = els.dbStats.querySelectorAll('.db-spark');
-      for (var s = 0; s < sparks.length; s++) {
-        var key = sparks[s].getAttribute('data-spark');
-        drawSparkline(sparks[s], sparkHistory[key]);
-      }
-
+      redrawMetricCharts();
       updateLastUpdated();
     });
   }
@@ -558,11 +575,10 @@
       renderMetrics(els.serverMetrics, serverSamples, function (s) {
         return s.name.replace('turnstone_server_', '').replace(/_/g, ' ');
       });
-      var sparkMap = { 'key count': 'key_count', 'log bytes': 'log_bytes', 'replica lag': 'replica_lag' };
       var dbLabel = function (s) {
         return s.name.replace('turnstone_db_', '').replace(/_/g, ' ');
       };
-      renderMetrics(els.dbMetrics, dbSamples, dbLabel, [], sparkMap);
+      renderMetrics(els.dbMetrics, dbSamples, dbLabel);
       if (els.dbMetricsProm) {
         renderMetricCharts(els.dbMetricsProm, [
           {
