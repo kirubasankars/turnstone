@@ -19,24 +19,32 @@ func mapIndexError(err error) error {
 }
 
 func (idx *Index) SetMaxArenaBytes(n int64) {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
 	if idx.hash != nil {
 		idx.hash.SetMaxArenaBytes(n)
 	}
 }
 
 func (idx *Index) SetEnforceLimit(enforce bool) {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
 	if idx.hash != nil {
 		idx.hash.SetEnforceLimit(enforce)
 	}
 }
 
 func (idx *Index) RecalcUsedBytes() {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
 	if idx.hash != nil {
 		idx.hash.RecalcUsedBytes()
 	}
 }
 
 func (idx *Index) IndexArenaUsedBytes() int64 {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
 	if idx.hash == nil {
 		return 0
 	}

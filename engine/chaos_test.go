@@ -441,6 +441,27 @@ func TestChaos_CloseDuringWritesThenRecover(t *testing.T) {
 	}
 }
 
+func TestIndex_CloseConcurrentDropXid(t *testing.T) {
+	idx := NewIndex()
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			key := []byte(fmt.Sprintf("k%d", id))
+			for n := 0; n < 200; n++ {
+				_ = idx.Put(key, indexVersion{xmin: uint64(id + 1)})
+				_ = idx.DropXid(uint64(id + 1))
+			}
+		}(i)
+	}
+	time.Sleep(2 * time.Millisecond)
+	if err := idx.Close(); err != nil {
+		t.Fatal(err)
+	}
+	wg.Wait()
+}
+
 func TestChaos_MonkeyModel(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(dir, Options{})
