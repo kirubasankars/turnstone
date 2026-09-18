@@ -5,13 +5,23 @@
 
 package hashindex
 
-import "fmt"
+import (
+	"fmt"
 
-func heapNewShardBuffer(size int64) (*shardBuffer, error) {
+	"turnstone/internal/mlock"
+)
+
+func heapNewShardBuffer(size int64, lock bool) (*shardBuffer, error) {
 	if size <= 0 {
 		return nil, fmt.Errorf("hashindex: invalid buffer size %d", size)
 	}
-	return &shardBuffer{data: make([]byte, size)}, nil
+	data := make([]byte, size)
+	if lock {
+		if err := mlock.Lock(data); err != nil {
+			return nil, fmt.Errorf("mlock shard buffer: %w", err)
+		}
+	}
+	return &shardBuffer{data: data, locked: lock}, nil
 }
 
 func heapGrowShardBuffer(b *shardBuffer, minSize int64) error {
@@ -30,6 +40,12 @@ func heapGrowShardBuffer(b *shardBuffer, minSize int64) error {
 	}
 	out := make([]byte, n)
 	copy(out, b.data)
+	if b.locked {
+		if err := mlock.Lock(out); err != nil {
+			return fmt.Errorf("mlock shard buffer: %w", err)
+		}
+		mlock.Unlock(b.data)
+	}
 	b.data = out
 	return nil
 }
@@ -37,6 +53,10 @@ func heapGrowShardBuffer(b *shardBuffer, minSize int64) error {
 func heapReleaseShardBuffer(b *shardBuffer) {
 	if b == nil {
 		return
+	}
+	if b.locked {
+		mlock.Unlock(b.data)
+		b.locked = false
 	}
 	b.data = nil
 }

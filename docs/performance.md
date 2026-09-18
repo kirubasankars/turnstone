@@ -57,9 +57,10 @@ foreign keys. Use PostgreSQL there.
    `mmap(MAP_SHARED)` with `madvise` (`RANDOM` for point GET, `SEQUENTIAL`
    on replay, `DONTNEED` on unmap).
 8. **Shared buffers + decoded value cache.** An 8 KiB page pool
-   (`SharedBuffersBytes`, default 64 MiB) holds hot WAL pages so concurrent
-   GETs share one copy instead of each `pread`'ing. A 64 MiB offset value
-   cache sits in front for decoded payloads. Disable the page pool with
+   (`SharedBuffersBytes`, default 64 MiB **per process**, split across
+   databases) holds hot WAL pages so concurrent GETs share one copy
+   instead of each `pread`'ing. A 64 MiB process-wide offset value cache
+   sits in front for decoded payloads. Disable the page pool with
    `SharedBuffersBytes < 0`, the decoded cache with `ValueCacheBytes < 0`.
 9. **Batch writes in one transaction.** `--batch N` on `turnstone bench`
    amortizes one group fsync across N keys — the same advice as

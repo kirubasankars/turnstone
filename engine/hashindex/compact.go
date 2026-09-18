@@ -229,7 +229,8 @@ func (s *shard) compact(filter VersionFilter) (compactResult, error) {
 		newSize = int64(headerSize) + int64(tableBytes) + headerSize
 	}
 
-	newBuf, err := newShardBuffer(newSize)
+	lock := s.parent != nil && s.parent.mlock
+	newBuf, err := newShardBufferLocked(newSize, lock)
 	if err != nil {
 		return res, err
 	}

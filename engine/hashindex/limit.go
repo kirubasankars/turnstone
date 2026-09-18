@@ -11,6 +11,20 @@ func (idx *Index) SetMaxArenaBytes(n int64) {
 	atomic.StoreInt64(&idx.maxArenaBytes, n)
 }
 
+// SetSharedBudget attaches a process-wide arena cap and reserves the
+// index's current buffer bytes against it.
+func (idx *Index) SetSharedBudget(b *SharedBudget) error {
+	idx.shared = b
+	if b == nil {
+		return nil
+	}
+	if err := b.reserve(atomic.LoadInt64(&idx.usedBytes)); err != nil {
+		idx.shared = nil
+		return err
+	}
+	return nil
+}
+
 func (idx *Index) MaxArenaBytes() int64 {
 	return atomic.LoadInt64(&idx.maxArenaBytes)
 }
@@ -47,8 +61,12 @@ func (idx *Index) accountDelta(delta int64) error {
 		return nil
 	}
 	if delta < 0 {
+		_ = idx.shared.reserve(delta)
 		atomic.AddInt64(&idx.usedBytes, delta)
 		return nil
+	}
+	if err := idx.shared.reserve(delta); err != nil {
+		return err
 	}
 	if atomic.LoadInt32(&idx.enforceLimit) == 0 {
 		atomic.AddInt64(&idx.usedBytes, delta)
@@ -63,6 +81,7 @@ func (idx *Index) accountDelta(delta int64) error {
 		used := atomic.LoadInt64(&idx.usedBytes)
 		next := used + delta
 		if next > limit {
+			_ = idx.shared.reserve(-delta)
 			return ErrArenaLimit
 		}
 		if atomic.CompareAndSwapInt64(&idx.usedBytes, used, next) {

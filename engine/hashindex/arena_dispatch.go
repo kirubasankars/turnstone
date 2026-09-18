@@ -6,13 +6,17 @@
 package hashindex
 
 var (
-	shardBufferNew     func(int64) (*shardBuffer, error)
+	shardBufferNew     func(int64, bool) (*shardBuffer, error)
 	shardBufferGrow    func(*shardBuffer, int64) error
 	shardBufferRelease func(*shardBuffer)
 )
 
 func newShardBuffer(size int64) (*shardBuffer, error) {
-	return shardBufferNew(size)
+	return shardBufferNew(size, false)
+}
+
+func newShardBufferLocked(size int64, lock bool) (*shardBuffer, error) {
+	return shardBufferNew(size, lock)
 }
 
 func growShardBuffer(b *shardBuffer, minSize int64) error {

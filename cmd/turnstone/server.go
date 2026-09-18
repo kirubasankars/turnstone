@@ -26,6 +26,8 @@ import (
 	"turnstone/config"
 	"turnstone/console"
 	"turnstone/database"
+	"turnstone/engine"
+	"turnstone/engine/hashindex"
 	"turnstone/internal/tlsutil"
 	"turnstone/metrics"
 	"turnstone/repl"
@@ -109,7 +111,29 @@ func runServer(logger *slog.Logger, devMode bool, consoleAddr string) {
 	g, openCtx := errgroup.WithContext(ctx)
 	g.SetLimit(openLimit)
 
-	for i := 0; i <= cfg.NumberOfDatabases; i++ {
+	nDB := config.DatabaseCount(cfg.NumberOfDatabases)
+	bufTotal := cfg.SharedBuffersBytes
+	if bufTotal == 0 {
+		bufTotal = engine.DefaultSharedBuffersBytes
+	}
+	cacheTotal := cfg.ValueCacheBytes
+	if cacheTotal == 0 {
+		cacheTotal = engine.DefaultValueCacheBytes
+	}
+	perBuf := config.ShareBytes(bufTotal, nDB)
+	perCache := config.ShareBytes(cacheTotal, nDB)
+	arenaBudget := hashindex.NewSharedBudget(cfg.MaxIndexArenaBytes)
+	logger.Info("Memory budget",
+		"databases", nDB,
+		"shared_buffers_bytes", bufTotal,
+		"shared_buffers_bytes_per_db", perBuf,
+		"value_cache_bytes", cacheTotal,
+		"value_cache_bytes_per_db", perCache,
+		"max_index_arena_bytes", cfg.MaxIndexArenaBytes,
+		"mlock", cfg.Mlock,
+	)
+
+	for i := 0; i < nDB; i++ {
 		name := strconv.Itoa(i)
 		path := filepath.Join(homeDir, "data", name)
 		dbLogger := logger.With("db", name)
@@ -119,7 +143,13 @@ func runServer(logger *slog.Logger, devMode bool, consoleAddr string) {
 				return err
 			}
 			dbLogger.Info("Opening database...")
-			st, err := database.Open(openCtx, path, dbLogger, 0, cfg.LogRetention, cfg.MaxDiskUsagePercent, cfg.MaxIndexArenaBytes)
+			st, err := database.OpenWithEngineOpts(openCtx, path, dbLogger, 0, cfg.LogRetention, cfg.MaxDiskUsagePercent, engine.Options{
+				MaxIndexArenaBytes: 0,
+				IndexArenaBudget:   arenaBudget,
+				SharedBuffersBytes: perBuf,
+				ValueCacheBytes:    perCache,
+				Mlock:              cfg.Mlock,
+			})
 			if err != nil {
 				return fmt.Errorf("db %s: %w", name, err)
 			}

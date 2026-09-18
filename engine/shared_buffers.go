@@ -7,15 +7,21 @@ package engine
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
+
+	"turnstone/internal/mlock"
 )
 
 var errSharedBuffersBusy = errors.New("shared buffers: no unpinned page")
 
 const (
-	sharedBufferPageSize      = 8192
-	defaultSharedBuffersBytes = 64 << 20
+	sharedBufferPageSize = 8192
+	// DefaultSharedBuffersBytes is the process-wide WAL page-pool default
+	// (split across databases at server start).
+	DefaultSharedBuffersBytes = 64 << 20
+	defaultSharedBuffersBytes = DefaultSharedBuffersBytes
 	sharedBufferMinPages      = 16
 	sharedBufferClockMaxUsage = 5
 )
@@ -43,17 +49,43 @@ type sharedBuffers struct {
 	hits    uint64
 	misses  uint64
 	evicts  uint64
+	locked  bool
 }
 
 func newSharedBuffers(bytes int64) *sharedBuffers {
+	b, err := newSharedBuffersLocked(bytes, false)
+	if err != nil {
+		panic(err)
+	}
+	return b
+}
+
+func newSharedBuffersLocked(bytes int64, lock bool) (*sharedBuffers, error) {
 	n := int(bytes / sharedBufferPageSize)
 	if n < sharedBufferMinPages {
 		n = sharedBufferMinPages
 	}
-	return &sharedBuffers{
+	b := &sharedBuffers{
 		descs:   make([]bufDesc, n),
 		backing: make([]byte, n*sharedBufferPageSize),
 		lookup:  make(map[bufferTag]int, n),
+	}
+	if lock {
+		if err := mlock.Lock(b.backing); err != nil {
+			return nil, fmt.Errorf("mlock shared_buffers: %w", err)
+		}
+		b.locked = true
+	}
+	return b, nil
+}
+
+func (b *sharedBuffers) close() {
+	if b == nil {
+		return
+	}
+	if b.locked {
+		mlock.Unlock(b.backing)
+		b.locked = false
 	}
 }
 

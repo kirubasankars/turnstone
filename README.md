@@ -48,7 +48,7 @@ flowchart LR
     engine --> index
 ```
 
-On Unix the hash index lives in anonymous mmap arenas (heap fallback elsewhere) and is **rebuilt from the WAL on every open**. WAL segments are file-backed `mmap` with `madvise`; values are assembled from an 8 KiB `shared_buffers` page pool. WAL retention can compact fragmented shards, copy live frames forward, and drop sealed segments. Cap index memory with `max_index_arena_bytes`.
+On Unix the hash index lives in anonymous mmap arenas (heap fallback elsewhere) and is **rebuilt from the WAL on every open**. WAL segments are file-backed `mmap` with `madvise`; values are assembled from an 8 KiB `shared_buffers` page pool. WAL retention can compact fragmented shards, copy live frames forward, and drop sealed segments. Cap index memory process-wide with `max_index_arena_bytes`; `shared_buffers` and the value cache are instance totals split across databases.
 
 ---
 
@@ -217,10 +217,13 @@ Highlights in `turnstone.json` (all fields: [config/README.md](config/README.md)
 | Field | Default | Description |
 | --- | --- | --- |
 | `port` | `:6379` | Listen address |
-| `number_of_databases` | `4` | Highest logical database id (`0` … `N`) |
+| `number_of_databases` | `4` | Isolated keyspaces `0` … `N-1` |
 | `log_retention` | `replication` | WAL purge: `replication` or `none` |
 | `max_disk_usage_percent` | `90` | Reject writes above this disk usage |
-| `max_index_arena_bytes` | `0` | Reject writes when index arenas exceed this (bytes); `0` disables |
+| `max_index_arena_bytes` | `0` | Process-wide index arena cap shared by every database; `0` disables |
+| `shared_buffers_bytes` | `0` (64 MiB) | Process-wide WAL page pool, split across databases |
+| `value_cache_bytes` | `0` (64 MiB) | Process-wide decoded-value cache, split across databases |
+| `mlock` | `false` | Pin page pool and index arenas in RAM (`mlock`). Requires a sufficient `ulimit -l`. |
 | `metrics_addr` | `:9090` | Prometheus scrape address |
 
 Every connection is **mTLS**. Role is the certificate **Organization** field:

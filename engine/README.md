@@ -113,12 +113,14 @@ Notable tunables in `types.go` `Options`:
 
 - `TruncateCorruptTail` — recovery behavior on partial last frame
 - `CommitDelay` / `CommitSiblings` — optional gather window (default 0) plus drain-after-fsync batching
-- `ValueCacheBytes` — decoded WAL-offset value cache (0 = 64 MiB, negative disables)
-- `SharedBuffersBytes` — 8 KiB WAL page pool (0 = 64 MiB, negative disables)
+- `ValueCacheBytes` — decoded WAL-offset value cache (0 = 64 MiB, negative disables). The server splits the process-wide default across databases.
+- `SharedBuffersBytes` — 8 KiB WAL page pool (0 = 64 MiB, negative disables). The server splits the process-wide default across databases.
 - `UnsafeDisableFsync` — tests only
 - `IndexCompactOnRetention`, `WalCopyForwardOnRetention` — maintenance toggles
 - `MaxDiskUsagePercent` — reject writes when disk full
-- `MaxIndexArenaBytes` — reject writes when total index shard buffers would exceed cap (0 disables)
+- `MaxIndexArenaBytes` — reject writes when this index's shard buffers exceed the cap (0 disables)
+- `IndexArenaBudget` — optional process-wide arena cap shared by every open database
+- `Mlock` — `mlock` the page pool and hash-index arenas (Unix). WAL `mmap` is not locked.
 
 ## Educational focus
 
@@ -150,7 +152,7 @@ Write transactions allocate an xid and pin `beginOffsets` at the current WAL hea
 
 On Unix each WAL segment is `mmap(MAP_SHARED)` after open. Point reads copy from the mapping (no `pread`). `madvise` hints: `MADV_RANDOM` after map, `MADV_SEQUENTIAL` during replay, `MADV_DONTNEED` before unmap, plus `MADV_DONTFORK`/`MADV_DONTDUMP` on Linux. The write path does not `MADV_WILLNEED` after each append — the pages are already in cache from `pwrite`.
 
-`shared_buffers` is an 8 KiB page pool (clock sweep, pin counts) keyed by `(segment id, page)`. A GET that misses the decoded value cache pins the pages covering the frame, CRC-checks, and decodes. Writes write-through into resident pages so a neighbor key on the same page stays valid. Copy-forward and segment delete drop the matching buffers.
+`shared_buffers` is an 8 KiB page pool (clock sweep, pin counts) keyed by `(segment id, page)`. A GET that misses the decoded value cache pins the pages covering the frame, CRC-checks, and decodes. Writes write-through into resident pages so a neighbor key on the same page stays valid. Copy-forward and segment delete drop the matching buffers. `Options.Mlock` / config `mlock` runs `mlock` on that pool and on hash-index arenas so those pages cannot be swapped; it does not lock WAL file mappings (those stay in the kernel page cache).
 
 The decoded value cache remains an L1 heap copy keyed by WAL offset. Copy-forward remaps clear both caches.
 

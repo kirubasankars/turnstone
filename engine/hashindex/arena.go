@@ -12,6 +12,7 @@ import "fmt"
 type shardBuffer struct {
 	data        []byte
 	mmapBacking []byte // non-nil on Unix: full mapping passed to Munmap on release
+	locked      bool
 }
 
 func (b *shardBuffer) bytes() []byte {
@@ -35,6 +36,7 @@ func (b *shardBuffer) close() {
 	releaseShardBuffer(b)
 	b.data = nil
 	b.mmapBacking = nil
+	b.locked = false
 }
 
 func (s *shard) shardData() []byte {

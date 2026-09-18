@@ -12,8 +12,11 @@ import (
 
 // Decoded-value L1 in front of shared_buffers / WAL mmap.
 const (
-	valueCacheShards       = 64
-	defaultValueCacheBytes = 64 << 20
+	valueCacheShards = 64
+	// DefaultValueCacheBytes is the process-wide decoded-value cache default
+	// (split across databases at server start).
+	DefaultValueCacheBytes = 64 << 20
+	defaultValueCacheBytes = DefaultValueCacheBytes
 	valueCacheMaxEntry     = 1 << 20
 )
 

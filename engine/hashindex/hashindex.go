@@ -38,16 +38,33 @@ type Index struct {
 	maxArenaBytes int64
 	usedBytes     int64
 	enforceLimit  int32
+	shared        *SharedBudget
+	mlock         bool
 }
 
 // New creates numShards mmap-backed index shards (heap fallback on non-Unix).
 func New() *Index {
-	idx := &Index{enforceLimit: 1}
+	idx, err := Open(false)
+	if err != nil {
+		panic("hashindex: " + err.Error())
+	}
+	return idx
+}
+
+// Open is New with optional mlock of shard arenas. A failed lock
+// (permission or RLIMIT_MEMLOCK) is returned instead of panicking.
+func Open(lock bool) (*Index, error) {
+	idx := &Index{enforceLimit: 1, mlock: lock}
 	for i := 0; i < numShards; i++ {
-		idx.shards[i] = idx.newShard()
+		s, err := idx.newShard()
+		if err != nil {
+			_ = idx.Close()
+			return nil, err
+		}
+		idx.shards[i] = s
 	}
 	idx.RecalcUsedBytes()
-	return idx
+	return idx, nil
 }
 
 func (idx *Index) Close() error {
@@ -100,16 +117,16 @@ type shard struct {
 	parent *Index
 }
 
-func (idx *Index) newShard() *shard {
+func (idx *Index) newShard() (*shard, error) {
 	tableBytes := int64(initialSlots * 8)
 	minSize := int64(headerSize) + tableBytes + headerSize
-	buf, err := newShardBuffer(minSize)
+	buf, err := newShardBufferLocked(minSize, idx.mlock)
 	if err != nil {
-		panic("hashindex: new shard buffer: " + err.Error())
+		return nil, err
 	}
 	s := &shard{buf: buf, parent: idx}
 	s.initNew(initialSlots)
-	return s
+	return s, nil
 }
 
 func (s *shard) close() {
