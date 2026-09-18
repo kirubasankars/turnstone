@@ -39,25 +39,30 @@ foreign keys. Use PostgreSQL there.
    `COMMIT`s that arrive during an in-flight `fdatasync` share the next
    flush. `CommitDelay` defaults to **0** (PostgreSQL's `commit_delay`
    default). Set a positive delay only for spinning disks.
-4. **`fdatasync` on Unix.** Same durable-write shortcut PostgreSQL uses:
+4. **WAL insert does not wait for `fdatasync`.** The write lock is dropped
+   after the COMMIT record (and TSF1 footer) hit the page cache. Concurrent
+   `SET`s keep appending so the next group already has frames ready. The
+   commit path also skips `stat` — preallocated segments remember they have
+   a footer slot.
+5. **`fdatasync` on Unix.** Same durable-write shortcut PostgreSQL uses:
    flush file data, skip inode metadata that `fsync` would write.
-5. **No `BEGIN` WAL record.** Recovery treats `SET`/`DEL` without `COMMIT`
+6. **No `BEGIN` WAL record.** Recovery treats `SET`/`DEL` without `COMMIT`
    as in-progress, unless that xid already committed. Copy-forward writes
    a `COMMIT` per copied xid. That cuts one log frame per write transaction.
-6. **Keep WAL files open and mmap them.** GET used to `open` + `close`
+7. **Keep WAL files open and mmap them.** GET used to `open` + `close`
    the segment on every read. Sealed segments keep a reader FD; the
    active segment reuses the writer. On Unix the file is also
    `mmap(MAP_SHARED)` with `madvise` (`RANDOM` for point GET, `SEQUENTIAL`
-   on replay, `WILLNEED` after append, `DONTNEED` on unmap).
-7. **Shared buffers + decoded value cache.** An 8 KiB page pool
+   on replay, `DONTNEED` on unmap).
+8. **Shared buffers + decoded value cache.** An 8 KiB page pool
    (`SharedBuffersBytes`, default 64 MiB) holds hot WAL pages so concurrent
    GETs share one copy instead of each `pread`'ing. A 64 MiB offset value
    cache sits in front for decoded payloads. Disable the page pool with
    `SharedBuffersBytes < 0`, the decoded cache with `ValueCacheBytes < 0`.
-8. **Batch writes in one transaction.** `--batch N` on `turnstone bench`
+9. **Batch writes in one transaction.** `--batch N` on `turnstone bench`
    amortizes one group fsync across N keys — the same advice as
    multi-row `INSERT` in PostgreSQL.
-9. **Fully allocated, recycled WAL segments.** New segments are
+10. **Fully allocated, recycled WAL segments.** New segments are
    `fallocate`d to the configured size (default 64 MiB). Retention
    **renames** retired files into `wal/recycle/` and the next rotation
    reuses them — PostgreSQL's `wal_recycle` pattern, so commit does not

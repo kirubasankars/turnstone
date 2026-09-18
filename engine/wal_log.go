@@ -20,32 +20,38 @@ import (
 )
 
 type walSegment struct {
-	id      uint32
-	file    string
-	path    string
-	baseLSN int64
-	endLSN  int64 // exclusive global end; 0 means active/growing
-	writer  *os.File
-	reader  *os.File // sealed segments keep an FD so GET does not open/close per read
-	mapping []byte   // MAP_SHARED mmap of the preallocated file; nil if unavailable
+	id        uint32
+	file      string
+	path      string
+	baseLSN   int64
+	endLSN    int64 // exclusive global end; 0 means active/growing
+	writer    *os.File
+	reader    *os.File // sealed segments keep an FD so GET does not open/close per read
+	mapping   []byte   // MAP_SHARED mmap of the preallocated file; nil if unavailable
+	allocated bool     // file is segment-sized and has a TSF1 footer slot
 }
 
 // DataLog is a segmented append-only WAL addressed by a global byte LSN.
 // Segment rotation does not remap existing index or replication offsets.
 type DataLog struct {
-	dir          string
-	walDir       string
-	manifestPath string
-	mu           sync.RWMutex
-	logger       *slog.Logger
-	segmentSize  int64
-	segments     []walSegment
-	activeIndex  int
-	writeOffset  int64
-	recycle      []string
-	recycleSeq   uint32
-	buffers      *sharedBuffers
+	dir           string
+	walDir        string
+	manifestPath  string
+	mu            sync.RWMutex
+	inflightSyncs sync.WaitGroup
+	logger        *slog.Logger
+	segmentSize   int64
+	segments      []walSegment
+	activeIndex   int
+	writeOffset   int64
+	recycle       []string
+	recycleSeq    uint32
+	buffers       *sharedBuffers
 }
+
+// testingBeforeSync, when set, runs after the WAL insert lock is released and
+// before fdatasync. Tests use it to prove SET can append during COMMIT's flush.
+var testingBeforeSync func()
 
 // OpenDataLog opens or creates wal/manifest.json and segment files under dir/wal/.
 func OpenDataLog(dir string, logger *slog.Logger, segmentSize int64) (*DataLog, error) {
@@ -109,11 +115,12 @@ func (l *DataLog) loadSegments(m *walManifest) error {
 			endLSN = seg.BaseLSN + l.logicalSizeFromFile(path, info.Size())
 		}
 		l.segments[i] = walSegment{
-			id:      seg.ID,
-			file:    seg.File,
-			path:    path,
-			baseLSN: seg.BaseLSN,
-			endLSN:  endLSN,
+			id:        seg.ID,
+			file:      seg.File,
+			path:      path,
+			baseLSN:   seg.BaseLSN,
+			endLSN:    endLSN,
+			allocated: info.Size() >= l.segmentSize,
 		}
 		if seg.ID != m.ActiveID {
 			if rf, openErr := os.Open(path); openErr == nil {
@@ -139,10 +146,19 @@ func (l *DataLog) loadSegments(m *walManifest) error {
 	}
 	l.segments[activeIdx].writer = f
 	l.segments[activeIdx].endLSN = 0
+	l.segments[activeIdx].allocated = l.fileAllocated(f)
 	l.mapSegment(&l.segments[activeIdx])
 	l.activeIndex = activeIdx
 	l.writeOffset = l.segments[activeIdx].baseLSN + used
 	return nil
+}
+
+func (l *DataLog) fileAllocated(f *os.File) bool {
+	if f == nil {
+		return false
+	}
+	info, err := f.Stat()
+	return err == nil && info.Size() >= l.segmentSize
 }
 
 func (l *DataLog) mapSegment(seg *walSegment) {
@@ -288,16 +304,45 @@ func (l *DataLog) WriteOffset() int64 {
 	return l.writeOffset
 }
 
-func (l *DataLog) strictSyncLocked() {
+func (l *DataLog) persistHeadLocked() {
 	seg := &l.segments[l.activeIndex]
-	if seg.writer == nil {
+	if seg.writer == nil || !seg.allocated {
 		return
 	}
-	_ = writeSegmentFooterIfAllocated(seg.writer, l.segmentSize, l.writeOffset-seg.baseLSN)
-	err := syncFile(seg.writer)
+	_ = writeSegmentFooter(seg.writer, l.segmentSize, l.writeOffset-seg.baseLSN)
+}
+
+// beginSyncLocked records the write head and returns the active writer for
+// fdatasync outside l.mu. The caller must invoke completeSync.
+func (l *DataLog) beginSyncLocked() *os.File {
+	l.persistHeadLocked()
+	f := l.segments[l.activeIndex].writer
+	if f == nil {
+		return nil
+	}
+	l.inflightSyncs.Add(1)
+	return f
+}
+
+func (l *DataLog) completeSync(f *os.File) {
+	if f == nil {
+		return
+	}
+	defer l.inflightSyncs.Done()
+	if hook := testingBeforeSync; hook != nil {
+		hook()
+	}
+	l.syncWriter(f)
+}
+
+func (l *DataLog) syncWriter(f *os.File) {
+	if f == nil {
+		return
+	}
+	err := syncFile(f)
 	if err != nil {
 		if errors.Is(err, syscall.EINTR) {
-			l.strictSyncLocked()
+			l.syncWriter(f)
 			return
 		}
 		l.logger.Error("CRITICAL: fsync failed", "err", err)
@@ -321,10 +366,12 @@ func (l *DataLog) AppendRecords(builders []func() []byte, sync bool) ([]int64, e
 		}
 		offsets[i] = off
 	}
+	var syncF *os.File
 	if sync {
-		l.strictSyncLocked()
+		syncF = l.beginSyncLocked()
 	}
 	l.mu.Unlock()
+	l.completeSync(syncF)
 	return offsets, nil
 }
 
@@ -335,10 +382,12 @@ func (l *DataLog) AppendEncoded(payload []byte, sync bool) (int64, error) {
 		l.mu.Unlock()
 		return 0, err
 	}
+	var syncF *os.File
 	if sync {
-		l.strictSyncLocked()
+		syncF = l.beginSyncLocked()
 	}
 	l.mu.Unlock()
+	l.completeSync(syncF)
 	return off, nil
 }
 
@@ -374,7 +423,6 @@ func (l *DataLog) writeFrameLocked(payload []byte) error {
 	n, err := seg.writer.WriteAt(buf, localOff)
 	if err == nil {
 		l.buffers.applyWrite(seg.id, localOff, buf[:n])
-		adviseWALRange(seg.mapping, localOff, int64(n), walAdviseWillneed())
 	}
 	if cap(buf) <= maxPooledFrameCap {
 		frameBufPool.Put(buf[:0])
@@ -391,9 +439,14 @@ func (l *DataLog) writeFrameLocked(payload []byte) error {
 }
 
 func (l *DataLog) rotateSegmentLocked() error {
+	// Close of the active FD must wait for any fdatasync that already
+	// released l.mu; otherwise that flush would operate on a closed file.
+	l.inflightSyncs.Wait()
 	active := &l.segments[l.activeIndex]
-	if err := writeSegmentFooterIfAllocated(active.writer, l.segmentSize, l.writeOffset-active.baseLSN); err != nil {
-		return err
+	if active.allocated {
+		if err := writeSegmentFooter(active.writer, l.segmentSize, l.writeOffset-active.baseLSN); err != nil {
+			return err
+		}
 	}
 	if err := syncFile(active.writer); err != nil {
 		return err
@@ -422,11 +475,12 @@ func (l *DataLog) rotateSegmentLocked() error {
 	}
 
 	l.segments = append(l.segments, walSegment{
-		id:      nextID,
-		file:    nextName,
-		path:    nextPath,
-		baseLSN: l.writeOffset,
-		writer:  f,
+		id:        nextID,
+		file:      nextName,
+		path:      nextPath,
+		baseLSN:   l.writeOffset,
+		writer:    f,
+		allocated: l.fileAllocated(f),
 	})
 	l.activeIndex = len(l.segments) - 1
 	l.mapSegment(&l.segments[l.activeIndex])
@@ -951,6 +1005,7 @@ func (l *DataLog) deleteSegmentsThrough(maxEndLSN int64) (int, int64, error) {
 func (l *DataLog) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.inflightSyncs.Wait()
 	var firstErr error
 	for i := range l.segments {
 		if len(l.segments[i].mapping) > 0 {
