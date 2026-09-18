@@ -85,6 +85,9 @@ func (tx *Transaction) write(key, value []byte, isDelete bool) error {
 		return ErrWriteConflict
 	}
 	db := tx.db
+	if atomic.LoadInt32(&db.closed) == 1 {
+		return ErrDatabaseClosed
+	}
 	if atomic.LoadInt32(&db.isDiskFull) == 1 {
 		return ErrDiskFull
 	}

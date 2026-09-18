@@ -296,6 +296,16 @@ func (db *DB) LastLogOffset() int64 {
 	return db.log.WriteOffset()
 }
 
+// DurableOffset is the exclusive end of fdatasync'd WAL. Replication and
+// sync-quorum waits must use this, not LastLogOffset, which can include
+// frames still in an in-flight flush.
+func (db *DB) DurableOffset() int64 {
+	if db.log == nil {
+		return 0
+	}
+	return db.log.DurableOffset()
+}
+
 // OldestLogOffset is the base LSN of the earliest retained WAL segment.
 // Hello cursor 0 is remapped to this value; it is not ScanFloor.
 func (db *DB) OldestLogOffset() int64 {
@@ -518,6 +528,9 @@ func (db *DB) VerifyChecksums() error {
 }
 
 func (db *DB) NewTransaction(update bool) *Transaction {
+	if atomic.LoadInt32(&db.closed) == 1 {
+		return &Transaction{db: db, update: update, beginErr: ErrDatabaseClosed, finished: true}
+	}
 	if !update {
 		db.activeTxnsMu.Lock()
 		db.txMu.Lock()
