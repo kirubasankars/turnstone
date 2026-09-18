@@ -102,6 +102,9 @@ func (idx *Index) HasNewerCommitted(key []byte, excludeXid uint64, snap Snapshot
 }
 
 func (idx *Index) ForEachKey(fn func(key []byte, chain []indexVersion)) {
+	if idx.hash == nil {
+		return
+	}
 	idx.hash.ForEachKey(func(key []byte, chain []hashindex.Version) {
 		out := make([]indexVersion, len(chain))
 		for i, v := range chain {
@@ -125,6 +128,9 @@ func (idx *Index) LiveKeyCount(clog func(uint64) TxStatus) int64 {
 }
 
 func (idx *Index) walkKeyVersions(key []byte, fn func(indexVersion) bool) {
+	if idx.hash == nil {
+		return
+	}
 	idx.hash.WalkVersions(key, func(v hashindex.Version) bool {
 		return fn(fromHashVersion(v))
 	})

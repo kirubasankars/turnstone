@@ -528,6 +528,9 @@ func (db *DB) VerifyChecksums() error {
 }
 
 func (db *DB) NewTransaction(update bool) *Transaction {
+	if atomic.LoadInt32(&db.closed) == 1 {
+		return &Transaction{db: db, update: update, beginErr: ErrDatabaseClosed, finished: true}
+	}
 	if !update {
 		db.activeTxnsMu.Lock()
 		db.txMu.Lock()
