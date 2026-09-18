@@ -24,9 +24,9 @@ test.describe('Turnstone Console', function () {
     await expect(page.getByTestId('db-stats')).not.toContainText('Loading');
     await expect(page.getByTestId('panel-gc')).toBeVisible();
     await expect(page.getByTestId('panel-gc')).toContainText('GC');
-    await expect(page.getByTestId('gc-stats')).toContainText('Index live');
-    await expect(page.getByTestId('gc-stats')).toContainText('WAL segments');
-    await expect(page.getByTestId('gc-stats')).toContainText('Hash segments');
+    await expect(page.getByTestId('gc-stats')).toContainText('Index Live');
+    await expect(page.getByTestId('gc-stats')).toContainText('WAL Segments');
+    await expect(page.getByTestId('gc-stats')).toContainText('Hash Segments');
   });
 
   test('formats key count as a number not a byte size', async function ({ page }) {
@@ -72,13 +72,13 @@ test.describe('Turnstone Console', function () {
     await showMonitorTab(page);
     await page.getByTestId('btn-refresh').click();
     await expect(page.getByTestId('gc-stats')).toContainText('4 KB');
-    await expect(page.getByTestId('gc-stats')).toContainText('WAL live');
-    await expect(page.getByTestId('gc-stats')).toContainText('WAL segments');
+    await expect(page.getByTestId('gc-stats')).toContainText('WAL Live');
+    await expect(page.getByTestId('gc-stats')).toContainText('WAL Segments');
     await expect(page.getByTestId('gc-stats')).toContainText('12');
-    await expect(page.getByTestId('gc-stats')).toContainText('Hash segments');
-    await expect(page.getByTestId('gc-stats')).toContainText('Hash compacted');
+    await expect(page.getByTestId('gc-stats')).toContainText('Hash Segments');
+    await expect(page.getByTestId('gc-stats')).toContainText('Hash Compacted');
     await expect(page.getByTestId('gc-stats')).toContainText('3');
-    await expect(page.getByTestId('gc-stats')).toContainText('Last compact');
+    await expect(page.getByTestId('gc-stats')).toContainText('Last Compact');
     await expect(page.getByTestId('gc-stats')).toContainText('ago');
   });
 
@@ -109,10 +109,10 @@ test.describe('Turnstone Console', function () {
     await expect(page.getByTestId('metrics-group-overview')).toBeVisible();
     await expect(page.getByTestId('metrics-group-wal')).toBeVisible();
     await expect(page.getByTestId('metrics-group-hash-index')).toBeVisible();
-    await expect(page.getByTestId('metrics-group-overview')).toContainText('key count');
-    await expect(page.getByTestId('metrics-group-overview')).toContainText('replicas');
-    await expect(page.getByTestId('metrics-group-wal')).toContainText('wal segments');
-    await expect(page.getByTestId('metrics-group-hash-index')).toContainText('hash shards');
-    await expect(page.getByTestId('metrics-group-hash-index')).toContainText('index allocated');
+    await expect(page.getByTestId('metrics-group-overview')).toContainText('Key Count');
+    await expect(page.getByTestId('metrics-group-overview')).toContainText('Replicas');
+    await expect(page.getByTestId('metrics-group-wal')).toContainText('Wal Segments');
+    await expect(page.getByTestId('metrics-group-hash-index')).toContainText('Hash Shards');
+    await expect(page.getByTestId('metrics-group-hash-index')).toContainText('Index Allocated');
   });
 });

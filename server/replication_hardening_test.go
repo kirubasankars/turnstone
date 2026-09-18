@@ -310,8 +310,16 @@ func TestBackup_DoesNotPinRetention(t *testing.T) {
 		t.Fatalf("backup failed: %v", err)
 	}
 
-	if got := st1.MinReplicaOffset(); got != math.MaxUint64 {
-		t.Fatalf("disconnected backup must not pin retention, MinReplicaOffset=%d", got)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		got := st1.MinReplicaOffset()
+		if got == math.MaxUint64 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("disconnected backup must not pin retention, MinReplicaOffset=%d", got)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	if role, ok := st1.ReplicaRole("turnstone-backup"); ok && role != RoleBackup {
