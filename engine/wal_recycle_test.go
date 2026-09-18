@@ -167,6 +167,9 @@ func TestWal_GrowsWhenPreallocHasNoSpace(t *testing.T) {
 	if len(log.segments[log.activeIndex].mapping) != 0 {
 		t.Fatal("grow-mode segment must not be mmap'd")
 	}
+	if log.segments[log.activeIndex].allocated {
+		t.Fatal("grow-mode segment must not be marked allocated")
+	}
 
 	payload := encodeRecord(Record{Type: RecordSet, XID: 1, Key: []byte("k"), Value: []byte("v")})
 	off, err := log.AppendEncoded(payload, true)

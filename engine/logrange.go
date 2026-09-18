@@ -163,9 +163,11 @@ func (l *DataLog) AppendRawFrames(data []byte, fsync bool) (int64, error) {
 			}
 		}
 	}
+	var syncF *os.File
 	if fsync {
-		l.strictSyncLocked()
+		syncF = l.beginSyncLocked()
 	}
 	l.mu.Unlock()
+	l.completeSync(syncF)
 	return startOff, nil
 }

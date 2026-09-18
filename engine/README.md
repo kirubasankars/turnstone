@@ -138,13 +138,15 @@ Mixing these when reading code is a common source of confusion.
 
 `committer.go` batches concurrent `COMMIT` requests to amortize `fdatasync` cost — study `committer_test.go` for latency/throughput tradeoffs. Default `CommitDelay` is 0 (PostgreSQL-style: do not sleep; batch what queued during the previous flush).
 
+WAL insert (`log.mu`) is released before `fdatasync`. Concurrent `SET`s append while a group flush is in flight so the next batch already has its frames written. Rotation and `Close` wait for in-flight syncs so they never `close` a file that is still flushing. The TSF1 footer is written from the in-memory `allocated` flag (no `stat` on the commit path).
+
 ### Why no BEGIN record
 
 Write transactions allocate an xid and pin `beginOffsets` at the current WAL head. Recovery treats `SET`/`DEL` without `COMMIT` as in-progress and drops those versions, unless a later `COMMIT` for that xid was already seen (copy-forwarded SET frames). Copy-forward appends a `COMMIT` record per copied xid so reopen does not treat compacted live data as a crash.
 
 ### WAL mmap, madvise, and shared buffers
 
-On Unix each WAL segment is `mmap(MAP_SHARED)` after open. Point reads copy from the mapping (no `pread`). `madvise` hints: `MADV_RANDOM` after map, `MADV_SEQUENTIAL` during replay, `MADV_WILLNEED` on the just-written range, `MADV_DONTNEED` before unmap, plus `MADV_DONTFORK`/`MADV_DONTDUMP` on Linux.
+On Unix each WAL segment is `mmap(MAP_SHARED)` after open. Point reads copy from the mapping (no `pread`). `madvise` hints: `MADV_RANDOM` after map, `MADV_SEQUENTIAL` during replay, `MADV_DONTNEED` before unmap, plus `MADV_DONTFORK`/`MADV_DONTDUMP` on Linux. The write path does not `MADV_WILLNEED` after each append — the pages are already in cache from `pwrite`.
 
 `shared_buffers` is an 8 KiB page pool (clock sweep, pin counts) keyed by `(segment id, page)`. A GET that misses the decoded value cache pins the pages covering the frame, CRC-checks, and decodes. Writes write-through into resident pages so a neighbor key on the same page stays valid. Copy-forward and segment delete drop the matching buffers.
 

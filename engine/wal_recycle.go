@@ -52,11 +52,11 @@ func writeSegmentFooter(f *os.File, segmentSize, used int64) error {
 	if f == nil || segmentSize < walSegFooterSize {
 		return nil
 	}
-	buf := make([]byte, walSegFooterSize)
+	var buf [walSegFooterSize]byte
 	binary.BigEndian.PutUint32(buf[0:], walSegFooterMagic)
 	binary.BigEndian.PutUint64(buf[4:], uint64(used))
 	binary.BigEndian.PutUint32(buf[12:], crc32.Checksum(buf[:12], Crc32Table))
-	_, err := f.WriteAt(buf, segmentSize-walSegFooterSize)
+	_, err := f.WriteAt(buf[:], segmentSize-walSegFooterSize)
 	return err
 }
 
