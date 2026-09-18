@@ -66,5 +66,3 @@ func adviseWALRange(mapping []byte, off, n int64, advice int) {
 
 func walAdviseSequential() int { return unix.MADV_SEQUENTIAL }
 func walAdviseRandom() int     { return unix.MADV_RANDOM }
-func walAdviseWillneed() int   { return unix.MADV_WILLNEED }
-func walAdviseDontneed() int   { return unix.MADV_DONTNEED }

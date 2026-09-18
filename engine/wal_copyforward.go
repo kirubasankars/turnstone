@@ -93,7 +93,6 @@ func (l *DataLog) appendCopyForwardFrames(oldOffsets []int64, frames [][]byte) (
 			return walCopyForwardOutcome{}, fmt.Errorf("wal copy-forward: short write")
 		}
 		l.buffers.applyWrite(seg.id, localOff, frame[:n])
-		adviseWALRange(seg.mapping, localOff, int64(n), walAdviseWillneed())
 		l.writeOffset += int64(n)
 		out.remap[oldOffsets[i]] = off
 
