@@ -94,7 +94,7 @@ func TestHashTableGrowSameShard(t *testing.T) {
 
 	seg := idx.shards[0]
 	seg.mu.RLock()
-	tableBytes := seg.arenaOff() - seg.tableOff()
+	tableBytes := uint64(len(seg.buf.data)) - uint64(headerSize)
 	slots := seg.slotCount()
 	seg.mu.RUnlock()
 	if slots <= initialSlots {
@@ -163,13 +163,13 @@ func TestSlotTableUsesU32Entries(t *testing.T) {
 	seg := idx.shards[0]
 	seg.mu.RLock()
 	table := seg.tableOff()
-	arena := seg.arenaOff()
 	slots := seg.slotCount()
 	ver := readU32(seg.shardData(), hdrVersionOff)
+	tableBytes := uint64(len(seg.buf.data)) - table
 	seg.mu.RUnlock()
 
-	if arena-table != uint64(slots)*slotWidth {
-		t.Fatalf("slot table width: arena-table=%d want %d (slots=%d)", arena-table, uint64(slots)*slotWidth, slots)
+	if tableBytes != uint64(slots)*slotWidth {
+		t.Fatalf("slot table width: table bytes=%d want %d (slots=%d)", tableBytes, uint64(slots)*slotWidth, slots)
 	}
 	if slotWidth != 4 {
 		t.Fatalf("slotWidth=%d want 4", slotWidth)
@@ -188,6 +188,46 @@ func TestSlotTableUsesU32Entries(t *testing.T) {
 	})
 	if n != 1 {
 		t.Fatalf("walk after u32 slot put: %d", n)
+	}
+}
+
+func TestArenaUsesLinkedPages(t *testing.T) {
+	idx := New()
+	defer idx.Close()
+
+	a := make([]byte, 40<<10)
+	copy(a, "page-a")
+	b := make([]byte, 40<<10)
+	for i := 0; i < 256; i++ {
+		b[0] = byte(i)
+		if hashKey(a)&255 == hashKey(b)&255 && a[0] != b[0] {
+			break
+		}
+	}
+	if hashKey(a)&255 != hashKey(b)&255 {
+		t.Fatal("could not place two large keys on one shard")
+	}
+	if err := idx.Put(a, Version{Offset: 1, Xmin: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.Put(b, Version{Offset: 2, Xmin: 2}); err != nil {
+		t.Fatal(err)
+	}
+
+	seg := idx.shardFor(a)
+	seg.mu.RLock()
+	head := seg.arenaHead()
+	next := readU32(seg.arenaBytes(), int(head)+pageNextOff)
+	seg.mu.RUnlock()
+	if next == 0 {
+		t.Fatal("expected a second arena page after spilling the first")
+	}
+
+	var nA, nB int
+	idx.WalkVersions(a, func(Version) bool { nA++; return true })
+	idx.WalkVersions(b, func(Version) bool { nB++; return true })
+	if nA != 1 || nB != 1 {
+		t.Fatalf("after page spill: A=%d B=%d", nA, nB)
 	}
 }
 

@@ -39,15 +39,42 @@ func (b *shardBuffer) close() {
 	b.locked = false
 }
 
-func (s *shard) shardData() []byte {
+func (s *shard) metaData() []byte {
 	if s == nil || s.buf == nil {
 		return nil
 	}
 	return s.buf.data
 }
 
+// shardData is the address-table mapping (header + slots). Arena bytes are
+// in the separate paged mmap (arenaBytes).
+func (s *shard) shardData() []byte {
+	return s.metaData()
+}
+
 func (s *shard) isClosed() bool {
-	return s.buf == nil || s.buf.data == nil
+	return s.buf == nil || s.buf.data == nil || s.arena == nil || s.arena.data == nil
+}
+
+func growBufferExact(b *shardBuffer, minSize int64) error {
+	if b == nil || b.data == nil {
+		return fmt.Errorf("hashindex: buffer is closed")
+	}
+	if minSize <= int64(len(b.data)) {
+		return nil
+	}
+	next, err := shardBufferNew(minSize, b.locked)
+	if err != nil {
+		return err
+	}
+	copy(next.data, b.data)
+	releaseShardBuffer(b)
+	b.data = next.data
+	b.mmapBacking = next.mmapBacking
+	b.locked = next.locked
+	next.data = nil
+	next.mmapBacking = nil
+	return nil
 }
 
 func (s *shard) grow(minSize int64) error {
@@ -87,22 +114,25 @@ func (s *shard) grow(minSize int64) error {
 	return nil
 }
 
-func (s *shard) replaceBuffer(next *shardBuffer) error {
-	if next == nil {
+func (s *shard) replaceBuffers(meta, arena *shardBuffer) error {
+	if meta == nil || arena == nil {
 		panic("hashindex: nil replacement buffer")
 	}
-	oldLen := int64(0)
-	if s.buf != nil {
-		oldLen = int64(len(s.buf.data))
+	oldLen := s.allocatedBytes()
+	newLen := int64(len(meta.data) + len(arena.data))
+	if s.parent != nil {
+		if err := s.parent.accountDelta(newLen - oldLen); err != nil {
+			return err
+		}
 	}
-	newLen := int64(len(next.data))
-	if err := s.parent.accountDelta(newLen - oldLen); err != nil {
-		return err
+	oldMeta, oldArena := s.buf, s.arena
+	s.buf = meta
+	s.arena = arena
+	if oldMeta != nil {
+		oldMeta.close()
 	}
-	old := s.buf
-	s.buf = next
-	if old != nil {
-		old.close()
+	if oldArena != nil {
+		oldArena.close()
 	}
 	return nil
 }

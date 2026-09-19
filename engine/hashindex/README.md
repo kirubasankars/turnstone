@@ -28,7 +28,8 @@ type Index struct {
 
 Each `shard` owns:
 
-- Slot table of u32 arena offsets (open addressing, load-factor growth; 0 = empty)
+- Address table of u32 **arena** offsets (open addressing, load-factor growth; 0 = empty)
+- Arena: one mmap per shard, linked 64 KiB pages (grow appends a page; slot-table grow does not move records)
 - Arena backing version nodes and key bytes
 - `RWMutex` for readers / writers
 
@@ -57,7 +58,7 @@ Regression tests: `compact_regression_test.go`, `compact_test.go`.
 
 ## On-disk format note
 
-The arena header includes magic `TGHSH` and `formatVersion` for debugging — this is **not** a durable database file, only an in-memory layout marker. Slots are u32 (4 bytes) so a 1024-slot table is 4 KiB instead of 8 KiB; a shard mapping is capped at 4 GiB because that is the largest offset a slot can name. Version `head`/`next` links stay u64.
+The meta header includes magic `TGHSH` and `formatVersion` for debugging — this is **not** a durable database file, only an in-memory layout marker. The address table lives in one mapping; the arena is a **separate** mmap of linked pages (`next` + `used` in each page header). Slots are u32 offsets into that arena mmap (4 GiB cap). Version `head`/`next` stay u64. Rehash only rewrites the address table.
 
 ## Educational focus
 
