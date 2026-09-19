@@ -39,7 +39,7 @@ Each `shard` owns:
 | --- | --- |
 | `Put(key, ver)` | Prepend new version to key's chain |
 | `WalkVersions(key, fn)` | Traverse chain newest-first |
-| `DropXid(xid)` | Remove in-progress/aborted versions for xid |
+| `DropXid(xid)` | Remove in-progress/aborted versions for xid; empty keys keep their slot so linear-probe chains stay intact |
 | `ForEachKey(fn)` | Full scan — used by compaction / GC |
 | `Compact(ctx)` | MVCC-aware prune + arena reclaim (`compact.go`) |
 
@@ -83,7 +83,7 @@ When debugging index bugs, determine whether the fault is in **chain structure**
 ## Review checklist
 
 - [ ] `Put` / `WalkVersions` agree on chain order (newest at head).
-- [ ] `DropXid` safe during concurrent reads (shard lock held).
+- [ ] `DropXid` safe during concurrent reads (shard lock held); empty keys keep their slot.
 - [ ] Compaction does not drop offsets still referenced by MVCC or replication.
 - [ ] Load factor growth copies slots correctly (no lost keys).
 - [ ] `Close` releases arena memory (tests for leak detection).
