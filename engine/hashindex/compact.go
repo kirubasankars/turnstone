@@ -13,7 +13,7 @@ type ShardStats struct {
 	SlotCount      uint32
 	KeyCount       uint32
 	ArenaUsed      uint64 // bump-allocated key/version bytes
-	AllocatedBytes uint64 // shard buffer length, including header and slot table
+	AllocatedBytes uint64 // address-table mapping + paged arena mapping
 	LiveBytes      uint64
 }
 
@@ -46,7 +46,7 @@ func (s *shard) stats(shardIndex uint32) ShardStats {
 		SlotCount:      s.slotCount(),
 		KeyCount:       s.keyCount(),
 		ArenaUsed:      s.arenaUsed(),
-		AllocatedBytes: uint64(len(s.shardData())),
+		AllocatedBytes: uint64(s.allocatedBytes()),
 	}
 	if st.KeyCount > 0 {
 		st.LiveBytes = s.liveBytesLocked(nil)
@@ -87,15 +87,15 @@ func (idx *Index) FilteredLiveBytes(shardIndex int, filter VersionFilter) (arena
 type VersionFilter func(key []byte, chain []Version) []Version
 
 func (s *shard) liveBytesLocked(filter VersionFilter) uint64 {
-	data := s.shardData()
-	if data == nil {
+	data := s.metaData()
+	if data == nil || s.arenaBytes() == nil {
 		return 0
 	}
 	table := int(s.tableOff())
 	slots := s.slotCount()
 	var live uint64
 	for slot := uint32(0); slot < slots; slot++ {
-		recOff := readU64(data, table+int(slot)*8)
+		recOff := readSlot(data, table, slot)
 		if recOff == 0 {
 			continue
 		}
@@ -115,8 +115,11 @@ func (s *shard) liveBytesLocked(filter VersionFilter) uint64 {
 }
 
 func (s *shard) readChainLocked(recOff uint64) []Version {
-	data := s.shardData()
+	data := s.arenaBytes()
 	var chain []Version
+	if data == nil {
+		return nil
+	}
 	for node := s.versionHead(recOff); node != 0; node = readU64(data, int(node)+versionSize) {
 		if int(node)+versionNodeSz > len(data) {
 			break
@@ -151,7 +154,7 @@ func (idx *Index) CompactShard(shardIndex int, filter VersionFilter) (ShardStats
 		SlotCount:      seg.slotCount(),
 		KeyCount:       seg.keyCount(),
 		ArenaUsed:      res.ArenaAfter,
-		AllocatedBytes: uint64(len(seg.shardData())),
+		AllocatedBytes: uint64(seg.allocatedBytes()),
 		LiveBytes:      res.ArenaAfter,
 	}, nil
 }
@@ -199,7 +202,7 @@ func (s *shard) compact(filter VersionFilter) (compactResult, error) {
 	var entries []keyEntry
 
 	for slot := uint32(0); slot < slots; slot++ {
-		recOff := readU64(data, table+int(slot)*8)
+		recOff := readSlot(data, table, slot)
 		if recOff == 0 {
 			continue
 		}
@@ -219,43 +222,24 @@ func (s *shard) compact(filter VersionFilter) (compactResult, error) {
 	if slotCount == 0 {
 		slotCount = initialSlots
 	}
-	tableBytes := uint64(slotCount) * 8
-	var liveBytes uint64
-	for _, e := range entries {
-		liveBytes += uint64(12+len(e.key)) + uint64(len(e.versions))*versionNodeSz
-	}
-	newSize := int64(headerSize) + int64(tableBytes) + int64(liveBytes) + headerSize
-	if newSize < int64(headerSize)+int64(tableBytes)+headerSize {
-		newSize = int64(headerSize) + int64(tableBytes) + headerSize
-	}
 
-	lock := s.parent != nil && s.parent.mlock
-	newBuf, err := newShardBufferLocked(newSize, lock)
-	if err != nil {
+	work := &shard{mlock: s.mlock}
+	if err := work.initMeta(slotCount); err != nil {
 		return res, err
 	}
-	newData := newBuf.data
-	writeU64(newData, hdrMagicOff, magic)
-	writeU32(newData, hdrVersionOff, formatVersion)
-	writeU32(newData, hdrSlotCountOff, slotCount)
-	writeU32(newData, hdrKeyCountOff, 0)
-	tableOff := uint64(headerSize)
-	arenaOff := tableOff + tableBytes
-	writeU64(newData, hdrTableOffOff, tableOff)
-	writeU64(newData, hdrArenaOffOff, arenaOff)
-	writeU64(newData, hdrArenaUsedOff, 0)
-
-	work := &shard{buf: newBuf, parent: s.parent}
-	work.setArenaUsed(0)
+	if err := work.initArena(); err != nil {
+		work.close()
+		return res, err
+	}
 
 	for _, e := range entries {
 		recSize := 12 + len(e.key)
 		recOff, err := work.alloc(recSize)
 		if err != nil {
-			newBuf.close()
+			work.close()
 			return res, err
 		}
-		workData := work.shardData()
+		workData := work.arenaBytes()
 		writeU32(workData, int(recOff), uint32(len(e.key)))
 		writeU64(workData, int(recOff)+4, 0)
 		copy(workData[int(recOff)+12:], e.key)
@@ -264,9 +248,10 @@ func (s *shard) compact(filter VersionFilter) (compactResult, error) {
 		for i := len(e.versions) - 1; i >= 0; i-- {
 			nodeOff, err := work.alloc(versionNodeSz)
 			if err != nil {
-				newBuf.close()
+				work.close()
 				return res, err
 			}
+			workData = work.arenaBytes()
 			writeVersion(workData, int(nodeOff), e.versions[i])
 			writeU64(workData, int(nodeOff)+versionSize, head)
 			head = nodeOff
@@ -274,15 +259,17 @@ func (s *shard) compact(filter VersionFilter) (compactResult, error) {
 		work.setVersionHead(recOff, head)
 
 		if err := work.insertKeySlot(e.key, recOff); err != nil {
-			newBuf.close()
+			work.close()
 			return res, err
 		}
 	}
 
-	if err := s.replaceBuffer(newBuf); err != nil {
-		newBuf.close()
+	if err := s.replaceBuffers(work.buf, work.arena); err != nil {
+		work.close()
 		return res, err
 	}
+	work.buf = nil
+	work.arena = nil
 	res.ArenaAfter = s.arenaUsed()
 	res.KeysAfter = s.keyCount()
 	return res, nil

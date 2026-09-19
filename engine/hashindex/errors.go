@@ -9,3 +9,6 @@ import "errors"
 
 // ErrArenaLimit is returned when a shard buffer grow would exceed MaxArenaBytes.
 var ErrArenaLimit = errors.New("index arena size exceeds limit")
+
+// ErrSlotOffset is returned when an arena offset does not fit in a u32 slot.
+var ErrSlotOffset = errors.New("index arena offset exceeds u32 slot")
