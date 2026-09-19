@@ -95,7 +95,7 @@ func (s *shard) liveBytesLocked(filter VersionFilter) uint64 {
 	slots := s.slotCount()
 	var live uint64
 	for slot := uint32(0); slot < slots; slot++ {
-		recOff := readU64(data, table+int(slot)*8)
+		recOff := readSlot(data, table, slot)
 		if recOff == 0 {
 			continue
 		}
@@ -199,7 +199,7 @@ func (s *shard) compact(filter VersionFilter) (compactResult, error) {
 	var entries []keyEntry
 
 	for slot := uint32(0); slot < slots; slot++ {
-		recOff := readU64(data, table+int(slot)*8)
+		recOff := readSlot(data, table, slot)
 		if recOff == 0 {
 			continue
 		}
@@ -219,7 +219,7 @@ func (s *shard) compact(filter VersionFilter) (compactResult, error) {
 	if slotCount == 0 {
 		slotCount = initialSlots
 	}
-	tableBytes := uint64(slotCount) * 8
+	tableBytes := slotTableBytes(slotCount)
 	var liveBytes uint64
 	for _, e := range entries {
 		liveBytes += uint64(12+len(e.key)) + uint64(len(e.versions))*versionNodeSz

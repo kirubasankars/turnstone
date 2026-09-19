@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 )
 
@@ -18,10 +19,14 @@ const (
 	maxLoadFactorNum = 3 // grow when keyCount*4 > slotCount*3
 	maxLoadFactorDen = 4
 	headerSize       = 4096
+	slotWidth        = 4 // u32 arena offset; 0 = empty
+	maxSlotOffset    = math.MaxUint32
+	// maxShardBytes is the largest mapping a u32 slot can address.
+	maxShardBytes    = int64(maxSlotOffset) + 1
 	versionSize      = 21
 	versionNodeSz    = versionSize + 8      // next pointer
 	magic            = uint64(0x5447485348) // "TGHSH"
-	formatVersion    = uint32(1)
+	formatVersion    = uint32(2)
 )
 
 // Version is one MVCC index entry pointing at a log record.
@@ -118,7 +123,7 @@ type shard struct {
 }
 
 func (idx *Index) newShard() (*shard, error) {
-	tableBytes := int64(initialSlots * 8)
+	tableBytes := int64(slotTableBytes(initialSlots))
 	minSize := int64(headerSize) + tableBytes + headerSize
 	buf, err := newShardBufferLocked(minSize, idx.mlock)
 	if err != nil {
@@ -158,7 +163,7 @@ func (s *shard) initNew(slotCount uint32) {
 	writeU32(data, hdrSlotCountOff, slotCount)
 	writeU32(data, hdrKeyCountOff, 0)
 	tableOff := uint64(headerSize)
-	arenaOff := tableOff + uint64(slotCount)*8
+	arenaOff := tableOff + slotTableBytes(slotCount)
 	writeU64(data, hdrTableOffOff, tableOff)
 	writeU64(data, hdrArenaOffOff, arenaOff)
 	writeU64(data, hdrArenaUsedOff, 0)
@@ -192,9 +197,32 @@ func (s *shard) setArenaUsed(n uint64) {
 	writeU64(s.shardData(), hdrArenaUsedOff, n)
 }
 
+func slotTableBytes(slots uint32) uint64 {
+	return uint64(slots) * slotWidth
+}
+
+func slotAt(table int, slot uint32) int {
+	return table + int(slot)*slotWidth
+}
+
+func readSlot(data []byte, table int, slot uint32) uint64 {
+	return uint64(readU32(data, slotAt(table, slot)))
+}
+
+func writeSlot(data []byte, table int, slot uint32, recOff uint64) error {
+	if recOff > maxSlotOffset {
+		return ErrSlotOffset
+	}
+	writeU32(data, slotAt(table, slot), uint32(recOff))
+	return nil
+}
+
 func (s *shard) alloc(size int) (uint64, error) {
 	off := s.arenaOff() + s.arenaUsed()
 	need := int64(off) + int64(size)
+	if need > maxShardBytes {
+		return 0, ErrSlotOffset
+	}
 	if need > int64(len(s.shardData())) {
 		if err := s.grow(need); err != nil {
 			return 0, err
@@ -215,7 +243,7 @@ func (s *shard) findKeyRecord(key []byte) (uint64, bool) {
 	table := int(s.tableOff())
 	for i := uint32(0); i < slots; i++ {
 		slot := (start + i) % slots
-		off := readU64(data, table+int(slot)*8)
+		off := readSlot(data, table, slot)
 		if off == 0 {
 			return 0, false
 		}
@@ -274,7 +302,7 @@ func (s *shard) growHashTable() error {
 	tableStart := s.tableOff()
 	arenaStart := s.arenaOff()
 	used := s.arenaUsed()
-	newTableBytes := uint64(newSlots) * 8
+	newTableBytes := slotTableBytes(newSlots)
 	newArenaStart := tableStart + newTableBytes
 	need := int64(newArenaStart + used)
 	if err := s.grow(need); err != nil {
@@ -293,7 +321,7 @@ func (s *shard) growHashTable() error {
 	}
 	var entries []entry
 	for slot := uint32(0); slot < oldSlots; slot++ {
-		recOff := readU64(data, oldTableInt+int(slot)*8)
+		recOff := readSlot(data, oldTableInt, slot)
 		if recOff == 0 {
 			continue
 		}
@@ -308,7 +336,7 @@ func (s *shard) growHashTable() error {
 	}
 	newTable := int(tableStart)
 	for i := uint32(0); i < newSlots; i++ {
-		writeU64(data, newTable+int(i)*8, 0)
+		writeU32(data, slotAt(newTable, i), 0)
 	}
 	if used > 0 {
 		copy(data[int(newArenaStart):int(newArenaStart+used)], arenaSnap)
@@ -318,9 +346,11 @@ func (s *shard) growHashTable() error {
 		start := uint32(hashKey(e.key) % uint64(newSlots))
 		inserted := false
 		for i := uint32(0); i < newSlots; i++ {
-			slotOff := newTable + int((start+i)%newSlots)*8
-			if readU64(data, slotOff) == 0 {
-				writeU64(data, slotOff, e.newRecOff)
+			slot := (start + i) % newSlots
+			if readSlot(data, newTable, slot) == 0 {
+				if err := writeSlot(data, newTable, slot, e.newRecOff); err != nil {
+					return err
+				}
 				inserted = true
 				break
 			}
@@ -341,9 +371,10 @@ func (s *shard) insertKeySlot(key []byte, recOff uint64) error {
 	table := int(s.tableOff())
 	for i := uint32(0); i < slots; i++ {
 		slot := (start + i) % slots
-		slotOff := table + int(slot)*8
-		if readU64(data, slotOff) == 0 {
-			writeU64(data, slotOff, recOff)
+		if readSlot(data, table, slot) == 0 {
+			if err := writeSlot(data, table, slot, recOff); err != nil {
+				return err
+			}
 			s.setKeyCount(s.keyCount() + 1)
 			return nil
 		}
@@ -474,7 +505,7 @@ func (s *shard) forEachKey(fn func(key []byte, chain []Version)) {
 	slots := s.slotCount()
 	table := int(s.tableOff())
 	for slot := uint32(0); slot < slots; slot++ {
-		recOff := readU64(data, table+int(slot)*8)
+		recOff := readSlot(data, table, slot)
 		if recOff == 0 {
 			continue
 		}
@@ -505,8 +536,7 @@ func (s *shard) dropXid(xid uint64) error {
 	table := int(s.tableOff())
 	for slot := uint32(0); slot < slots; slot++ {
 		data := s.shardData()
-		slotOff := table + int(slot)*8
-		recOff := readU64(data, slotOff)
+		recOff := readSlot(data, table, slot)
 		if recOff == 0 {
 			continue
 		}
@@ -515,7 +545,7 @@ func (s *shard) dropXid(xid uint64) error {
 			return err
 		}
 		if empty {
-			writeU64(s.shardData(), slotOff, 0)
+			_ = writeSlot(s.shardData(), table, slot, 0)
 			s.setKeyCount(s.keyCount() - 1)
 		} else {
 			s.setVersionHead(recOff, newHead)

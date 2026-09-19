@@ -54,7 +54,13 @@ func (s *shard) grow(minSize int64) error {
 	if s.isClosed() {
 		return fmt.Errorf("hashindex: shard is closed")
 	}
+	if minSize > maxShardBytes {
+		return ErrSlotOffset
+	}
 	if s.parent == nil {
+		if plannedBufferSize(int64(len(s.buf.data)), minSize) > maxShardBytes {
+			return ErrSlotOffset
+		}
 		return growShardBuffer(s.buf, minSize)
 	}
 	oldLen := int64(len(s.buf.data))
@@ -62,6 +68,9 @@ func (s *shard) grow(minSize int64) error {
 		return nil
 	}
 	planned := plannedBufferSize(oldLen, minSize)
+	if planned > maxShardBytes {
+		return ErrSlotOffset
+	}
 	delta := planned - oldLen
 	if err := s.parent.accountDelta(delta); err != nil {
 		return err
