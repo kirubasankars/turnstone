@@ -510,16 +510,15 @@ func (s *shard) dropXid(xid uint64) error {
 		if recOff == 0 {
 			continue
 		}
-		newHead, empty, err := s.filterChain(recOff, func(v Version) bool { return v.Xmin != xid })
+		newHead, _, err := s.filterChain(recOff, func(v Version) bool { return v.Xmin != xid })
 		if err != nil {
 			return err
 		}
-		if empty {
-			writeU64(s.shardData(), slotOff, 0)
-			s.setKeyCount(s.keyCount() - 1)
-		} else {
-			s.setVersionHead(recOff, newHead)
-		}
+		// Leave the slot occupied even when the chain is empty. Clearing it
+		// would punch a 0 into the linear-probe sequence and hide keys that
+		// collided onto later slots. Compact rebuilds the table without these
+		// empty records.
+		s.setVersionHead(recOff, newHead)
 	}
 	return nil
 }
