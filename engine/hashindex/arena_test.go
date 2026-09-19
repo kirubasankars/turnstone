@@ -99,7 +99,7 @@ func TestCompactReleasesOldShardMapping(t *testing.T) {
 	shardIdx := int(hashKey(key) & 255)
 	seg := idx.shards[shardIdx]
 	seg.mu.RLock()
-	oldBacking := seg.buf.mmapBacking
+	oldBacking := seg.arena.mmapBacking
 	seg.mu.RUnlock()
 
 	filter := func(_ []byte, chain []Version) []Version {
@@ -113,7 +113,7 @@ func TestCompactReleasesOldShardMapping(t *testing.T) {
 	}
 
 	seg.mu.RLock()
-	newBacking := seg.buf.mmapBacking
+	newBacking := seg.arena.mmapBacking
 	seg.mu.RUnlock()
 
 	if runtime.GOOS != "windows" {
@@ -135,8 +135,8 @@ func TestIndexCloseReleasesShardMappings(t *testing.T) {
 		if seg == nil {
 			continue
 		}
-		if seg.buf != nil {
-			t.Fatalf("shard %d buffer not cleared on index close", i)
+		if seg.buf != nil || seg.arena != nil {
+			t.Fatalf("shard %d buffers not cleared on index close", i)
 		}
 	}
 }

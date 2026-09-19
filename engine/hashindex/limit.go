@@ -48,9 +48,7 @@ func (idx *Index) RecalcUsedBytes() {
 			continue
 		}
 		s.mu.RLock()
-		if s.buf != nil {
-			total += int64(len(s.buf.data))
-		}
+		total += s.allocatedBytes()
 		s.mu.RUnlock()
 	}
 	atomic.StoreInt64(&idx.usedBytes, total)

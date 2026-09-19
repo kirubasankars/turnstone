@@ -298,9 +298,9 @@ func (db *DB) hashVersionFilter(fn func([]byte, []indexVersion) []indexVersion) 
 }
 
 // IndexHashMetrics is aggregate hash-index shard usage (no per-shard breakdown).
-// ArenaBytes is bump-allocated key/version bytes (comparable to LiveBytes and
-// compact reclaimed). AllocatedBytes is shard buffer size (header, slot table,
-// and capacity). LiveBytes is estimated live key and version payload.
+// ArenaBytes is bump-allocated key/version payload (comparable to LiveBytes and
+// compact reclaimed). AllocatedBytes is address-table plus paged-arena mapping
+// size. LiveBytes is estimated live key and version payload.
 type IndexHashMetrics struct {
 	ShardsUsed     int
 	ArenaBytes     uint64
