@@ -1,6 +1,6 @@
 [package]
 name = "turnstone"
-description = "TurnstoneDB CLI (init, server stub, client ping)"
+description = "TurnstoneDB CLI (init, server, client)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,5 +14,9 @@ path = "src/main.rs"
 clap.workspace = true
 turnstone-config = { path = "../turnstone-config" }
 turnstone-client = { path = "../turnstone-client" }
+turnstone-database = { path = "../turnstone-database" }
 turnstone-engine = { path = "../turnstone-engine" }
+turnstone-repl = { path = "../turnstone-repl" }
+turnstone-server = { path = "../turnstone-server" }
 turnstone-tls = { path = "../turnstone-tls" }
+serde_json = { workspace = true }

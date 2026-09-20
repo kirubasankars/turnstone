@@ -116,6 +116,16 @@ pub(crate) struct ConnState {
     client_id: String,
 }
 
+/// Rust's `TcpListener::bind(":6379")` fails on some hosts; Go accepts it. Map to all interfaces.
+pub fn normalize_bind_addr(addr: &str) -> String {
+    if let Some(port) = addr.strip_prefix(':') {
+        if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) {
+            return format!("0.0.0.0:{port}");
+        }
+    }
+    addr.to_string()
+}
+
 pub fn new_server(
     id: impl Into<String>,
     addr: impl Into<String>,
@@ -127,6 +137,7 @@ pub fn new_server(
     repl_manager: Option<Arc<Manager>>,
     dev_mode: bool,
 ) -> Result<Arc<Server>, ServerError> {
+    let addr = normalize_bind_addr(&addr.into());
     let tls_cert = tls_cert.into();
     let tls_key = tls_key.into();
     let tls_ca = tls_ca.into();
@@ -141,7 +152,7 @@ pub fn new_server(
         stores,
         default_db,
         id: id.into(),
-        addr: addr.into(),
+        addr,
         max_conns,
         sem: Arc::new(Semaphore::new(max_conns)),
         wg: Mutex::new(Vec::new()),
@@ -216,6 +227,9 @@ impl Server {
             return;
         };
         let mut stream = StreamOwned::new(tls, tcp);
+        if drive_tls_handshake(&mut stream).is_err() {
+            return;
+        }
         let default_db = self.default_db.clone();
         let db = self.stores.get(&default_db).cloned().unwrap();
         let mut state = ConnState {
@@ -595,6 +609,16 @@ pub fn write_binary_response(w: &mut impl Write, status: u8, body: &[u8]) -> io:
         w.write_all(body)?;
     }
     w.flush()
+}
+
+fn drive_tls_handshake(stream: &mut TlsStream) -> io::Result<()> {
+    while stream.conn.is_handshaking() {
+        stream
+            .conn
+            .complete_io(&mut stream.sock)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    }
+    Ok(())
 }
 
 fn read_full(r: &mut impl Read, buf: &mut [u8]) -> io::Result<()> {

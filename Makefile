@@ -8,8 +8,9 @@ build:
 	go build -o bin/turnstone ./cmd/turnstone
 
 build-rust:
-	cd rust && cargo build --release
+	cd rust && cargo build --release -p turnstone -p turnstone-rs
 	mkdir -p ./bin
+	cp rust/target/release/turnstone ./bin/turnstone-rust
 	cp rust/target/release/turnstone-rs ./bin/turnstone-rs
 
 test-rust:

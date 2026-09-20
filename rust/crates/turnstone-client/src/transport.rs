@@ -123,12 +123,27 @@ impl Transport {
     }
 }
 
+fn drive_client_handshake(stream: &mut Stream) -> Result<(), ClientError> {
+    match stream {
+        Stream::Tls(s) => {
+            while s.conn.is_handshaking() {
+                s.conn
+                    .complete_io(&mut s.sock)
+                    .map_err(|e| ClientError::Connection(e.to_string()))?;
+            }
+        }
+        Stream::Plain(_) => {}
+    }
+    Ok(())
+}
+
 fn round_trip_on_stream(
     stream: &mut Stream,
     frame: &[u8],
     read_timeout: Duration,
     write_timeout: Duration,
 ) -> Result<Vec<u8>, ClientError> {
+    drive_client_handshake(stream)?;
     set_write_timeout(stream, write_timeout)?;
     stream
         .write_all(frame)

@@ -3,17 +3,24 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root of this source tree.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use turnstone_client::{Client, ClientConfig};
-use turnstone_config::{generate_config_artifacts, Config};
-use turnstone_engine::{Db, Options};
+use turnstone_config::{
+    database_count, generate_config_artifacts, resolve_path, share_bytes, validate_config, Config,
+};
+use turnstone_database::{open as open_database, OpenOptions, STATE_PRIMARY};
+use turnstone_engine::Options as EngineOptions;
+use turnstone_repl::Manager;
+use turnstone_server::new_server;
 use turnstone_tls::{cert_paths, load_mtls, Role};
 
 #[derive(Parser)]
-#[command(name = "turnstone", about = "TurnstoneDB — Rust CLI")]
+#[command(name = "turnstone", about = "TurnstoneDB — Rust implementation")]
 struct Cli {
     #[arg(long, global = true, default_value = "tsdata")]
     home: PathBuf,
@@ -29,9 +36,12 @@ enum Commands {
         #[arg(long)]
         ip: Option<String>,
     },
-    /// Run embedded engine smoke test (wire server not yet ported)
-    Server,
-    /// Wire client: OP_PING
+    /// Run the mTLS wire server
+    Server {
+        #[arg(long)]
+        dev: bool,
+    },
+    /// Wire client commands
     Cli {
         #[command(subcommand)]
         cmd: CliCmd,
@@ -76,20 +86,7 @@ fn run(cli: &Cli) -> Result<(), String> {
             generate_config_artifacts(&cli.home, cfg, &path, &extra).map_err(|e| e.to_string())?;
             Ok(())
         }
-        Commands::Server => {
-            let db_dir = cli.home.join("data").join("0");
-            std::fs::create_dir_all(&db_dir).map_err(|e| e.to_string())?;
-            let db = Db::open(&db_dir, Options::default()).map_err(|e| e.to_string())?;
-            let mut tx = db.new_transaction(true);
-            tx.put(b"turnstone:ready", b"1").map_err(|e| e.to_string())?;
-            tx.commit().map_err(|e| e.to_string())?;
-            db.close().map_err(|e| e.to_string())?;
-            eprintln!(
-                "engine OK at {}; full wire server is still Go — use `turnstone server` from the Go binary for production",
-                db_dir.display()
-            );
-            Ok(())
-        }
+        Commands::Server { dev } => run_server(&cli.home, *dev),
         Commands::Cli { cmd } => match cmd {
             CliCmd::Ping { host } => {
                 let mut cfg = ClientConfig {
@@ -109,4 +106,94 @@ fn run(cli: &Cli) -> Result<(), String> {
             }
         },
     }
+}
+
+fn run_server(home: &PathBuf, dev: bool) -> Result<(), String> {
+    if !home.is_dir() {
+        return Err(format!(
+            "home directory does not exist: {} (run `turnstone init` first)",
+            home.display()
+        ));
+    }
+
+    let config_path = home.join("turnstone.json");
+    let bytes = std::fs::read(&config_path).map_err(|e| e.to_string())?;
+    let cfg: Config = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    validate_config(&cfg).map_err(|e| e.to_string())?;
+
+    let retention = if cfg.log_retention.is_empty() {
+        "replication".to_string()
+    } else {
+        cfg.log_retention.clone()
+    };
+
+    let n_db = database_count(cfg.number_of_databases);
+    let _per_cache = share_bytes(cfg.value_cache_bytes, n_db);
+
+    let cert_file = resolve_path(home, &cfg.tls_cert_file);
+    let key_file = resolve_path(home, &cfg.tls_key_file);
+    let ca_file = resolve_path(home, &cfg.tls_ca_file);
+    let client_cert = resolve_path(home, &cfg.tls_client_cert_file);
+    let client_key = resolve_path(home, &cfg.tls_client_key_file);
+
+    let mut stores: HashMap<String, Arc<turnstone_database::Database>> = HashMap::new();
+    for i in 0..n_db {
+        let name = i.to_string();
+        let path = home.join("data").join(&name);
+        eprintln!("Opening database {name}...");
+        let db = open_database(
+            &path,
+            OpenOptions {
+                retention_strategy: retention.clone(),
+                max_disk_usage_percent: cfg.max_disk_usage_percent,
+                max_index_arena_bytes: cfg.max_index_arena_bytes,
+                engine: EngineOptions {
+                    max_disk_usage_percent: cfg.max_disk_usage_percent,
+                    ..EngineOptions::default()
+                },
+                ..OpenOptions::default()
+            },
+        )
+        .map_err(|e| e.to_string())?;
+
+        if dev {
+            db.set_min_replicas(0);
+            db.promote().map_err(|e| e.to_string())?;
+            eprintln!("Dev mode: auto-promoted DB {name} to {STATE_PRIMARY}");
+        }
+
+        stores.insert(name, db);
+    }
+
+    let repl_tls = load_mtls(&ca_file, &client_cert, &client_key).map_err(|e| e.to_string())?;
+    let repl_manager = Arc::new(Manager::new(cfg.id.clone(), stores.clone(), repl_tls));
+
+    let max_conns = if cfg.max_conns > 0 {
+        cfg.max_conns as usize
+    } else {
+        1000
+    };
+
+    let listen = cfg.port.clone();
+    let server = new_server(
+        cfg.id,
+        listen.clone(),
+        stores,
+        max_conns,
+        cert_file.display().to_string(),
+        key_file.display().to_string(),
+        ca_file.display().to_string(),
+        Some(repl_manager),
+        dev,
+    )
+    .map_err(|e| e.to_string())?;
+
+    eprintln!(
+        "TurnstoneDB (Rust) listening on {}",
+        server
+            .addr()
+            .map(|a| a.to_string())
+            .unwrap_or(listen)
+    );
+    server.run().map_err(|e| e.to_string())
 }

@@ -903,9 +903,13 @@ name = "turnstone"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "serde_json",
  "turnstone-client",
  "turnstone-config",
+ "turnstone-database",
  "turnstone-engine",
+ "turnstone-repl",
+ "turnstone-server",
  "turnstone-tls",
 ]
 
