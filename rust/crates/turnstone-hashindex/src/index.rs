@@ -80,7 +80,7 @@ pub struct Index {
 }
 
 impl Index {
-    /// Creates mmap-backed index shards (heap fallback on non-Unix).
+    /// Creates heap-backed index shards.
     pub fn new() -> Self {
         Self::open(false).unwrap_or_else(|e| panic!("hashindex: {e}"))
     }

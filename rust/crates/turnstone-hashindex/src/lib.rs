@@ -7,8 +7,6 @@
 
 mod arena;
 mod arena_heap;
-#[cfg(unix)]
-mod arena_mmap;
 mod buffer_size;
 mod budget;
 mod compact;

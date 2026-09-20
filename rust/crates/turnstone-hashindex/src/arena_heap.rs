@@ -7,7 +7,6 @@ use turnstone_mlock as mlock;
 
 use crate::arena::ShardBuffer;
 
-#[cfg_attr(unix, allow(dead_code))]
 pub(crate) fn heap_new_shard_buffer(
     size: i64,
     lock: bool,
@@ -21,7 +20,6 @@ pub(crate) fn heap_new_shard_buffer(
     }
     Ok(ShardBuffer {
         data: Some(data),
-        mmap: None,
         locked: lock,
     })
 }
