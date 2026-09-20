@@ -5,8 +5,6 @@
 
 use std::io::{self, BufRead, Write};
 
-use turnstone_client::Client;
-
 use crate::commands::{execute_line, handle_command, is_command_failure, welcome_message, CommandOutcome};
 use crate::connect::{connect, ConnectOptions};
 

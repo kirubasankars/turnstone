@@ -57,6 +57,7 @@ impl Write for BackupConn {
             Self::Tls(s) => s.write(buf),
         }
     }
+
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
             Self::Plain(t) => t.flush(),
@@ -112,14 +113,14 @@ pub fn stream_log_range(
     send_hello(&mut stream, client_id, &opts.db_name, opts.start_lsn)?;
 
     let mut header = [0u8; protocol::PROTO_HEADER_SIZE];
-    read_full(&mut stream, &mut header)?;
+    stream.read_exact(&mut header)?;
     if header[0] != protocol::RES_OK {
         return Err(StreamError::Protocol("handshake rejected".into()));
     }
     let ln = u32::from_be_bytes(header[1..5].try_into().unwrap()) as usize;
     if ln > 0 {
         let mut skip = vec![0u8; ln];
-        read_full(&mut stream, &mut skip)?;
+        stream.read_exact(&mut skip)?;
     }
 
     let mut result = StreamResult {
@@ -127,28 +128,31 @@ pub fn stream_log_range(
         end_lsn: opts.start_lsn,
         bytes: 0,
     };
-    let mut last_data = std::time::Instant::now();
     let mut expect_off = opts.start_lsn;
     let mut have_expect = false;
 
     loop {
         stream.set_read_timeout(Some(wait_idle))?;
-        match read_full(&mut stream, &mut header) {
+        match stream.read_exact(&mut header) {
             Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
                 break;
             }
             Err(e) => return Err(StreamError::Io(e)),
         }
-        last_data = std::time::Instant::now();
         let op = header[0];
         let length = u32::from_be_bytes(header[1..5].try_into().unwrap()) as usize;
         let mut payload = vec![0u8; length];
         if length > 0 {
-            read_full(&mut stream, &mut payload)?;
+            stream.read_exact(&mut payload)?;
         }
         if op == protocol::RES_ERR {
-            return Err(StreamError::Protocol(String::from_utf8_lossy(&payload).into_owned()));
+            return Err(StreamError::Protocol(
+                String::from_utf8_lossy(&payload).into_owned(),
+            ));
         }
         if op != protocol::OP_REPL_SAFE_POINT && op != protocol::OP_REPL_LOG_RANGE {
             continue;
@@ -159,21 +163,17 @@ pub fn stream_log_range(
         let crc_received = u32::from_be_bytes(payload[0..4].try_into().unwrap());
         let raw_body = &payload[4..];
         if crc32fast::hash(raw_body) != crc_received {
-            return Err(StreamError::Protocol("CRC mismatch on replication stream".into()));
+            return Err(StreamError::Protocol(
+                "CRC mismatch on replication stream".into(),
+            ));
         }
         if op == protocol::OP_REPL_LOG_RANGE {
-            if raw_body.len() < 16 {
-                continue;
-            }
-            let start_off = u64::from_be_bytes(raw_body[0..8].try_into().unwrap());
-            let end_off = u64::from_be_bytes(raw_body[8..16].try_into().unwrap());
-            let seg = &raw_body[16..];
+            let (start_off, end_off, seg) = parse_log_range_payload(raw_body, &opts.db_name)?;
             if seg.is_empty() {
                 continue;
             }
             if result.bytes == 0 {
                 result.base_lsn = start_off;
-                expect_off = start_off;
                 have_expect = true;
             } else if have_expect && start_off != expect_off {
                 return Err(StreamError::Protocol(format!(
@@ -185,12 +185,52 @@ pub fn stream_log_range(
             result.end_lsn = end_off;
             expect_off = end_off;
         }
-        let _ = last_data;
     }
+
+    if result.end_lsn > opts.start_lsn {
+        let _ = send_repl_ack(&mut stream, &opts.db_name, result.end_lsn);
+    }
+    send_quit(&mut stream);
     Ok(result)
 }
 
-fn send_hello(w: &mut impl Write, client_id: &str, db_name: &str, start_lsn: u64) -> Result<(), StreamError> {
+/// Wire layout after CRC: db_name_len + name + reserved u32 + start/end u64 + segment.
+pub(crate) fn parse_log_range_payload<'a>(
+    raw_body: &'a [u8],
+    want_db: &str,
+) -> Result<(u64, u64, &'a [u8]), StreamError> {
+    if raw_body.len() < 4 {
+        return Err(StreamError::Protocol("malformed log range packet".into()));
+    }
+    let n_len = u32::from_be_bytes(raw_body[0..4].try_into().unwrap()) as usize;
+    let mut cursor = 4;
+    if cursor + n_len + 4 + 16 > raw_body.len() {
+        return Err(StreamError::Protocol("malformed log range db name".into()));
+    }
+    let db_name = std::str::from_utf8(&raw_body[cursor..cursor + n_len])
+        .map_err(|_| StreamError::Protocol("malformed log range db name".into()))?;
+    cursor += n_len + 4;
+    if db_name != want_db {
+        return Err(StreamError::Protocol(format!(
+            "unexpected database in stream: {db_name}"
+        )));
+    }
+    let start_off = u64::from_be_bytes(raw_body[cursor..cursor + 8].try_into().unwrap());
+    let end_off = u64::from_be_bytes(raw_body[cursor + 8..cursor + 16].try_into().unwrap());
+    cursor += 16;
+    let seg = &raw_body[cursor..];
+    if end_off < start_off || (end_off - start_off) as usize != seg.len() {
+        return Err(StreamError::Protocol("log range offset mismatch".into()));
+    }
+    Ok((start_off, end_off, seg))
+}
+
+fn send_hello(
+    w: &mut impl Write,
+    client_id: &str,
+    db_name: &str,
+    start_lsn: u64,
+) -> Result<(), StreamError> {
     let mut payload = Vec::new();
     payload.extend_from_slice(&1u32.to_be_bytes());
     payload.extend_from_slice(&(client_id.len() as u32).to_be_bytes());
@@ -205,10 +245,48 @@ fn send_hello(w: &mut impl Write, client_id: &str, db_name: &str, start_lsn: u64
     Ok(())
 }
 
-fn read_full(r: &mut impl Read, buf: &mut [u8]) -> std::io::Result<()> {
-    let mut off = 0;
-    while off < buf.len() {
-        off += r.read(&mut buf[off..])?;
-    }
+fn send_repl_ack(w: &mut impl Write, db_name: &str, offset: u64) -> Result<(), StreamError> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&(db_name.len() as u32).to_be_bytes());
+    payload.extend_from_slice(db_name.as_bytes());
+    payload.extend_from_slice(&offset.to_be_bytes());
+    let frame = protocol::encode_frame(protocol::OP_REPL_ACK, &payload);
+    w.write_all(&frame)?;
+    w.flush()?;
     Ok(())
+}
+
+fn send_quit(w: &mut impl Write) {
+    let frame = protocol::encode_frame(protocol::OP_QUIT, &[]);
+    let _ = w.write_all(&frame);
+    let _ = w.flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_log_range_payload;
+
+    #[test]
+    fn parse_log_range_payload_ok() {
+        let payload = [
+            0, 0, 0, 1, b'1', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 1, 2, 3,
+        ];
+        let (start, end, data) = parse_log_range_payload(&payload, "1").unwrap();
+        assert_eq!(start, 0);
+        assert_eq!(end, 3);
+        assert_eq!(data, &[1, 2, 3]);
+    }
+
+    #[test]
+    fn parse_log_range_payload_rejects_short() {
+        assert!(parse_log_range_payload(&[], "1").is_err());
+    }
+
+    #[test]
+    fn parse_log_range_payload_rejects_wrong_db() {
+        let payload = [
+            0, 0, 0, 1, b'2', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3,
+        ];
+        assert!(parse_log_range_payload(&payload, "1").is_err());
+    }
 }

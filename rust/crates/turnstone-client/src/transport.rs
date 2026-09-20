@@ -48,8 +48,6 @@ impl Write for Stream {
 
 pub struct Transport {
     inner: Mutex<Option<BufReader<Stream>>>,
-    read_timeout: Duration,
-    write_timeout: Duration,
 }
 
 impl Transport {
@@ -71,8 +69,6 @@ impl Transport {
         apply_io_timeouts(io.get_mut(), read_timeout, write_timeout)?;
         Ok(Self {
             inner: Mutex::new(Some(io)),
-            read_timeout,
-            write_timeout,
         })
     }
 
@@ -101,8 +97,6 @@ impl Transport {
         apply_io_timeouts(io.get_mut(), read_timeout, write_timeout)?;
         Ok(Self {
             inner: Mutex::new(Some(io)),
-            read_timeout,
-            write_timeout,
         })
     }
 
@@ -141,7 +135,7 @@ impl Transport {
         stream
             .write_all(write_data)
             .map_err(|e| ClientError::Connection(format!("I/O failed: {e}")))?;
-        drive_tls_after_write(stream)?;
+        finish_tls_write(stream)?;
 
         let mut header = [0u8; turnstone_protocol::PROTO_HEADER_SIZE];
         for _ in 0..expected_responses {
@@ -173,7 +167,7 @@ impl Transport {
         let io = guard.as_mut().ok_or_else(|| {
             ClientError::Connection("connection closed".into())
         })?;
-        read_frame_buffered(io, self.read_timeout)
+        read_frame_buffered(io)
     }
 
     pub fn close(&self) {
@@ -187,18 +181,6 @@ fn finish_tls_write(stream: &mut Stream) -> Result<(), ClientError> {
         while s.conn.wants_write() {
             s.conn
                 .write_tls(&mut s.sock)
-                .map_err(|e| ClientError::Connection(e.to_string()))?;
-        }
-    }
-    Ok(())
-}
-
-/// Push pending TLS writes and pull any already-arrived ciphertext before reading responses.
-fn drive_tls_after_write(stream: &mut Stream) -> Result<(), ClientError> {
-    if let Stream::Tls(s) = stream {
-        while s.conn.wants_write() || s.conn.wants_read() {
-            s.conn
-                .complete_io(&mut s.sock)
                 .map_err(|e| ClientError::Connection(e.to_string()))?;
         }
     }
@@ -231,10 +213,7 @@ fn drive_client_handshake(stream: &mut Stream) -> Result<(), ClientError> {
     Ok(())
 }
 
-fn read_frame_buffered(
-    io: &mut BufReader<Stream>,
-    read_timeout: Duration,
-) -> Result<(u8, Vec<u8>), ClientError> {
+fn read_frame_buffered(io: &mut BufReader<Stream>) -> Result<(u8, Vec<u8>), ClientError> {
     let mut header = [0u8; turnstone_protocol::PROTO_HEADER_SIZE];
     io.read_exact(&mut header)
         .map_err(|e| ClientError::Connection(format!("I/O failed: {e}")))?;

@@ -44,16 +44,6 @@ fn slot_count_for(key_count: u32) -> u32 {
 }
 
 impl Shard {
-    pub fn empty(parent: Arc<IndexInner>) -> Self {
-        Self {
-            parent,
-            state: RwLock::new(ShardState {
-                keys: HashMap::new(),
-                closed: true,
-            }),
-        }
-    }
-
     pub fn new(parent: Arc<IndexInner>) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         parent
             .account_delta(HEADER_SIZE as i64)
@@ -235,16 +225,7 @@ impl Shard {
     pub(crate) fn compact(
         &self,
         filter: Option<&crate::compact::VersionFilter<'_>>,
-    ) -> Result<crate::compact::CompactResult, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         crate::compact::compact_shard(self, filter)
-    }
-
-    pub(crate) fn read_chain(&self, key: &[u8]) -> Vec<Version> {
-        self.state
-            .read()
-            .keys
-            .get(key)
-            .cloned()
-            .unwrap_or_default()
     }
 }

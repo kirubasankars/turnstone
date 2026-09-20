@@ -10,7 +10,6 @@ use std::time::{Duration, Instant};
 
 use rand::Rng;
 use serde_json::Value;
-use turnstone_client::Client;
 use turnstone_tls::{cert_paths, Role};
 
 use crate::bench_io::BenchConn;

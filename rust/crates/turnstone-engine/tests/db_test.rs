@@ -44,6 +44,25 @@ fn basic_crud() {
 }
 
 #[test]
+fn drop_uncommitted_write_releases_key_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path(), Options::default()).unwrap();
+
+    {
+        let mut tx = db.new_transaction(true);
+        tx.put(b"k", b"v").unwrap();
+    }
+
+    let mut tx = db.new_transaction(true);
+    tx.put(b"k", b"v2").unwrap();
+    tx.commit().unwrap();
+
+    let tx = db.new_transaction(false);
+    assert_eq!(tx.get(b"k").unwrap(), b"v2");
+    db.close().unwrap();
+}
+
+#[test]
 fn reopen_preserves_data() {
     let dir = tempfile::tempdir().unwrap();
     {
@@ -56,4 +75,5 @@ fn reopen_preserves_data() {
     let db = Db::open(dir.path(), Options::default()).unwrap();
     let tx = db.new_transaction(false);
     assert_eq!(tx.get(b"k").unwrap(), b"v");
+    db.close().unwrap();
 }

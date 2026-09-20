@@ -47,7 +47,7 @@ fn setup_env() -> (
         dir.path().join("certs/server.key"),
     )
     .unwrap();
-    (dir.into_path(), stores, tls)
+    (dir.keep(), stores, tls)
 }
 
 fn load_server_config(dir: &PathBuf) -> Arc<ServerConfig> {

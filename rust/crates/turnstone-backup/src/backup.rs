@@ -4,10 +4,11 @@
 // LICENSE file in the root of this source tree.
 
 use std::io::{self, Write};
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
@@ -87,17 +88,22 @@ pub fn run_backup(opts: BackupOptions) -> Result<Meta, BackupError> {
         hash: &mut hasher,
     };
 
-    let stream_res = stream_log_range(
-        &StreamOptions {
-            host: opts.host,
-            db_name: opts.db_name.clone(),
-            start_lsn,
-            wait_idle: opts.wait_idle,
-            client_id: String::new(),
-            tls: opts.tls,
-        },
-        &mut disk_writer,
-    )?;
+    let stream_opts = StreamOptions {
+        host: opts.host,
+        db_name: opts.db_name.clone(),
+        start_lsn,
+        wait_idle: opts.wait_idle,
+        client_id: String::new(),
+        tls: opts.tls,
+    };
+    let stream_res = if opts.compress {
+        let mut gz = GzEncoder::new(&mut disk_writer, Compression::default());
+        let res = stream_log_range(&stream_opts, &mut gz)?;
+        gz.try_finish()?;
+        res
+    } else {
+        stream_log_range(&stream_opts, &mut disk_writer)?
+    };
 
     f.flush()?;
 
@@ -128,5 +134,34 @@ impl<W: Write, H: Write> Write for TeeWriter<'_, W, H> {
 
     fn flush(&mut self) -> io::Result<()> {
         self.inner.flush()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TeeWriter;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+
+    #[test]
+    fn compressed_tee_hashes_gzip_bytes() {
+        let mut file = Vec::new();
+        let mut hasher = Sha256::new();
+        {
+            let mut disk = TeeWriter {
+                inner: &mut file,
+                hash: &mut hasher,
+            };
+            let mut gz = GzEncoder::new(&mut disk, Compression::default());
+            gz.write_all(b"wal").unwrap();
+            gz.finish().unwrap();
+        }
+        assert_eq!(&file[..2], [0x1f, 0x8b]);
+        assert_eq!(
+            hex::encode(hasher.finalize()),
+            hex::encode(Sha256::digest(&file))
+        );
     }
 }

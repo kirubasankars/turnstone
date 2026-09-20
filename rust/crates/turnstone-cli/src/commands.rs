@@ -3,7 +3,6 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root of this source tree.
 
-use std::collections::HashMap;
 use std::io::{self, Write};
 
 use serde_json::Value;
@@ -232,17 +231,4 @@ pub fn welcome_message() {
     println!(
         "Commands: select <db>, replicaof <host:port> <remote_db>, promote [min_replicas], stepdown, flushdb, get <k>, set <k> <v>, del <k>, mget <k>..., mset <k> <v>..., mdel <k>..., begin [read], commit, abort, stat, ping, clear, quit"
     );
-}
-
-#[allow(dead_code)]
-pub fn parse_mset_map(parts: &[String]) -> Option<HashMap<String, Vec<u8>>> {
-    let all = collect_trailing_args(parts);
-    if all.len() < 2 || all.len() % 2 != 0 {
-        return None;
-    }
-    let mut m = HashMap::new();
-    for chunk in all.chunks(2) {
-        m.insert(chunk[0].clone(), chunk[1].as_bytes().to_vec());
-    }
-    Some(m)
 }

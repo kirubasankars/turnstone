@@ -126,6 +126,8 @@ fn maybe_compact_index_no_panic() {
     tx.put(b"a", b"2").unwrap();
     tx.commit().unwrap();
     let _ = db.maybe_compact_index().expect("compact");
+    let ctx = db.build_index_gc_context();
+    let _ = db.compact_index(&ctx).expect("compact_index");
     let tx = db.new_transaction(false);
     assert_eq!(tx.get(b"a").unwrap(), b"2");
     db.close().unwrap();

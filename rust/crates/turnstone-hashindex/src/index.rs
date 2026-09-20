@@ -18,7 +18,6 @@ pub(crate) struct IndexInner {
     pub used_bytes: AtomicI64,
     pub enforce_limit: AtomicI32,
     pub shared: Mutex<Option<Arc<SharedBudget>>>,
-    pub mlock: bool,
 }
 
 impl IndexInner {
@@ -86,13 +85,12 @@ impl Index {
     }
 
     /// Like [`Self::new`] (`lock` is retained for API compatibility; ignored for map-backed shards).
-    pub fn open(lock: bool) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn open(_lock: bool) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let inner = Arc::new(IndexInner {
             max_arena_bytes: AtomicI64::new(0),
             used_bytes: AtomicI64::new(0),
             enforce_limit: AtomicI32::new(1),
             shared: Mutex::new(None),
-            mlock: lock,
         });
         let mut built: Vec<Arc<Shard>> = Vec::with_capacity(NUM_SHARDS);
         for _ in 0..NUM_SHARDS {

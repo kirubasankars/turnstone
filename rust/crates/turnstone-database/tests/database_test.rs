@@ -31,6 +31,17 @@ fn database_recover_basic() {
         let val = s2.get(k).unwrap();
         assert_eq!(String::from_utf8_lossy(&val), format!("val-{k}"));
     }
+    s2.close().unwrap();
+}
+
+#[test]
+fn database_reset_wipes_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = open(&dir, OpenOptions::default()).unwrap();
+    put_kv(&s, "keep-me", "until-reset");
+    s.reset().unwrap();
+    assert!(s.get("keep-me").is_err());
+    s.close().unwrap();
 }
 
 #[test]

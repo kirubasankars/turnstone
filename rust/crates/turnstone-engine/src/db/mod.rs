@@ -6,7 +6,7 @@
 pub(crate) mod transaction;
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
@@ -14,7 +14,7 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::clog::ClogState;
 use crate::encode_record;
-use crate::hashindex::{Index, IndexExt};
+use crate::hashindex::Index;
 use crate::index::{IndexHashMetrics, MvccIndex};
 use crate::recovery::replay_log;
 use crate::types::{
@@ -81,7 +81,6 @@ pub struct Db {
     pub(crate) log: Arc<DataLog>,
     pub(crate) index: Arc<MvccIndex>,
     pub(crate) clog: Arc<ClogState>,
-    pub(crate) tx_mu: Mutex<()>,
     pub(crate) active_xids: Mutex<std::collections::HashMap<u64, Arc<transaction::WriteTransaction>>>,
     pub(crate) key_locks: Mutex<std::collections::HashMap<String, u64>>,
     pub(crate) begin_offsets: Mutex<std::collections::HashMap<u64, i64>>,
@@ -113,6 +112,9 @@ pub struct Db {
     pub(crate) wal_rewrite_mu: RwLock<()>,
     pub(crate) value_cache: Option<Arc<ValueCache>>,
     pub(crate) shared_buffers: Option<Arc<SharedBuffers>>,
+    max_disk_usage_percent: i32,
+    disk_monitor_shutdown: Mutex<Option<mpsc::Sender<()>>>,
+    disk_monitor_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl Db {
@@ -171,7 +173,7 @@ impl Db {
                 .map_err(|e| EngineError::Other(e.to_string()))?,
         );
         let raw_index = Index::new();
-        raw_index.set_max_arena_bytes(opts.max_index_arena_bytes);
+        raw_index.set_enforce_limit(false);
         let clog = Arc::new(ClogState::default());
         let txid = AtomicU64::new(0);
 
@@ -181,6 +183,7 @@ impl Db {
         let key_count = index.live_key_count(|xid| clog.clog_status(xid));
         let scan_floor = log.oldest_segment_base_lsn();
         let write_off = log.write_offset();
+        index.set_max_arena_bytes(opts.max_index_arena_bytes);
         index.set_enforce_limit(true);
         index.recalc_used_bytes();
 
@@ -207,13 +210,13 @@ impl Db {
 
         let (commit_tx, commit_rx) = mpsc::channel();
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let max_disk_usage_percent = opts.max_disk_usage_percent;
 
         let db = Arc::new(Self {
             dir,
             log,
             index,
             clog,
-            tx_mu: Mutex::new(()),
             active_xids: Mutex::new(std::collections::HashMap::new()),
             key_locks: Mutex::new(std::collections::HashMap::new()),
             begin_offsets: Mutex::new(std::collections::HashMap::new()),
@@ -245,6 +248,9 @@ impl Db {
             wal_rewrite_mu: RwLock::new(()),
             value_cache,
             shared_buffers,
+            max_disk_usage_percent,
+            disk_monitor_shutdown: Mutex::new(None),
+            disk_monitor_handle: Mutex::new(None),
         });
 
         let db_runner = Arc::clone(&db);
@@ -252,6 +258,16 @@ impl Db {
             db_runner.run_group_commits(commit_rx, shutdown_rx);
         });
         *db.committer_handle.lock() = Some(handle);
+
+        if max_disk_usage_percent > 0 {
+            let (disk_tx, disk_rx) = mpsc::channel();
+            let db_disk = Arc::clone(&db);
+            let disk_handle = std::thread::spawn(move || {
+                db_disk.run_disk_monitor(disk_rx);
+            });
+            *db.disk_monitor_shutdown.lock() = Some(disk_tx);
+            *db.disk_monitor_handle.lock() = Some(disk_handle);
+        }
 
         Ok(db)
     }
@@ -431,7 +447,7 @@ impl Db {
     }
 
     fn account_replicated_set(&self, key: &[u8], xid: u64) {
-        let (ver, _, found) = self.index.latest_resolved(key, xid, |x| self.clog.clog_status(x));
+        let (ver, _, _found) = self.index.latest_resolved(key, xid, |x| self.clog.clog_status(x));
         let was_live = ver.filter(|v| !v.tombstone && self.clog.clog_status(v.xmin) == TxStatus::Committed).is_some();
         if !was_live {
             self.key_count.fetch_add(1, Ordering::AcqRel);
@@ -616,6 +632,34 @@ impl Db {
         }
     }
 
+    fn run_disk_monitor(&self, shutdown: mpsc::Receiver<()>) {
+        self.check_disk();
+        loop {
+            match shutdown.recv_timeout(Duration::from_secs(10)) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => self.check_disk(),
+            }
+        }
+    }
+
+    fn check_disk(&self) {
+        if self.max_disk_usage_percent <= 0 {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            match crate::disk_unix::get_disk_usage(&self.dir) {
+                Ok(usage) => {
+                    self.is_disk_full.store(
+                        (usage as i32) > self.max_disk_usage_percent,
+                        Ordering::Release,
+                    );
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
     pub fn close(&self) -> Result<(), EngineError> {
         if self.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
@@ -623,8 +667,14 @@ impl Db {
         if let Some(tx) = self.committer_shutdown.lock().take() {
             let _ = tx.send(());
         }
+        if let Some(tx) = self.disk_monitor_shutdown.lock().take() {
+            let _ = tx.send(());
+        }
         drop(self.commit_tx.clone());
         if let Some(h) = self.committer_handle.lock().take() {
+            let _ = h.join();
+        }
+        if let Some(h) = self.disk_monitor_handle.lock().take() {
             let _ = h.join();
         }
         self.log

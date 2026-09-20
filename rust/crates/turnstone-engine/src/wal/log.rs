@@ -5,8 +5,8 @@
 
 use std::cell::RefCell;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, ErrorKind, Read, Write};
-use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::io::{self, ErrorKind};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicI32, Ordering};
 use std::sync::{Condvar, Mutex, RwLock};
@@ -29,12 +29,8 @@ use crate::castagnoli_checksum;
 use crate::shared_buffers::{BufferTag, SharedBuffers, SHARED_BUFFER_PAGE_SIZE};
 use crate::decode_record;
 use crate::decode_value_into;
-use crate::types::{
-    EngineError, Record, RecordSpan, LOG_FRAME_HEADER_SIZE, FILE_MODE,
-};
-use crate::{encode_record, frame_size, RecordType};
-
-const REPLAY_CANCEL_CHECK_INTERVAL: u64 = 1024;
+use crate::types::{EngineError, Record, RecordSpan, LOG_FRAME_HEADER_SIZE};
+use crate::{frame_size, RecordType};
 
 thread_local! {
     static FRAME_SCRATCH: RefCell<Vec<u8>> = RefCell::new(Vec::new());
@@ -92,7 +88,7 @@ struct WalSegment {
     path: String,
     base_lsn: i64,
     end_lsn: i64,
-    writer: Option<File>,
+    writer: Option<Arc<File>>,
     reader: Option<File>,
     mapping: Option<WalMapping>,
     allocated: bool,
@@ -108,7 +104,6 @@ struct Inner {
 
 /// Segmented append-only WAL addressed by a global byte LSN.
 pub struct DataLog {
-    dir: PathBuf,
     wal_dir: PathBuf,
     manifest_path: PathBuf,
     segment_size: i64,
@@ -129,8 +124,8 @@ impl DataLog {
         segment_size: i64,
         buffers: Option<Arc<SharedBuffers>>,
     ) -> io::Result<Self> {
-        let dir = dir.as_ref().to_path_buf();
-        fs::create_dir_all(&dir)?;
+        let dir = dir.as_ref();
+        fs::create_dir_all(dir)?;
         let segment_size = normalize_wal_segment_size(segment_size);
         let wal_dir = dir.join(WAL_DIR_NAME);
         let manifest_path = wal_dir.join(WAL_MANIFEST_NAME);
@@ -149,7 +144,6 @@ impl DataLog {
         }
 
         let log = Self {
-            dir,
             wal_dir: wal_dir.clone(),
             manifest_path,
             segment_size,
@@ -730,7 +724,7 @@ impl DataLog {
                 file_size_of(&inner.segments[active_idx].path),
             )
         });
-        inner.segments[active_idx].writer = Some(f);
+        inner.segments[active_idx].writer = Some(Arc::new(f));
         inner.segments[active_idx].end_lsn = 0;
         inner.segments[active_idx].allocated =
             file_allocated(&inner.segments[active_idx].writer, self.segment_size);
@@ -797,32 +791,30 @@ impl DataLog {
         })
     }
 
-    /// Snapshots the write head and returns a writer clone for fdatasync after the WAL lock is released.
-    fn begin_sync_locked(&self, inner: &Inner) -> Result<(Option<File>, i64), EngineError> {
+    /// Snapshots the write head and returns the active writer for fdatasync after the WAL lock is released.
+    fn begin_sync_locked(&self, inner: &Inner) -> Result<(Option<Arc<File>>, i64), EngineError> {
         self.persist_head_locked(inner)
             .map_err(|e| EngineError::Other(e.to_string()))?;
         let flushed = inner.write_offset;
-        let sync_f = inner.segments[inner.active_index]
-            .writer
-            .as_ref()
-            .and_then(|f| f.try_clone().ok());
-        if sync_f.is_some() {
-            self.syncing.fetch_add(1, Ordering::AcqRel);
-            self.inflight_syncs.add();
-        }
-        Ok((sync_f, flushed))
+        let Some(sync_f) = inner.segments[inner.active_index].writer.clone() else {
+            return Ok((None, flushed));
+        };
+        self.syncing.fetch_add(1, Ordering::AcqRel);
+        self.inflight_syncs.add();
+        Ok((Some(sync_f), flushed))
     }
 
     /// Must not take the WAL lock: concurrent appends may proceed during fdatasync.
-    fn complete_sync(&self, sync_f: Option<File>, flushed: i64) {
-        if let Some(f) = sync_f {
-            if let Some(hook) = TESTING_BEFORE_SYNC.lock().unwrap().as_ref() {
-                hook();
-            }
-            self.sync_writer(&f);
-            self.syncing.fetch_sub(1, Ordering::AcqRel);
-            self.inflight_syncs.done();
+    fn complete_sync(&self, sync_f: Option<Arc<File>>, flushed: i64) {
+        let Some(f) = sync_f else {
+            return;
+        };
+        if let Some(hook) = TESTING_BEFORE_SYNC.lock().unwrap().as_ref() {
+            hook();
         }
+        self.sync_writer(f.as_ref());
+        self.syncing.fetch_sub(1, Ordering::AcqRel);
+        self.inflight_syncs.done();
         self.publish_durable(flushed);
     }
 
@@ -864,7 +856,7 @@ impl DataLog {
             return Ok(());
         }
         write_segment_footer(
-            seg.writer.as_ref().unwrap(),
+            seg.writer.as_deref().unwrap(),
             self.segment_size,
             inner.write_offset - seg.base_lsn,
         )
@@ -893,7 +885,7 @@ impl DataLog {
         if seg.mapping.is_some() {
             return;
         }
-        let f = seg.writer.as_ref().or(seg.reader.as_ref());
+        let f = seg.writer.as_deref().or(seg.reader.as_ref());
         let Some(f) = f else { return };
         if f.metadata().map(|m| m.len()).unwrap_or(0) < self.segment_size as u64 {
             return;
@@ -1068,7 +1060,7 @@ impl Inner {
             return Ok(());
         }
         let owned;
-        let f: &File = if let Some(w) = seg.writer.as_ref() {
+        let f: &File = if let Some(w) = seg.writer.as_deref() {
             w
         } else if let Some(r) = seg.reader.as_ref() {
             r
@@ -1089,12 +1081,12 @@ impl Inner {
 
     fn write_segment_at(&mut self, seg_idx: usize, local_off: i64, buf: &[u8]) -> io::Result<usize> {
         let seg = &mut self.segments[seg_idx];
-        let f = seg.writer.as_mut().ok_or_else(|| {
+        let f = seg.writer.as_ref().ok_or_else(|| {
             io::Error::new(ErrorKind::NotConnected, "no active wal writer")
         })?;
         let mut off = 0;
         while off < buf.len() {
-            let n = f.write_at(&buf[off..], (local_off + off as i64) as u64)?;
+            let n = f.as_ref().write_at(&buf[off..], (local_off + off as i64) as u64)?;
             if n == 0 {
                 return Err(ErrorKind::WriteZero.into());
             }
@@ -1122,7 +1114,7 @@ impl Inner {
         log.inflight_syncs.wait();
         let active_idx = self.active_index;
         if self.segments[active_idx].allocated {
-            if let Some(w) = self.segments[active_idx].writer.as_ref() {
+            if let Some(w) = self.segments[active_idx].writer.as_deref() {
                 write_segment_footer(
                     w,
                     log.segment_size,
@@ -1131,7 +1123,7 @@ impl Inner {
                 .map_err(|e| EngineError::Other(e.to_string()))?;
             }
         }
-        if let Some(w) = self.segments[active_idx].writer.as_ref() {
+        if let Some(w) = self.segments[active_idx].writer.as_deref() {
             sync_file(w).map_err(|e| EngineError::Other(e.to_string()))?;
         }
         log.publish_durable(self.write_offset);
@@ -1156,7 +1148,7 @@ impl Inner {
             path: next_path.to_string_lossy().into_owned(),
             base_lsn: self.write_offset,
             end_lsn: 0,
-            writer: Some(f),
+            writer: Some(Arc::new(f)),
             reader: None,
             mapping: None,
             allocated: false,
@@ -1285,7 +1277,7 @@ impl Inner {
             let limit = limit.min(m.len() as i64);
             return read_frame_at_mapping(m, offset, limit);
         }
-        let f = match seg.writer.as_ref().or(seg.reader.as_ref()) {
+        let f = match seg.writer.as_deref().or(seg.reader.as_ref()) {
             Some(f) => f,
             None => {
                 return (
@@ -1340,7 +1332,7 @@ impl Inner {
                     && truncate_corrupt
                     && is_active
                 {
-                    if let Some(w) = self.segments[self.active_index].writer.as_ref() {
+                    if let Some(w) = self.segments[self.active_index].writer.as_deref() {
                         let _ = write_segment_footer_if_allocated(w, segment_size, pos);
                     }
                     self.write_offset = base_lsn + pos;
@@ -1363,7 +1355,7 @@ impl Inner {
     }
 }
 
-fn file_allocated(writer: &Option<File>, segment_size: i64) -> bool {
+fn file_allocated(writer: &Option<Arc<File>>, segment_size: i64) -> bool {
     writer
         .as_ref()
         .and_then(|f| f.metadata().ok())

@@ -74,6 +74,7 @@ impl Db {
     }
 
     pub fn maybe_compact_index(&self) -> Result<IndexCompactResult, crate::types::EngineError> {
+        let _guard = self.wal_rewrite_mu.write();
         let ratio = if self.index_fragmentation_ratio > 0.0 {
             self.index_fragmentation_ratio
         } else {
@@ -109,6 +110,38 @@ impl Db {
         }
         let res = IndexCompactResult {
             shards_compacted: compacted,
+            arena_before: before,
+            arena_after: after,
+        };
+        self.record_index_compact(&res);
+        Ok(res)
+    }
+
+    /// Rewrites every shard, dropping versions below the log floor (Go `CompactIndex`).
+    pub fn compact_index(
+        &self,
+        ctx: &IndexGcContext,
+    ) -> Result<IndexCompactResult, crate::types::EngineError> {
+        let _guard = self.wal_rewrite_mu.write();
+        let mut before = 0u64;
+        let mut shards_compacted = 0i32;
+        self.index.with_hash_index(|idx| {
+            let stats = idx.stats();
+            for st in stats.shards {
+                before += st.arena_used;
+                if st.key_count > 0 {
+                    shards_compacted += 1;
+                }
+            }
+        });
+        let filter = self.index_version_filter(ctx);
+        let stats_after = self.index.compact_all_filtered(Some(filter.as_ref()))?;
+        let mut after = 0u64;
+        for st in stats_after.shards {
+            after += st.arena_used;
+        }
+        let res = IndexCompactResult {
+            shards_compacted,
             arena_before: before,
             arena_after: after,
         };
@@ -162,7 +195,7 @@ impl Db {
 }
 
 impl IndexGcContext {
-    pub fn filter_versions(
+    pub(crate) fn filter_versions(
         &self,
         _key: &[u8],
         chain: &[IndexVersion],
@@ -177,7 +210,7 @@ impl IndexGcContext {
             .collect()
     }
 
-    pub fn filter_versions_for_wal_retain(
+    pub(crate) fn filter_versions_for_wal_retain(
         &self,
         key: &[u8],
         chain: &[Version],

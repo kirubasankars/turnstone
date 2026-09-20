@@ -248,6 +248,7 @@ fn run_init(home: &PathBuf, ip: Option<&str>) -> Result<(), String> {
     }
     let cfg = Config {
         port: ":6379".into(),
+        max_conns: 1000,
         number_of_databases: 4,
         tls_cert_file: "certs/server.crt".into(),
         tls_key_file: "certs/server.key".into(),
@@ -348,11 +349,13 @@ fn run_server(home: &PathBuf, dev: bool) -> Result<(), String> {
         eprintln!("Server listening in plain TCP mode (no server TLS cert files).");
     }
     eprintln!(
-        "TurnstoneDB (Rust) listening on {}",
+        "TurnstoneDB (Rust) listening on {} (id={} max_conns={})",
         server
             .addr()
             .map(|a| a.to_string())
-            .unwrap_or(listen)
+            .unwrap_or(listen),
+        server.id(),
+        server.max_conns(),
     );
     server.run().map_err(|e| e.to_string())
 }

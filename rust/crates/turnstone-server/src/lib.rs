@@ -6,7 +6,7 @@
 mod replication;
 
 use std::collections::HashMap;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
@@ -40,9 +40,8 @@ impl ServerConn {
     fn from_tcp(tcp: TcpStream, tls: Option<Arc<rustls::ServerConfig>>) -> io::Result<Self> {
         let _ = tcp.set_nodelay(true);
         if let Some(cfg) = tls {
-            let Ok(conn) = ServerConnection::new(cfg) else {
-                return Ok(Self::Plain(tcp));
-            };
+            let conn = ServerConnection::new(cfg)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
             let mut stream = StreamOwned::new(conn, tcp);
             drive_tls_handshake(&mut stream)?;
             Ok(Self::Tls(stream))
@@ -107,7 +106,6 @@ pub struct Server {
     addr: String,
     max_conns: usize,
     sem: Arc<Semaphore>,
-    wg: Mutex<Vec<()>>,
     active_conns: AtomicI64,
     tls_cert_file: String,
     tls_key_file: String,
@@ -262,7 +260,6 @@ pub fn new_server(
         addr,
         max_conns,
         sem: Arc::new(Semaphore::new(max_conns)),
-        wg: Mutex::new(Vec::new()),
         active_conns: AtomicI64::new(0),
         tls_cert_file: tls_cert,
         tls_key_file: tls_key,
@@ -294,6 +291,14 @@ impl Server {
 
     pub fn tls_enabled(&self) -> bool {
         self.tls_enabled
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn max_conns(&self) -> usize {
+        self.max_conns
     }
 
     pub fn addr(&self) -> Option<SocketAddr> {
@@ -344,7 +349,7 @@ impl Server {
     }
 
     fn handle_connection(self: &Arc<Self>, tcp: TcpStream) {
-        let Ok(mut stream) = ServerConn::from_tcp(tcp, self.active_tls_config()) else {
+        let Ok(stream) = ServerConn::from_tcp(tcp, self.active_tls_config()) else {
             return;
         };
         let default_db = self.default_db.clone();
@@ -382,7 +387,7 @@ impl Server {
                 break;
             }
             let _ = reader.get_mut().set_read_timeout(Some(protocol::IDLE_TIMEOUT));
-            if read_full(&mut reader, &mut header).is_err() {
+            if reader.read_exact(&mut header).is_err() {
                 break;
             }
             if self.tls_enabled && state.client_id == "unknown" {
@@ -398,7 +403,7 @@ impl Server {
                 break;
             }
             let mut payload = self.get_payload_buffer(payload_len);
-            if payload_len > 0 && read_full(&mut reader, &mut payload[..payload_len]).is_err() {
+            if payload_len > 0 && reader.read_exact(&mut payload[..payload_len]).is_err() {
                 self.recycle_payload_buffer(payload);
                 break;
             }
@@ -473,6 +478,7 @@ impl Server {
             protocol::OP_SET => self.handle_set(out, payload, st),
             protocol::OP_DEL => self.handle_del(out, payload, st),
             protocol::OP_STAT => self.handle_stat(out, st),
+            protocol::OP_FLUSH_DB => self.handle_flush_db(out, st),
             protocol::OP_REPL_HELLO => {
                 let _ = out.drain_to(stream, true);
                 replication::handle_replica_connection(self, stream, payload, st);
@@ -531,6 +537,8 @@ impl Server {
         if !self.dev_mode {
             if let Some(start) = st.tx_start {
                 if start.elapsed() > protocol::MAX_TX_DURATION {
+                    tx.discard();
+                    st.tx_start = None;
                     let _ = write_binary_response(
                         out,
                         protocol::RES_TX_TIMEOUT,
@@ -649,9 +657,55 @@ impl Server {
         }
     }
 
-    fn handle_del(&self, out: &mut ResponseBuffer, payload: &[u8], _st: &mut ConnState) {
-        let _ = payload;
-        let _ = write_binary_response(out, protocol::RES_ERR, b"DEL not fully ported");
+    fn handle_del(&self, out: &mut ResponseBuffer, payload: &[u8], st: &mut ConnState) {
+        let state = st.db.get_state();
+        if state != STATE_PRIMARY && state != STATE_STEPPING_DOWN {
+            let _ = write_binary_response(out, protocol::RES_ERR, b"Read-only/Undefined state");
+            return;
+        }
+        let Some(tx) = st.tx.as_mut() else {
+            let _ = write_binary_response(out, protocol::RES_TX_REQUIRED, &[]);
+            return;
+        };
+        let key = String::from_utf8_lossy(payload);
+        if !protocol::is_ascii(&key) {
+            let _ = write_binary_response(out, protocol::RES_ERR, b"Key must be ASCII");
+            return;
+        }
+        match tx.get(payload) {
+            Ok(_) => {}
+            Err(EngineError::KeyNotFound) => {
+                let _ = write_binary_response(out, protocol::RES_NOT_FOUND, &[]);
+                return;
+            }
+            Err(EngineError::WriteConflict) => {
+                let _ = write_binary_response(
+                    out,
+                    protocol::RES_TX_CONFLICT,
+                    b"write conflict detected",
+                );
+                return;
+            }
+            Err(e) => {
+                let _ = write_binary_response(out, protocol::RES_ERR, e.to_string().as_bytes());
+                return;
+            }
+        }
+        match tx.delete(payload) {
+            Ok(()) => {
+                let _ = write_binary_response(out, protocol::RES_OK, &[]);
+            }
+            Err(EngineError::WriteConflict) => {
+                let _ = write_binary_response(
+                    out,
+                    protocol::RES_TX_CONFLICT,
+                    b"write conflict detected",
+                );
+            }
+            Err(e) => {
+                let _ = write_binary_response(out, protocol::RES_ERR, e.to_string().as_bytes());
+            }
+        }
     }
 
     fn handle_stat(&self, out: &mut ResponseBuffer, st: &mut ConnState) {
@@ -672,6 +726,32 @@ impl Server {
             "min_replicas": st.db.min_replicas(),
         });
         let _ = write_binary_response(out, protocol::RES_OK, &body.to_string().into_bytes());
+    }
+
+    fn handle_flush_db(&self, out: &mut ResponseBuffer, st: &mut ConnState) {
+        if st.role != ROLE_ADMIN && st.role != ROLE_SERVER {
+            let _ = write_binary_response(
+                out,
+                protocol::RES_ERR,
+                b"Permission Denied: FLUSHDB requires admin role",
+            );
+            return;
+        }
+        if let Some(rm) = &self.repl_manager {
+            if rm.is_following(&st.db_name) {
+                rm.stop_following(&st.db_name);
+            }
+        }
+        if let Err(e) = st.db.reset() {
+            let _ = write_binary_response(
+                out,
+                protocol::RES_ERR,
+                format!("FLUSHDB failed: {e}").as_bytes(),
+            );
+            return;
+        }
+        st.db.set_state(STATE_UNDEFINED);
+        let _ = write_binary_response(out, protocol::RES_OK, &[]);
     }
 
     fn track_conn(&self, db: &str, delta: i64) {
@@ -729,6 +809,10 @@ impl Server {
         }
         if let Some(rm) = &self.repl_manager {
             rm.stop_all();
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while self.active_conns.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
         }
         for store in self.stores.values() {
             let _ = store.close();
@@ -807,14 +891,6 @@ fn pipelined_command_ready(reader: &BufReader<ServerConn>) -> bool {
         return false;
     }
     buf.len() >= protocol::PROTO_HEADER_SIZE + payload_len
-}
-
-fn read_full(r: &mut impl Read, buf: &mut [u8]) -> io::Result<()> {
-    let mut off = 0;
-    while off < buf.len() {
-        off += r.read(&mut buf[off..])?;
-    }
-    Ok(())
 }
 
 fn tls_files_present(cert: &str, key: &str, ca: &str) -> bool {

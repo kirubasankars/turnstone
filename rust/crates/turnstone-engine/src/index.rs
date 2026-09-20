@@ -15,15 +15,15 @@ pub struct MvccIndex {
 
 impl Default for MvccIndex {
     fn default() -> Self {
-        Self {
-            inner: RwLock::new(Some(Index::new())),
-        }
+        Self::new()
     }
 }
 
 impl MvccIndex {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            inner: RwLock::new(Some(Index::new())),
+        }
     }
 
     pub fn from_index(index: Index) -> Self {

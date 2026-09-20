@@ -35,13 +35,6 @@ impl Default for IndexStats {
     }
 }
 
-pub(crate) struct CompactResult {
-    pub arena_before: u64,
-    pub arena_after: u64,
-    pub keys_before: u32,
-    pub keys_after: u32,
-}
-
 /// Returns the version chain to retain for a key (newest first).
 pub type VersionFilter<'a> = dyn Fn(&[u8], &[Version]) -> Vec<Version> + 'a;
 
@@ -82,7 +75,7 @@ impl Index {
             return Err(format!("hashindex: invalid shard index {shard_index}").into());
         }
         let seg = &self.shards[shard_index as usize];
-        let _res = seg.compact(filter)?;
+        seg.compact(filter)?;
         Ok(seg.stats(shard_index as u32))
     }
 
@@ -102,7 +95,7 @@ impl Index {
 pub(crate) fn compact_shard(
     shard: &Shard,
     filter: Option<&VersionFilter<'_>>,
-) -> Result<CompactResult, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     shard.parent().set_enforce_limit(false);
     let _restore = RestoreEnforce(Arc::clone(shard.parent()));
 
@@ -111,13 +104,7 @@ pub(crate) fn compact_shard(
         return Err("hashindex: shard is closed".into());
     }
 
-    let res_before = CompactResult {
-        arena_before: live_bytes_for_map(&st.keys),
-        keys_before: st.keys.len() as u32,
-        arena_after: 0,
-        keys_after: 0,
-    };
-
+    let arena_before = live_bytes_for_map(&st.keys);
     let mut next: HashMap<Vec<u8>, Vec<Version>> = HashMap::new();
     for (key, chain) in st.keys.drain() {
         let versions = if let Some(f) = filter {
@@ -130,7 +117,7 @@ pub(crate) fn compact_shard(
         }
     }
 
-    let before_alloc = crate::encoding::HEADER_SIZE as i64 + res_before.arena_before as i64;
+    let before_alloc = crate::encoding::HEADER_SIZE as i64 + arena_before as i64;
     st.keys = next;
     let arena_after = live_bytes_for_map(&st.keys);
     let after_alloc = crate::encoding::HEADER_SIZE as i64 + arena_after as i64;
@@ -144,10 +131,5 @@ pub(crate) fn compact_shard(
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
     }
 
-    Ok(CompactResult {
-        arena_before: res_before.arena_before,
-        keys_before: res_before.keys_before,
-        arena_after,
-        keys_after: shard.state.read().keys.len() as u32,
-    })
+    Ok(())
 }

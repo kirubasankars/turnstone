@@ -6,14 +6,15 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::{Condvar, Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use turnstone_engine::{
     Db, EngineError, IndexHashMetrics, Options as EngineOptions, Transaction, WalSegmentInfo,
-    WalSegmentMetrics,
 };
 use turnstone_protocol::KeyNotFound;
 
@@ -127,7 +128,8 @@ pub struct Database {
     replica_timeout: Duration,
     quorum_timeout: Duration,
     closed: AtomicU64,
-    close_tx: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    bg_shutdown: Mutex<Vec<mpsc::Sender<()>>>,
+    bg_handles: Mutex<Vec<thread::JoinHandle<()>>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -202,10 +204,14 @@ pub fn open(dir: impl AsRef<Path>, opts: OpenOptions) -> Result<Arc<Database>, D
         replica_timeout,
         quorum_timeout,
         closed: AtomicU64::new(0),
-        close_tx: Mutex::new(None),
+        bg_shutdown: Mutex::new(Vec::new()),
+        bg_handles: Mutex::new(Vec::new()),
     });
 
     db.load_slots();
+    if db.retention_strategy == "replication" {
+        db.start_retention_tasks();
+    }
     Ok(db)
 }
 
@@ -547,7 +553,7 @@ impl Database {
         rx
     }
 
-    pub fn get_replica_signal_channel(&self, id: &str) -> Option<std::sync::mpsc::Receiver<()>> {
+    pub fn get_replica_signal_channel(&self, _id: &str) -> Option<std::sync::mpsc::Receiver<()>> {
         None
     }
 
@@ -684,12 +690,51 @@ impl Database {
         }
     }
 
+    pub fn reset(&self) -> Result<(), DatabaseError> {
+        self.remove_all_replicas();
+        let mut eng = self.engine.write();
+        eng.close()?;
+        if let Ok(entries) = std::fs::read_dir(&self.dir) {
+            for entry in entries.flatten() {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+        *eng = Db::open(&self.dir, self.db_opts.clone())?;
+        drop(eng);
+        self.set_leader_retain_offset(u64::MAX);
+        Ok(())
+    }
+
+    fn start_retention_tasks(self: &Arc<Self>) {
+        let (ret_tx, ret_rx) = mpsc::channel();
+        let ret_db = Arc::clone(self);
+        let ret_h = thread::spawn(move || loop {
+            match ret_rx.recv_timeout(Duration::from_secs(30)) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => ret_db.enforce_retention_policy(),
+            }
+        });
+        let (ev_tx, ev_rx) = mpsc::channel();
+        let ev_db = Arc::clone(self);
+        let ev_h = thread::spawn(move || loop {
+            match ev_rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => ev_db.evict_zombie_replicas_now(),
+            }
+        });
+        self.bg_shutdown.lock().extend([ret_tx, ev_tx]);
+        self.bg_handles.lock().extend([ret_h, ev_h]);
+    }
+
     pub fn close(&self) -> Result<(), DatabaseError> {
         if self.closed.fetch_add(1, Ordering::AcqRel) > 0 {
             return Ok(());
         }
-        if let Some(tx) = self.close_tx.lock().take() {
+        for tx in self.bg_shutdown.lock().drain(..) {
             let _ = tx.send(());
+        }
+        for h in self.bg_handles.lock().drain(..) {
+            let _ = h.join();
         }
         self.engine.read().close()?;
         Ok(())

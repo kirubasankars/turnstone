@@ -6,36 +6,23 @@
 use std::fs::File;
 use std::io;
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::Mutex;
 
 use nix::errno::Errno;
 use nix::fcntl::{fallocate, FallocateFlags};
 
-static TESTING_PREALLOC_ERR: AtomicPtr<io::ErrorKind> = AtomicPtr::new(std::ptr::null_mut());
+static TESTING_PREALLOC_ERR: Mutex<Option<io::ErrorKind>> = Mutex::new(None);
 
 /// Test hook: force preallocate to fail with the given error kind.
-#[cfg(test)]
 pub fn set_testing_prealloc_err(kind: Option<io::ErrorKind>) {
-    use std::sync::Mutex;
-    static SLOT: Mutex<Option<io::ErrorKind>> = Mutex::new(None);
-    *SLOT.lock().unwrap() = kind;
+    *TESTING_PREALLOC_ERR.lock().unwrap() = kind;
 }
 
 pub(crate) fn testing_prealloc_err() -> Option<io::Error> {
-    #[cfg(test)]
-    {
-        use std::sync::Mutex;
-        static SLOT: Mutex<Option<io::ErrorKind>> = Mutex::new(None);
-        return SLOT
-            .lock()
-            .unwrap()
-            .map(|k| io::Error::from(k));
-    }
-    #[cfg(not(test))]
-    {
-        let _ = TESTING_PREALLOC_ERR.load(Ordering::Relaxed);
-        None
-    }
+    TESTING_PREALLOC_ERR
+        .lock()
+        .unwrap()
+        .map(io::Error::from)
 }
 
 pub fn is_no_space(err: &io::Error) -> bool {

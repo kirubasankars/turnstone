@@ -58,6 +58,12 @@ impl Transaction {
     }
 }
 
+impl Drop for Transaction {
+    fn drop(&mut self) {
+        self.discard();
+    }
+}
+
 pub struct WriteTransaction {
     pub(crate) db: Arc<Db>,
     pub xid: u64,
@@ -211,6 +217,12 @@ impl WriteTransaction {
         }
         if self.aborted.load(Ordering::Acquire) {
             return Err(EngineError::WriteConflict);
+        }
+        if self.db.closed.load(Ordering::Acquire) {
+            return Err(EngineError::DatabaseClosed);
+        }
+        if self.db.is_disk_full.load(Ordering::Acquire) {
+            return Err(EngineError::DiskFull);
         }
         if key.is_empty() {
             return Err(EngineError::Other("empty key".into()));

@@ -318,6 +318,7 @@ mod tests {
         let config_path = tmp.path().join("config.json");
         let default_cfg = Config {
             port: ":9999".to_string(),
+            max_conns: 1000,
             tls_cert_file: "certs/server.crt".to_string(),
             tls_key_file: "certs/server.key".to_string(),
             tls_ca_file: "certs/ca.crt".to_string(),
@@ -335,6 +336,7 @@ mod tests {
         let loaded: Config = serde_json::from_str(&data).unwrap();
         assert_eq!(loaded.port, ":9999");
         assert_eq!(loaded.number_of_databases, 1);
+        assert_eq!(loaded.max_conns, 1000);
 
         for f in [
             "certs/ca.crt",

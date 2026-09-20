@@ -20,6 +20,7 @@ fn bench_opts() -> Options {
         commit_siblings: 1,
         value_cache_bytes: -1,
         shared_buffers_bytes: -1,
+        max_disk_usage_percent: 0,
         ..Options::default()
     }
 }

@@ -3,7 +3,7 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root of this source tree.
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -138,7 +138,7 @@ pub(crate) fn handle_replica_connection(
 
     let mut header = [0u8; protocol::PROTO_HEADER_SIZE];
     loop {
-        if read_full(conn, &mut header).is_err() {
+        if conn.read_exact(&mut header).is_err() {
             break;
         }
         if let Ok(pkt) = out_rx.try_recv() {
@@ -151,7 +151,7 @@ pub(crate) fn handle_replica_connection(
             break;
         }
         let mut body = vec![0u8; ln as usize];
-        if ln > 0 && read_full(conn, &mut body).is_err() {
+        if ln > 0 && conn.read_exact(&mut body).is_err() {
             break;
         }
         if header[0] == protocol::OP_REPL_ACK && body.len() > 4 {
@@ -222,12 +222,4 @@ fn write_repl_packet(conn: &mut ServerConn, p: &ReplPacket) -> std::io::Result<(
     payload.extend_from_slice(&crc.to_be_bytes());
     payload.extend_from_slice(&body);
     write_binary_response(conn, p.op, &payload)
-}
-
-fn read_full(r: &mut impl Read, buf: &mut [u8]) -> std::io::Result<()> {
-    let mut off = 0;
-    while off < buf.len() {
-        off += r.read(&mut buf[off..])?;
-    }
-    Ok(())
 }

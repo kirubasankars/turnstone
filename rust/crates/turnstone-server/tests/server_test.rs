@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use turnstone_client::{Client, ClientConfig, PipelineResponse};
+use turnstone_client::{Client, ClientConfig, ClientError, PipelineResponse};
 use turnstone_protocol::{encode_frame, OP_PING};
 use turnstone_config::{generate_config_artifacts, Config};
 use turnstone_database::{open, OpenOptions, STATE_PRIMARY};
@@ -115,6 +115,15 @@ fn server_set_get_in_tx() {
     let val = client.get("mykey").unwrap();
     client.commit().unwrap();
     assert_eq!(val, b"myval");
+
+    client.begin().unwrap();
+    client.del("mykey").unwrap();
+    client.commit().unwrap();
+
+    client.begin().unwrap();
+    let missing = client.get("mykey");
+    client.commit().unwrap();
+    assert!(matches!(missing, Err(ClientError::NotFound)));
 
     srv.close_all();
 }
