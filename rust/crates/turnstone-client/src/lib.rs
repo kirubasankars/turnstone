@@ -99,6 +99,11 @@ impl Client {
         self.transport.write_all(data)
     }
 
+    /// Pushes buffered request bytes to the server (call once after pipelined `write_raw`).
+    pub fn flush_write(&self) -> Result<(), ClientError> {
+        self.transport.flush()
+    }
+
     /// Reads the next response frame from the server.
     pub fn read_response(&self) -> Result<PipelineResponse, ClientError> {
         pipeline::read_response(&self.transport)

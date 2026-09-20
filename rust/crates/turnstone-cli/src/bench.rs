@@ -449,7 +449,7 @@ fn flush_pipeline(
     depth: usize,
     batch: usize,
 ) -> PipelineFlushOutcome {
-    if client.write_raw(write_buf).is_err() {
+    if client.write_raw(write_buf).is_err() || client.flush_write().is_err() {
         return PipelineFlushOutcome::IoError;
     }
     let expected = depth * (2 + batch);

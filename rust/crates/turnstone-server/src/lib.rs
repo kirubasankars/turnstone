@@ -6,7 +6,7 @@
 mod replication;
 
 use std::collections::HashMap;
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
@@ -63,6 +63,7 @@ impl ServerConn {
             Self::Tls(s) => peer_identity_tls(s),
         }
     }
+
 }
 
 impl Read for ServerConn {
@@ -330,33 +331,49 @@ impl Server {
             db_name: state.db_name.clone(),
             conn_id,
         };
+        let mut reader = BufReader::with_capacity(64 * 1024, stream);
         let mut header = [0u8; protocol::PROTO_HEADER_SIZE];
+        let mut pending_flush = false;
         loop {
             if self.closing.load(Ordering::Acquire) {
                 break;
             }
-            let _ = stream.set_read_timeout(Some(protocol::IDLE_TIMEOUT));
-            if read_full(&mut stream, &mut header).is_err() {
+            // Flush buffered TLS/TCP responses when no further pipelined commands remain
+            // in the read buffer (matches Go not flushing after every response).
+            if pending_flush {
+                let more = reader.fill_buf().map(|b| b.len()).unwrap_or(0);
+                if more == 0 {
+                    let _ = reader.get_mut().flush();
+                    pending_flush = false;
+                }
+            }
+            let _ = reader.get_mut().set_read_timeout(Some(protocol::IDLE_TIMEOUT));
+            if read_full(&mut reader, &mut header).is_err() {
                 break;
             }
             if self.tls_enabled && state.client_id == "unknown" {
-                let (role, client_id) = stream.peer_identity();
+                let (role, client_id) = reader.get_mut().peer_identity();
                 state.role = role;
                 state.client_id = client_id;
             }
             let op = header[0];
             let payload_len = u32::from_be_bytes(header[1..5].try_into().unwrap()) as usize;
             if payload_len as u64 > protocol::MAX_COMMAND_SIZE {
-                let _ = write_binary_response(&mut stream, protocol::RES_ENTITY_TOO_LARGE, &[]);
+                let _ = write_binary_response(reader.get_mut(), protocol::RES_ENTITY_TOO_LARGE, &[]);
                 break;
             }
             let mut payload = vec![0u8; payload_len];
-            if payload_len > 0 && read_full(&mut stream, &mut payload).is_err() {
+            if payload_len > 0 && read_full(&mut reader, &mut payload).is_err() {
                 break;
             }
-            if self.dispatch_command(&mut stream, op, &payload, &mut state) {
+            if self.dispatch_command(reader.get_mut(), op, &payload, &mut state) {
+                pending_flush = true;
                 break;
             }
+            pending_flush = true;
+        }
+        if pending_flush {
+            let _ = reader.get_mut().flush();
         }
         if let Some(mut tx) = state.tx.take() {
             tx.discard();
@@ -690,7 +707,7 @@ pub fn write_binary_response(w: &mut impl Write, status: u8, body: &[u8]) -> io:
     if !body.is_empty() {
         w.write_all(body)?;
     }
-    w.flush()
+    Ok(())
 }
 
 fn drive_tls_handshake(stream: &mut TlsStream) -> io::Result<()> {
@@ -723,6 +740,7 @@ fn tls_files_present(cert: &str, key: &str, ca: &str) -> bool {
 fn reject_busy(tcp: TcpStream, cfg: Option<Arc<rustls::ServerConfig>>) -> io::Result<()> {
     if let Ok(mut stream) = ServerConn::from_tcp(tcp, cfg) {
         let _ = write_binary_response(&mut stream, protocol::RES_SERVER_BUSY, b"Max connections");
+        let _ = stream.flush();
     }
     Ok(())
 }
@@ -730,7 +748,6 @@ fn reject_busy(tcp: TcpStream, cfg: Option<Arc<rustls::ServerConfig>>) -> io::Re
 fn peer_identity_tls(stream: &mut TlsStream) -> (String, String) {
     let mut role = ROLE_CLIENT.to_string();
     let mut client_id = "unknown".to_string();
-    let _ = stream.flush();
     if let Some(certs) = stream.conn.peer_certificates() {
         if let Some(cert) = certs.first() {
             if let Ok(parsed) = x509_parser::parse_x509_certificate(cert.as_ref()) {

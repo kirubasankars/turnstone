@@ -101,9 +101,22 @@ impl Transport {
 
     pub fn round_trip(&self, frame: &[u8]) -> Result<Vec<u8>, ClientError> {
         self.write_all(frame)?;
+        self.flush()?;
         let (status, body) = self.read_frame()?;
         crate::error::map_status(status, &body)?;
         Ok(body)
+    }
+
+    /// Ensures buffered request bytes are sent (needed for single-frame RPC over TLS).
+    pub fn flush(&self) -> Result<(), ClientError> {
+        let mut guard = self.inner.lock().unwrap();
+        let stream = guard.as_mut().ok_or_else(|| {
+            ClientError::Connection("connection closed".into())
+        })?;
+        stream
+            .flush()
+            .map_err(|e| ClientError::Connection(format!("I/O failed: {e}")))?;
+        Ok(())
     }
 
     /// Writes raw bytes (one or more concatenated frames) without waiting for responses.
@@ -116,9 +129,6 @@ impl Transport {
         set_write_timeout(stream, self.write_timeout)?;
         stream
             .write_all(data)
-            .map_err(|e| ClientError::Connection(format!("I/O failed: {e}")))?;
-        stream
-            .flush()
             .map_err(|e| ClientError::Connection(format!("I/O failed: {e}")))?;
         Ok(())
     }
