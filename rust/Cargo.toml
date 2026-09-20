@@ -8,6 +8,8 @@ resolver = "2"
 members = [
     "crates/turnstone-protocol",
     "crates/turnstone-engine",
+    "crates/turnstone-hashindex",
+    "crates/turnstone-mlock",
     "crates/turnstone-tls",
     "crates/turnstone-client",
     "crates/turnstone-cli",
@@ -20,8 +22,12 @@ license = "MIT"
 repository = "https://github.com/kirubasankars/turnstone"
 
 [workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 thiserror = "2.0"
 crc32fast = "1.4"
+parking_lot = "0.12"
+libc = "0.2"
 rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 rustls-pemfile = "2.2"
 clap = { version = "4.5", features = ["derive"] }
