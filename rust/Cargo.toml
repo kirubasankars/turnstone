@@ -39,3 +39,4 @@ libc = "0.2"
 rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 rustls-pemfile = "2.2"
 clap = { version = "4.5", features = ["derive"] }
+criterion = { version = "0.5", features = ["html_reports"] }

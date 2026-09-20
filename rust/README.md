@@ -63,3 +63,15 @@ make test-rust-coverage
 ```
 
 Recent additions include Go-ported **index GC keep-mask** regression tests (`turnstone-engine` `index_gc` module), **active transaction readers** in `build_index_gc_context`, value-cache and shared-buffer integration tests, and heap-only hash-index smoke checks.
+
+## Benchmarks
+
+Microbenchmarks (Criterion, aligned with Go `engine/benchmark_test.go` and `hashindex/benchmark_test.go`):
+
+```bash
+make bench-rust
+# or:
+cd rust && cargo bench -p turnstone-engine -p turnstone-hashindex
+```
+
+Lightweight **benchmark smoke tests** run with the normal test suite (`tests/benchmark_test.rs` in `turnstone-engine` and `turnstone-hashindex`).

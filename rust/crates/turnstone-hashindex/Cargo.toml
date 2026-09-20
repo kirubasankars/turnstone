@@ -10,3 +10,10 @@ repository.workspace = true
 crc32fast.workspace = true
 thiserror.workspace = true
 parking_lot.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "hashindex_bench"
+harness = false
