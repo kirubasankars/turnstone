@@ -28,7 +28,8 @@ type Index struct {
 
 Each `shard` owns:
 
-- Slot table (open addressing, load-factor growth)
+- Address table of u32 **arena** offsets (open addressing, load-factor growth; 0 = empty)
+- Arena: one mmap per shard, linked 64 KiB pages (grow appends a page; slot-table grow does not move records)
 - Arena backing version nodes and key bytes
 - `RWMutex` for readers / writers
 
@@ -38,7 +39,7 @@ Each `shard` owns:
 | --- | --- |
 | `Put(key, ver)` | Prepend new version to key's chain |
 | `WalkVersions(key, fn)` | Traverse chain newest-first |
-| `DropXid(xid)` | Remove in-progress/aborted versions for xid |
+| `DropXid(xid)` | Remove in-progress/aborted versions for xid; empty keys keep their slot so linear-probe chains stay intact |
 | `ForEachKey(fn)` | Full scan — used by compaction / GC |
 | `Compact(ctx)` | MVCC-aware prune + arena reclaim (`compact.go`) |
 
@@ -57,7 +58,7 @@ Regression tests: `compact_regression_test.go`, `compact_test.go`.
 
 ## On-disk format note
 
-The arena header includes magic `TGHSH` and `formatVersion` for debugging — this is **not** a durable database file, only an in-memory layout marker.
+The meta header includes magic `TGHSH` and `formatVersion` for debugging — this is **not** a durable database file, only an in-memory layout marker. The address table lives in one mapping; the arena is a **separate** mmap of linked pages (`next` + `used` in each page header). Slots are u32 offsets into that arena mmap (4 GiB cap). Version `head`/`next` stay u64. Rehash only rewrites the address table.
 
 ## Educational focus
 
@@ -82,7 +83,7 @@ When debugging index bugs, determine whether the fault is in **chain structure**
 ## Review checklist
 
 - [ ] `Put` / `WalkVersions` agree on chain order (newest at head).
-- [ ] `DropXid` safe during concurrent reads (shard lock held).
+- [ ] `DropXid` safe during concurrent reads (shard lock held); empty keys keep their slot.
 - [ ] Compaction does not drop offsets still referenced by MVCC or replication.
 - [ ] Load factor growth copies slots correctly (no lost keys).
 - [ ] `Close` releases arena memory (tests for leak detection).

@@ -6,6 +6,7 @@
 package engine
 
 import (
+	"fmt"
 	"testing"
 )
 
@@ -360,5 +361,80 @@ func TestVisibility_AbortedWriteNotVisibleToReaders(t *testing.T) {
 	})
 	if chainLen != 1 {
 		t.Fatalf("expected aborted version removed from index chain, got %d versions", chainLen)
+	}
+}
+
+// probeHashKey matches hashindex.hashKey so tests can place two keys in one
+// home slot (hashindex.initialSlots = 1024).
+func probeHashKey(key []byte) uint64 {
+	const (
+		offset64 = 14695981039346656037
+		prime64  = 1099511628211
+	)
+	h := uint64(offset64)
+	for _, b := range key {
+		h ^= uint64(b)
+		h *= prime64
+	}
+	return h
+}
+
+func collidingIndexKeys(t *testing.T) (a, b []byte) {
+	t.Helper()
+	const slots = 1024
+	for i := 0; i < 200000; i++ {
+		ka := []byte(fmt.Sprintf("probe-%d", i))
+		ha := probeHashKey(ka)
+		for j := i + 1; j < i+8000; j++ {
+			kb := []byte(fmt.Sprintf("probe-%d", j))
+			hb := probeHashKey(kb)
+			if ha&255 != hb&255 {
+				continue
+			}
+			if ha%slots == hb%slots {
+				return ka, kb
+			}
+		}
+	}
+	t.Fatal("no colliding keys")
+	return nil, nil
+}
+
+func TestAbort_DoesNotHideCollidingCommittedKey(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir, Options{UnsafeDisableFsync: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	a, b := collidingIndexKeys(t)
+
+	txA := db.NewTransaction(true)
+	if err := txA.Put(a, []byte("abort-me")); err != nil {
+		t.Fatal(err)
+	}
+
+	txB := db.NewTransaction(true)
+	if err := txB.Put(b, []byte("keep-me")); err != nil {
+		t.Fatal(err)
+	}
+	if err := txB.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	txA.Discard()
+
+	rtx := db.NewTransaction(false)
+	defer rtx.Discard()
+	val, err := rtx.Get(b)
+	if err != nil {
+		t.Fatalf("GET colliding key after neighbor abort: %v", err)
+	}
+	if string(val) != "keep-me" {
+		t.Fatalf("expected keep-me, got %q", val)
+	}
+	if _, err := rtx.Get(a); err != ErrKeyNotFound {
+		t.Fatalf("aborted key should be missing, got %v", err)
 	}
 }
