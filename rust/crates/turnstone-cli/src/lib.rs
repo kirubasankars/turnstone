@@ -7,6 +7,7 @@
 
 mod backup_cmd;
 mod bench;
+mod bench_io;
 mod commands;
 mod connect;
 mod repl;

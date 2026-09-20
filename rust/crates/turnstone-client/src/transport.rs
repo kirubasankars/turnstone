@@ -67,11 +67,10 @@ impl Transport {
         let stream = TcpStream::connect_timeout(&addr, connect_timeout)
             .map_err(|e| ClientError::Connection(e.to_string()))?;
         let _ = stream.set_nodelay(true);
+        let mut io = BufReader::with_capacity(READ_BUF_CAPACITY, Stream::Plain(stream));
+        apply_io_timeouts(io.get_mut(), read_timeout, write_timeout)?;
         Ok(Self {
-            inner: Mutex::new(Some(BufReader::with_capacity(
-                READ_BUF_CAPACITY,
-                Stream::Plain(stream),
-            ))),
+            inner: Mutex::new(Some(io)),
             read_timeout,
             write_timeout,
         })
@@ -98,11 +97,10 @@ impl Transport {
         let conn = ClientConnection::new(config, server_name)
             .map_err(|e| ClientError::Connection(e.to_string()))?;
         let tls = Box::new(StreamOwned::new(conn, tcp));
+        let mut io = BufReader::with_capacity(READ_BUF_CAPACITY, Stream::Tls(tls));
+        apply_io_timeouts(io.get_mut(), read_timeout, write_timeout)?;
         Ok(Self {
-            inner: Mutex::new(Some(BufReader::with_capacity(
-                READ_BUF_CAPACITY,
-                Stream::Tls(tls),
-            ))),
+            inner: Mutex::new(Some(io)),
             read_timeout,
             write_timeout,
         })
@@ -140,16 +138,11 @@ impl Transport {
         })?;
         let stream = io.get_mut();
         drive_client_handshake(stream)?;
-        set_write_timeout(stream, self.write_timeout)?;
         stream
             .write_all(write_data)
             .map_err(|e| ClientError::Connection(format!("I/O failed: {e}")))?;
-        finish_tls_write(stream)?;
-        stream
-            .flush()
-            .map_err(|e| ClientError::Connection(format!("I/O failed: {e}")))?;
+        drive_tls_after_write(stream)?;
 
-        set_read_timeout(stream, self.read_timeout)?;
         let mut header = [0u8; turnstone_protocol::PROTO_HEADER_SIZE];
         for _ in 0..expected_responses {
             io.read_exact(&mut header)
@@ -169,7 +162,6 @@ impl Transport {
         })?;
         let stream = io.get_mut();
         drive_client_handshake(stream)?;
-        set_write_timeout(stream, self.write_timeout)?;
         stream
             .write_all(data)
             .map_err(|e| ClientError::Connection(format!("I/O failed: {e}")))?;
@@ -195,6 +187,18 @@ fn finish_tls_write(stream: &mut Stream) -> Result<(), ClientError> {
         while s.conn.wants_write() {
             s.conn
                 .write_tls(&mut s.sock)
+                .map_err(|e| ClientError::Connection(e.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Push pending TLS writes and pull any already-arrived ciphertext before reading responses.
+fn drive_tls_after_write(stream: &mut Stream) -> Result<(), ClientError> {
+    if let Stream::Tls(s) = stream {
+        while s.conn.wants_write() || s.conn.wants_read() {
+            s.conn
+                .complete_io(&mut s.sock)
                 .map_err(|e| ClientError::Connection(e.to_string()))?;
         }
     }
@@ -231,7 +235,6 @@ fn read_frame_buffered(
     io: &mut BufReader<Stream>,
     read_timeout: Duration,
 ) -> Result<(u8, Vec<u8>), ClientError> {
-    set_read_timeout(io.get_mut(), read_timeout)?;
     let mut header = [0u8; turnstone_protocol::PROTO_HEADER_SIZE];
     io.read_exact(&mut header)
         .map_err(|e| ClientError::Connection(format!("I/O failed: {e}")))?;
@@ -244,28 +247,24 @@ fn read_frame_buffered(
     Ok((header[0], body))
 }
 
-fn set_write_timeout(stream: &mut Stream, timeout: Duration) -> Result<(), ClientError> {
-    if timeout.is_zero() {
-        return Ok(());
-    }
+fn apply_io_timeouts(
+    stream: &mut Stream,
+    read_timeout: Duration,
+    write_timeout: Duration,
+) -> Result<(), ClientError> {
     let tcp = match stream {
         Stream::Plain(s) => s,
         Stream::Tls(s) => s.get_mut(),
     };
-    tcp.set_write_timeout(Some(timeout))
-        .map_err(|e| ClientError::Connection(e.to_string()))
-}
-
-fn set_read_timeout(stream: &mut Stream, timeout: Duration) -> Result<(), ClientError> {
-    if timeout.is_zero() {
-        return Ok(());
+    if !read_timeout.is_zero() {
+        tcp.set_read_timeout(Some(read_timeout))
+            .map_err(|e| ClientError::Connection(e.to_string()))?;
     }
-    let tcp = match stream {
-        Stream::Plain(s) => s,
-        Stream::Tls(s) => s.get_mut(),
-    };
-    tcp.set_read_timeout(Some(timeout))
-        .map_err(|e| ClientError::Connection(e.to_string()))
+    if !write_timeout.is_zero() {
+        tcp.set_write_timeout(Some(write_timeout))
+            .map_err(|e| ClientError::Connection(e.to_string()))?;
+    }
+    Ok(())
 }
 
 pub fn default_io_timeout() -> Duration {

@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 
 use rand::Rng;
 use serde_json::Value;
-use turnstone_client::{Client, ClientError};
+use turnstone_client::Client;
+
+use crate::bench_io::BenchConn;
 use turnstone_protocol::{
     append_header, BEGIN_READ_ONLY, OP_BEGIN, OP_COMMIT, OP_GET, OP_SET,
 };
@@ -156,14 +158,14 @@ fn run_phase(
             if ops == 0 {
                 return;
             }
-            let client = match connect(&conn_opts) {
+            let mut conn = match BenchConn::connect(&conn_opts) {
                 Ok(c) => c,
                 Err(_) => {
                     failed_c.fetch_add(ops, Ordering::Relaxed);
                     return;
                 }
             };
-            if client.select_db(&db.to_string()).is_err() {
+            if conn.select_db(db).is_err() {
                 failed_c.fetch_add(ops, Ordering::Relaxed);
                 return;
             }
@@ -195,14 +197,11 @@ fn run_phase(
                     tx_count += 1;
                 }
                 let ops_in_batch = (depth * batch) as u64;
-                match flush_pipeline(&client, &write_buf, depth, batch) {
-                    PipelineFlushOutcome::Success => {
+                match conn.pipeline(&write_buf, depth * (2 + batch)) {
+                    Ok(()) => {
                         completed_c.fetch_add(ops_in_batch, Ordering::Relaxed);
                     }
-                    PipelineFlushOutcome::BatchFailed => {
-                        failed_c.fetch_add(ops_in_batch, Ordering::Relaxed);
-                    }
-                    PipelineFlushOutcome::IoError => {
+                    Err(_) => {
                         failed_c.fetch_add(ops_in_batch, Ordering::Relaxed);
                         return;
                     }
@@ -246,11 +245,11 @@ fn run_duration(opts: &BenchOptions, payload: &[u8]) -> Result<(), String> {
         let db = opts.db;
         let payload = payload.to_vec();
         handles.push(thread::spawn(move || {
-            let client = match connect(&conn_opts) {
+            let mut conn = match BenchConn::connect(&conn_opts) {
                 Ok(c) => c,
                 Err(_) => return,
             };
-            if client.select_db(&db.to_string()).is_err() {
+            if conn.select_db(db).is_err() {
                 return;
             }
             let est_op_size = 20 + payload.len() + key_size;
@@ -274,14 +273,11 @@ fn run_duration(opts: &BenchOptions, payload: &[u8]) -> Result<(), String> {
                     );
                 }
                 let ops_in_batch = (depth * batch) as u64;
-                match flush_pipeline(&client, &write_buf, depth, batch) {
-                    PipelineFlushOutcome::Success => {
-                        completed_c.fetch_add(ops_in_batch, Ordering::Relaxed);
-                    }
-                    PipelineFlushOutcome::BatchFailed => {
-                        failed_c.fetch_add(ops_in_batch, Ordering::Relaxed);
-                    }
-                    PipelineFlushOutcome::IoError => return,
+                if conn.pipeline(&write_buf, depth * (2 + batch)).is_ok() {
+                    completed_c.fetch_add(ops_in_batch, Ordering::Relaxed);
+                } else {
+                    failed_c.fetch_add(ops_in_batch, Ordering::Relaxed);
+                    return;
                 }
             }
         }));
@@ -434,26 +430,6 @@ fn append_op(
         buf.extend_from_slice(&(key_bytes.len() as u32).to_be_bytes());
         buf.extend_from_slice(key_bytes);
         buf.extend_from_slice(payload);
-    }
-}
-
-enum PipelineFlushOutcome {
-    Success,
-    BatchFailed,
-    IoError,
-}
-
-fn flush_pipeline(
-    client: &Client,
-    write_buf: &[u8],
-    depth: usize,
-    batch: usize,
-) -> PipelineFlushOutcome {
-    let expected = depth * (2 + batch);
-    match client.pipeline_exchange(write_buf, expected) {
-        Ok(()) => PipelineFlushOutcome::Success,
-        Err(ClientError::Connection(_) | ClientError::Protocol(_)) => PipelineFlushOutcome::IoError,
-        Err(_) => PipelineFlushOutcome::BatchFailed,
     }
 }
 
