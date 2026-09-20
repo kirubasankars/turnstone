@@ -16,6 +16,9 @@ build-rust:
 test-rust:
 	cd rust && cargo test
 
+test-rust-coverage:
+	bash scripts/rust-coverage.sh
+
 clean:
 	rm -rf ./bin
 

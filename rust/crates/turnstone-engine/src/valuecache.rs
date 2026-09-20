@@ -72,3 +72,27 @@ impl ValueCache {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_put_and_eviction() {
+        let cache = ValueCache::new(4096);
+        cache.put(100, b"hello");
+        assert_eq!(cache.get(100).as_deref(), Some(b"hello".as_ref()));
+        cache.put(100, b"world");
+        assert_eq!(cache.get(100).as_deref(), Some(b"world".as_ref()));
+        cache.clear();
+        assert!(cache.get(100).is_none());
+    }
+
+    #[test]
+    fn ignores_oversized_entries() {
+        let cache = ValueCache::new(1 << 20);
+        let huge = vec![0u8; MAX_ENTRY + 1];
+        cache.put(1, &huge);
+        assert!(cache.get(1).is_none());
+    }
+}

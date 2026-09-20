@@ -1046,7 +1046,6 @@ name = "turnstone-hashindex"
 version = "0.1.0"
 dependencies = [
  "crc32fast",
- "libc",
  "parking_lot",
  "thiserror 2.0.20",
  "turnstone-mlock",

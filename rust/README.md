@@ -54,3 +54,12 @@ make test-rust
 cargo test --manifest-path rust/Cargo.toml   # Rust unit/integration tests
 go test -race -count=1 ./...               # Full Go reference suite (unchanged)
 ```
+
+From repo root, `make test-rust` runs the Rust suite. Coverage (requires `llvm-tools` / `cargo-llvm-cov`, installed by the script if missing):
+
+```bash
+make test-rust-coverage
+# writes rust/target/llvm-cov/lcov.info and prints a line summary
+```
+
+Recent additions include Go-ported **index GC keep-mask** regression tests (`turnstone-engine` `index_gc` module), **active transaction readers** in `build_index_gc_context`, value-cache and shared-buffer integration tests, and heap-only hash-index smoke checks.

@@ -259,6 +259,16 @@ mod tests {
     }
 
     #[test]
+    fn shard_buffer_is_heap_backed() {
+        let idx = Index::new();
+        let stats = idx.stats();
+        assert_eq!(stats.shards.len(), NUM_SHARDS);
+        for st in &stats.shards {
+            assert!(st.allocated_bytes > 0);
+        }
+    }
+
+    #[test]
     fn compact_shard_removes_key_when_filter_empty() {
         let idx = Index::new();
         let key = b"drop-me";

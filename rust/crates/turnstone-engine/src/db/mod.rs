@@ -27,6 +27,13 @@ use crate::wal::DataLog;
 
 pub use transaction::{Transaction, TxnHandle};
 
+/// Snapshot metadata for an open client transaction (index GC / WAL retain).
+pub(crate) struct ActiveTxnRegistration {
+    pub snapshot: crate::types::Snapshot,
+    pub my_xid: u64,
+    pub update: bool,
+}
+
 const DEFAULT_VALUE_CACHE_BYTES: i64 = 64 << 20;
 
 #[derive(Debug, Clone)]
@@ -78,7 +85,8 @@ pub struct Db {
     pub(crate) active_xids: Mutex<std::collections::HashMap<u64, Arc<transaction::WriteTransaction>>>,
     pub(crate) key_locks: Mutex<std::collections::HashMap<String, u64>>,
     pub(crate) begin_offsets: Mutex<std::collections::HashMap<u64, i64>>,
-    pub(crate) active_txns: Mutex<std::collections::HashMap<u64, u64>>,
+    pub(crate) active_txns: Mutex<std::collections::HashMap<u64, ActiveTxnRegistration>>,
+    active_txn_token: AtomicU64,
     pub(crate) transaction_id: AtomicU64,
     pub(crate) key_count: AtomicI64,
     pub(crate) scan_floor: AtomicI64,
@@ -210,6 +218,7 @@ impl Db {
             key_locks: Mutex::new(std::collections::HashMap::new()),
             begin_offsets: Mutex::new(std::collections::HashMap::new()),
             active_txns: Mutex::new(std::collections::HashMap::new()),
+            active_txn_token: AtomicU64::new(0),
             transaction_id: txid,
             key_count: AtomicI64::new(key_count),
             scan_floor: AtomicI64::new(scan_floor),
@@ -268,7 +277,11 @@ impl Db {
             let xid = self.transaction_id.fetch_add(1, Ordering::AcqRel) + 1;
             let snap = self.build_snapshot_locked();
             let begin_off = self.log.write_offset();
-            let tx = Arc::new(transaction::WriteTransaction::new_write(self.clone(), xid, snap));
+            let tx = Arc::new(transaction::WriteTransaction::new_write(
+                self.clone(),
+                xid,
+                snap.clone(),
+            ));
             self.active_xids.lock().insert(xid, tx.clone());
             self.begin_offsets.lock().insert(xid, begin_off);
             self.clog
@@ -276,19 +289,27 @@ impl Db {
                 .write()
                 .unwrap()
                 .insert(xid);
-            let id = self.register_active_txn(xid);
+            let id = self.register_active_txn(ActiveTxnRegistration {
+                snapshot: snap,
+                my_xid: xid,
+                update: true,
+            });
             TxnHandle::Write(tx, id)
         } else {
             let _guard = self.wal_rewrite_mu.read();
             let snap = self.build_snapshot_locked();
-            let id = self.register_active_txn(snap.xmax);
+            let id = self.register_active_txn(ActiveTxnRegistration {
+                snapshot: snap.clone(),
+                my_xid: 0,
+                update: false,
+            });
             TxnHandle::Read(self.clone(), snap, id)
         }
     }
 
-    fn register_active_txn(&self, token: u64) -> u64 {
-        let mut m = self.active_txns.lock();
-        m.insert(token, token);
+    fn register_active_txn(&self, reg: ActiveTxnRegistration) -> u64 {
+        let token = self.active_txn_token.fetch_add(1, Ordering::Relaxed) + 1;
+        self.active_txns.lock().insert(token, reg);
         token
     }
 
