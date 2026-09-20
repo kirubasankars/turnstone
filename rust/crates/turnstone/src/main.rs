@@ -68,9 +68,13 @@ enum Commands {
         concurrency: usize,
         #[arg(long, default_value = "10000")]
         ops: u64,
-        #[arg(long, help = "Run until elapsed seconds (overrides --ops when > 0)")]
+        #[arg(long, default_value = "0", help = "Run until elapsed seconds (overrides --ops when > 0)")]
         duration_secs: u64,
-        #[arg(long, help = "Soak stats interval in seconds (default 5 with --duration)")]
+        #[arg(
+            long,
+            default_value = "0",
+            help = "Soak stats interval in seconds (default 5 with --duration)"
+        )]
         report_secs: u64,
         #[arg(long, default_value = "128")]
         value_size: usize,
