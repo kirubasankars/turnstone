@@ -71,7 +71,8 @@ Microbenchmarks (Criterion, aligned with Go `engine/benchmark_test.go` and `hash
 ```bash
 make bench-rust
 # or:
-cd rust && cargo bench -p turnstone-engine -p turnstone-hashindex
+cd rust && cargo bench -p turnstone-engine --bench engine_bench
+cd rust && cargo bench -p turnstone-hashindex --bench hashindex_bench
 ```
 
 Lightweight **benchmark smoke tests** run with the normal test suite (`tests/benchmark_test.rs` in `turnstone-engine` and `turnstone-hashindex`).

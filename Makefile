@@ -17,7 +17,8 @@ test-rust:
 	cd rust && cargo test
 
 bench-rust:
-	cd rust && cargo bench -p turnstone-engine -p turnstone-hashindex -- --sample-size 20
+	cd rust && cargo bench -p turnstone-engine --bench engine_bench -- --sample-size 20
+	cd rust && cargo bench -p turnstone-hashindex --bench hashindex_bench -- --sample-size 20
 
 test-rust-coverage:
 	bash scripts/rust-coverage.sh
