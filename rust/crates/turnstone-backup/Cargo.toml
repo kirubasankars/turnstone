@@ -1,0 +1,26 @@
+[package]
+name = "turnstone-backup"
+description = "TurnstoneDB WAL backup and restore"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+turnstone-engine = { path = "../turnstone-engine" }
+turnstone-protocol = { path = "../turnstone-protocol" }
+turnstone-tls = { path = "../turnstone-tls" }
+crc32fast = { workspace = true }
+flate2 = "1.0"
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+thiserror = { workspace = true }
+rustls = { workspace = true }
+time = { version = "0.3", features = ["serde", "formatting"] }
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3.14"
+turnstone-config = { path = "../turnstone-config" }
+turnstone-tls = { path = "../turnstone-tls" }

@@ -84,7 +84,7 @@ pub fn frame_size(payload_len: usize) -> i64 {
     (LOG_FRAME_HEADER_SIZE + payload_len) as i64
 }
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum EngineError {
     #[error("transaction is already finished")]
     TxnFinished,

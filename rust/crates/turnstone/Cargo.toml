@@ -1,0 +1,18 @@
+[package]
+name = "turnstone"
+description = "TurnstoneDB CLI (init, server stub, client ping)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "turnstone"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+turnstone-config = { path = "../turnstone-config" }
+turnstone-client = { path = "../turnstone-client" }
+turnstone-engine = { path = "../turnstone-engine" }
+turnstone-tls = { path = "../turnstone-tls" }

@@ -11,8 +11,15 @@ members = [
     "crates/turnstone-hashindex",
     "crates/turnstone-mlock",
     "crates/turnstone-tls",
+    "crates/turnstone-config",
+    "crates/turnstone-metrics",
     "crates/turnstone-client",
     "crates/turnstone-cli",
+    "crates/turnstone-database",
+    "crates/turnstone-repl",
+    "crates/turnstone-server",
+    "crates/turnstone-backup",
+    "crates/turnstone",
 ]
 
 [workspace.package]
@@ -24,6 +31,7 @@ repository = "https://github.com/kirubasankars/turnstone"
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+prometheus = "0.13"
 thiserror = "2.0"
 crc32fast = "1.4"
 parking_lot = "0.12"

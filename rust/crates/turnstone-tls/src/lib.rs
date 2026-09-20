@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::{ClientConfig, RootCertStore};
+use rustls::server::WebPkiClientVerifier;
+use rustls::{ClientConfig, RootCertStore, ServerConfig};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -78,6 +79,40 @@ pub fn load_mtls(
     let config = ClientConfig::builder()
         .with_root_certificates(roots)
         .with_client_auth_cert(cert_chain, key)
+        .map_err(TlsError::Rustls)?;
+
+    Ok(Arc::new(config))
+}
+
+pub fn load_server_mtls(
+    ca_file: impl AsRef<Path>,
+    cert_file: impl AsRef<Path>,
+    key_file: impl AsRef<Path>,
+) -> Result<Arc<ServerConfig>, TlsError> {
+    let ca_file = ca_file.as_ref();
+    let cert_file = cert_file.as_ref();
+    let key_file = key_file.as_ref();
+
+    let mut roots = RootCertStore::empty();
+    let ca_pem = read_file(ca_file)?;
+    let mut ca_reader = BufReader::new(ca_pem.as_slice());
+    for cert in rustls_pemfile::certs(&mut ca_reader).flatten() {
+        roots.add(cert).map_err(TlsError::Rustls)?;
+    }
+    if roots.is_empty() {
+        return Err(TlsError::BadCa(ca_file.to_path_buf()));
+    }
+
+    let client_verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .map_err(|e| TlsError::Rustls(rustls::Error::General(e.to_string())))?;
+
+    let cert_chain = read_certs(cert_file)?;
+    let key = read_private_key(key_file)?;
+
+    let config = ServerConfig::builder()
+        .with_client_cert_verifier(client_verifier)
+        .with_single_cert(cert_chain, key)
         .map_err(TlsError::Rustls)?;
 
     Ok(Arc::new(config))

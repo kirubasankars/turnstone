@@ -3,19 +3,26 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root of this source tree.
 
-//! TurnstoneDB storage engine: WAL types, encoding, and segmented data log.
+//! TurnstoneDB storage engine: WAL types, encoding, MVCC index, and `Db`.
 
 mod clog;
+mod db;
+#[cfg(unix)]
+mod disk_unix;
 mod encode;
 pub mod hashindex;
+mod index;
 mod recovery;
 mod types;
+mod valuecache;
 pub mod wal;
 
 pub use clog::ClogState;
+pub use db::{Db, Options, Transaction, TxnHandle, WalSegmentInfo, WalSegmentMetrics};
 pub use encode::{
     decode_record, decode_value_at, encode_record, EncodeError,
 };
+pub use index::IndexHashMetrics;
 pub use recovery::{replay_into_mem, replay_log};
 pub use types::*;
 pub use wal::{validate_frames, DataLog};

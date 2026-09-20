@@ -1,0 +1,20 @@
+[package]
+name = "turnstone-database"
+description = "TurnstoneDB database layer (role state, replication slots)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+turnstone-engine = { path = "../turnstone-engine" }
+turnstone-protocol = { path = "../turnstone-protocol" }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+log = "0.4"
+
+[dev-dependencies]
+tempfile = "3.14"
+turnstone-config = { path = "../turnstone-config" }

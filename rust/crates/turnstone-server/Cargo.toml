@@ -1,0 +1,28 @@
+[package]
+name = "turnstone-server"
+description = "TurnstoneDB mTLS TCP server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+turnstone-database = { path = "../turnstone-database" }
+turnstone-engine = { path = "../turnstone-engine" }
+turnstone-protocol = { path = "../turnstone-protocol" }
+turnstone-repl = { path = "../turnstone-repl" }
+turnstone-tls = { path = "../turnstone-tls" }
+crc32fast = { workspace = true }
+log = "0.4"
+parking_lot = { workspace = true }
+rustls = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+x509-parser = "0.16"
+
+[dev-dependencies]
+tempfile = "3.14"
+turnstone-config = { path = "../turnstone-config" }
+turnstone-client = { path = "../turnstone-client" }
+

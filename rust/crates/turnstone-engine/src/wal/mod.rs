@@ -11,7 +11,7 @@ mod mmap;
 mod recycle;
 mod sync;
 
-pub use log::DataLog;
+pub use log::{CopyForwardOutcome, DataLog};
 pub use logrange::{validate_frames, LogFrame};
 
 pub use manifest::{

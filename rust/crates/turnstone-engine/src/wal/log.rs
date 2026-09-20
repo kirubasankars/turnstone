@@ -32,6 +32,14 @@ use crate::{encode_record, frame_size, RecordType};
 
 const REPLAY_CANCEL_CHECK_INTERVAL: u64 = 1024;
 
+/// Result of copying live WAL frames into a fresh segment.
+pub struct CopyForwardOutcome {
+    pub remap: std::collections::HashMap<i64, i64>,
+    pub head_before: i64,
+    pub bytes_before: i64,
+    pub bytes_after: i64,
+}
+
 static TESTING_BEFORE_SYNC: Mutex<Option<Box<dyn Fn() + Send>>> = Mutex::new(None);
 
 /// Test hook: runs after WAL insert lock release and before fdatasync.
@@ -161,6 +169,42 @@ impl DataLog {
         self.inner.read().unwrap().segments.len()
     }
 
+    /// Retained WAL LSN span (write head minus oldest segment base).
+    pub fn logical_size(&self) -> i64 {
+        let inner = self.inner.read().unwrap();
+        if inner.segments.is_empty() {
+            return 0;
+        }
+        let size = inner.write_offset - inner.segments[0].base_lsn;
+        if size < 0 {
+            0
+        } else {
+            size
+        }
+    }
+
+    /// On-disk allocated bytes for all WAL segment files.
+    pub fn allocated_size(&self) -> i64 {
+        let inner = self.inner.read().unwrap();
+        let mut total = 0i64;
+        for seg in &inner.segments {
+            if let Ok(meta) = std::fs::metadata(&seg.path) {
+                total += meta.len() as i64;
+            }
+        }
+        total
+    }
+
+    /// Base LSN of the earliest retained segment.
+    pub fn oldest_segment_base_lsn(&self) -> i64 {
+        let inner = self.inner.read().unwrap();
+        inner
+            .segments
+            .first()
+            .map(|s| s.base_lsn)
+            .unwrap_or(0)
+    }
+
     pub fn segments(&self) -> Vec<(u32, i64, i64)> {
         let inner = self.inner.read().unwrap();
         inner
@@ -217,6 +261,73 @@ impl DataLog {
     pub fn read_value_at(&self, offset: i64, val_len: u32) -> Result<Vec<u8>, EngineError> {
         let inner = self.inner.read().unwrap();
         inner.read_value_at_locked(offset, val_len)
+    }
+
+    /// On-disk frame bytes (header + payload) at global LSN.
+    pub fn read_frame_bytes_at(&self, lsn: i64) -> Result<Vec<u8>, EngineError> {
+        let inner = self.inner.read().unwrap();
+        let seg_idx = inner.segment_index_for_lsn(lsn);
+        if seg_idx < 0 {
+            return Err(EngineError::InvalidLogOffset);
+        }
+        let seg = &inner.segments[seg_idx as usize];
+        let local = lsn - seg.base_lsn;
+        let limit = inner.segment_scan_limit(seg, file_size_of(&seg.path), self.segment_size);
+        let (_valid_end, _rec, span, rerr) = inner.read_frame_at_seg(seg, local, limit);
+        if rerr.is_err() {
+            return Err(EngineError::InvalidLogOffset);
+        }
+        let mut frame = vec![0u8; span.length as usize];
+        inner
+            .read_segment_at(seg, local, &mut frame)
+            .map_err(EngineError::from)?;
+        Ok(frame)
+    }
+
+    pub fn append_copy_forward_frames(
+        &self,
+        old_offsets: &[i64],
+        frames: &[Vec<u8>],
+    ) -> Result<CopyForwardOutcome, EngineError> {
+        if old_offsets.len() != frames.len() {
+            return Err(EngineError::Other(
+                "wal copy-forward: offset/frame count mismatch".into(),
+            ));
+        }
+        let mut inner = self.inner.write().unwrap();
+        let mut out = CopyForwardOutcome {
+            remap: std::collections::HashMap::with_capacity(old_offsets.len()),
+            head_before: inner.write_offset,
+            bytes_before: 0,
+            bytes_after: 0,
+        };
+        for seg in &inner.segments {
+            if let Ok(meta) = fs::metadata(&seg.path) {
+                out.bytes_before += meta.len() as i64;
+            }
+        }
+        inner.rotate_segment_locked(self)?;
+        for (i, frame) in frames.iter().enumerate() {
+            let off = inner.write_offset;
+            let seg_idx = inner.active_index;
+            let local_off = off - inner.segments[seg_idx].base_lsn;
+            inner.write_segment_at(seg_idx, local_off, frame)?;
+            inner.write_offset += frame.len() as i64;
+            out.remap.insert(old_offsets[i], off);
+            if inner.write_offset - inner.segments[seg_idx].base_lsn
+                >= inner.usable_segment_size(self.segment_size)
+            {
+                inner.rotate_segment_locked(self)?;
+            }
+        }
+        for seg in &inner.segments {
+            if let Ok(meta) = fs::metadata(&seg.path) {
+                out.bytes_after += meta.len() as i64;
+            }
+        }
+        self.persist_manifest_locked(&mut inner)
+            .map_err(|e| EngineError::Other(e.to_string()))?;
+        Ok(out)
     }
 
     pub fn read_log_range(

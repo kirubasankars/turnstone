@@ -1,0 +1,11 @@
+[package]
+name = "turnstone-metrics"
+description = "Prometheus metrics collector for TurnstoneDB"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+prometheus.workspace = true
+thiserror.workspace = true

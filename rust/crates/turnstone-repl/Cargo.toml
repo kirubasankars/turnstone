@@ -1,0 +1,16 @@
+[package]
+name = "turnstone-repl"
+description = "TurnstoneDB outbound replication manager"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+turnstone-database = { path = "../turnstone-database" }
+turnstone-protocol = { path = "../turnstone-protocol" }
+turnstone-client = { path = "../turnstone-client" }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+log = "0.4"
+rustls = { workspace = true }

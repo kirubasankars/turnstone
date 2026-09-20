@@ -14,3 +14,8 @@ pub use limits::*;
 pub use opcode::*;
 pub use payload::{PayloadError, *};
 pub use wire::*;
+
+/// Key missing on GET (matches Go `protocol.ErrKeyNotFound`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("key does not exist")]
+pub struct KeyNotFound;
