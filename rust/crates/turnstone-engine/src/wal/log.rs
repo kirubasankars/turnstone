@@ -27,7 +27,7 @@ use std::sync::Arc;
 use crate::castagnoli_checksum;
 use crate::shared_buffers::{BufferTag, SharedBuffers, SHARED_BUFFER_PAGE_SIZE};
 use crate::decode_record;
-use crate::decode_value_at;
+use crate::decode_value_into;
 use crate::types::{
     EngineError, Record, RecordSpan, LOG_FRAME_HEADER_SIZE, FILE_MODE,
 };
@@ -300,16 +300,36 @@ impl DataLog {
     }
 
     pub fn read_value_at(&self, offset: i64, val_len: u32) -> Result<Vec<u8>, EngineError> {
+        let mut out = Vec::new();
+        self.read_value_at_into(offset, val_len, &mut out)?;
+        Ok(out)
+    }
+
+    /// Read a SET value into `out`, reusing capacity across calls on the same buffer.
+    pub fn read_value_at_into(
+        &self,
+        offset: i64,
+        val_len: u32,
+        out: &mut Vec<u8>,
+    ) -> Result<(), EngineError> {
         if self.buffers.is_some() {
-            if let Ok(v) = self.read_value_via_buffers(offset, val_len) {
-                return Ok(v);
+            if self
+                .read_value_via_buffers_into(offset, val_len, out)
+                .is_ok()
+            {
+                return Ok(());
             }
         }
         let inner = self.inner.read().unwrap();
-        inner.read_value_at_locked(offset, val_len)
+        inner.read_value_at_locked_into(offset, val_len, out)
     }
 
-    fn read_value_via_buffers(&self, offset: i64, val_len: u32) -> Result<Vec<u8>, EngineError> {
+    fn read_value_via_buffers_into(
+        &self,
+        offset: i64,
+        val_len: u32,
+        out: &mut Vec<u8>,
+    ) -> Result<(), EngineError> {
         let buffers = self.buffers.as_ref().ok_or(EngineError::LogUnavailable)?;
         let inner = self.inner.read().unwrap();
         let (seg, local) = inner
@@ -343,7 +363,7 @@ impl DataLog {
         if castagnoli_checksum(&payload) != checksum {
             return Err(EngineError::Checksum);
         }
-        decode_value_at(&payload, val_len)
+        decode_value_into(&payload, val_len, out)
     }
 
     /// On-disk frame bytes (header + payload) at global LSN.
@@ -980,7 +1000,12 @@ impl Inner {
         -1
     }
 
-    fn read_value_at_locked(&self, offset: i64, val_len: u32) -> Result<Vec<u8>, EngineError> {
+    fn read_value_at_locked_into(
+        &self,
+        offset: i64,
+        val_len: u32,
+        out: &mut Vec<u8>,
+    ) -> Result<(), EngineError> {
         let (seg, local) = self
             .resolve_lsn(offset)
             .ok_or(EngineError::InvalidLogOffset)?;
@@ -992,13 +1017,30 @@ impl Inner {
             return Err(EngineError::CorruptData);
         }
         let checksum = u32::from_be_bytes(header[4..8].try_into().unwrap());
-        let mut payload = vec![0u8; payload_len as usize];
-        self.read_segment_at(seg, local + LOG_FRAME_HEADER_SIZE as i64, &mut payload)
+        let payload_start = local + LOG_FRAME_HEADER_SIZE as i64;
+
+        if let Some(m) = &seg.mapping {
+            let mmap = &m.mmap;
+            let start = payload_start as usize;
+            let end = start + payload_len as usize;
+            if end > mmap.len() {
+                return Err(EngineError::CorruptData);
+            }
+            let payload = &mmap[start..end];
+            if castagnoli_checksum(payload) != checksum {
+                return Err(EngineError::Checksum);
+            }
+            return decode_value_into(payload, val_len, out);
+        }
+
+        let mut payload = Vec::with_capacity(payload_len as usize);
+        payload.resize(payload_len as usize, 0);
+        self.read_segment_at(seg, payload_start, &mut payload)
             .map_err(|e| EngineError::Other(e.to_string()))?;
         if castagnoli_checksum(&payload) != checksum {
             return Err(EngineError::Checksum);
         }
-        decode_value_at(&payload, val_len)
+        decode_value_into(&payload, val_len, out)
     }
 
     fn read_segment_at(&self, seg: &WalSegment, local: i64, dst: &mut [u8]) -> io::Result<()> {

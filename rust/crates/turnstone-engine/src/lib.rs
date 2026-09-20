@@ -27,7 +27,7 @@ pub use index_gc::{IndexCompactResult, IndexGcContext, DEFAULT_INDEX_FRAGMENTATI
 pub use shared_buffers::{SharedBuffers, DEFAULT_SHARED_BUFFERS_BYTES, SHARED_BUFFER_PAGE_SIZE};
 pub use wal_maintenance::{WalRetentionResult, DEFAULT_WAL_COPY_FORWARD_RATIO};
 pub use encode::{
-    decode_record, decode_value_at, encode_record, EncodeError,
+    decode_record, decode_value_at, decode_value_into, encode_record, set_value_range, EncodeError,
 };
 pub use index::IndexHashMetrics;
 pub use recovery::{replay_into_mem, replay_log};

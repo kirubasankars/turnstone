@@ -155,36 +155,35 @@ pub(crate) fn compact_shard(
         keys_after: 0,
     };
 
-    struct KeyEntry {
-        key: Vec<u8>,
+    struct CompactEntry {
+        rec_off: u64,
         versions: Vec<Version>,
     }
 
-    let entries: Vec<KeyEntry> = {
-        let data = buf.as_slice();
-        let slots = Shard::slot_count_on_data(data);
-        let table = read_u64(data, HDR_TABLE_OFF_OFF) as usize;
-        let mut entries = Vec::new();
+    let old_data = buf.as_slice();
+    let keys_before_count = res_before.keys_before.max(1) as usize;
+    let mut entries: Vec<CompactEntry> = Vec::with_capacity(keys_before_count);
+    {
+        let slots = Shard::slot_count_on_data(old_data);
+        let table = read_u64(old_data, HDR_TABLE_OFF_OFF) as usize;
         for slot in 0..slots {
-            let rec_off = read_u64(data, table + slot as usize * 8);
+            let rec_off = read_u64(old_data, table + slot as usize * 8);
             if rec_off == 0 {
                 continue;
             }
-            let k_len = read_u32(data, rec_off as usize) as usize;
-            let key = data[rec_off as usize + 12..rec_off as usize + 12 + k_len].to_vec();
-            let chain = shard.read_chain_locked(data, rec_off);
+            let key = Shard::key_bytes(old_data, rec_off);
+            let chain = shard.read_chain_locked(old_data, rec_off);
             let versions = if let Some(f) = filter {
-                f(&key, &chain)
+                f(key, &chain)
             } else {
                 chain
             };
             if versions.is_empty() {
                 continue;
             }
-            entries.push(KeyEntry { key, versions });
+            entries.push(CompactEntry { rec_off, versions });
         }
-        entries
-    };
+    }
 
     let mut slot_count = Shard::slot_count_on_data(buf.as_slice());
     if slot_count == 0 {
@@ -193,7 +192,8 @@ pub(crate) fn compact_shard(
     let table_bytes = u64::from(slot_count) * 8;
     let mut live_bytes = 0u64;
     for e in &entries {
-        live_bytes += (12 + e.key.len()) as u64 + (e.versions.len() as u64) * VERSION_NODE_SZ as u64;
+        let key_len = Shard::key_bytes(old_data, e.rec_off).len();
+        live_bytes += (12 + key_len) as u64 + (e.versions.len() as u64) * VERSION_NODE_SZ as u64;
     }
     let mut new_size =
         HEADER_SIZE as i64 + table_bytes as i64 + live_bytes as i64 + HEADER_SIZE as i64;
@@ -209,7 +209,8 @@ pub(crate) fn compact_shard(
     let arena_off = table_off + table_bytes;
 
     for e in &entries {
-        let rec_size = 12 + e.key.len();
+        let key = Shard::key_bytes(old_data, e.rec_off);
+        let rec_size = 12 + key.len();
         let rec_off = arena_off + Shard::arena_used_on_data(new_buf.as_slice());
         if rec_off as i64 + rec_size as i64 > new_buf.len() as i64 {
             new_buf.close();
@@ -217,9 +218,9 @@ pub(crate) fn compact_shard(
         }
         {
             let data = new_buf.as_mut_slice();
-            write_u32(data, rec_off as usize, e.key.len() as u32);
+            write_u32(data, rec_off as usize, key.len() as u32);
             write_u64(data, rec_off as usize + 4, 0);
-            data[rec_off as usize + 12..rec_off as usize + 12 + e.key.len()].copy_from_slice(&e.key);
+            data[rec_off as usize + 12..rec_off as usize + 12 + key.len()].copy_from_slice(key);
             Shard::set_arena_used_on_data(data, Shard::arena_used_on_data(data) + rec_size as u64);
         }
 
@@ -246,7 +247,7 @@ pub(crate) fn compact_shard(
             write_u64(data, rec_off as usize + 4, head);
         }
 
-        Shard::insert_key_slot_on_data(new_buf.as_mut_slice(), &e.key, rec_off)?;
+        Shard::insert_key_slot_on_data(new_buf.as_mut_slice(), key, rec_off)?;
     }
 
     drop(st);

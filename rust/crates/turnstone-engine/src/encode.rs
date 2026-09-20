@@ -87,12 +87,16 @@ pub fn decode_record(payload: &[u8]) -> Result<Record, EncodeError> {
     Ok(rec)
 }
 
-/// Extract the SET value from a log payload without copying the key.
-pub fn decode_value_at(payload: &[u8], val_len: u32) -> Result<Vec<u8>, EngineError> {
+/// Byte range of the SET value inside a decoded frame payload.
+pub fn set_value_range(payload: &[u8], val_len: u32) -> Result<std::ops::Range<usize>, EngineError> {
     if payload.len() < LOG_RECORD_HEADER_SIZE + 8 || payload[0] != RecordType::Set as u8 {
         return Err(EngineError::CorruptData);
     }
-    let klen = u32::from_be_bytes(payload[LOG_RECORD_HEADER_SIZE..LOG_RECORD_HEADER_SIZE + 4].try_into().unwrap()) as usize;
+    let klen = u32::from_be_bytes(
+        payload[LOG_RECORD_HEADER_SIZE..LOG_RECORD_HEADER_SIZE + 4]
+            .try_into()
+            .unwrap(),
+    ) as usize;
     let mut off = LOG_RECORD_HEADER_SIZE + 4 + klen;
     if off + 4 > payload.len() {
         return Err(EngineError::CorruptData);
@@ -102,12 +106,48 @@ pub fn decode_value_at(payload: &[u8], val_len: u32) -> Result<Vec<u8>, EngineEr
     if vlen != val_len as usize || off + vlen > payload.len() {
         return Err(EngineError::CorruptData);
     }
-    Ok(payload[off..off + vlen].to_vec())
+    Ok(off..off + vlen)
+}
+
+/// Extract the SET value from a log payload without copying the key.
+pub fn decode_value_at(payload: &[u8], val_len: u32) -> Result<Vec<u8>, EngineError> {
+    let range = set_value_range(payload, val_len)?;
+    Ok(payload[range].to_vec())
+}
+
+/// Copy the SET value into `out`, reusing `out`'s capacity when possible.
+pub fn decode_value_into(
+    payload: &[u8],
+    val_len: u32,
+    out: &mut Vec<u8>,
+) -> Result<(), EngineError> {
+    let range = set_value_range(payload, val_len)?;
+    out.clear();
+    out.reserve(range.len());
+    out.extend_from_slice(&payload[range]);
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_value_into_reuses_buffer() {
+        let rec = Record {
+            ty: RecordType::Set,
+            xid: 1,
+            key: b"key".to_vec(),
+            value: b"value-bytes".to_vec(),
+        };
+        let payload = encode_record(&rec);
+        let mut buf = vec![0u8; 4];
+        decode_value_into(&payload, rec.value.len() as u32, &mut buf).unwrap();
+        assert_eq!(buf, b"value-bytes");
+        decode_value_into(&payload, rec.value.len() as u32, &mut buf).unwrap();
+        assert_eq!(buf, b"value-bytes");
+        assert!(buf.capacity() >= 11);
+    }
 
     #[test]
     fn roundtrip_set_record() {

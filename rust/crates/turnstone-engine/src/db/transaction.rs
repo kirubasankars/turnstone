@@ -3,9 +3,26 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root of this source tree.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
+
+thread_local! {
+    static WAL_VALUE_SCRATCH: RefCell<Vec<u8>> = RefCell::new(Vec::new());
+}
+
+fn read_wal_value(
+    log: &crate::wal::DataLog,
+    offset: i64,
+    val_len: u32,
+) -> Result<Vec<u8>, EngineError> {
+    WAL_VALUE_SCRATCH.with(|scratch| {
+        let mut buf = scratch.borrow_mut();
+        log.read_value_at_into(offset, val_len, &mut buf)?;
+        Ok(buf.clone())
+    })
+}
 
 use parking_lot::Mutex;
 
@@ -337,7 +354,7 @@ impl WriteTransaction {
         if let Some(v) = self.db.cached_value(ver.offset) {
             return Ok(v);
         }
-        let val = self.db.log.read_value_at(ver.offset, ver.value_len)?;
+        let val = read_wal_value(&self.db.log, ver.offset, ver.value_len)?;
         self.db.cache_value(ver.offset, &val);
         Ok(val)
     }
@@ -435,7 +452,7 @@ impl Db {
         if let Some(v) = self.cached_value(ver.offset) {
             return Ok(v);
         }
-        let val = self.log.read_value_at(ver.offset, ver.value_len)?;
+        let val = read_wal_value(&self.log, ver.offset, ver.value_len)?;
         self.cache_value(ver.offset, &val);
         Ok(val)
     }

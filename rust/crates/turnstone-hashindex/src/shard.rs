@@ -193,9 +193,13 @@ impl Shard {
             > u64::from(slots) * MAX_LOAD_FACTOR_NUM
     }
 
-    fn read_key(data: &[u8], rec_off: u64) -> Vec<u8> {
+    pub(crate) fn key_bytes<'a>(data: &'a [u8], rec_off: u64) -> &'a [u8] {
         let k_len = read_u32(data, rec_off as usize) as usize;
-        data[rec_off as usize + 12..rec_off as usize + 12 + k_len].to_vec()
+        &data[rec_off as usize + 12..rec_off as usize + 12 + k_len]
+    }
+
+    fn read_key(data: &[u8], rec_off: u64) -> Vec<u8> {
+        Self::key_bytes(data, rec_off).to_vec()
     }
 
     fn version_head(data: &[u8], rec_off: u64) -> u64 {
@@ -411,10 +415,10 @@ impl Shard {
             if rec_off == 0 {
                 continue;
             }
-            let key = Self::read_key(data, rec_off);
+            let key = Self::key_bytes(data, rec_off);
             let chain = self.read_chain_locked(data, rec_off);
             if !chain.is_empty() {
-                f(&key, &chain);
+                f(key, &chain);
             }
         }
     }
@@ -539,10 +543,10 @@ impl Shard {
             if rec_off == 0 {
                 continue;
             }
-            let key = Self::read_key(data, rec_off);
+            let key = Self::key_bytes(data, rec_off);
             let chain = self.read_chain_locked(data, rec_off);
             let versions = if let Some(f) = filter {
-                f(&key, &chain)
+                f(key, &chain)
             } else {
                 chain
             };
