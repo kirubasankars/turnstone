@@ -303,9 +303,14 @@ fn run_server(home: &PathBuf, dev: bool) -> Result<(), String> {
         stores.insert(name, db);
     }
 
-    let repl_tls =
-        turnstone_tls::load_mtls(&ca_file, &client_cert, &client_key).map_err(|e| e.to_string())?;
-    let repl_manager = Arc::new(Manager::new(cfg.id.clone(), stores.clone(), repl_tls));
+    let repl_manager = if ca_file.is_file() && client_cert.is_file() && client_key.is_file() {
+        let repl_tls =
+            turnstone_tls::load_mtls(&ca_file, &client_cert, &client_key).map_err(|e| e.to_string())?;
+        Some(Arc::new(Manager::new(cfg.id.clone(), stores.clone(), repl_tls)))
+    } else {
+        eprintln!("Replication manager disabled (client TLS certs not found; plain TCP only).");
+        None
+    };
 
     let max_conns = if cfg.max_conns > 0 {
         cfg.max_conns as usize
@@ -322,11 +327,14 @@ fn run_server(home: &PathBuf, dev: bool) -> Result<(), String> {
         cert_file.display().to_string(),
         key_file.display().to_string(),
         ca_file.display().to_string(),
-        Some(repl_manager),
+        repl_manager,
         dev,
     )
     .map_err(|e| e.to_string())?;
 
+    if !server.tls_enabled() {
+        eprintln!("Server listening in plain TCP mode (no server TLS cert files).");
+    }
     eprintln!(
         "TurnstoneDB (Rust) listening on {}",
         server

@@ -3,7 +3,7 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root of this source tree.
 
-use turnstone_cli::commands::parse_command_line;
+use turnstone_cli::parse_command_line;
 
 #[test]
 fn parse_exec_line() {

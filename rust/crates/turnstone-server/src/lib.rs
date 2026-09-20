@@ -8,6 +8,7 @@ mod replication;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -29,10 +30,68 @@ pub const ROLE_BACKUP: &str = "backup";
 
 type TlsStream = StreamOwned<ServerConnection, TcpStream>;
 
+/// Wire transport: mTLS when configured, otherwise plain TCP (dev / no certs yet).
+pub(crate) enum ServerConn {
+    Plain(TcpStream),
+    Tls(TlsStream),
+}
+
+impl ServerConn {
+    fn from_tcp(tcp: TcpStream, tls: Option<Arc<rustls::ServerConfig>>) -> io::Result<Self> {
+        if let Some(cfg) = tls {
+            let Ok(conn) = ServerConnection::new(cfg) else {
+                return Ok(Self::Plain(tcp));
+            };
+            let mut stream = StreamOwned::new(conn, tcp);
+            drive_tls_handshake(&mut stream)?;
+            Ok(Self::Tls(stream))
+        } else {
+            Ok(Self::Plain(tcp))
+        }
+    }
+
+    fn set_read_timeout(&self, d: Option<std::time::Duration>) -> io::Result<()> {
+        match self {
+            Self::Plain(t) => t.set_read_timeout(d),
+            Self::Tls(s) => s.sock.set_read_timeout(d),
+        }
+    }
+
+    fn peer_identity(&mut self) -> (String, String) {
+        match self {
+            Self::Plain(_) => (ROLE_CLIENT.to_string(), "plain".to_string()),
+            Self::Tls(s) => peer_identity_tls(s),
+        }
+    }
+}
+
+impl Read for ServerConn {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(t) => t.read(buf),
+            Self::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for ServerConn {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(t) => t.write(buf),
+            Self::Tls(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Plain(t) => t.flush(),
+            Self::Tls(s) => s.flush(),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
-    #[error("tls cert, key, and ca required")]
-    TlsRequired,
     #[error(transparent)]
     Tls(#[from] turnstone_tls::TlsError),
     #[error("{0}")]
@@ -51,7 +110,8 @@ pub struct Server {
     tls_cert_file: String,
     tls_key_file: String,
     tls_ca_file: String,
-    tls_config: Arc<RwLock<Arc<rustls::ServerConfig>>>,
+    tls_enabled: bool,
+    tls_config: Option<Arc<RwLock<Arc<rustls::ServerConfig>>>>,
     repl_manager: Option<Arc<Manager>>,
     dev_mode: bool,
     closing: AtomicBool,
@@ -141,13 +201,17 @@ pub fn new_server(
     let tls_cert = tls_cert.into();
     let tls_key = tls_key.into();
     let tls_ca = tls_ca.into();
-    if tls_cert.is_empty() || tls_key.is_empty() || tls_ca.is_empty() {
-        return Err(ServerError::TlsRequired);
-    }
+    let tls_enabled = tls_files_present(&tls_cert, &tls_key, &tls_ca);
+    let tls_config = if tls_enabled {
+        Some(Arc::new(RwLock::new(load_server_mtls(
+            &tls_ca, &tls_cert, &tls_key,
+        )?)))
+    } else {
+        None
+    };
     let mut db_names: Vec<_> = stores.keys().cloned().collect();
     db_names.sort();
     let default_db = db_names.first().cloned().unwrap_or_default();
-    let tls = load_server_mtls(&tls_ca, &tls_cert, &tls_key)?;
     Ok(Arc::new(Server {
         stores,
         default_db,
@@ -160,7 +224,8 @@ pub fn new_server(
         tls_cert_file: tls_cert,
         tls_key_file: tls_key,
         tls_ca_file: tls_ca,
-        tls_config: Arc::new(RwLock::new(tls)),
+        tls_enabled,
+        tls_config,
         repl_manager,
         dev_mode,
         closing: AtomicBool::new(false),
@@ -173,9 +238,18 @@ pub fn new_server(
 
 impl Server {
     pub fn reload_tls(&self) -> Result<(), ServerError> {
+        if !self.tls_enabled {
+            return Ok(());
+        }
         let cfg = load_server_mtls(&self.tls_ca_file, &self.tls_cert_file, &self.tls_key_file)?;
-        *self.tls_config.write() = cfg;
+        if let Some(lock) = &self.tls_config {
+            *lock.write() = cfg;
+        }
         Ok(())
+    }
+
+    pub fn tls_enabled(&self) -> bool {
+        self.tls_enabled
     }
 
     pub fn addr(&self) -> Option<SocketAddr> {
@@ -208,7 +282,7 @@ impl Server {
                 ln.accept()?
             };
             if !self.sem.acquire() {
-                let _ = reject_busy(tcp, &self.tls_config.read());
+                let _ = reject_busy(tcp, self.active_tls_config());
                 continue;
             }
             self.active_conns.fetch_add(1, Ordering::Relaxed);
@@ -221,24 +295,32 @@ impl Server {
         }
     }
 
+    fn active_tls_config(&self) -> Option<Arc<rustls::ServerConfig>> {
+        self.tls_config.as_ref().map(|l| l.read().clone())
+    }
+
     fn handle_connection(self: &Arc<Self>, tcp: TcpStream) {
-        let cfg = self.tls_config.read().clone();
-        let Ok(tls) = ServerConnection::new(cfg) else {
+        let Ok(mut stream) = ServerConn::from_tcp(tcp, self.active_tls_config()) else {
             return;
         };
-        let mut stream = StreamOwned::new(tls, tcp);
-        if drive_tls_handshake(&mut stream).is_err() {
-            return;
-        }
         let default_db = self.default_db.clone();
         let db = self.stores.get(&default_db).cloned().unwrap();
+        let default_role = if !self.tls_enabled && self.dev_mode {
+            ROLE_ADMIN
+        } else {
+            ROLE_CLIENT
+        };
         let mut state = ConnState {
             db_name: default_db.clone(),
             db,
             tx: None,
             tx_start: None,
-            role: ROLE_CLIENT.to_string(),
-            client_id: "unknown".to_string(),
+            role: default_role.to_string(),
+            client_id: if self.tls_enabled {
+                "unknown".to_string()
+            } else {
+                "plain".to_string()
+            },
         };
         self.track_conn(&state.db_name, 1);
         let conn_id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
@@ -253,12 +335,12 @@ impl Server {
             if self.closing.load(Ordering::Acquire) {
                 break;
             }
-            let _ = stream.get_mut().set_read_timeout(Some(protocol::IDLE_TIMEOUT));
+            let _ = stream.set_read_timeout(Some(protocol::IDLE_TIMEOUT));
             if read_full(&mut stream, &mut header).is_err() {
                 break;
             }
-            if state.client_id == "unknown" {
-                let (role, client_id) = peer_identity(&mut stream);
+            if self.tls_enabled && state.client_id == "unknown" {
+                let (role, client_id) = stream.peer_identity();
                 state.role = role;
                 state.client_id = client_id;
             }
@@ -284,7 +366,7 @@ impl Server {
 
     fn dispatch_command(
         self: &Arc<Self>,
-        conn: &mut TlsStream,
+        conn: &mut ServerConn,
         op: u8,
         payload: &[u8],
         st: &mut ConnState,
@@ -340,7 +422,7 @@ impl Server {
         false
     }
 
-    fn handle_select(&self, conn: &mut TlsStream, payload: &[u8], st: &mut ConnState) {
+    fn handle_select(&self, conn: &mut ServerConn, payload: &[u8], st: &mut ConnState) {
         let name = String::from_utf8_lossy(payload);
         if let Some(db) = self.stores.get(name.as_ref()) {
             self.track_conn(&st.db_name, -1);
@@ -353,7 +435,7 @@ impl Server {
         }
     }
 
-    fn handle_begin(&self, conn: &mut TlsStream, payload: &[u8], st: &mut ConnState) {
+    fn handle_begin(&self, conn: &mut ServerConn, payload: &[u8], st: &mut ConnState) {
         let state = st.db.get_state();
         if state != STATE_PRIMARY && state != STATE_REPLICA {
             let _ = write_binary_response(
@@ -378,7 +460,7 @@ impl Server {
         let _ = write_binary_response(conn, protocol::RES_OK, &[]);
     }
 
-    fn handle_commit(&self, conn: &mut TlsStream, st: &mut ConnState) {
+    fn handle_commit(&self, conn: &mut ServerConn, st: &mut ConnState) {
         let Some(mut tx) = st.tx.take() else {
             let _ = write_binary_response(conn, protocol::RES_TX_REQUIRED, &[]);
             return;
@@ -419,7 +501,7 @@ impl Server {
         }
     }
 
-    fn handle_abort(&self, conn: &mut TlsStream, st: &mut ConnState) {
+    fn handle_abort(&self, conn: &mut ServerConn, st: &mut ConnState) {
         if let Some(mut tx) = st.tx.take() {
             tx.discard();
         }
@@ -427,7 +509,7 @@ impl Server {
         let _ = write_binary_response(conn, protocol::RES_OK, &[]);
     }
 
-    fn handle_get(&self, conn: &mut TlsStream, payload: &[u8], st: &mut ConnState) {
+    fn handle_get(&self, conn: &mut ServerConn, payload: &[u8], st: &mut ConnState) {
         let Some(tx) = st.tx.as_mut() else {
             let _ = write_binary_response(conn, protocol::RES_TX_REQUIRED, &[]);
             return;
@@ -457,7 +539,7 @@ impl Server {
         }
     }
 
-    fn handle_set(&self, conn: &mut TlsStream, payload: &[u8], st: &mut ConnState) {
+    fn handle_set(&self, conn: &mut ServerConn, payload: &[u8], st: &mut ConnState) {
         let state = st.db.get_state();
         if state != STATE_PRIMARY && state != STATE_STEPPING_DOWN {
             let _ = write_binary_response(conn, protocol::RES_ERR, b"Read-only/Undefined state");
@@ -504,12 +586,12 @@ impl Server {
         }
     }
 
-    fn handle_del(&self, conn: &mut TlsStream, payload: &[u8], st: &mut ConnState) {
+    fn handle_del(&self, conn: &mut ServerConn, payload: &[u8], st: &mut ConnState) {
         let _ = payload;
         let _ = write_binary_response(conn, protocol::RES_ERR, b"DEL not fully ported");
     }
 
-    fn handle_stat(&self, conn: &mut TlsStream, st: &mut ConnState) {
+    fn handle_stat(&self, conn: &mut ServerConn, st: &mut ConnState) {
         let stats = st.db.stats();
         let conns = self.database_conns(&st.db_name);
         let body = serde_json::json!({
@@ -629,16 +711,23 @@ fn read_full(r: &mut impl Read, buf: &mut [u8]) -> io::Result<()> {
     Ok(())
 }
 
-fn reject_busy(tcp: TcpStream, cfg: &Arc<rustls::ServerConfig>) -> io::Result<()> {
-    let Ok(conn) = ServerConnection::new(Arc::clone(cfg)) else {
-        return Ok(());
-    };
-    let mut stream = StreamOwned::new(conn, tcp);
-    let _ = write_binary_response(&mut stream, protocol::RES_SERVER_BUSY, b"Max connections");
+fn tls_files_present(cert: &str, key: &str, ca: &str) -> bool {
+    !cert.is_empty()
+        && !key.is_empty()
+        && !ca.is_empty()
+        && Path::new(cert).is_file()
+        && Path::new(key).is_file()
+        && Path::new(ca).is_file()
+}
+
+fn reject_busy(tcp: TcpStream, cfg: Option<Arc<rustls::ServerConfig>>) -> io::Result<()> {
+    if let Ok(mut stream) = ServerConn::from_tcp(tcp, cfg) {
+        let _ = write_binary_response(&mut stream, protocol::RES_SERVER_BUSY, b"Max connections");
+    }
     Ok(())
 }
 
-fn peer_identity(stream: &mut TlsStream) -> (String, String) {
+fn peer_identity_tls(stream: &mut TlsStream) -> (String, String) {
     let mut role = ROLE_CLIENT.to_string();
     let mut client_id = "unknown".to_string();
     let _ = stream.flush();

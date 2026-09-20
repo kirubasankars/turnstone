@@ -13,6 +13,8 @@ mod repl;
 
 pub use backup_cmd::{run_backup_cmd, run_restore_cmd, BackupCliOptions, RestoreCliOptions};
 pub use bench::{run_bench, BenchOptions};
-pub use commands::{execute_line, handle_command, print_cli_error, CommandOutcome};
+pub use commands::{
+    execute_line, handle_command, parse_command_line, print_cli_error, CommandOutcome,
+};
 pub use connect::{connect, home_exists, ConnectOptions};
 pub use repl::{run_exec, run_interactive};

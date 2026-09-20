@@ -7,7 +7,7 @@ Rust port of [TurnstoneDB](../README.md). The Go tree remains in-repo for compar
 | Area | Rust crate | Notes |
 | --- | --- | --- |
 | Wire protocol | `turnstone-protocol` | Opcode/framing parity |
-| mTLS | `turnstone-tls` | Client + server cert loading |
+| mTLS | `turnstone-tls` | Optional: plain TCP when cert files absent; mTLS when present |
 | Hash index | `turnstone-hashindex` | Mmap/heaps, compact, budget |
 | Engine | `turnstone-engine` | WAL, MVCC `Db`, group commit, shared buffer pool, index GC, WAL copy-forward/retention |
 | Database layer | `turnstone-database` | Roles, slots, quorum, retention hooks |
@@ -41,7 +41,7 @@ make test-rust
 
 ```bash
 ./rust/target/release/turnstone init --home tsdata --ip 127.0.0.1
-./rust/target/release/turnstone server --home tsdata --dev
+./rust/target/release/turnstone server --home tsdata --dev   # plain TCP if server certs missing; --dev grants admin on plain links
 # other terminal:
 ./rust/target/release/turnstone cli --home tsdata exec get mykey
 ./rust/target/release/turnstone cli --home tsdata   # interactive REPL

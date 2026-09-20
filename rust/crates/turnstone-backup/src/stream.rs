@@ -19,8 +19,6 @@ pub enum StreamError {
     Io(#[from] std::io::Error),
     #[error("{0}")]
     Protocol(String),
-    #[error("TLS config is required")]
-    TlsRequired,
 }
 
 pub struct StreamOptions {
@@ -38,11 +36,48 @@ pub struct StreamResult {
     pub bytes: i64,
 }
 
+enum BackupConn {
+    Plain(TcpStream),
+    Tls(StreamOwned<ClientConnection, TcpStream>),
+}
+
+impl Read for BackupConn {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(t) => t.read(buf),
+            Self::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for BackupConn {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(t) => t.write(buf),
+            Self::Tls(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Plain(t) => t.flush(),
+            Self::Tls(s) => s.flush(),
+        }
+    }
+}
+
+impl BackupConn {
+    fn set_read_timeout(&mut self, d: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            Self::Plain(t) => t.set_read_timeout(d),
+            Self::Tls(s) => s.get_mut().set_read_timeout(d),
+        }
+    }
+}
+
 pub fn stream_log_range(
     opts: &StreamOptions,
     writer: &mut impl Write,
 ) -> Result<StreamResult, StreamError> {
-    let tls = opts.tls.as_ref().ok_or(StreamError::TlsRequired)?;
     let client_id = if opts.client_id.is_empty() {
         "turnstone-backup"
     } else {
@@ -61,13 +96,17 @@ pub fn stream_log_range(
         .next()
         .ok_or_else(|| StreamError::Protocol("no addresses".into()))?;
     let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(10))?;
-    let server_name = ServerName::try_from(opts.host.as_str())
-        .map_err(|_| StreamError::Protocol("invalid server name".into()))?
-        .to_owned();
-    let conn = ClientConnection::new(Arc::clone(tls), server_name).map_err(|e| {
-        StreamError::Protocol(format!("tls: {e}"))
-    })?;
-    let mut stream = StreamOwned::new(conn, tcp);
+
+    let mut stream = if let Some(tls) = opts.tls.as_ref() {
+        let server_name = ServerName::try_from(opts.host.as_str())
+            .map_err(|_| StreamError::Protocol("invalid server name".into()))?
+            .to_owned();
+        let conn = ClientConnection::new(Arc::clone(tls), server_name)
+            .map_err(|e| StreamError::Protocol(format!("tls: {e}")))?;
+        BackupConn::Tls(StreamOwned::new(conn, tcp))
+    } else {
+        BackupConn::Plain(tcp)
+    };
     stream.flush()?;
 
     send_hello(&mut stream, client_id, &opts.db_name, opts.start_lsn)?;
@@ -93,7 +132,7 @@ pub fn stream_log_range(
     let mut have_expect = false;
 
     loop {
-        stream.get_mut().set_read_timeout(Some(wait_idle))?;
+        stream.set_read_timeout(Some(wait_idle))?;
         match read_full(&mut stream, &mut header) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {

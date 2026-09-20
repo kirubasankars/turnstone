@@ -27,7 +27,11 @@ pub struct BackupCliOptions {
 
 pub fn run_backup_cmd(opts: BackupCliOptions) -> Result<(), String> {
     let (ca, cert, key) = cert_paths(&opts.home, Role::Admin);
-    let tls = load_mtls(ca, cert, key).map_err(|e| e.to_string())?;
+    let tls = if ca.exists() {
+        Some(load_mtls(ca, cert, key).map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
     let meta = run_backup(BackupOptions {
         host: opts.host,
         db_name: opts.db,
@@ -46,7 +50,7 @@ pub fn run_backup_cmd(opts: BackupCliOptions) -> Result<(), String> {
         base_meta_path: opts.base_meta,
         compress: opts.compress,
         wait_idle: opts.wait_idle,
-        tls: Some(tls),
+        tls,
     })
     .map_err(|e| e.to_string())?;
     let path = resolve_wal_file(&opts.out_dir, &opts.file, meta.compressed);

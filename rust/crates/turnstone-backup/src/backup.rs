@@ -43,9 +43,6 @@ pub enum BackupError {
 }
 
 pub fn run_backup(opts: BackupOptions) -> Result<Meta, BackupError> {
-    if opts.tls.is_none() {
-        return Err(BackupError::Invalid("TLS config is required".into()));
-    }
     if opts.ty != TypeFull && opts.ty != TypeDifferential {
         return Err(BackupError::Invalid(format!(
             "invalid backup type {:?} (want full or differential)",

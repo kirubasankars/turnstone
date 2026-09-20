@@ -8,22 +8,17 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use rustls::StreamOwned;
-use rustls::ServerConnection;
-use std::net::TcpStream;
 use turnstone_database::{Database, STATE_PRIMARY, STATE_STEPPING_DOWN};
 use turnstone_protocol as protocol;
 
-use crate::{write_binary_response, Server, ROLE_BACKUP, ROLE_SERVER};
-
-type TlsStream = StreamOwned<ServerConnection, TcpStream>;
+use crate::{write_binary_response, Server, ServerConn, ROLE_BACKUP, ROLE_SERVER};
 
 const MAX_REPL_ACK_SIZE: u32 = 64 * 1024;
 const MAX_REPLICATION_BATCH_SIZE: i64 = 1024 * 1024;
 
 pub(crate) fn handle_replica_connection(
     server: &Arc<Server>,
-    conn: &mut TlsStream,
+    conn: &mut ServerConn,
     payload: &[u8],
     st: &mut crate::ConnState,
 ) {
@@ -216,7 +211,7 @@ fn run_log_stream_loop(
     Ok(())
 }
 
-fn write_repl_packet(conn: &mut TlsStream, p: &ReplPacket) -> std::io::Result<()> {
+fn write_repl_packet(conn: &mut ServerConn, p: &ReplPacket) -> std::io::Result<()> {
     let mut body = Vec::new();
     body.extend_from_slice(&(p.db_name.len() as u32).to_be_bytes());
     body.extend_from_slice(p.db_name.as_bytes());
