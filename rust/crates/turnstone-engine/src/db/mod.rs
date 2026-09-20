@@ -7,7 +7,7 @@ pub(crate) mod transaction;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use parking_lot::{Mutex, RwLock};
@@ -17,10 +17,8 @@ use crate::encode_record;
 use crate::hashindex::Index;
 use crate::index::{IndexHashMetrics, MvccIndex};
 use crate::recovery::replay_log;
-use crate::types::{
-    EngineError, IndexVersion, Record, RecordType, TxStatus, DIR_MODE,
-};
 use crate::shared_buffers::{SharedBuffers, DEFAULT_SHARED_BUFFERS_BYTES};
+use crate::types::{EngineError, IndexVersion, Record, RecordType, TxStatus, DIR_MODE};
 use crate::valuecache::ValueCache;
 use crate::wal::validate_frames;
 use crate::wal::DataLog;
@@ -81,7 +79,8 @@ pub struct Db {
     pub(crate) log: Arc<DataLog>,
     pub(crate) index: Arc<MvccIndex>,
     pub(crate) clog: Arc<ClogState>,
-    pub(crate) active_xids: Mutex<std::collections::HashMap<u64, Arc<transaction::WriteTransaction>>>,
+    pub(crate) active_xids:
+        Mutex<std::collections::HashMap<u64, Arc<transaction::WriteTransaction>>>,
     pub(crate) key_locks: Mutex<std::collections::HashMap<String, u64>>,
     pub(crate) begin_offsets: Mutex<std::collections::HashMap<u64, i64>>,
     pub(crate) active_txns: Mutex<std::collections::HashMap<u64, ActiveTxnRegistration>>,
@@ -153,8 +152,7 @@ impl Db {
                 opts.shared_buffers_bytes
             };
             Some(Arc::new(
-                SharedBuffers::new_locked(bytes, opts.mlock)
-                    .map_err(|e| EngineError::Other(e))?,
+                SharedBuffers::new_locked(bytes, opts.mlock).map_err(|e| EngineError::Other(e))?,
             ))
         };
         let value_cache = if opts.value_cache_bytes < 0 {
@@ -300,11 +298,7 @@ impl Db {
             ));
             self.active_xids.lock().insert(xid, tx.clone());
             self.begin_offsets.lock().insert(xid, begin_off);
-            self.clog
-                .active_xids
-                .write()
-                .unwrap()
-                .insert(xid);
+            self.clog.active_xids.write().unwrap().insert(xid);
             let id = self.register_active_txn(ActiveTxnRegistration {
                 snapshot: snap,
                 my_xid: xid,
@@ -397,18 +391,10 @@ impl Db {
             let rec = fr.rec;
             match rec.ty {
                 RecordType::Begin => {
-                    self.clog
-                        .active_xids
-                        .write()
-                        .unwrap()
-                        .insert(rec.xid);
+                    self.clog.active_xids.write().unwrap().insert(rec.xid);
                 }
                 RecordType::Set | RecordType::Delete => {
-                    self.clog
-                        .active_xids
-                        .write()
-                        .unwrap()
-                        .insert(rec.xid);
+                    self.clog.active_xids.write().unwrap().insert(rec.xid);
                     let is_delete = rec.ty == RecordType::Delete;
                     self.index.put(
                         &rec.key,
@@ -447,15 +433,21 @@ impl Db {
     }
 
     fn account_replicated_set(&self, key: &[u8], xid: u64) {
-        let (ver, _, _found) = self.index.latest_resolved(key, xid, |x| self.clog.clog_status(x));
-        let was_live = ver.filter(|v| !v.tombstone && self.clog.clog_status(v.xmin) == TxStatus::Committed).is_some();
+        let (ver, _, _found) = self
+            .index
+            .latest_resolved(key, xid, |x| self.clog.clog_status(x));
+        let was_live = ver
+            .filter(|v| !v.tombstone && self.clog.clog_status(v.xmin) == TxStatus::Committed)
+            .is_some();
         if !was_live {
             self.key_count.fetch_add(1, Ordering::AcqRel);
         }
     }
 
     fn account_replicated_delete(&self, key: &[u8], xid: u64) {
-        let (ver, _, found) = self.index.latest_resolved(key, xid, |x| self.clog.clog_status(x));
+        let (ver, _, found) = self
+            .index
+            .latest_resolved(key, xid, |x| self.clog.clog_status(x));
         if found {
             if let Some(v) = ver {
                 if !v.tombstone && self.clog.clog_status(v.xmin) == TxStatus::Committed {
@@ -537,13 +529,11 @@ impl Db {
     }
 
     pub fn hash_shards_compacted(&self) -> u64 {
-        self.metrics_hash_shards_compacted
-            .load(Ordering::Acquire)
+        self.metrics_hash_shards_compacted.load(Ordering::Acquire)
     }
 
     pub fn hash_compact_bytes_reclaimed(&self) -> u64 {
-        self.metrics_hash_compact_reclaimed
-            .load(Ordering::Acquire)
+        self.metrics_hash_compact_reclaimed.load(Ordering::Acquire)
     }
 
     pub fn hash_compact_unix(&self) -> i64 {
@@ -558,7 +548,9 @@ impl Db {
                 .dir
                 .join("wal")
                 .join(crate::wal::wal_segment_file_name(id));
-            let size = std::fs::metadata(&path).map(|m| m.len() as i64).unwrap_or(0);
+            let size = std::fs::metadata(&path)
+                .map(|m| m.len() as i64)
+                .unwrap_or(0);
             let end_lsn = if end == 0 {
                 self.log.write_offset()
             } else {
@@ -583,7 +575,9 @@ impl Db {
                     continue;
                 }
                 let frame = estimated_frame_size(key, v.tombstone, v.value_len);
-                if let Some(seg) = infos.iter_mut().find(|s| v.offset >= s.base_lsn && v.offset < s.end_lsn)
+                if let Some(seg) = infos
+                    .iter_mut()
+                    .find(|s| v.offset >= s.base_lsn && v.offset < s.end_lsn)
                 {
                     seg.live_bytes += frame;
                     live_total += frame;

@@ -104,8 +104,7 @@ impl Index {
                 }
             }
         }
-        let shards: Box<[Arc<Shard>; NUM_SHARDS]> =
-            built.try_into().map_err(|_| "shard count")?;
+        let shards: Box<[Arc<Shard>; NUM_SHARDS]> = built.try_into().map_err(|_| "shard count")?;
         let idx = Self { inner, shards };
         idx.recalc_used_bytes();
         Ok(idx)
@@ -122,7 +121,11 @@ impl Index {
         &self.shards[(hash_key(key) & 255) as usize]
     }
 
-    pub fn put(&self, key: &[u8], ver: crate::Version) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn put(
+        &self,
+        key: &[u8],
+        ver: crate::Version,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.shard_for(key).put(key, ver)
     }
 
@@ -157,9 +160,7 @@ impl Index {
     }
 
     pub fn set_max_arena_bytes(&self, n: i64) {
-        self.inner
-            .max_arena_bytes
-            .store(n, Ordering::Release);
+        self.inner.max_arena_bytes.store(n, Ordering::Release);
     }
 
     pub fn set_shared_budget(&self, b: Option<Arc<SharedBudget>>) -> Result<(), ErrArenaLimit> {

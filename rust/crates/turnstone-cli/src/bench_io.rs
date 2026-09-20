@@ -41,10 +41,16 @@ impl BenchConn {
 
         let link = if ca.exists() {
             let tls = load_mtls(&ca, &cert, &key).map_err(|e| e.to_string())?;
-            let host = opts.host.split(':').next().unwrap_or(&opts.host).to_string();
+            let host = opts
+                .host
+                .split(':')
+                .next()
+                .unwrap_or(&opts.host)
+                .to_string();
             let server_name = rustls::pki_types::ServerName::try_from(host)
                 .map_err(|_| "invalid DNS name for TLS".to_string())?;
-            let conn = rustls::ClientConnection::new(tls, server_name).map_err(|e| e.to_string())?;
+            let conn =
+                rustls::ClientConnection::new(tls, server_name).map_err(|e| e.to_string())?;
             let mut stream = rustls::StreamOwned::new(conn, tcp);
             while stream.conn.is_handshaking() {
                 stream

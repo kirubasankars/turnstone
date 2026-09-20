@@ -4,10 +4,10 @@
 // LICENSE file in the root of this source tree.
 
 use turnstone_engine::hashindex::IndexExt;
+use turnstone_engine::wal::wal_segment_file_name;
 use turnstone_engine::{
     encode_record, frame_size, replay_into_mem, validate_frames, DataLog, Record, RecordType,
 };
-use turnstone_engine::wal::wal_segment_file_name;
 
 #[test]
 fn wal_creates_fresh_manifest_on_open() {

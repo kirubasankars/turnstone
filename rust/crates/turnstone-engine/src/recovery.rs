@@ -5,10 +5,10 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::clog::ClogState;
 use crate::hashindex::{Index, Version};
 use crate::types::{EngineError, RecordType};
 use crate::wal::DataLog;
-use crate::clog::ClogState;
 
 /// Replay WAL records into `index`, mirroring Go `replayLog`.
 pub fn replay_log(
@@ -138,9 +138,6 @@ mod tests {
         let chain = index.get_chain(b"k");
         assert!(!chain.is_empty());
         assert_eq!(chain[0].value_len, 1);
-        assert_eq!(
-            index.live_key_count(|xid| clog.clog_status(xid)),
-            1
-        );
+        assert_eq!(index.live_key_count(|xid| clog.clog_status(xid)), 1);
     }
 }

@@ -68,7 +68,11 @@ enum Commands {
         concurrency: usize,
         #[arg(long, default_value = "10000")]
         ops: u64,
-        #[arg(long, default_value = "0", help = "Run until elapsed seconds (overrides --ops when > 0)")]
+        #[arg(
+            long,
+            default_value = "0",
+            help = "Run until elapsed seconds (overrides --ops when > 0)"
+        )]
         duration_secs: u64,
         #[arg(
             long,
@@ -317,9 +321,13 @@ fn run_server(home: &PathBuf, dev: bool) -> Result<(), String> {
     }
 
     let repl_manager = if ca_file.is_file() && client_cert.is_file() && client_key.is_file() {
-        let repl_tls =
-            turnstone_tls::load_mtls(&ca_file, &client_cert, &client_key).map_err(|e| e.to_string())?;
-        Some(Arc::new(Manager::new(cfg.id.clone(), stores.clone(), repl_tls)))
+        let repl_tls = turnstone_tls::load_mtls(&ca_file, &client_cert, &client_key)
+            .map_err(|e| e.to_string())?;
+        Some(Arc::new(Manager::new(
+            cfg.id.clone(),
+            stores.clone(),
+            repl_tls,
+        )))
     } else {
         eprintln!("Replication manager disabled (client TLS certs not found; plain TCP only).");
         None
@@ -350,10 +358,7 @@ fn run_server(home: &PathBuf, dev: bool) -> Result<(), String> {
     }
     eprintln!(
         "TurnstoneDB (Rust) listening on {} (id={} max_conns={})",
-        server
-            .addr()
-            .map(|a| a.to_string())
-            .unwrap_or(listen),
+        server.addr().map(|a| a.to_string()).unwrap_or(listen),
         server.id(),
         server.max_conns(),
     );

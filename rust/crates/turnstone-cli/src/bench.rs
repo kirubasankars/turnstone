@@ -13,9 +13,7 @@ use serde_json::Value;
 use turnstone_tls::{cert_paths, Role};
 
 use crate::bench_io::BenchConn;
-use turnstone_protocol::{
-    append_header, BEGIN_READ_ONLY, OP_BEGIN, OP_COMMIT, OP_GET, OP_SET,
-};
+use turnstone_protocol::{append_header, BEGIN_READ_ONLY, OP_BEGIN, OP_COMMIT, OP_GET, OP_SET};
 
 use crate::connect::{connect, ConnectOptions};
 
@@ -110,10 +108,7 @@ fn bench_preflight(opts: &BenchOptions) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let raw = client.stat().map_err(|e| e.to_string())?;
     let v: Value = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
-    let state = v
-        .get("state")
-        .and_then(|s| s.as_str())
-        .unwrap_or("UNKNOWN");
+    let state = v.get("state").and_then(|s| s.as_str()).unwrap_or("UNKNOWN");
     if state != "PRIMARY" {
         return Err(format!(
             "database {} is {state}; writes require PRIMARY (use `turnstone cli --admin exec promote` or server --dev)",
@@ -292,10 +287,12 @@ fn run_duration(opts: &BenchOptions, payload: &[u8]) -> Result<(), String> {
         let ok = completed.load(Ordering::Relaxed);
         let bad = failed.load(Ordering::Relaxed);
         let elapsed = start.elapsed().as_secs_f64();
-        let rate = if elapsed > 0.0 { ok as f64 / elapsed } else { 0.0 };
-        eprintln!(
-            "[report] ops={ok} failed={bad} elapsed={elapsed:.1}s rate={rate:.0} ops/s"
-        );
+        let rate = if elapsed > 0.0 {
+            ok as f64 / elapsed
+        } else {
+            0.0
+        };
+        eprintln!("[report] ops={ok} failed={bad} elapsed={elapsed:.1}s rate={rate:.0} ops/s");
     }
     stop.store(true, Ordering::Relaxed);
     for h in handles {
@@ -354,7 +351,15 @@ fn append_workload_transaction(
             PhaseKind::Mixed(_) => rng.gen_range(0..num_ops as usize),
             _ => tx_count as usize * batch + k,
         };
-        append_op(buf, op_is_read[k], worker, key_index, key_size, prefix, payload);
+        append_op(
+            buf,
+            op_is_read[k],
+            worker,
+            key_index,
+            key_size,
+            prefix,
+            payload,
+        );
     }
     append_header(buf, OP_COMMIT, 0);
 }

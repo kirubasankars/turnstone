@@ -19,10 +19,7 @@ pub fn set_testing_prealloc_err(kind: Option<io::ErrorKind>) {
 }
 
 pub(crate) fn testing_prealloc_err() -> Option<io::Error> {
-    TESTING_PREALLOC_ERR
-        .lock()
-        .unwrap()
-        .map(io::Error::from)
+    TESTING_PREALLOC_ERR.lock().unwrap().map(io::Error::from)
 }
 
 pub fn is_no_space(err: &io::Error) -> bool {
@@ -41,12 +38,7 @@ pub fn preallocate_file(f: &File, size: i64) -> io::Result<()> {
 }
 
 fn preallocate_file_os(f: &File, size: i64) -> io::Result<()> {
-    match fallocate(
-        f.as_raw_fd(),
-        FallocateFlags::empty(),
-        0,
-        size as i64,
-    ) {
+    match fallocate(f.as_raw_fd(), FallocateFlags::empty(), 0, size as i64) {
         Ok(()) => Ok(()),
         Err(Errno::EOPNOTSUPP) | Err(Errno::ENOSYS) => {
             f.set_len(size as u64)?;

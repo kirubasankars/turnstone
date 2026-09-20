@@ -183,9 +183,8 @@ fn wait_for_quorum_ignores_non_server_roles() {
     s.register_replica("backup-only", target, REPLICA_ROLE_BACKUP);
 
     let s2 = Arc::clone(&s);
-    let handle = std::thread::spawn(move || {
-        s2.wait_for_quorum(target, Duration::from_millis(200), None)
-    });
+    let handle =
+        std::thread::spawn(move || s2.wait_for_quorum(target, Duration::from_millis(200), None));
     assert!(matches!(
         handle.join().unwrap(),
         Err(DatabaseError::Other(_))

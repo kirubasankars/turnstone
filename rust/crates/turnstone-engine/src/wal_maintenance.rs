@@ -37,7 +37,10 @@ impl Db {
         Ok(())
     }
 
-    pub fn delete_wal_segments(&self, min_deletable_lsn: i64) -> Result<WalRetentionResult, EngineError> {
+    pub fn delete_wal_segments(
+        &self,
+        min_deletable_lsn: i64,
+    ) -> Result<WalRetentionResult, EngineError> {
         let delete_through = self.effective_wal_delete_through(min_deletable_lsn);
         if delete_through <= 0 {
             return Ok(WalRetentionResult::default());
@@ -135,8 +138,11 @@ impl Db {
         self.append_copy_forward_commits(&frames)?;
         self.remap_index_offsets(&ctx, &outcome.remap)?;
 
-        let delete_through =
-            copy_forward_segment_delete_through(min_deletable_lsn, outcome.head_before, self.scan_floor());
+        let delete_through = copy_forward_segment_delete_through(
+            min_deletable_lsn,
+            outcome.head_before,
+            self.scan_floor(),
+        );
         let (deleted, _) = self
             .log
             .delete_segments_through(delete_through)
@@ -208,7 +214,8 @@ impl Db {
         let mut seen = HashSet::new();
         let mut builders: Vec<Box<dyn Fn() -> Vec<u8> + Send>> = Vec::new();
         for frame in frames {
-            if frame.len() < crate::types::LOG_FRAME_HEADER_SIZE + crate::types::LOG_RECORD_HEADER_SIZE
+            if frame.len()
+                < crate::types::LOG_FRAME_HEADER_SIZE + crate::types::LOG_RECORD_HEADER_SIZE
             {
                 continue;
             }
@@ -307,7 +314,11 @@ fn estimated_wal_frame_size(key: &[u8], tombstone: bool, value_len: u32) -> i64 
     crate::types::frame_size(payload)
 }
 
-fn copy_forward_segment_delete_through(min_deletable: i64, head_before: i64, scan_floor: i64) -> i64 {
+fn copy_forward_segment_delete_through(
+    min_deletable: i64,
+    head_before: i64,
+    scan_floor: i64,
+) -> i64 {
     let mut through = head_before;
     if min_deletable > 0 && min_deletable < through {
         through = min_deletable;

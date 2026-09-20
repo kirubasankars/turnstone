@@ -11,8 +11,8 @@ mod mmap;
 mod recycle;
 mod sync;
 
-pub use log::{set_testing_before_sync, CopyForwardOutcome, DataLog};
 pub use alloc::set_testing_prealloc_err;
+pub use log::{set_testing_before_sync, CopyForwardOutcome, DataLog};
 pub use logrange::{validate_frames, LogFrame};
 
 pub use manifest::{

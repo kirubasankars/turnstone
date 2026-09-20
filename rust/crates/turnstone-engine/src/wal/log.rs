@@ -8,7 +8,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 use std::sync::{Condvar, Mutex, RwLock};
 
 use super::alloc::{is_no_space, preallocate_file};
@@ -17,18 +17,22 @@ use super::manifest::{
     create_fresh_wal_manifest, load_wal_manifest, normalize_wal_segment_size, save_wal_manifest,
     wal_segment_file_name, WalManifest, WalManifestSegment, WAL_DIR_NAME, WAL_MANIFEST_NAME,
 };
-use super::mmap::{advise_wal_range, mmap_wal_file, unmap_wal, wal_advise_random, wal_advise_sequential, WalMapping};
+use super::mmap::{
+    advise_wal_range, mmap_wal_file, unmap_wal, wal_advise_random, wal_advise_sequential,
+    WalMapping,
+};
 use super::recycle::{
-    create_allocated_wal_file, parse_recycle_seq, read_segment_footer, reset_allocated_wal_file,
-    recycle_dir, write_segment_footer, write_segment_footer_if_allocated, WAL_SEG_FOOTER_SIZE,
+    create_allocated_wal_file, parse_recycle_seq, read_segment_footer, recycle_dir,
+    reset_allocated_wal_file, write_segment_footer, write_segment_footer_if_allocated,
+    WAL_SEG_FOOTER_SIZE,
 };
 use super::sync::sync_file;
 use std::sync::Arc;
 
 use crate::castagnoli_checksum;
-use crate::shared_buffers::{BufferTag, SharedBuffers, SHARED_BUFFER_PAGE_SIZE};
 use crate::decode_record;
 use crate::decode_value_into;
+use crate::shared_buffers::{BufferTag, SharedBuffers, SHARED_BUFFER_PAGE_SIZE};
 use crate::types::{EngineError, Record, RecordSpan, LOG_FRAME_HEADER_SIZE};
 use crate::{frame_size, RecordType};
 
@@ -210,11 +214,7 @@ impl DataLog {
     /// Base LSN of the earliest retained segment.
     pub fn oldest_segment_base_lsn(&self) -> i64 {
         let inner = self.inner.read().unwrap();
-        inner
-            .segments
-            .first()
-            .map(|s| s.base_lsn)
-            .unwrap_or(0)
+        inner.segments.first().map(|s| s.base_lsn).unwrap_or(0)
     }
 
     pub fn segments(&self) -> Vec<(u32, i64, i64)> {
@@ -553,11 +553,7 @@ impl DataLog {
         inner.read_frame_at_seg(seg, local, limit).3.is_ok()
     }
 
-    pub fn replay<F>(
-        &self,
-        truncate_corrupt: bool,
-        mut on_record: F,
-    ) -> Result<(), EngineError>
+    pub fn replay<F>(&self, truncate_corrupt: bool, mut on_record: F) -> Result<(), EngineError>
     where
         F: FnMut(Record, RecordSpan),
     {
@@ -630,7 +626,9 @@ impl DataLog {
 
     pub fn init_log_at_lsn(&self, lsn: i64) -> Result<(), EngineError> {
         if lsn < 0 {
-            return Err(EngineError::Other(format!("init log at lsn: negative lsn {lsn}")));
+            return Err(EngineError::Other(format!(
+                "init log at lsn: negative lsn {lsn}"
+            )));
         }
         let mut inner = self.inner.write().unwrap();
         if inner.write_offset == lsn
@@ -685,8 +683,7 @@ impl DataLog {
                 active_idx = Some(inner.segments.len());
                 end_lsn = 0;
             } else if end_lsn == 0 {
-                end_lsn = seg.base_lsn
-                    + self.logical_size_from_file(&path, info.len() as i64);
+                end_lsn = seg.base_lsn + self.logical_size_from_file(&path, info.len() as i64);
             }
             inner.segments.push(WalSegment {
                 id: seg.id,
@@ -863,8 +860,11 @@ impl DataLog {
     }
 
     fn persist_manifest_locked(&self, inner: &mut Inner) -> Result<(), EngineError> {
-        save_wal_manifest(&self.manifest_path, &inner.manifest_snapshot(self.segment_size))
-            .map_err(|e| EngineError::Other(e.to_string()))
+        save_wal_manifest(
+            &self.manifest_path,
+            &inner.manifest_snapshot(self.segment_size),
+        )
+        .map_err(|e| EngineError::Other(e.to_string()))
     }
 
     fn ensure_allocated(&self, f: &File) -> io::Result<()> {
@@ -1079,14 +1079,22 @@ impl Inner {
         Ok(())
     }
 
-    fn write_segment_at(&mut self, seg_idx: usize, local_off: i64, buf: &[u8]) -> io::Result<usize> {
+    fn write_segment_at(
+        &mut self,
+        seg_idx: usize,
+        local_off: i64,
+        buf: &[u8],
+    ) -> io::Result<usize> {
         let seg = &mut self.segments[seg_idx];
-        let f = seg.writer.as_ref().ok_or_else(|| {
-            io::Error::new(ErrorKind::NotConnected, "no active wal writer")
-        })?;
+        let f = seg
+            .writer
+            .as_ref()
+            .ok_or_else(|| io::Error::new(ErrorKind::NotConnected, "no active wal writer"))?;
         let mut off = 0;
         while off < buf.len() {
-            let n = f.as_ref().write_at(&buf[off..], (local_off + off as i64) as u64)?;
+            let n = f
+                .as_ref()
+                .write_at(&buf[off..], (local_off + off as i64) as u64)?;
             if n == 0 {
                 return Err(ErrorKind::WriteZero.into());
             }
@@ -1250,7 +1258,9 @@ impl Inner {
             .position(|s| s.writer.is_some())
             .unwrap_or(0);
         if self.segments.iter().all(|s| s.writer.is_none()) {
-            return Err(EngineError::Other("wal: no active segment after delete".into()));
+            return Err(EngineError::Other(
+                "wal: no active segment after delete".into(),
+            ));
         }
         if let Err(e) = log.persist_manifest_locked(self) {
             return Err(EngineError::Other(e.to_string()));
@@ -1288,7 +1298,10 @@ impl Inner {
                         key: vec![],
                         value: vec![],
                     },
-                    RecordSpan { offset: 0, length: 0 },
+                    RecordSpan {
+                        offset: 0,
+                        length: 0,
+                    },
                     Err(ErrorKind::NotFound),
                 )
             }
@@ -1389,8 +1402,11 @@ fn read_frame_at_mapping(
         return frame_err(offset, ErrorKind::UnexpectedEof);
     }
     let length = u32::from_be_bytes(m[offset as usize..offset as usize + 4].try_into().unwrap());
-    let checksum =
-        u32::from_be_bytes(m[offset as usize + 4..offset as usize + 8].try_into().unwrap());
+    let checksum = u32::from_be_bytes(
+        m[offset as usize + 4..offset as usize + 8]
+            .try_into()
+            .unwrap(),
+    );
     if length > 1 << 30 {
         return frame_err(offset, ErrorKind::InvalidData);
     }
@@ -1398,7 +1414,8 @@ fn read_frame_at_mapping(
     if offset + total > file_size || offset + total > m.len() as i64 {
         return frame_err(offset, ErrorKind::UnexpectedEof);
     }
-    let payload = &m[offset as usize + LOG_FRAME_HEADER_SIZE..offset as usize + LOG_FRAME_HEADER_SIZE + length as usize];
+    let payload = &m[offset as usize + LOG_FRAME_HEADER_SIZE
+        ..offset as usize + LOG_FRAME_HEADER_SIZE + length as usize];
     if castagnoli_checksum(payload) != checksum {
         return frame_err(offset, ErrorKind::Other);
     }
@@ -1463,10 +1480,7 @@ fn read_frame_at_file(
     }
 }
 
-fn frame_err(
-    offset: i64,
-    kind: ErrorKind,
-) -> (i64, Record, RecordSpan, Result<(), ErrorKind>) {
+fn frame_err(offset: i64, kind: ErrorKind) -> (i64, Record, RecordSpan, Result<(), ErrorKind>) {
     (
         offset,
         Record {
@@ -1475,7 +1489,10 @@ fn frame_err(
             key: vec![],
             value: vec![],
         },
-        RecordSpan { offset: 0, length: 0 },
+        RecordSpan {
+            offset: 0,
+            length: 0,
+        },
         Err(kind),
     )
 }

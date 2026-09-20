@@ -30,11 +30,7 @@ pub fn write_segment_footer(f: &File, segment_size: i64, used: i64) -> io::Resul
     f.write_all_at(&buf, (segment_size - WAL_SEG_FOOTER_SIZE) as u64)
 }
 
-pub fn write_segment_footer_if_allocated(
-    f: &File,
-    segment_size: i64,
-    used: i64,
-) -> io::Result<()> {
+pub fn write_segment_footer_if_allocated(f: &File, segment_size: i64, used: i64) -> io::Result<()> {
     let meta = f.metadata()?;
     if meta.len() < segment_size as u64 {
         return Ok(());

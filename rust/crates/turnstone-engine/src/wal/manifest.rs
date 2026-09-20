@@ -71,15 +71,18 @@ pub fn load_wal_manifest(path: &Path) -> io::Result<WalManifest> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Err(e),
         Err(_) => {
             let _ = fs::remove_file(&tmp);
-            Err(io::Error::new(io::ErrorKind::NotFound, "wal manifest missing"))
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "wal manifest missing",
+            ))
         }
     }
 }
 
 fn read_wal_manifest_file(path: &Path) -> io::Result<WalManifest> {
     let data = fs::read(path)?;
-    let m: WalManifest = serde_json::from_slice(&data)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let m: WalManifest =
+        serde_json::from_slice(&data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     if m.version != WAL_MANIFEST_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -96,8 +99,8 @@ fn read_wal_manifest_file(path: &Path) -> io::Result<WalManifest> {
 }
 
 pub fn save_wal_manifest(path: &Path, m: &WalManifest) -> io::Result<()> {
-    let data = serde_json::to_vec_pretty(m)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let data =
+        serde_json::to_vec_pretty(m).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let mut data = data;
     data.push(b'\n');
     write_file_atomic(path, &data)

@@ -55,7 +55,8 @@ pub enum MetaError {
 
 pub fn load_meta(path: impl AsRef<Path>) -> Result<Meta, MetaError> {
     let data = std::fs::read(path.as_ref())?;
-    let raw: MetaRaw = serde_json::from_slice(&data).map_err(|e| MetaError::Invalid(e.to_string()))?;
+    let raw: MetaRaw =
+        serde_json::from_slice(&data).map_err(|e| MetaError::Invalid(e.to_string()))?;
     let mut meta = Meta {
         timestamp: raw.timestamp,
         database: raw.database,
@@ -98,7 +99,10 @@ pub fn resolve_wal_file(dir: impl AsRef<Path>, name: &str, compressed: bool) -> 
     }
 }
 
-pub fn resolve_wal_input_file(dir: impl AsRef<Path>, name: &str) -> Result<(PathBuf, bool), MetaError> {
+pub fn resolve_wal_input_file(
+    dir: impl AsRef<Path>,
+    name: &str,
+) -> Result<(PathBuf, bool), MetaError> {
     let plain = dir.as_ref().join(name);
     if plain.is_file() {
         return Ok((plain, false));
@@ -149,7 +153,10 @@ pub fn validate_restore_chain(metas: &[Meta]) -> Result<(), MetaError> {
     Ok(())
 }
 
-pub fn resolve_restore_chain(in_dir: impl AsRef<Path>, chain: &str) -> Result<Vec<PathBuf>, MetaError> {
+pub fn resolve_restore_chain(
+    in_dir: impl AsRef<Path>,
+    chain: &str,
+) -> Result<Vec<PathBuf>, MetaError> {
     if chain.is_empty() {
         return Ok(vec![in_dir.as_ref().to_path_buf()]);
     }

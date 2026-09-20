@@ -17,7 +17,9 @@ use std::time::{Duration, Instant};
 use parking_lot::{Mutex, RwLock};
 use rustls::ServerConnection;
 use rustls::StreamOwned;
-use turnstone_database::{Database, STATE_PRIMARY, STATE_REPLICA, STATE_STEPPING_DOWN, STATE_UNDEFINED};
+use turnstone_database::{
+    Database, STATE_PRIMARY, STATE_REPLICA, STATE_STEPPING_DOWN, STATE_UNDEFINED,
+};
 use turnstone_engine::EngineError;
 use turnstone_protocol as protocol;
 use turnstone_repl::Manager;
@@ -40,8 +42,8 @@ impl ServerConn {
     fn from_tcp(tcp: TcpStream, tls: Option<Arc<rustls::ServerConfig>>) -> io::Result<Self> {
         let _ = tcp.set_nodelay(true);
         if let Some(cfg) = tls {
-            let conn = ServerConnection::new(cfg)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            let conn =
+                ServerConnection::new(cfg).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
             let mut stream = StreamOwned::new(conn, tcp);
             drive_tls_handshake(&mut stream)?;
             Ok(Self::Tls(stream))
@@ -63,7 +65,6 @@ impl ServerConn {
             Self::Tls(s) => peer_identity_tls(s),
         }
     }
-
 }
 
 impl Read for ServerConn {
@@ -326,7 +327,11 @@ impl Server {
             }
             let (tcp, _) = {
                 let guard = self.listener.lock();
-                let ln = guard.as_ref().unwrap().try_clone().map_err(io::Error::other)?;
+                let ln = guard
+                    .as_ref()
+                    .unwrap()
+                    .try_clone()
+                    .map_err(io::Error::other)?;
                 drop(guard);
                 ln.accept()?
             };
@@ -386,7 +391,9 @@ impl Server {
             if self.closing.load(Ordering::Acquire) {
                 break;
             }
-            let _ = reader.get_mut().set_read_timeout(Some(protocol::IDLE_TIMEOUT));
+            let _ = reader
+                .get_mut()
+                .set_read_timeout(Some(protocol::IDLE_TIMEOUT));
             if reader.read_exact(&mut header).is_err() {
                 break;
             }
@@ -398,7 +405,8 @@ impl Server {
             let op = header[0];
             let payload_len = u32::from_be_bytes(header[1..5].try_into().unwrap()) as usize;
             if payload_len as u64 > protocol::MAX_COMMAND_SIZE {
-                let _ = write_binary_response(&mut response_buf, protocol::RES_ENTITY_TOO_LARGE, &[]);
+                let _ =
+                    write_binary_response(&mut response_buf, protocol::RES_ENTITY_TOO_LARGE, &[]);
                 let _ = response_buf.drain_to(reader.get_mut(), true);
                 break;
             }
@@ -554,14 +562,22 @@ impl Server {
                 if st.db.min_replicas() > 0 {
                     let off = st.db.durable_offset();
                     if let Err(e) = st.db.wait_for_quorum(off, Duration::ZERO, None) {
-                        let _ = write_binary_response(out, protocol::RES_SERVER_BUSY, e.to_string().as_bytes());
+                        let _ = write_binary_response(
+                            out,
+                            protocol::RES_SERVER_BUSY,
+                            e.to_string().as_bytes(),
+                        );
                         return;
                     }
                 }
                 let _ = write_binary_response(out, protocol::RES_OK, &[]);
             }
             Err(EngineError::WriteConflict) => {
-                let _ = write_binary_response(out, protocol::RES_TX_CONFLICT, b"write conflict detected");
+                let _ = write_binary_response(
+                    out,
+                    protocol::RES_TX_CONFLICT,
+                    b"write conflict detected",
+                );
             }
             Err(EngineError::DiskFull) => {
                 let _ = write_binary_response(out, protocol::RES_SERVER_BUSY, b"ERR disk is full");
@@ -602,7 +618,11 @@ impl Server {
                 let _ = write_binary_response(out, protocol::RES_NOT_FOUND, &[]);
             }
             Err(EngineError::WriteConflict) => {
-                let _ = write_binary_response(out, protocol::RES_TX_CONFLICT, b"write conflict detected");
+                let _ = write_binary_response(
+                    out,
+                    protocol::RES_TX_CONFLICT,
+                    b"write conflict detected",
+                );
             }
             Err(e) => {
                 let _ = write_binary_response(out, protocol::RES_ERR, e.to_string().as_bytes());
@@ -649,7 +669,11 @@ impl Server {
                 let _ = write_binary_response(out, protocol::RES_OK, &[]);
             }
             Err(EngineError::WriteConflict) => {
-                let _ = write_binary_response(out, protocol::RES_TX_CONFLICT, b"write conflict detected");
+                let _ = write_binary_response(
+                    out,
+                    protocol::RES_TX_CONFLICT,
+                    b"write conflict detected",
+                );
             }
             Err(e) => {
                 let _ = write_binary_response(out, protocol::RES_ERR, e.to_string().as_bytes());

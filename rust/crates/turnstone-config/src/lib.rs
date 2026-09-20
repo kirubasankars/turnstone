@@ -9,11 +9,11 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rcgen::Ia5String;
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
     KeyPair, SanType,
 };
-use rcgen::Ia5String;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -87,9 +87,7 @@ pub fn resolve_path(home_dir: impl AsRef<Path>, path: impl AsRef<Path>) -> PathB
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ValidateError {
-    #[error(
-        "max_disk_usage_percent must be between 0 and 100 (0 disables the check), got {0}"
-    )]
+    #[error("max_disk_usage_percent must be between 0 and 100 (0 disables the check), got {0}")]
     MaxDiskUsagePercent(i32),
     #[error("max_index_arena_bytes must be >= 0 (0 disables the check), got {0}")]
     MaxIndexArenaBytes(i64),
@@ -98,7 +96,9 @@ pub enum ValidateError {
 /// Sanity-checks user-supplied config values (matches Go `ValidateConfig`).
 pub fn validate_config(cfg: &Config) -> Result<(), ValidateError> {
     if cfg.max_disk_usage_percent < 0 || cfg.max_disk_usage_percent > 100 {
-        return Err(ValidateError::MaxDiskUsagePercent(cfg.max_disk_usage_percent));
+        return Err(ValidateError::MaxDiskUsagePercent(
+            cfg.max_disk_usage_percent,
+        ));
     }
     if cfg.max_index_arena_bytes < 0 {
         return Err(ValidateError::MaxIndexArenaBytes(cfg.max_index_arena_bytes));
@@ -155,10 +155,7 @@ pub fn generate_config_artifacts(
     for i in 0..db_count {
         let db_id = i.to_string();
         let db_path = home_dir.join("data").join(&db_id);
-        fs::create_dir_all(&db_path).map_err(|source| GenerateError::DataDir {
-            db_id,
-            source,
-        })?;
+        fs::create_dir_all(&db_path).map_err(|source| GenerateError::DataDir { db_id, source })?;
     }
 
     let certs_dir = resolve_path(home_dir, &default_cfg.tls_cert_file)
@@ -183,11 +180,7 @@ pub fn generate_config_artifacts(
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
-            .or_else(|| {
-                std::env::var("HOSTNAME")
-                    .ok()
-                    .filter(|s| !s.is_empty())
-            })
+            .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
             .unwrap_or_else(|| "server".to_string());
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -198,10 +191,7 @@ pub fn generate_config_artifacts(
 
     let data = serde_json::to_string_pretty(&default_cfg).map_err(GenerateError::Json)?;
     fs::write(config_path, data).map_err(GenerateError::WriteConfig)?;
-    eprintln!(
-        "Sample configuration written to {}",
-        config_path.display()
-    );
+    eprintln!("Sample configuration written to {}", config_path.display());
     Ok(())
 }
 
@@ -228,8 +218,22 @@ fn generate_certs(out_dir: &Path, extra_hosts: &[&str]) -> Result<(), rcgen::Err
         &ca_cert,
         &ca_key,
     )?;
-    gen_leaf(out_dir, "client", "TurnstoneDB client", &[], &ca_cert, &ca_key)?;
-    gen_leaf(out_dir, "admin", "TurnstoneDB admin", &[], &ca_cert, &ca_key)?;
+    gen_leaf(
+        out_dir,
+        "client",
+        "TurnstoneDB client",
+        &[],
+        &ca_cert,
+        &ca_key,
+    )?;
+    gen_leaf(
+        out_dir,
+        "admin",
+        "TurnstoneDB admin",
+        &[],
+        &ca_cert,
+        &ca_key,
+    )?;
     Ok(())
 }
 
@@ -254,7 +258,9 @@ fn gen_leaf(
         ExtendedKeyUsagePurpose::ClientAuth,
     ];
 
-    params.subject_alt_names.push(SanType::IpAddress("127.0.0.1".parse().unwrap()));
+    params
+        .subject_alt_names
+        .push(SanType::IpAddress("127.0.0.1".parse().unwrap()));
     params
         .subject_alt_names
         .push(SanType::IpAddress("::1".parse().unwrap()));
@@ -263,9 +269,9 @@ fn gen_leaf(
         if let Ok(ip) = h.parse::<IpAddr>() {
             params.subject_alt_names.push(SanType::IpAddress(ip));
         } else {
-            params
-                .subject_alt_names
-                .push(SanType::DnsName(Ia5String::try_from(*h).map_err(|_| rcgen::Error::RingUnspecified)?));
+            params.subject_alt_names.push(SanType::DnsName(
+                Ia5String::try_from(*h).map_err(|_| rcgen::Error::RingUnspecified)?,
+            ));
         }
     }
 
@@ -304,7 +310,10 @@ mod tests {
     fn resolve_path_cases() {
         let home = PathBuf::from("/app/home");
         assert_eq!(resolve_path(&home, ""), home);
-        assert_eq!(resolve_path(&home, "/etc/config"), PathBuf::from("/etc/config"));
+        assert_eq!(
+            resolve_path(&home, "/etc/config"),
+            PathBuf::from("/etc/config")
+        );
         assert_eq!(
             resolve_path(&home, "data/db"),
             PathBuf::from("/app/home/data/db")

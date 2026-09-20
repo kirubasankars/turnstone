@@ -25,9 +25,7 @@ impl From<KvError> for DatabaseError {
         match e {
             KvError::Engine(e) => DatabaseError::Engine(e),
             KvError::Database(e) => e,
-            KvError::InvalidKey | KvError::ReadOnlyDb => {
-                DatabaseError::Other(e.to_string())
-            }
+            KvError::InvalidKey | KvError::ReadOnlyDb => DatabaseError::Other(e.to_string()),
         }
     }
 }

@@ -5,8 +5,8 @@
 
 use crate::castagnoli_checksum;
 use crate::decode_record;
-use crate::types::{EngineError, Record, LOG_FRAME_HEADER_SIZE};
 use crate::frame_size;
+use crate::types::{EngineError, Record, LOG_FRAME_HEADER_SIZE};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogFrame {

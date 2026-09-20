@@ -23,11 +23,7 @@ fn run_backup_allows_plain_tcp_without_tls() {
 
 #[test]
 fn run_backup_invalid_type() {
-    let tls = turnstone_tls::load_mtls(
-        "/dev/null",
-        "/dev/null",
-        "/dev/null",
-    );
+    let tls = turnstone_tls::load_mtls("/dev/null", "/dev/null", "/dev/null");
     if tls.is_err() {
         return;
     }

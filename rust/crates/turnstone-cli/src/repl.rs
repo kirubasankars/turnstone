@@ -5,7 +5,9 @@
 
 use std::io::{self, BufRead, Write};
 
-use crate::commands::{execute_line, handle_command, is_command_failure, welcome_message, CommandOutcome};
+use crate::commands::{
+    execute_line, handle_command, is_command_failure, welcome_message, CommandOutcome,
+};
 use crate::connect::{connect, ConnectOptions};
 
 pub fn run_interactive(opts: ConnectOptions) -> Result<(), String> {

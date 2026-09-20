@@ -21,10 +21,7 @@ fn basic_crud() {
         let mut tx = db.new_transaction(false);
         assert_eq!(tx.get(b"user:1").unwrap(), b"Alice");
         assert_eq!(tx.get(b"user:2").unwrap(), b"Bob");
-        assert!(matches!(
-            tx.get(b"user:3"),
-            Err(EngineError::KeyNotFound)
-        ));
+        assert!(matches!(tx.get(b"user:3"), Err(EngineError::KeyNotFound)));
         tx.discard();
     }
 

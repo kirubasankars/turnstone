@@ -6,8 +6,8 @@
 use std::time::Duration;
 
 use turnstone_backup::{
-    resolve_restore_chain, resolve_wal_file, run_backup, run_restore, BackupOptions, RestoreOptions,
-    TypeDifferential, TypeFull, DEFAULT_WAL_FILE,
+    resolve_restore_chain, resolve_wal_file, run_backup, run_restore, BackupOptions,
+    RestoreOptions, TypeDifferential, TypeFull, DEFAULT_WAL_FILE,
 };
 use turnstone_tls::{cert_paths, load_mtls, Role};
 
@@ -72,7 +72,10 @@ pub struct RestoreCliOptions {
 
 pub fn run_restore_cmd(opts: RestoreCliOptions) -> Result<(), String> {
     let dirs = resolve_restore_chain(&opts.in_dir, &opts.chain).map_err(|e| e.to_string())?;
-    let backup_dirs: Vec<String> = dirs.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+    let backup_dirs: Vec<String> = dirs
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
     let meta = run_restore(RestoreOptions {
         backup_dirs,
         out_home: opts.out_home.clone(),

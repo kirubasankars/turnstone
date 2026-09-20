@@ -27,9 +27,7 @@ pub(crate) fn entry_bytes(key: &[u8], chain: &[Version]) -> i64 {
 }
 
 pub(crate) fn live_bytes_for_map(keys: &HashMap<Vec<u8>, Vec<Version>>) -> u64 {
-    keys.iter()
-        .map(|(k, c)| entry_bytes(k, c) as u64)
-        .sum()
+    keys.iter().map(|(k, c)| entry_bytes(k, c) as u64).sum()
 }
 
 fn slot_count_for(key_count: u32) -> u32 {
@@ -88,10 +86,7 @@ impl Shard {
         &self.parent
     }
 
-    fn account_mutation<F, R>(
-        &self,
-        f: F,
-    ) -> Result<R, Box<dyn std::error::Error + Send + Sync>>
+    fn account_mutation<F, R>(&self, f: F) -> Result<R, Box<dyn std::error::Error + Send + Sync>>
     where
         F: FnOnce(&mut ShardState) -> Result<R, Box<dyn std::error::Error + Send + Sync>>,
     {
@@ -111,12 +106,13 @@ impl Shard {
         Ok(out)
     }
 
-    pub fn put(&self, key: &[u8], ver: Version) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn put(
+        &self,
+        key: &[u8],
+        ver: Version,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.account_mutation(|st| {
-            st.keys
-                .entry(key.to_vec())
-                .or_default()
-                .insert(0, ver);
+            st.keys.entry(key.to_vec()).or_default().insert(0, ver);
             Ok(())
         })
     }
@@ -207,7 +203,10 @@ impl Shard {
         live
     }
 
-    pub fn filtered_live_bytes(&self, filter: Option<&crate::compact::VersionFilter<'_>>) -> (u64, u64, u32) {
+    pub fn filtered_live_bytes(
+        &self,
+        filter: Option<&crate::compact::VersionFilter<'_>>,
+    ) -> (u64, u64, u32) {
         let st = self.state.read();
         if st.closed {
             return (0, 0, 0);

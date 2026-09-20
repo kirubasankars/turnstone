@@ -25,8 +25,7 @@ fn benchmark_insert_smoke() {
     const N: u64 = 2_000;
     for i in 0..N {
         let mut tx = db.new_transaction(true);
-        tx.put(format!("insert-key-{i}").as_bytes(), val)
-            .unwrap();
+        tx.put(format!("insert-key-{i}").as_bytes(), val).unwrap();
         tx.commit().unwrap();
     }
     let elapsed = start.elapsed();
@@ -51,10 +50,7 @@ fn benchmark_read_smoke() {
     let start = Instant::now();
     for i in 0..500 {
         let tx = db.new_transaction(false);
-        assert_eq!(
-            tx.get(format!("read-key-{i}").as_bytes()).unwrap(),
-            val
-        );
+        assert_eq!(tx.get(format!("read-key-{i}").as_bytes()).unwrap(), val);
     }
     let elapsed = start.elapsed();
     eprintln!("benchmark_read_smoke: 500 gets in {elapsed:?}");

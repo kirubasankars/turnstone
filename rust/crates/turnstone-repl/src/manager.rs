@@ -79,12 +79,7 @@ impl Manager {
         (String::new(), String::new())
     }
 
-    pub fn follow(
-        &self,
-        db_name: &str,
-        source_addr: &str,
-        source_db: &str,
-    ) -> Result<(), String> {
+    pub fn follow(&self, db_name: &str, source_addr: &str, source_db: &str) -> Result<(), String> {
         {
             let peers = self.peers.lock();
             if let Some(dbs) = peers.get(source_addr) {
@@ -96,7 +91,12 @@ impl Manager {
 
         self.remove_db_from_other_peers(db_name, source_addr);
 
-        let mut candidate = self.peers.lock().get(source_addr).cloned().unwrap_or_default();
+        let mut candidate = self
+            .peers
+            .lock()
+            .get(source_addr)
+            .cloned()
+            .unwrap_or_default();
         candidate.push(Source {
             local_db: db_name.to_string(),
             remote_db: source_db.to_string(),
@@ -423,8 +423,8 @@ fn apply_log_segment(
     expected_offset: &mut HashMap<String, u64>,
     stream: &mut rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
 ) -> Result<(), String> {
-    let (remote_db, mut cursor) =
-        read_len_prefixed_string(payload, 0).ok_or_else(|| "malformed log segment packet".to_string())?;
+    let (remote_db, mut cursor) = read_len_prefixed_string(payload, 0)
+        .ok_or_else(|| "malformed log segment packet".to_string())?;
     cursor += 4;
     if cursor + 16 > payload.len() {
         return Err("malformed log segment header".into());
@@ -440,10 +440,7 @@ fn apply_log_segment(
         ));
     }
 
-    let locals = remote_to_local
-        .get(&remote_db)
-        .cloned()
-        .unwrap_or_default();
+    let locals = remote_to_local.get(&remote_db).cloned().unwrap_or_default();
     for local_db in locals {
         let Some(st) = stores.get(&local_db) else {
             continue;

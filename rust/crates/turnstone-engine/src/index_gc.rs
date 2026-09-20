@@ -60,12 +60,7 @@ impl Db {
                 update: reg.update,
             })
             .collect();
-        let active_xids: HashSet<u64> = self
-            .active_xids
-            .lock()
-            .keys()
-            .copied()
-            .collect();
+        let active_xids: HashSet<u64> = self.active_xids.lock().keys().copied().collect();
         IndexGcContext {
             readers,
             active_xids,
@@ -156,10 +151,8 @@ impl Db {
         self.metrics_hash_shards_compacted
             .fetch_add(res.shards_compacted as u64, Ordering::AcqRel);
         if res.arena_before > res.arena_after {
-            self.metrics_hash_compact_reclaimed.fetch_add(
-                res.arena_before - res.arena_after,
-                Ordering::AcqRel,
-            );
+            self.metrics_hash_compact_reclaimed
+                .fetch_add(res.arena_before - res.arena_after, Ordering::AcqRel);
         }
         self.metrics_hash_compact_unix.store(
             SystemTime::now()

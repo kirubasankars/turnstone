@@ -285,11 +285,7 @@ impl Collector for TurnstoneCollector {
                 .unwrap_or(0);
 
             let labels = [("db", name.as_str())];
-            families.push(gauge_family(
-                &self.db_connections,
-                db_conns as f64,
-                &labels,
-            ));
+            families.push(gauge_family(&self.db_connections, db_conns as f64, &labels));
             families.push(gauge_family(
                 &self.db_active_txs,
                 stats.active_txs as f64,
@@ -300,11 +296,7 @@ impl Collector for TurnstoneCollector {
                 stats.conflicts as f64,
                 &labels,
             ));
-            families.push(gauge_family(
-                &self.db_offset,
-                stats.offset as f64,
-                &labels,
-            ));
+            families.push(gauge_family(&self.db_offset, stats.offset as f64, &labels));
             families.push(gauge_family(
                 &self.db_replica_lag,
                 stats.replica_lag as f64,
@@ -381,15 +373,12 @@ fn gauge_family(desc: &Desc, value: f64, labels: &[(&str, &str)]) -> MetricFamil
     mf.set_name(desc.fq_name.clone());
     mf.set_help(desc.help.clone());
     mf.set_field_type(MetricType::GAUGE);
-    mf.mut_metric().push(metric_with_labels(
-        value,
-        labels,
-        |m, v| {
+    mf.mut_metric()
+        .push(metric_with_labels(value, labels, |m, v| {
             let mut g = Gauge::default();
             g.set_value(v);
             m.set_gauge(g);
-        },
-    ));
+        }));
     mf
 }
 
@@ -398,15 +387,12 @@ fn counter_family(desc: &Desc, value: f64, labels: &[(&str, &str)]) -> MetricFam
     mf.set_name(desc.fq_name.clone());
     mf.set_help(desc.help.clone());
     mf.set_field_type(MetricType::COUNTER);
-    mf.mut_metric().push(metric_with_labels(
-        value,
-        labels,
-        |m, v| {
+    mf.mut_metric()
+        .push(metric_with_labels(value, labels, |m, v| {
             let mut c = Counter::default();
             c.set_value(v);
             m.set_counter(c);
-        },
-    ));
+        }));
     mf
 }
 

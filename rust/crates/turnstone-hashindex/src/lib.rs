@@ -35,19 +35,25 @@ mod tests {
     fn put_and_walk_versions() {
         let idx = Index::new();
         let key = b"alpha";
-        idx.put(key, Version {
-            offset: 10,
-            value_len: 3,
-            xmin: 1,
-            tombstone: false,
-        })
+        idx.put(
+            key,
+            Version {
+                offset: 10,
+                value_len: 3,
+                xmin: 1,
+                tombstone: false,
+            },
+        )
         .unwrap();
-        idx.put(key, Version {
-            offset: 20,
-            value_len: 3,
-            xmin: 2,
-            tombstone: false,
-        })
+        idx.put(
+            key,
+            Version {
+                offset: 20,
+                value_len: 3,
+                xmin: 2,
+                tombstone: false,
+            },
+        )
         .unwrap();
 
         let mut chain = Vec::new();
@@ -63,26 +69,35 @@ mod tests {
     #[test]
     fn for_each_key_and_drop_xid() {
         let idx = Index::new();
-        idx.put(b"a", Version {
-            offset: 1,
-            value_len: 0,
-            xmin: 1,
-            tombstone: false,
-        })
+        idx.put(
+            b"a",
+            Version {
+                offset: 1,
+                value_len: 0,
+                xmin: 1,
+                tombstone: false,
+            },
+        )
         .unwrap();
-        idx.put(b"b", Version {
-            offset: 2,
-            value_len: 0,
-            xmin: 2,
-            tombstone: false,
-        })
+        idx.put(
+            b"b",
+            Version {
+                offset: 2,
+                value_len: 0,
+                xmin: 2,
+                tombstone: false,
+            },
+        )
         .unwrap();
-        idx.put(b"a", Version {
-            offset: 3,
-            value_len: 0,
-            xmin: 3,
-            tombstone: false,
-        })
+        idx.put(
+            b"a",
+            Version {
+                offset: 3,
+                value_len: 0,
+                xmin: 3,
+                tombstone: false,
+            },
+        )
         .unwrap();
 
         let mut count = 0;
@@ -117,12 +132,15 @@ mod tests {
         }
 
         for (i, key) in keys.iter().enumerate() {
-            idx.put(key, Version {
-                offset: i as i64,
-                value_len: 0,
-                xmin: (i + 1) as u64,
-                tombstone: false,
-            })
+            idx.put(
+                key,
+                Version {
+                    offset: i as i64,
+                    value_len: 0,
+                    xmin: (i + 1) as u64,
+                    tombstone: false,
+                },
+            )
             .unwrap();
         }
 
@@ -137,12 +155,15 @@ mod tests {
         const N: usize = 5000;
         for i in 0..N {
             let key = format!("grow-key-{i}");
-            idx.put(key.as_bytes(), Version {
-                offset: i as i64,
-                value_len: 0,
-                xmin: (i + 1) as u64,
-                tombstone: false,
-            })
+            idx.put(
+                key.as_bytes(),
+                Version {
+                    offset: i as i64,
+                    value_len: 0,
+                    xmin: (i + 1) as u64,
+                    tombstone: false,
+                },
+            )
             .unwrap();
         }
 
@@ -166,12 +187,15 @@ mod tests {
             let idx = Arc::clone(&idx);
             handles.push(thread::spawn(move || {
                 let key = format!("key-{i}");
-                idx.put(key.as_bytes(), Version {
-                    offset: i as i64,
-                    value_len: 4,
-                    xmin: (i + 1) as u64,
-                    tombstone: false,
-                })
+                idx.put(
+                    key.as_bytes(),
+                    Version {
+                        offset: i as i64,
+                        value_len: 4,
+                        xmin: (i + 1) as u64,
+                        tombstone: false,
+                    },
+                )
                 .unwrap();
             }));
         }
@@ -192,12 +216,15 @@ mod tests {
         let idx = Index::new();
         let key = b"k";
         for i in 1..=4 {
-            idx.put(key, Version {
-                offset: (i * 10) as i64,
-                value_len: 1,
-                xmin: i as u64,
-                tombstone: false,
-            })
+            idx.put(
+                key,
+                Version {
+                    offset: (i * 10) as i64,
+                    value_len: 1,
+                    xmin: i as u64,
+                    tombstone: false,
+                },
+            )
             .unwrap();
         }
         let shard_idx = (hash_key(key) & 255) as i32;
@@ -224,12 +251,15 @@ mod tests {
         let idx = Index::new();
         let key = b"k";
         for i in 1..=5 {
-            idx.put(key, Version {
-                offset: (i * 10) as i64,
-                value_len: 1,
-                xmin: i as u64,
-                tombstone: false,
-            })
+            idx.put(
+                key,
+                Version {
+                    offset: (i * 10) as i64,
+                    value_len: 1,
+                    xmin: i as u64,
+                    tombstone: false,
+                },
+            )
             .unwrap();
         }
 
@@ -259,12 +289,15 @@ mod tests {
     fn compact_shard_removes_key_when_filter_empty() {
         let idx = Index::new();
         let key = b"drop-me";
-        idx.put(key, Version {
-            offset: 1,
-            value_len: 0,
-            xmin: 1,
-            tombstone: false,
-        })
+        idx.put(
+            key,
+            Version {
+                offset: 1,
+                value_len: 0,
+                xmin: 1,
+                tombstone: false,
+            },
+        )
         .unwrap();
 
         let shard_idx = (hash_key(key) & 255) as i32;

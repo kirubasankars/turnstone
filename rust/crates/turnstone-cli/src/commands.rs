@@ -50,7 +50,9 @@ pub fn handle_command(client: &Client, cmd: &str, parts: &[String]) -> CommandOu
         }
         "replicaof" => {
             if parts.len() < 2 {
-                println!("Usage: replicaof <host:port> <remote_db>  (use stepdown to stop following)");
+                println!(
+                    "Usage: replicaof <host:port> <remote_db>  (use stepdown to stop following)"
+                );
                 return CommandOutcome::UsageError;
             }
             client

@@ -110,9 +110,9 @@ impl Transport {
 
     pub fn flush(&self) -> Result<(), ClientError> {
         let mut guard = self.inner.lock().unwrap();
-        let io = guard.as_mut().ok_or_else(|| {
-            ClientError::Connection("connection closed".into())
-        })?;
+        let io = guard
+            .as_mut()
+            .ok_or_else(|| ClientError::Connection("connection closed".into()))?;
         let stream = io.get_mut();
         finish_tls_write(stream)?;
         stream
@@ -127,9 +127,9 @@ impl Transport {
         expected_responses: usize,
     ) -> Result<(), ClientError> {
         let mut guard = self.inner.lock().unwrap();
-        let io = guard.as_mut().ok_or_else(|| {
-            ClientError::Connection("connection closed".into())
-        })?;
+        let io = guard
+            .as_mut()
+            .ok_or_else(|| ClientError::Connection("connection closed".into()))?;
         let stream = io.get_mut();
         drive_client_handshake(stream)?;
         stream
@@ -151,9 +151,9 @@ impl Transport {
 
     pub fn write_all(&self, data: &[u8]) -> Result<(), ClientError> {
         let mut guard = self.inner.lock().unwrap();
-        let io = guard.as_mut().ok_or_else(|| {
-            ClientError::Connection("connection closed".into())
-        })?;
+        let io = guard
+            .as_mut()
+            .ok_or_else(|| ClientError::Connection("connection closed".into()))?;
         let stream = io.get_mut();
         drive_client_handshake(stream)?;
         stream
@@ -164,9 +164,9 @@ impl Transport {
 
     pub fn read_frame(&self) -> Result<(u8, Vec<u8>), ClientError> {
         let mut guard = self.inner.lock().unwrap();
-        let io = guard.as_mut().ok_or_else(|| {
-            ClientError::Connection("connection closed".into())
-        })?;
+        let io = guard
+            .as_mut()
+            .ok_or_else(|| ClientError::Connection("connection closed".into()))?;
         read_frame_buffered(io)
     }
 

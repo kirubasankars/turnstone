@@ -4,14 +4,18 @@ use std::thread;
 use std::time::Duration;
 
 use turnstone_client::{Client, ClientConfig, ClientError, PipelineResponse};
-use turnstone_protocol::{encode_frame, OP_PING};
 use turnstone_config::{generate_config_artifacts, Config};
 use turnstone_database::{open, OpenOptions, STATE_PRIMARY};
+use turnstone_protocol::{encode_frame, OP_PING};
 use turnstone_repl::Manager;
 use turnstone_server::new_server;
 use turnstone_tls::load_mtls;
 
-fn setup_test_env() -> (tempfile::TempDir, HashMap<String, Arc<turnstone_database::Database>>, Arc<turnstone_server::Server>) {
+fn setup_test_env() -> (
+    tempfile::TempDir,
+    HashMap<String, Arc<turnstone_database::Database>>,
+    Arc<turnstone_server::Server>,
+) {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.json");
     generate_config_artifacts(
@@ -58,9 +62,18 @@ fn setup_test_env() -> (tempfile::TempDir, HashMap<String, Arc<turnstone_databas
         "127.0.0.1:0",
         stores.clone(),
         10,
-        dir.path().join("certs/server.crt").to_string_lossy().into_owned(),
-        dir.path().join("certs/server.key").to_string_lossy().into_owned(),
-        dir.path().join("certs/ca.crt").to_string_lossy().into_owned(),
+        dir.path()
+            .join("certs/server.crt")
+            .to_string_lossy()
+            .into_owned(),
+        dir.path()
+            .join("certs/server.key")
+            .to_string_lossy()
+            .into_owned(),
+        dir.path()
+            .join("certs/ca.crt")
+            .to_string_lossy()
+            .into_owned(),
         Some(rm),
         false,
     )

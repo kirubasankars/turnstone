@@ -24,7 +24,11 @@ pub fn connect(opts: &ConnectOptions) -> Result<Client, ClientError> {
             if opts.admin { "admin" } else { "client" }
         );
     }
-    let role = if opts.admin { Role::Admin } else { Role::Client };
+    let role = if opts.admin {
+        Role::Admin
+    } else {
+        Role::Client
+    };
     let (ca, cert, key) = cert_paths(&opts.home, role);
     if ca.exists() {
         Client::from_mtls_files(&opts.host, ca, cert, key)

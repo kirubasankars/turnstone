@@ -188,10 +188,7 @@ impl Db {
                     o.tx.force_abort();
                 }
             }
-            results.insert(
-                o.tx.xid,
-                o.err.map_or(Ok(()), Err),
-            );
+            results.insert(o.tx.xid, o.err.map_or(Ok(()), Err));
         }
         for req in requests {
             let r = results

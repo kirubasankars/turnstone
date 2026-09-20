@@ -87,12 +87,16 @@ fn start_fake_leader(
     server_cfg: Arc<ServerConfig>,
 ) -> (
     String,
-    std::sync::mpsc::Sender<Box<dyn FnOnce(rustls::StreamOwned<rustls::ServerConnection, std::net::TcpStream>) + Send>>,
+    std::sync::mpsc::Sender<
+        Box<dyn FnOnce(rustls::StreamOwned<rustls::ServerConnection, std::net::TcpStream>) + Send>,
+    >,
     impl FnOnce(),
 ) {
     let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = tcp.local_addr().unwrap().to_string();
-    let (task_tx, task_rx) = std::sync::mpsc::channel::<Box<dyn FnOnce(rustls::StreamOwned<rustls::ServerConnection, std::net::TcpStream>) + Send>>();
+    let (task_tx, task_rx) = std::sync::mpsc::channel::<
+        Box<dyn FnOnce(rustls::StreamOwned<rustls::ServerConnection, std::net::TcpStream>) + Send>,
+    >();
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop2 = Arc::clone(&stop);
     std::thread::spawn(move || {
@@ -111,13 +115,9 @@ fn start_fake_leader(
             });
         }
     });
-    (
-        addr,
-        task_tx,
-        move || {
-            stop.store(true, std::sync::atomic::Ordering::Release);
-        },
-    )
+    (addr, task_tx, move || {
+        stop.store(true, std::sync::atomic::Ordering::Release);
+    })
 }
 
 fn wait_for_key(db: &turnstone_database::Database, key: &str, want: &str) {
@@ -139,20 +139,25 @@ fn manager_apply_log_range_offset_mismatch() {
     let server_cfg = load_server_config(&dir);
     let (addr, task_tx, stop) = start_fake_leader(server_cfg);
     let handler = || {
-        Box::new(|mut conn: rustls::StreamOwned<rustls::ServerConnection, std::net::TcpStream>| {
-            let mut head = [0u8; 5];
-            conn.read_exact(&mut head).unwrap();
-            write_status_ok(&mut conn);
-            let mut body = Vec::new();
-            body.extend_from_slice(&1u32.to_be_bytes());
-            body.push(b'0');
-            body.extend_from_slice(&0u32.to_be_bytes());
-            body.extend_from_slice(&999u64.to_be_bytes());
-            body.extend_from_slice(&999u64.to_be_bytes());
-            write_repl_frame(&mut conn, OP_REPL_LOG_RANGE, &body);
-            std::thread::sleep(Duration::from_secs(2));
-        })
-            as Box<dyn FnOnce(rustls::StreamOwned<rustls::ServerConnection, std::net::TcpStream>) + Send>
+        Box::new(
+            |mut conn: rustls::StreamOwned<rustls::ServerConnection, std::net::TcpStream>| {
+                let mut head = [0u8; 5];
+                conn.read_exact(&mut head).unwrap();
+                write_status_ok(&mut conn);
+                let mut body = Vec::new();
+                body.extend_from_slice(&1u32.to_be_bytes());
+                body.push(b'0');
+                body.extend_from_slice(&0u32.to_be_bytes());
+                body.extend_from_slice(&999u64.to_be_bytes());
+                body.extend_from_slice(&999u64.to_be_bytes());
+                write_repl_frame(&mut conn, OP_REPL_LOG_RANGE, &body);
+                std::thread::sleep(Duration::from_secs(2));
+            },
+        )
+            as Box<
+                dyn FnOnce(rustls::StreamOwned<rustls::ServerConnection, std::net::TcpStream>)
+                    + Send,
+            >
     };
     task_tx.send(handler()).unwrap();
     task_tx.send(handler()).unwrap();
@@ -184,21 +189,26 @@ fn manager_apply_log_range_valid_segment() {
     let seg2 = seg.clone();
     let handler = move || {
         let seg = seg2.clone();
-        Box::new(move |mut conn: rustls::StreamOwned<rustls::ServerConnection, std::net::TcpStream>| {
-            let mut head = [0u8; 5];
-            conn.read_exact(&mut head).unwrap();
-            write_status_ok(&mut conn);
-            let mut body = Vec::new();
-            body.extend_from_slice(&1u32.to_be_bytes());
-            body.push(b'0');
-            body.extend_from_slice(&0u32.to_be_bytes());
-            body.extend_from_slice(&0u64.to_be_bytes());
-            body.extend_from_slice(&end_off.to_be_bytes());
-            body.extend_from_slice(&seg);
-            write_repl_frame(&mut conn, OP_REPL_LOG_RANGE, &body);
-            std::thread::sleep(Duration::from_secs(2));
-        })
-            as Box<dyn FnOnce(rustls::StreamOwned<rustls::ServerConnection, std::net::TcpStream>) + Send>
+        Box::new(
+            move |mut conn: rustls::StreamOwned<rustls::ServerConnection, std::net::TcpStream>| {
+                let mut head = [0u8; 5];
+                conn.read_exact(&mut head).unwrap();
+                write_status_ok(&mut conn);
+                let mut body = Vec::new();
+                body.extend_from_slice(&1u32.to_be_bytes());
+                body.push(b'0');
+                body.extend_from_slice(&0u32.to_be_bytes());
+                body.extend_from_slice(&0u64.to_be_bytes());
+                body.extend_from_slice(&end_off.to_be_bytes());
+                body.extend_from_slice(&seg);
+                write_repl_frame(&mut conn, OP_REPL_LOG_RANGE, &body);
+                std::thread::sleep(Duration::from_secs(2));
+            },
+        )
+            as Box<
+                dyn FnOnce(rustls::StreamOwned<rustls::ServerConnection, std::net::TcpStream>)
+                    + Send,
+            >
     };
     task_tx.send(handler()).unwrap();
     task_tx.send(handler()).unwrap();

@@ -169,12 +169,13 @@ impl WriteTransaction {
     pub(crate) fn check_read_set_conflicts(&self) -> Result<(), EngineError> {
         let inner = self.inner.lock();
         for k in &inner.read_set {
-            if self.db.index.has_newer_committed(
-                k.as_bytes(),
-                self.xid,
-                &self.snapshot,
-                |x| self.db.clog_status(x),
-            ) {
+            if self
+                .db
+                .index
+                .has_newer_committed(k.as_bytes(), self.xid, &self.snapshot, |x| {
+                    self.db.clog_status(x)
+                })
+            {
                 return Err(EngineError::WriteConflict);
             }
         }
@@ -242,9 +243,7 @@ impl WriteTransaction {
             if let Some(owner) = locks.get(&key_str) {
                 if *owner != self.xid {
                     drop(locks);
-                    self.db
-                        .metrics_conflicts
-                        .fetch_add(1, Ordering::AcqRel);
+                    self.db.metrics_conflicts.fetch_add(1, Ordering::AcqRel);
                     self.aborted.store(true, Ordering::Release);
                     return Err(EngineError::WriteConflict);
                 }
@@ -254,16 +253,13 @@ impl WriteTransaction {
         if first_write {
             self.db.key_locks.lock().insert(key_str.clone(), self.xid);
             inner.key_locks.insert(key_str.clone());
-            let (ver, xmin, found) = self.db.index.latest_resolved(
-                key,
-                self.xid,
-                |x| self.db.clog_status(x),
-            );
+            let (ver, xmin, found) = self
+                .db
+                .index
+                .latest_resolved(key, self.xid, |x| self.db.clog_status(x));
             if found && (xmin >= self.snapshot.xmax || self.snapshot.contains(xmin)) {
                 self.release_key_lock(&key_str, &inner);
-                self.db
-                    .metrics_conflicts
-                    .fetch_add(1, Ordering::AcqRel);
+                self.db.metrics_conflicts.fetch_add(1, Ordering::AcqRel);
                 self.aborted.store(true, Ordering::Release);
                 return Err(EngineError::WriteConflict);
             }
@@ -312,11 +308,17 @@ impl WriteTransaction {
         } else if !was_live {
             inner.key_delta += 1;
         }
-        inner.disposition_seen.insert(key_str.to_string(), !is_delete);
+        inner
+            .disposition_seen
+            .insert(key_str.to_string(), !is_delete);
     }
 
     fn record_own(inner: &mut TxnInner, key_str: &str, is_delete: bool) {
-        let was_live = inner.disposition_seen.get(key_str).copied().unwrap_or(false);
+        let was_live = inner
+            .disposition_seen
+            .get(key_str)
+            .copied()
+            .unwrap_or(false);
         if is_delete {
             if was_live {
                 inner.key_delta -= 1;
@@ -324,7 +326,9 @@ impl WriteTransaction {
         } else if !was_live {
             inner.key_delta += 1;
         }
-        inner.disposition_seen.insert(key_str.to_string(), !is_delete);
+        inner
+            .disposition_seen
+            .insert(key_str.to_string(), !is_delete);
     }
 
     fn release_key_lock(&self, key: &str, inner: &TxnInner) {
@@ -350,13 +354,12 @@ impl WriteTransaction {
     }
 
     fn get_visible(&self, key: &[u8]) -> Result<Vec<u8>, EngineError> {
-        let (ver, ok) = self.db.index.get_visible(
-            key,
-            &self.snapshot,
-            self.xid,
-            true,
-            |xmin, snap| self.db.is_visible(xmin, snap),
-        );
+        let (ver, ok) =
+            self.db
+                .index
+                .get_visible(key, &self.snapshot, self.xid, true, |xmin, snap| {
+                    self.db.is_visible(xmin, snap)
+                });
         if !ok {
             return Err(EngineError::KeyNotFound);
         }
@@ -447,14 +450,14 @@ impl WriteTransaction {
 }
 
 impl Db {
-    pub(crate) fn read_snapshot(&self, key: &[u8], snap: &Snapshot) -> Result<Vec<u8>, EngineError> {
-        let (ver, ok) = self.index.get_visible(
-            key,
-            snap,
-            0,
-            false,
-            |xmin, s| self.is_visible(xmin, s),
-        );
+    pub(crate) fn read_snapshot(
+        &self,
+        key: &[u8],
+        snap: &Snapshot,
+    ) -> Result<Vec<u8>, EngineError> {
+        let (ver, ok) = self
+            .index
+            .get_visible(key, snap, 0, false, |xmin, s| self.is_visible(xmin, s));
         if !ok {
             return Err(EngineError::KeyNotFound);
         }

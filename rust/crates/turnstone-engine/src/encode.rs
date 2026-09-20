@@ -88,7 +88,10 @@ pub fn decode_record(payload: &[u8]) -> Result<Record, EncodeError> {
 }
 
 /// Byte range of the SET value inside a decoded frame payload.
-pub fn set_value_range(payload: &[u8], val_len: u32) -> Result<std::ops::Range<usize>, EngineError> {
+pub fn set_value_range(
+    payload: &[u8],
+    val_len: u32,
+) -> Result<std::ops::Range<usize>, EngineError> {
     if payload.len() < LOG_RECORD_HEADER_SIZE + 8 || payload[0] != RecordType::Set as u8 {
         return Err(EngineError::CorruptData);
     }

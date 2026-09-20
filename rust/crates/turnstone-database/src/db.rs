@@ -401,11 +401,7 @@ impl Database {
     }
 
     pub fn replica_generation(&self, id: &str) -> u64 {
-        self.replicas
-            .lock()
-            .get(id)
-            .map(|s| s.gen)
-            .unwrap_or(0)
+        self.replicas.lock().get(id).map(|s| s.gen).unwrap_or(0)
     }
 
     pub fn unregister_replica(&self, id: &str) {
@@ -516,7 +512,9 @@ impl Database {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        Err(DatabaseError::Other("timeout waiting for active transactions".into()))
+        Err(DatabaseError::Other(
+            "timeout waiting for active transactions".into(),
+        ))
     }
 
     pub fn abort_all_active_write_transactions(&self) {
@@ -533,7 +531,9 @@ impl Database {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        Err(DatabaseError::Other("timeout waiting for replication sync".into()))
+        Err(DatabaseError::Other(
+            "timeout waiting for replication sync".into(),
+        ))
     }
 
     pub fn trigger_safe_point(&self) {
@@ -582,11 +582,7 @@ impl Database {
         let mut server_replicas = 0i32;
         let mut replicas = Vec::new();
         for (id, r) in self.replicas.lock().iter() {
-            let lag = if head > r.offset {
-                head - r.offset
-            } else {
-                0
-            };
+            let lag = if head > r.offset { head - r.offset } else { 0 };
             if r.role == REPLICA_ROLE_SERVER {
                 server_replicas += 1;
                 max_lag = max_lag.max(lag);
@@ -779,14 +775,14 @@ impl Database {
                 },
             );
         }
-        let data = serde_json::to_string_pretty(&out).map_err(|e| DatabaseError::Other(e.to_string()))?;
+        let data =
+            serde_json::to_string_pretty(&out).map_err(|e| DatabaseError::Other(e.to_string()))?;
         let tmp = self.slots_file.with_extension("slots.tmp");
         std::fs::write(&tmp, data).map_err(|e| DatabaseError::Other(e.to_string()))?;
         std::fs::rename(&tmp, &self.slots_file).map_err(|e| DatabaseError::Other(e.to_string()))?;
         *self.repl_dirty.lock() = false;
         Ok(())
     }
-
 }
 
 fn humantime_rfc3339(t: SystemTime) -> String {

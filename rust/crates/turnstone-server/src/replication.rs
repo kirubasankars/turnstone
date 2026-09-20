@@ -103,7 +103,8 @@ pub(crate) fn handle_replica_connection(
             let _ = write_binary_response(
                 conn,
                 protocol::RES_ERR,
-                format!("Replica handshake rejected: DB '{name}' is {state} (must be PRIMARY)").as_bytes(),
+                format!("Replica handshake rejected: DB '{name}' is {state} (must be PRIMARY)")
+                    .as_bytes(),
             );
             return;
         }

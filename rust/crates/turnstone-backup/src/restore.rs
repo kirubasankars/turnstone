@@ -28,7 +28,9 @@ pub enum RestoreError {
 
 pub fn run_restore(opts: RestoreOptions) -> Result<Meta, RestoreError> {
     if opts.backup_dirs.is_empty() {
-        return Err(RestoreError::Invalid("no backup directories provided".into()));
+        return Err(RestoreError::Invalid(
+            "no backup directories provided".into(),
+        ));
     }
     if Path::new(&opts.out_home).exists() {
         return Err(RestoreError::Invalid(format!(

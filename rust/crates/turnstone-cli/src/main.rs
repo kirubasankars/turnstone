@@ -12,11 +12,7 @@ use clap::{Parser, Subcommand};
 use turnstone_cli::{run_exec, run_interactive, ConnectOptions};
 
 #[derive(Parser)]
-#[command(
-    name = "turnstone-rs",
-    version,
-    about = "TurnstoneDB Rust wire client"
-)]
+#[command(name = "turnstone-rs", version, about = "TurnstoneDB Rust wire client")]
 struct Cli {
     #[arg(long, global = true, default_value = "127.0.0.1:6379")]
     host: String,
