@@ -1,6 +1,6 @@
 [package]
 name = "turnstone-engine"
-description = "TurnstoneDB storage engine types and WAL record encoding"
+description = "TurnstoneDB storage engine types and WAL"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,3 +9,12 @@ repository.workspace = true
 [dependencies]
 crc32fast.workspace = true
 thiserror.workspace = true
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+memmap2 = "0.9"
+nix = { version = "0.29", features = ["fs", "mman"] }
+log = "0.4"
+turnstone-hashindex = { path = "../turnstone-hashindex" }
+
+[dev-dependencies]
+tempfile = "3.14"

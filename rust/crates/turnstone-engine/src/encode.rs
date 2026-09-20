@@ -3,13 +3,9 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root of this source tree.
 
-use crate::{Record, RecordType, LOG_RECORD_HEADER_SIZE};
+use crate::{EngineError, Record, RecordType, LOG_RECORD_HEADER_SIZE};
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum EncodeError {
-    #[error("data corruption detected")]
-    CorruptData,
-}
+pub type EncodeError = EngineError;
 
 pub fn encode_record(rec: &Record) -> Vec<u8> {
     let body_len = match rec.ty {
@@ -45,9 +41,9 @@ pub fn encode_record(rec: &Record) -> Vec<u8> {
 
 pub fn decode_record(payload: &[u8]) -> Result<Record, EncodeError> {
     if payload.len() < LOG_RECORD_HEADER_SIZE {
-        return Err(EncodeError::CorruptData);
+        return Err(EngineError::CorruptData);
     }
-    let ty = RecordType::try_from(payload[0]).map_err(|_| EncodeError::CorruptData)?;
+    let ty = RecordType::try_from(payload[0])?;
     let xid = u64::from_be_bytes(payload[1..9].try_into().unwrap());
     let body = &payload[LOG_RECORD_HEADER_SIZE..];
     let mut rec = Record {
@@ -59,36 +55,54 @@ pub fn decode_record(payload: &[u8]) -> Result<Record, EncodeError> {
     match ty {
         RecordType::Set => {
             if body.len() < 4 {
-                return Err(EncodeError::CorruptData);
+                return Err(EngineError::CorruptData);
             }
             let klen = u32::from_be_bytes(body[0..4].try_into().unwrap()) as usize;
             let mut off = 4;
             if off + klen + 4 > body.len() {
-                return Err(EncodeError::CorruptData);
+                return Err(EngineError::CorruptData);
             }
             rec.key = body[off..off + klen].to_vec();
             off += klen;
             let vlen = u32::from_be_bytes(body[off..off + 4].try_into().unwrap()) as usize;
             off += 4;
             if off + vlen > body.len() {
-                return Err(EncodeError::CorruptData);
+                return Err(EngineError::CorruptData);
             }
             rec.value = body[off..off + vlen].to_vec();
         }
         RecordType::Delete => {
             if body.len() < 4 {
-                return Err(EncodeError::CorruptData);
+                return Err(EngineError::CorruptData);
             }
             let klen = u32::from_be_bytes(body[0..4].try_into().unwrap()) as usize;
             let off = 4;
             if off + klen > body.len() {
-                return Err(EncodeError::CorruptData);
+                return Err(EngineError::CorruptData);
             }
             rec.key = body[off..off + klen].to_vec();
         }
         RecordType::Begin | RecordType::Commit | RecordType::Abort => {}
     }
     Ok(rec)
+}
+
+/// Extract the SET value from a log payload without copying the key.
+pub fn decode_value_at(payload: &[u8], val_len: u32) -> Result<Vec<u8>, EngineError> {
+    if payload.len() < LOG_RECORD_HEADER_SIZE + 8 || payload[0] != RecordType::Set as u8 {
+        return Err(EngineError::CorruptData);
+    }
+    let klen = u32::from_be_bytes(payload[LOG_RECORD_HEADER_SIZE..LOG_RECORD_HEADER_SIZE + 4].try_into().unwrap()) as usize;
+    let mut off = LOG_RECORD_HEADER_SIZE + 4 + klen;
+    if off + 4 > payload.len() {
+        return Err(EngineError::CorruptData);
+    }
+    let vlen = u32::from_be_bytes(payload[off..off + 4].try_into().unwrap()) as usize;
+    off += 4;
+    if vlen != val_len as usize || off + vlen > payload.len() {
+        return Err(EngineError::CorruptData);
+    }
+    Ok(payload[off..off + vlen].to_vec())
 }
 
 #[cfg(test)]
