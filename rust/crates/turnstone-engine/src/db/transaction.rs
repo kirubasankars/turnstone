@@ -4,7 +4,7 @@
 // LICENSE file in the root of this source tree.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -47,6 +47,7 @@ pub struct WriteTransaction {
     inner: Mutex<TxnInner>,
     aborted: AtomicBool,
     finished: AtomicBool,
+    decided: AtomicI32,
 }
 
 pub enum TxnHandle {
@@ -137,7 +138,45 @@ impl WriteTransaction {
             }),
             aborted: AtomicBool::new(false),
             finished: AtomicBool::new(false),
+            decided: AtomicI32::new(0),
         }
+    }
+
+    pub(crate) fn check_read_set_conflicts(&self) -> Result<(), EngineError> {
+        let inner = self.inner.lock();
+        for k in &inner.read_set {
+            if self.db.index.has_newer_committed(
+                k.as_bytes(),
+                self.xid,
+                &self.snapshot,
+                |x| self.db.clog_status(x),
+            ) {
+                return Err(EngineError::WriteConflict);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn claim_decision(&self) -> bool {
+        self.decided
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub(crate) fn key_delta(&self) -> i64 {
+        self.inner.lock().key_delta
+    }
+
+    pub(crate) fn mark_aborted(&self) {
+        self.aborted.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn release_committed_locks(&self) {
+        self.cleanup_xid(true);
+    }
+
+    pub(crate) fn force_release_locks(&self) {
+        self.cleanup_xid(false);
     }
 
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<(), EngineError> {
@@ -311,57 +350,34 @@ impl WriteTransaction {
             self.force_abort();
             return Err(EngineError::WriteConflict);
         }
-        let mut inner = self.inner.lock();
+        if self.db.closed.load(Ordering::Acquire) {
+            self.force_abort();
+            return Err(EngineError::DatabaseClosed);
+        }
+        let inner = self.inner.lock();
         if !inner.did_write || inner.key_locks.is_empty() {
             drop(inner);
             self.cleanup_xid(false);
             return Ok(());
         }
-
-        for k in &inner.read_set {
-            if self.db.index.has_newer_committed(
-                k.as_bytes(),
-                self.xid,
-                &self.snapshot,
-                |x| self.db.clog_status(x),
-            ) {
-                drop(inner);
-                self.db
-                    .metrics_conflicts
-                    .fetch_add(1, Ordering::AcqRel);
-                self.force_abort();
-                return Err(EngineError::WriteConflict);
-            }
-        }
-
-        let key_delta = inner.key_delta;
         drop(inner);
 
-        let xid = self.xid;
-        let sync = !self.db.unsafe_disable_fsync;
+        let arc_tx = self
+            .db
+            .active_xids
+            .lock()
+            .get(&self.xid)
+            .cloned()
+            .ok_or(EngineError::TxnFinished)?;
+        let (resp_tx, resp_rx) = std::sync::mpsc::sync_channel(1);
         self.db
-            .log
-            .append_records(
-                &[|| {
-                    crate::encode_record(&crate::types::Record {
-                        ty: RecordType::Commit,
-                        xid,
-                        key: vec![],
-                        value: vec![],
-                    })
-                }],
-                sync,
-            )?;
-
-        self.db.clog.forget_clog(xid);
-        self.db.clog.active_xids.write().unwrap().remove(&xid);
-        if key_delta != 0 {
-            self.db
-                .key_count
-                .fetch_add(key_delta, Ordering::AcqRel);
-        }
-        self.cleanup_xid(true);
-        Ok(())
+            .commit_tx
+            .send(crate::committer::CommitRequest {
+                tx: arc_tx,
+                resp: resp_tx,
+            })
+            .map_err(|_| EngineError::DatabaseClosed)?;
+        resp_rx.recv().unwrap_or(Err(EngineError::DatabaseClosed))
     }
 
     pub fn discard(&self) {

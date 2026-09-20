@@ -22,7 +22,10 @@ use super::recycle::{
     recycle_dir, write_segment_footer, write_segment_footer_if_allocated, WAL_SEG_FOOTER_SIZE,
 };
 use super::sync::sync_file;
+use std::sync::Arc;
+
 use crate::castagnoli_checksum;
+use crate::shared_buffers::{BufferTag, SharedBuffers, SHARED_BUFFER_PAGE_SIZE};
 use crate::decode_record;
 use crate::decode_value_at;
 use crate::types::{
@@ -108,10 +111,19 @@ pub struct DataLog {
     durable_offset: AtomicI64,
     inflight_syncs: WaitGroup,
     syncing: AtomicI32,
+    buffers: Option<Arc<SharedBuffers>>,
 }
 
 impl DataLog {
     pub fn open(dir: impl AsRef<Path>, segment_size: i64) -> io::Result<Self> {
+        Self::open_with_buffers(dir, segment_size, None)
+    }
+
+    pub fn open_with_buffers(
+        dir: impl AsRef<Path>,
+        segment_size: i64,
+        buffers: Option<Arc<SharedBuffers>>,
+    ) -> io::Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
         let segment_size = normalize_wal_segment_size(segment_size);
@@ -146,6 +158,7 @@ impl DataLog {
             durable_offset: AtomicI64::new(0),
             inflight_syncs: WaitGroup::new(),
             syncing: AtomicI32::new(0),
+            buffers,
         };
         {
             let mut inner = log.inner.write().unwrap();
@@ -258,9 +271,79 @@ impl DataLog {
         Ok(offsets)
     }
 
+    pub fn append_encoded_batch(
+        &self,
+        payloads: &[Vec<u8>],
+        sync: bool,
+    ) -> Result<Vec<i64>, EngineError> {
+        if payloads.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut inner = self.inner.write().unwrap();
+        let mut offsets = Vec::with_capacity(payloads.len());
+        for payload in payloads {
+            let off = inner.write_offset;
+            self.write_frame_locked(&mut inner, payload)?;
+            offsets.push(off);
+        }
+        let flushed = if sync {
+            self.begin_sync_locked(&inner)?
+        } else {
+            self.publish_append_locked(&inner);
+            0
+        };
+        drop(inner);
+        if sync {
+            self.complete_sync(flushed);
+        }
+        Ok(offsets)
+    }
+
     pub fn read_value_at(&self, offset: i64, val_len: u32) -> Result<Vec<u8>, EngineError> {
+        if self.buffers.is_some() {
+            if let Ok(v) = self.read_value_via_buffers(offset, val_len) {
+                return Ok(v);
+            }
+        }
         let inner = self.inner.read().unwrap();
         inner.read_value_at_locked(offset, val_len)
+    }
+
+    fn read_value_via_buffers(&self, offset: i64, val_len: u32) -> Result<Vec<u8>, EngineError> {
+        let buffers = self.buffers.as_ref().ok_or(EngineError::LogUnavailable)?;
+        let inner = self.inner.read().unwrap();
+        let (seg, local) = inner
+            .resolve_lsn(offset)
+            .ok_or(EngineError::InvalidLogOffset)?;
+        let mut pins = Vec::new();
+        let header = gather_from_buffers(
+            buffers,
+            seg,
+            local,
+            LOG_FRAME_HEADER_SIZE as i64,
+            &inner,
+            &mut pins,
+        )?;
+        let payload_len = u32::from_be_bytes(header[0..4].try_into().unwrap());
+        if payload_len > 1 << 30 {
+            return Err(EngineError::CorruptData);
+        }
+        let checksum = u32::from_be_bytes(header[4..8].try_into().unwrap());
+        let payload = gather_from_buffers(
+            buffers,
+            seg,
+            local + LOG_FRAME_HEADER_SIZE as i64,
+            payload_len as i64,
+            &inner,
+            &mut pins,
+        )?;
+        for i in pins {
+            buffers.unpin(i);
+        }
+        if castagnoli_checksum(&payload) != checksum {
+            return Err(EngineError::Checksum);
+        }
+        decode_value_at(&payload, val_len)
     }
 
     /// On-disk frame bytes (header + payload) at global LSN.
@@ -672,6 +755,9 @@ impl DataLog {
         let seg_idx = inner.active_index;
         let local_off = inner.write_offset - inner.segments[seg_idx].base_lsn;
         inner.write_segment_at(seg_idx, local_off, &buf)?;
+        if let Some(b) = &self.buffers {
+            b.apply_write(inner.segments[seg_idx].id, local_off, &buf);
+        }
         inner.write_offset += total_len as i64;
         if inner.write_offset - inner.segments[seg_idx].base_lsn
             >= inner.usable_segment_size(self.segment_size)
@@ -1346,4 +1432,44 @@ fn frame_err(
         RecordSpan { offset: 0, length: 0 },
         Err(kind),
     )
+}
+
+fn gather_from_buffers(
+    buffers: &SharedBuffers,
+    seg: &WalSegment,
+    local: i64,
+    n: i64,
+    inner: &Inner,
+    pins: &mut Vec<usize>,
+) -> Result<Vec<u8>, EngineError> {
+    if n <= 0 {
+        return Ok(Vec::new());
+    }
+    let mut out = vec![0u8; n as usize];
+    let mut copied = 0i64;
+    while copied < n {
+        let pos = local + copied;
+        let page_no = (pos / SHARED_BUFFER_PAGE_SIZE) as u32;
+        let page_off = (pos % SHARED_BUFFER_PAGE_SIZE) as usize;
+        let tag = BufferTag {
+            id: seg.id,
+            page: page_no,
+        };
+        let page_start = page_no as i64 * SHARED_BUFFER_PAGE_SIZE;
+        let (idx, ()) = buffers
+            .pin(tag, |page| {
+                inner
+                    .read_segment_at(seg, page_start, page)
+                    .map_err(|e| e.to_string())
+            })
+            .map_err(|e| EngineError::Other(e))?;
+        pins.push(idx);
+        let chunk = ((SHARED_BUFFER_PAGE_SIZE as i64) - (pos % SHARED_BUFFER_PAGE_SIZE))
+            .min(n - copied) as usize;
+        let mut buf = vec![0u8; chunk];
+        buffers.copy_page(idx, page_off, &mut buf);
+        out[copied as usize..copied as usize + chunk].copy_from_slice(&buf);
+        copied += chunk as i64;
+    }
+    Ok(out)
 }

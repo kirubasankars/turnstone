@@ -17,6 +17,7 @@ log = "0.4"
 parking_lot.workspace = true
 turnstone-hashindex = { path = "../turnstone-hashindex" }
 turnstone-protocol = { path = "../turnstone-protocol" }
+turnstone-mlock = { path = "../turnstone-mlock" }
 
 [dev-dependencies]
 tempfile = "3.14"

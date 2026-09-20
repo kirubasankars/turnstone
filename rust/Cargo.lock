@@ -995,6 +995,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "turnstone-hashindex",
+ "turnstone-mlock",
  "turnstone-protocol",
 ]
 

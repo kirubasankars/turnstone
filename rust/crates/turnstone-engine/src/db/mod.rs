@@ -3,11 +3,12 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root of this source tree.
 
-mod transaction;
+pub(crate) mod transaction;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
 
 use parking_lot::{Mutex, RwLock};
 
@@ -19,18 +20,52 @@ use crate::recovery::replay_log;
 use crate::types::{
     EngineError, IndexVersion, Record, RecordType, TxStatus, DIR_MODE,
 };
+use crate::shared_buffers::{SharedBuffers, DEFAULT_SHARED_BUFFERS_BYTES};
+use crate::valuecache::ValueCache;
 use crate::wal::validate_frames;
 use crate::wal::DataLog;
 
 pub use transaction::{Transaction, TxnHandle};
 
-#[derive(Debug, Clone, Default)]
+const DEFAULT_VALUE_CACHE_BYTES: i64 = 64 << 20;
+
+#[derive(Debug, Clone)]
 pub struct Options {
     pub wal_segment_size: i64,
     pub max_index_arena_bytes: i64,
     pub max_disk_usage_percent: i32,
     pub truncate_corrupt_tail: bool,
     pub unsafe_disable_fsync: bool,
+    pub commit_delay: Duration,
+    pub commit_siblings: i32,
+    pub value_cache_bytes: i64,
+    pub shared_buffers_bytes: i64,
+    pub index_compact_fragmentation: f64,
+    pub index_compact_on_retention: bool,
+    pub wal_copy_forward_fragmentation: f64,
+    pub wal_copy_forward_on_retention: bool,
+    pub mlock: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            wal_segment_size: 0,
+            max_index_arena_bytes: 0,
+            max_disk_usage_percent: 90,
+            truncate_corrupt_tail: false,
+            unsafe_disable_fsync: false,
+            commit_delay: Duration::ZERO,
+            commit_siblings: 2,
+            value_cache_bytes: 0,
+            shared_buffers_bytes: 0,
+            index_compact_fragmentation: 0.0,
+            index_compact_on_retention: true,
+            wal_copy_forward_fragmentation: 0.0,
+            wal_copy_forward_on_retention: true,
+            mlock: false,
+        }
+    }
 }
 
 /// Main database (matches Go `engine.DB`).
@@ -51,8 +86,25 @@ pub struct Db {
     pub(crate) metrics_conflicts: AtomicU64,
     pub(crate) closed: AtomicBool,
     pub(crate) unsafe_disable_fsync: bool,
-    wal_rewrite_mu: RwLock<()>,
-    value_cache: Option<Arc<crate::valuecache::ValueCache>>,
+    pub(crate) commit_tx: mpsc::Sender<crate::committer::CommitRequest>,
+    committer_shutdown: Mutex<Option<mpsc::Sender<()>>>,
+    committer_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+    pub(crate) commit_mu: Mutex<()>,
+    pub(crate) wal_maint_mu: Mutex<()>,
+    commit_delay: Duration,
+    pub(crate) commit_siblings: i32,
+    pub(crate) index_fragmentation_ratio: f64,
+    pub(crate) index_compact_on_retention: bool,
+    pub(crate) wal_copy_forward_ratio: f64,
+    pub(crate) wal_copy_forward_on_retention: bool,
+    pub(crate) metrics_hash_shards_compacted: AtomicU64,
+    pub(crate) metrics_hash_compact_reclaimed: AtomicU64,
+    pub(crate) metrics_hash_compact_unix: AtomicI64,
+    pub(crate) is_disk_full: AtomicBool,
+    pub(crate) is_corrupt: AtomicBool,
+    pub(crate) wal_rewrite_mu: RwLock<()>,
+    pub(crate) value_cache: Option<Arc<ValueCache>>,
+    pub(crate) shared_buffers: Option<Arc<SharedBuffers>>,
 }
 
 impl Db {
@@ -82,8 +134,33 @@ impl Db {
             unsafe_fsync = true;
         }
 
+        let shared_buffers = if opts.shared_buffers_bytes < 0 {
+            None
+        } else {
+            let bytes = if opts.shared_buffers_bytes == 0 {
+                DEFAULT_SHARED_BUFFERS_BYTES
+            } else {
+                opts.shared_buffers_bytes
+            };
+            Some(Arc::new(
+                SharedBuffers::new_locked(bytes, opts.mlock)
+                    .map_err(|e| EngineError::Other(e))?,
+            ))
+        };
+        let value_cache = if opts.value_cache_bytes < 0 {
+            None
+        } else {
+            let bytes = if opts.value_cache_bytes == 0 {
+                DEFAULT_VALUE_CACHE_BYTES
+            } else {
+                opts.value_cache_bytes
+            };
+            Some(Arc::new(ValueCache::new(bytes)))
+        };
+
         let log = Arc::new(
-            DataLog::open(&dir, seg_size).map_err(|e| EngineError::Other(e.to_string()))?,
+            DataLog::open_with_buffers(&dir, seg_size, shared_buffers.clone())
+                .map_err(|e| EngineError::Other(e.to_string()))?,
         );
         let raw_index = Index::new();
         raw_index.set_max_arena_bytes(opts.max_index_arena_bytes);
@@ -99,7 +176,31 @@ impl Db {
         index.set_enforce_limit(true);
         index.recalc_used_bytes();
 
-        Ok(Arc::new(Self {
+        let commit_delay = if opts.commit_delay < Duration::ZERO {
+            Duration::ZERO
+        } else {
+            opts.commit_delay
+        };
+        let commit_siblings = if opts.commit_siblings <= 0 {
+            2
+        } else {
+            opts.commit_siblings
+        };
+        let index_frag = if opts.index_compact_fragmentation > 0.0 {
+            opts.index_compact_fragmentation
+        } else {
+            crate::index_gc::DEFAULT_INDEX_FRAGMENTATION_RATIO
+        };
+        let wal_copy = if opts.wal_copy_forward_fragmentation > 0.0 {
+            opts.wal_copy_forward_fragmentation
+        } else {
+            crate::wal_maintenance::DEFAULT_WAL_COPY_FORWARD_RATIO
+        };
+
+        let (commit_tx, commit_rx) = mpsc::channel();
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+
+        let db = Arc::new(Self {
             dir,
             log,
             index,
@@ -116,9 +217,42 @@ impl Db {
             metrics_conflicts: AtomicU64::new(0),
             closed: AtomicBool::new(false),
             unsafe_disable_fsync: unsafe_fsync,
+            commit_tx,
+            committer_shutdown: Mutex::new(Some(shutdown_tx)),
+            committer_handle: Mutex::new(None),
+            commit_mu: Mutex::new(()),
+            wal_maint_mu: Mutex::new(()),
+            commit_delay,
+            commit_siblings,
+            index_fragmentation_ratio: index_frag,
+            index_compact_on_retention: opts.index_compact_on_retention,
+            wal_copy_forward_ratio: wal_copy,
+            wal_copy_forward_on_retention: opts.wal_copy_forward_on_retention,
+            metrics_hash_shards_compacted: AtomicU64::new(0),
+            metrics_hash_compact_reclaimed: AtomicU64::new(0),
+            metrics_hash_compact_unix: AtomicI64::new(0),
+            is_disk_full: AtomicBool::new(false),
+            is_corrupt: AtomicBool::new(false),
             wal_rewrite_mu: RwLock::new(()),
-            value_cache: None,
-        }))
+            value_cache,
+            shared_buffers,
+        });
+
+        let db_runner = Arc::clone(&db);
+        let handle = std::thread::spawn(move || {
+            db_runner.run_group_commits(commit_rx, shutdown_rx);
+        });
+        *db.committer_handle.lock() = Some(handle);
+
+        Ok(db)
+    }
+
+    pub fn shared_buffers(&self) -> Option<&Arc<SharedBuffers>> {
+        self.shared_buffers.as_ref()
+    }
+
+    pub fn commit_delay(&self) -> Duration {
+        self.commit_delay
     }
 
     pub fn new_transaction(self: &Arc<Self>, update: bool) -> Transaction {
@@ -317,14 +451,6 @@ impl Db {
         self.scan_floor.load(Ordering::Acquire)
     }
 
-    pub fn run_wal_maintenance(&self) -> Result<(), EngineError> {
-        let floor = self.scan_floor();
-        if floor > 0 {
-            let _ = self.log.delete_segments_through(floor);
-        }
-        Ok(())
-    }
-
     pub(crate) fn cache_value(&self, offset: i64, val: &[u8]) {
         if let Some(ref c) = self.value_cache {
             c.put(offset, val);
@@ -374,15 +500,17 @@ impl Db {
     }
 
     pub fn hash_shards_compacted(&self) -> u64 {
-        0
+        self.metrics_hash_shards_compacted
+            .load(Ordering::Acquire)
     }
 
     pub fn hash_compact_bytes_reclaimed(&self) -> u64 {
-        0
+        self.metrics_hash_compact_reclaimed
+            .load(Ordering::Acquire)
     }
 
     pub fn hash_compact_unix(&self) -> i64 {
-        0
+        self.metrics_hash_compact_unix.load(Ordering::Acquire)
     }
 
     pub fn wal_segment_metrics(&self) -> WalSegmentMetrics {
@@ -470,6 +598,13 @@ impl Db {
     pub fn close(&self) -> Result<(), EngineError> {
         if self.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
+        }
+        if let Some(tx) = self.committer_shutdown.lock().take() {
+            let _ = tx.send(());
+        }
+        drop(self.commit_tx.clone());
+        if let Some(h) = self.committer_handle.lock().take() {
+            let _ = h.join();
         }
         self.log
             .close()

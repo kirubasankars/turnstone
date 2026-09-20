@@ -66,6 +66,26 @@ impl MvccIndex {
             .map_err(|e| EngineError::Other(e.to_string()))
     }
 
+    pub(crate) fn with_hash_index<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&Index) -> R,
+        R: Default,
+    {
+        self.with_index(f)
+    }
+
+    pub(crate) fn compact_all_filtered(
+        &self,
+        filter: Option<&turnstone_hashindex::VersionFilter<'_>>,
+    ) -> Result<turnstone_hashindex::IndexStats, EngineError> {
+        let guard = self.inner.read();
+        let Some(idx) = guard.as_ref() else {
+            return Err(EngineError::DatabaseClosed);
+        };
+        idx.compact_all(filter)
+            .map_err(|e| EngineError::Other(e.to_string()))
+    }
+
     fn with_index<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&Index) -> R,
