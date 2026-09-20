@@ -18,7 +18,7 @@ Rust port of [TurnstoneDB](../README.md). The Go tree remains in-repo for compar
 | Client | `turnstone-client`, `turnstone-cli` | Wire client + `turnstone-rs` smoke |
 | CLI binary | `turnstone` | `init`, `server --dev`, `cli ping` |
 | Console UI | — | Still Go-only (`console/`) |
-| Full CLI | — | Go: `bench`, interactive REPL, backup/restore commands |
+| Full CLI | `turnstone`, `turnstone-rs` | `init`, `server`, `cli` (REPL + exec), `bench`, `backup`, `restore` |
 
 Rough size: ~12k lines of Rust vs ~32k lines of Go (prod + tests). **Rust `cargo test` covers a subset** of Go’s `-race ./...` suite (chaos, hardening, e2e console, most server integration tests are not ported).
 
@@ -43,8 +43,9 @@ make test-rust
 ./rust/target/release/turnstone init --home tsdata --ip 127.0.0.1
 ./rust/target/release/turnstone server --home tsdata --dev
 # other terminal:
+./rust/target/release/turnstone cli --home tsdata exec get mykey
+./rust/target/release/turnstone cli --home tsdata   # interactive REPL
 ./rust/target/release/turnstone-rs --home tsdata ping
-./rust/target/release/turnstone-rs --home tsdata smoke mykey hello
 ```
 
 ## Tests

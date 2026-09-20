@@ -12,8 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+turnstone-cli = { path = "../turnstone-cli" }
 turnstone-config = { path = "../turnstone-config" }
-turnstone-client = { path = "../turnstone-client" }
 turnstone-database = { path = "../turnstone-database" }
 turnstone-engine = { path = "../turnstone-engine" }
 turnstone-repl = { path = "../turnstone-repl" }

@@ -7,9 +7,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use turnstone_client::{Client, ClientConfig};
+use turnstone_cli::{
+    run_backup_cmd, run_bench, run_exec, run_interactive, run_restore_cmd, BackupCliOptions,
+    BenchOptions, ConnectOptions, RestoreCliOptions,
+};
 use turnstone_config::{
     database_count, generate_config_artifacts, resolve_path, share_bytes, validate_config, Config,
 };
@@ -17,10 +21,14 @@ use turnstone_database::{open as open_database, OpenOptions, STATE_PRIMARY};
 use turnstone_engine::Options as EngineOptions;
 use turnstone_repl::Manager;
 use turnstone_server::new_server;
-use turnstone_tls::{cert_paths, load_mtls, Role};
 
 #[derive(Parser)]
-#[command(name = "turnstone", about = "TurnstoneDB — Rust implementation")]
+#[command(
+    name = "turnstone",
+    version,
+    about = "TurnstoneDB — persistent transactional key-value store",
+    long_about = "Initialize a data home, run the server, open an interactive client, benchmark, or backup/restore."
+)]
 struct Cli {
     #[arg(long, global = true, default_value = "tsdata")]
     home: PathBuf,
@@ -31,28 +39,94 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Initialize home directory (certs + turnstone.json)
+    /// Create TLS certs, data dirs, and turnstone.json
     Init {
         #[arg(long)]
         ip: Option<String>,
     },
     /// Run the mTLS wire server
     Server {
-        #[arg(long)]
+        #[arg(long, help = "Auto-promote all databases to PRIMARY")]
         dev: bool,
     },
-    /// Wire client commands
+    /// Interactive client or one-shot exec
     Cli {
+        #[arg(long, default_value = "localhost:6379")]
+        host: String,
+        #[arg(long)]
+        admin: bool,
+        #[arg(long)]
+        debug: bool,
         #[command(subcommand)]
-        cmd: CliCmd,
+        cmd: Option<CliSub>,
+    },
+    /// Load/throughput benchmark against a running primary
+    Bench {
+        #[arg(long, default_value = "localhost:6379")]
+        addr: String,
+        #[arg(long, default_value = "50")]
+        concurrency: usize,
+        #[arg(long, default_value = "10000")]
+        ops: u64,
+        #[arg(long, help = "Run until elapsed seconds (overrides --ops when > 0)")]
+        duration_secs: u64,
+        #[arg(long, help = "Soak stats interval in seconds (default 5 with --duration)")]
+        report_secs: u64,
+        #[arg(long, default_value = "128")]
+        value_size: usize,
+        #[arg(long, default_value = "32")]
+        key_size: usize,
+        #[arg(long)]
+        read_ratio: Option<f64>,
+        #[arg(long, default_value = "1")]
+        batch: usize,
+        #[arg(long, default_value = "1")]
+        db: i32,
+        #[arg(long, default_value = "bench")]
+        prefix: String,
+    },
+    /// Stream a physical WAL backup from a primary
+    Backup {
+        #[arg(long, default_value = "localhost:6379")]
+        host: String,
+        #[arg(long, default_value = "1")]
+        db: String,
+        #[arg(long, default_value = "backup_data")]
+        out: String,
+        #[arg(long, default_value = "wal.bin")]
+        file: String,
+        #[arg(long, default_value = "full", value_parser = ["full", "differential"])]
+        ty: String,
+        #[arg(long, default_value = "0")]
+        from_lsn: u64,
+        #[arg(long)]
+        base_meta: String,
+        #[arg(long)]
+        compress: bool,
+        #[arg(long, default_value = "0")]
+        wait_idle_ms: u64,
+    },
+    /// Restore WAL backup chain into a new home directory
+    Restore {
+        #[arg(long, default_value = "backup_data")]
+        input: String,
+        #[arg(long, default_value = "restored_data")]
+        out: String,
+        #[arg(long, default_value = "wal.bin")]
+        file: String,
+        #[arg(long, default_value = "true")]
+        verify: bool,
+        #[arg(long, default_value = "")]
+        chain: String,
     },
 }
 
 #[derive(Subcommand)]
-enum CliCmd {
-    Ping {
-        #[arg(long, default_value = "127.0.0.1:6379")]
-        host: String,
+enum CliSub {
+    /// Run a single REPL command and exit
+    Exec {
+        #[arg(trailing_var_arg = true, required = true)]
+        args: Vec<String>,
     },
 }
 
@@ -69,43 +143,107 @@ fn main() -> ExitCode {
 
 fn run(cli: &Cli) -> Result<(), String> {
     match &cli.command {
-        Commands::Init { ip } => {
-            let extra: Vec<&str> = ip
-                .as_deref()
-                .map(|s| s.split(',').collect())
-                .unwrap_or_default();
-            let cfg = Config {
-                port: ":6379".into(),
-                number_of_databases: 4,
-                tls_cert_file: "certs/server.crt".into(),
-                tls_key_file: "certs/server.key".into(),
-                tls_ca_file: "certs/ca.crt".into(),
-                ..Default::default()
-            };
-            let path = cli.home.join("turnstone.json");
-            generate_config_artifacts(&cli.home, cfg, &path, &extra).map_err(|e| e.to_string())?;
-            Ok(())
-        }
+        Commands::Init { ip } => run_init(&cli.home, ip.as_deref()),
         Commands::Server { dev } => run_server(&cli.home, *dev),
-        Commands::Cli { cmd } => match cmd {
-            CliCmd::Ping { host } => {
-                let mut cfg = ClientConfig {
-                    address: host.clone(),
-                    ..ClientConfig::default()
-                };
-                let (ca, cert, key) = cert_paths(&cli.home, Role::Client);
-                if ca.exists() {
-                    cfg.tls = Some(load_mtls(ca, cert, key).map_err(|e| e.to_string())?);
-                }
-                Client::connect(cfg)
-                    .map_err(|e| e.to_string())?
-                    .ping()
-                    .map_err(|e| e.to_string())?;
-                println!("PONG");
-                Ok(())
+        Commands::Cli {
+            host,
+            admin,
+            debug,
+            cmd,
+        } => {
+            let opts = ConnectOptions {
+                host: host.clone(),
+                home: cli.home.clone(),
+                admin: *admin,
+                debug: *debug,
+            };
+            match cmd {
+                None => run_interactive(opts),
+                Some(CliSub::Exec { args }) => run_exec(opts, &args.join(" ")),
             }
-        },
+        }
+        Commands::Bench {
+            addr,
+            concurrency,
+            ops,
+            duration_secs,
+            report_secs,
+            value_size,
+            key_size,
+            read_ratio,
+            batch,
+            db,
+            prefix,
+        } => run_bench(BenchOptions {
+            home: cli.home.clone(),
+            addr: addr.clone(),
+            db: *db,
+            concurrency: *concurrency,
+            ops: *ops,
+            duration: Duration::from_secs(*duration_secs),
+            report: Duration::from_secs(*report_secs),
+            value_size: *value_size,
+            key_size: *key_size,
+            read_ratio: *read_ratio,
+            batch: *batch,
+            prefix: prefix.clone(),
+        }),
+        Commands::Backup {
+            host,
+            db,
+            out,
+            file,
+            ty,
+            from_lsn,
+            base_meta,
+            compress,
+            wait_idle_ms,
+        } => run_backup_cmd(BackupCliOptions {
+            home: cli.home.clone(),
+            host: host.clone(),
+            db: db.clone(),
+            out_dir: out.clone(),
+            file: file.clone(),
+            ty: ty.clone(),
+            from_lsn: *from_lsn,
+            base_meta: base_meta.clone(),
+            compress: *compress,
+            wait_idle: Duration::from_millis(*wait_idle_ms),
+        }),
+        Commands::Restore {
+            input,
+            out,
+            file,
+            verify,
+            chain,
+        } => run_restore_cmd(RestoreCliOptions {
+            in_dir: input.clone(),
+            out_home: out.clone(),
+            file: file.clone(),
+            verify: *verify,
+            chain: chain.clone(),
+        }),
     }
+}
+
+fn run_init(home: &PathBuf, ip: Option<&str>) -> Result<(), String> {
+    eprintln!("Initializing TurnstoneDB home at: {}", home.display());
+    let extra: Vec<&str> = ip
+        .map(|s| s.split(',').map(str::trim).collect())
+        .unwrap_or_default();
+    if !extra.is_empty() {
+        eprintln!("Adding subject alternative names: {extra:?}");
+    }
+    let cfg = Config {
+        port: ":6379".into(),
+        number_of_databases: 4,
+        tls_cert_file: "certs/server.crt".into(),
+        tls_key_file: "certs/server.key".into(),
+        tls_ca_file: "certs/ca.crt".into(),
+        ..Default::default()
+    };
+    let path = home.join("turnstone.json");
+    generate_config_artifacts(home, cfg, &path, &extra).map_err(|e| e.to_string())
 }
 
 fn run_server(home: &PathBuf, dev: bool) -> Result<(), String> {
@@ -165,7 +303,8 @@ fn run_server(home: &PathBuf, dev: bool) -> Result<(), String> {
         stores.insert(name, db);
     }
 
-    let repl_tls = load_mtls(&ca_file, &client_cert, &client_key).map_err(|e| e.to_string())?;
+    let repl_tls =
+        turnstone_tls::load_mtls(&ca_file, &client_cert, &client_key).map_err(|e| e.to_string())?;
     let repl_manager = Arc::new(Manager::new(cfg.id.clone(), stores.clone(), repl_tls));
 
     let max_conns = if cfg.max_conns > 0 {
