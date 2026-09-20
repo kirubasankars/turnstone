@@ -3,7 +3,7 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root of this source tree.
 
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -14,6 +14,7 @@ use rustls::StreamOwned;
 use crate::error::ClientError;
 
 const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(30);
+const READ_BUF_CAPACITY: usize = 256 * 1024;
 
 enum Stream {
     Plain(TcpStream),
@@ -46,7 +47,7 @@ impl Write for Stream {
 }
 
 pub struct Transport {
-    inner: Mutex<Option<Stream>>,
+    inner: Mutex<Option<BufReader<Stream>>>,
     read_timeout: Duration,
     write_timeout: Duration,
 }
@@ -65,8 +66,12 @@ impl Transport {
             .ok_or_else(|| ClientError::Connection("no addresses resolved".into()))?;
         let stream = TcpStream::connect_timeout(&addr, connect_timeout)
             .map_err(|e| ClientError::Connection(e.to_string()))?;
+        let _ = stream.set_nodelay(true);
         Ok(Self {
-            inner: Mutex::new(Some(Stream::Plain(stream))),
+            inner: Mutex::new(Some(BufReader::with_capacity(
+                READ_BUF_CAPACITY,
+                Stream::Plain(stream),
+            ))),
             read_timeout,
             write_timeout,
         })
@@ -87,13 +92,17 @@ impl Transport {
             .ok_or_else(|| ClientError::Connection("no addresses resolved".into()))?;
         let tcp = TcpStream::connect_timeout(&addr, connect_timeout)
             .map_err(|e| ClientError::Connection(e.to_string()))?;
+        let _ = tcp.set_nodelay(true);
         let server_name = rustls::pki_types::ServerName::try_from(host)
             .map_err(|_| ClientError::Connection("invalid DNS name for TLS".into()))?;
         let conn = ClientConnection::new(config, server_name)
             .map_err(|e| ClientError::Connection(e.to_string()))?;
         let tls = Box::new(StreamOwned::new(conn, tcp));
         Ok(Self {
-            inner: Mutex::new(Some(Stream::Tls(tls))),
+            inner: Mutex::new(Some(BufReader::with_capacity(
+                READ_BUF_CAPACITY,
+                Stream::Tls(tls),
+            ))),
             read_timeout,
             write_timeout,
         })
@@ -107,24 +116,58 @@ impl Transport {
         Ok(body)
     }
 
-    /// Ensures buffered request bytes are sent (needed for single-frame RPC over TLS).
     pub fn flush(&self) -> Result<(), ClientError> {
         let mut guard = self.inner.lock().unwrap();
-        let stream = guard.as_mut().ok_or_else(|| {
+        let io = guard.as_mut().ok_or_else(|| {
             ClientError::Connection("connection closed".into())
         })?;
+        let stream = io.get_mut();
+        finish_tls_write(stream)?;
         stream
             .flush()
             .map_err(|e| ClientError::Connection(format!("I/O failed: {e}")))?;
         Ok(())
     }
 
-    /// Writes raw bytes (one or more concatenated frames) without waiting for responses.
-    pub fn write_all(&self, data: &[u8]) -> Result<(), ClientError> {
+    pub fn pipeline_exchange(
+        &self,
+        write_data: &[u8],
+        expected_responses: usize,
+    ) -> Result<(), ClientError> {
         let mut guard = self.inner.lock().unwrap();
-        let stream = guard.as_mut().ok_or_else(|| {
+        let io = guard.as_mut().ok_or_else(|| {
             ClientError::Connection("connection closed".into())
         })?;
+        let stream = io.get_mut();
+        drive_client_handshake(stream)?;
+        set_write_timeout(stream, self.write_timeout)?;
+        stream
+            .write_all(write_data)
+            .map_err(|e| ClientError::Connection(format!("I/O failed: {e}")))?;
+        finish_tls_write(stream)?;
+        stream
+            .flush()
+            .map_err(|e| ClientError::Connection(format!("I/O failed: {e}")))?;
+
+        set_read_timeout(stream, self.read_timeout)?;
+        let mut header = [0u8; turnstone_protocol::PROTO_HEADER_SIZE];
+        for _ in 0..expected_responses {
+            io.read_exact(&mut header)
+                .map_err(|e| ClientError::Connection(format!("I/O failed: {e}")))?;
+            let len = u32::from_be_bytes(header[1..5].try_into().unwrap()) as usize;
+            if len > 0 {
+                discard_exact_buf(io, len)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn write_all(&self, data: &[u8]) -> Result<(), ClientError> {
+        let mut guard = self.inner.lock().unwrap();
+        let io = guard.as_mut().ok_or_else(|| {
+            ClientError::Connection("connection closed".into())
+        })?;
+        let stream = io.get_mut();
         drive_client_handshake(stream)?;
         set_write_timeout(stream, self.write_timeout)?;
         stream
@@ -133,19 +176,41 @@ impl Transport {
         Ok(())
     }
 
-    /// Reads one response frame (status byte + payload).
     pub fn read_frame(&self) -> Result<(u8, Vec<u8>), ClientError> {
         let mut guard = self.inner.lock().unwrap();
-        let stream = guard.as_mut().ok_or_else(|| {
+        let io = guard.as_mut().ok_or_else(|| {
             ClientError::Connection("connection closed".into())
         })?;
-        read_frame_on_stream(stream, self.read_timeout)
+        read_frame_buffered(io, self.read_timeout)
     }
 
     pub fn close(&self) {
         let mut guard = self.inner.lock().unwrap();
         *guard = None;
     }
+}
+
+fn finish_tls_write(stream: &mut Stream) -> Result<(), ClientError> {
+    if let Stream::Tls(s) = stream {
+        while s.conn.wants_write() {
+            s.conn
+                .write_tls(&mut s.sock)
+                .map_err(|e| ClientError::Connection(e.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+fn discard_exact_buf<R: Read>(reader: &mut R, mut n: usize) -> Result<(), ClientError> {
+    let mut scratch = [0u8; 8192];
+    while n > 0 {
+        let chunk = n.min(scratch.len());
+        reader
+            .read_exact(&mut scratch[..chunk])
+            .map_err(|e| ClientError::Connection(format!("I/O failed: {e}")))?;
+        n -= chunk;
+    }
+    Ok(())
 }
 
 fn drive_client_handshake(stream: &mut Stream) -> Result<(), ClientError> {
@@ -162,20 +227,18 @@ fn drive_client_handshake(stream: &mut Stream) -> Result<(), ClientError> {
     Ok(())
 }
 
-fn read_frame_on_stream(
-    stream: &mut Stream,
+fn read_frame_buffered(
+    io: &mut BufReader<Stream>,
     read_timeout: Duration,
 ) -> Result<(u8, Vec<u8>), ClientError> {
-    set_read_timeout(stream, read_timeout)?;
+    set_read_timeout(io.get_mut(), read_timeout)?;
     let mut header = [0u8; turnstone_protocol::PROTO_HEADER_SIZE];
-    stream
-        .read_exact(&mut header)
+    io.read_exact(&mut header)
         .map_err(|e| ClientError::Connection(format!("I/O failed: {e}")))?;
     let len = u32::from_be_bytes(header[1..5].try_into().unwrap()) as usize;
     let mut body = vec![0u8; len];
     if len > 0 {
-        stream
-            .read_exact(&mut body)
+        io.read_exact(&mut body)
             .map_err(|e| ClientError::Connection(format!("I/O failed: {e}")))?;
     }
     Ok((header[0], body))

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use rand::Rng;
 use serde_json::Value;
-use turnstone_client::{Client, ClientError, PipelineResponse};
+use turnstone_client::{Client, ClientError};
 use turnstone_protocol::{
     append_header, BEGIN_READ_ONLY, OP_BEGIN, OP_COMMIT, OP_GET, OP_SET,
 };
@@ -449,24 +449,11 @@ fn flush_pipeline(
     depth: usize,
     batch: usize,
 ) -> PipelineFlushOutcome {
-    if client.write_raw(write_buf).is_err() || client.flush_write().is_err() {
-        return PipelineFlushOutcome::IoError;
-    }
     let expected = depth * (2 + batch);
-    let mut batch_failed = false;
-    for _ in 0..expected {
-        match client.read_response() {
-            Ok(PipelineResponse::Ok) | Ok(PipelineResponse::NotFound) => {}
-            Err(ClientError::Connection(_) | ClientError::Protocol(_)) => {
-                return PipelineFlushOutcome::IoError;
-            }
-            Err(_) => batch_failed = true,
-        }
-    }
-    if batch_failed {
-        PipelineFlushOutcome::BatchFailed
-    } else {
-        PipelineFlushOutcome::Success
+    match client.pipeline_exchange(write_buf, expected) {
+        Ok(()) => PipelineFlushOutcome::Success,
+        Err(ClientError::Connection(_) | ClientError::Protocol(_)) => PipelineFlushOutcome::IoError,
+        Err(_) => PipelineFlushOutcome::BatchFailed,
     }
 }
 

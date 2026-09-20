@@ -3,6 +3,7 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root of this source tree.
 
+use std::cell::RefCell;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Read, Write};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
@@ -34,6 +35,10 @@ use crate::types::{
 use crate::{encode_record, frame_size, RecordType};
 
 const REPLAY_CANCEL_CHECK_INTERVAL: u64 = 1024;
+
+thread_local! {
+    static FRAME_SCRATCH: RefCell<Vec<u8>> = RefCell::new(Vec::new());
+}
 
 /// Result of copying live WAL frames into a fresh segment.
 pub struct CopyForwardOutcome {
@@ -231,15 +236,15 @@ impl DataLog {
         let mut inner = self.inner.write().unwrap();
         let off = inner.write_offset;
         self.write_frame_locked(&mut inner, payload)?;
-        let flushed = if sync {
-            self.begin_sync_locked(&inner)?
+        let sync_handle = if sync {
+            Some(self.begin_sync_locked(&inner)?)
         } else {
             self.publish_append_locked(&inner);
-            0
+            None
         };
         drop(inner);
-        if sync {
-            self.complete_sync(flushed);
+        if let Some((sync_f, flushed)) = sync_handle {
+            self.complete_sync(sync_f, flushed);
         }
         Ok(off)
     }
@@ -258,15 +263,15 @@ impl DataLog {
             self.write_frame_locked(&mut inner, &build())?;
             offsets.push(off);
         }
-        let flushed = if sync {
-            self.begin_sync_locked(&inner)?
+        let sync_handle = if sync {
+            Some(self.begin_sync_locked(&inner)?)
         } else {
             self.publish_append_locked(&inner);
-            0
+            None
         };
         drop(inner);
-        if sync {
-            self.complete_sync(flushed);
+        if let Some((sync_f, flushed)) = sync_handle {
+            self.complete_sync(sync_f, flushed);
         }
         Ok(offsets)
     }
@@ -286,15 +291,15 @@ impl DataLog {
             self.write_frame_locked(&mut inner, payload)?;
             offsets.push(off);
         }
-        let flushed = if sync {
-            self.begin_sync_locked(&inner)?
+        let sync_handle = if sync {
+            Some(self.begin_sync_locked(&inner)?)
         } else {
             self.publish_append_locked(&inner);
-            0
+            None
         };
         drop(inner);
-        if sync {
-            self.complete_sync(flushed);
+        if let Some((sync_f, flushed)) = sync_handle {
+            self.complete_sync(sync_f, flushed);
         }
         Ok(offsets)
     }
@@ -526,15 +531,15 @@ impl DataLog {
                 inner.rotate_segment_locked(self)?;
             }
         }
-        let flushed = if fsync {
-            self.begin_sync_locked(&inner)?
+        let sync_handle = if fsync {
+            Some(self.begin_sync_locked(&inner)?)
         } else {
             self.publish_append_locked(&inner);
-            0
+            None
         };
         drop(inner);
-        if fsync {
-            self.complete_sync(flushed);
+        if let Some((sync_f, flushed)) = sync_handle {
+            self.complete_sync(sync_f, flushed);
         }
         Ok(start_off)
     }
@@ -766,48 +771,55 @@ impl DataLog {
         let length = payload.len() as u32;
         let checksum = castagnoli_checksum(payload);
         let total_len = LOG_FRAME_HEADER_SIZE + payload.len();
-        let mut buf = vec![0u8; total_len];
-        buf[0..4].copy_from_slice(&length.to_be_bytes());
-        buf[4..8].copy_from_slice(&checksum.to_be_bytes());
-        buf[8..].copy_from_slice(payload);
+        FRAME_SCRATCH.with(|scratch| {
+            let mut buf = scratch.borrow_mut();
+            if buf.len() < total_len {
+                buf.resize(total_len, 0);
+            }
+            buf[0..4].copy_from_slice(&length.to_be_bytes());
+            buf[4..8].copy_from_slice(&checksum.to_be_bytes());
+            buf[8..total_len].copy_from_slice(payload);
 
-        inner.rotate_if_needed_locked(self, total_len as i64)?;
-        let seg_idx = inner.active_index;
-        let local_off = inner.write_offset - inner.segments[seg_idx].base_lsn;
-        inner.write_segment_at(seg_idx, local_off, &buf)?;
-        if let Some(b) = &self.buffers {
-            b.apply_write(inner.segments[seg_idx].id, local_off, &buf);
-        }
-        inner.write_offset += total_len as i64;
-        if inner.write_offset - inner.segments[seg_idx].base_lsn
-            >= inner.usable_segment_size(self.segment_size)
-        {
-            inner.rotate_segment_locked(self)?;
-        }
-        Ok(())
+            inner.rotate_if_needed_locked(self, total_len as i64)?;
+            let seg_idx = inner.active_index;
+            let local_off = inner.write_offset - inner.segments[seg_idx].base_lsn;
+            inner.write_segment_at(seg_idx, local_off, &buf[..total_len])?;
+            if let Some(b) = &self.buffers {
+                b.apply_write(inner.segments[seg_idx].id, local_off, &buf[..total_len]);
+            }
+            inner.write_offset += total_len as i64;
+            if inner.write_offset - inner.segments[seg_idx].base_lsn
+                >= inner.usable_segment_size(self.segment_size)
+            {
+                inner.rotate_segment_locked(self)?;
+            }
+            Ok(())
+        })
     }
 
-    fn begin_sync_locked(&self, inner: &Inner) -> Result<i64, EngineError> {
+    /// Snapshots the write head and returns a writer clone for fdatasync after the WAL lock is released.
+    fn begin_sync_locked(&self, inner: &Inner) -> Result<(Option<File>, i64), EngineError> {
         self.persist_head_locked(inner)
             .map_err(|e| EngineError::Other(e.to_string()))?;
         let flushed = inner.write_offset;
-        if inner.segments[inner.active_index].writer.is_some() {
+        let sync_f = inner.segments[inner.active_index]
+            .writer
+            .as_ref()
+            .and_then(|f| f.try_clone().ok());
+        if sync_f.is_some() {
             self.syncing.fetch_add(1, Ordering::AcqRel);
             self.inflight_syncs.add();
         }
-        Ok(flushed)
+        Ok((sync_f, flushed))
     }
 
-    fn complete_sync(&self, flushed: i64) {
-        let had_sync = self.syncing.load(Ordering::Acquire) > 0;
-        if had_sync {
+    /// Must not take the WAL lock: concurrent appends may proceed during fdatasync.
+    fn complete_sync(&self, sync_f: Option<File>, flushed: i64) {
+        if let Some(f) = sync_f {
             if let Some(hook) = TESTING_BEFORE_SYNC.lock().unwrap().as_ref() {
                 hook();
             }
-            let inner = self.inner.read().unwrap();
-            if let Some(f) = inner.segments[inner.active_index].writer.as_ref() {
-                self.sync_writer(f);
-            }
+            self.sync_writer(&f);
             self.syncing.fetch_sub(1, Ordering::AcqRel);
             self.inflight_syncs.done();
         }

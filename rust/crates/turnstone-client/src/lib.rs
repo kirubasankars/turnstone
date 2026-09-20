@@ -109,6 +109,11 @@ impl Client {
         pipeline::read_response(&self.transport)
     }
 
+    /// Pipelined bench path: one write burst and many response frames without per-frame allocations.
+    pub fn pipeline_exchange(&self, write_data: &[u8], expected_responses: usize) -> Result<(), ClientError> {
+        self.transport.pipeline_exchange(write_data, expected_responses)
+    }
+
     pub fn ping(&self) -> Result<(), ClientError> {
         self.round_trip(protocol::OP_PING, &[])?;
         Ok(())

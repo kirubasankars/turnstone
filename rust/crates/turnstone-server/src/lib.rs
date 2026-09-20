@@ -140,12 +140,16 @@ impl ResponseBuffer {
         }
     }
 
-    fn drain_to(&mut self, stream: &mut ServerConn) -> io::Result<()> {
+    /// Push buffered responses to the socket. Omitting flush matches Go (no per-response flush).
+    fn drain_to(&mut self, stream: &mut ServerConn, flush: bool) -> io::Result<()> {
         if !self.inner.is_empty() {
             stream.write_all(&self.inner)?;
             self.inner.clear();
         }
-        stream.flush()
+        if flush {
+            stream.flush()?;
+        }
+        Ok(())
     }
 }
 
@@ -390,7 +394,7 @@ impl Server {
             let payload_len = u32::from_be_bytes(header[1..5].try_into().unwrap()) as usize;
             if payload_len as u64 > protocol::MAX_COMMAND_SIZE {
                 let _ = write_binary_response(&mut response_buf, protocol::RES_ENTITY_TOO_LARGE, &[]);
-                let _ = response_buf.drain_to(reader.get_mut());
+                let _ = response_buf.drain_to(reader.get_mut(), true);
                 break;
             }
             let mut payload = self.get_payload_buffer(payload_len);
@@ -407,12 +411,14 @@ impl Server {
             );
             self.recycle_payload_buffer(payload);
             if quit {
-                let _ = response_buf.drain_to(reader.get_mut());
+                let _ = response_buf.drain_to(reader.get_mut(), true);
                 break;
             }
-            let _ = response_buf.drain_to(reader.get_mut());
+            if !pipelined_command_ready(&reader) {
+                let _ = response_buf.drain_to(reader.get_mut(), true);
+            }
         }
-        let _ = response_buf.drain_to(reader.get_mut());
+        let _ = response_buf.drain_to(reader.get_mut(), true);
         if let Some(mut tx) = state.tx.take() {
             tx.discard();
         }
@@ -468,7 +474,7 @@ impl Server {
             protocol::OP_DEL => self.handle_del(out, payload, st),
             protocol::OP_STAT => self.handle_stat(out, st),
             protocol::OP_REPL_HELLO => {
-                let _ = out.drain_to(stream);
+                let _ = out.drain_to(stream, true);
                 replication::handle_replica_connection(self, stream, payload, st);
                 return true;
             }
@@ -788,6 +794,19 @@ fn drive_tls_handshake(stream: &mut TlsStream) -> io::Result<()> {
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     }
     Ok(())
+}
+
+/// Next request frame fully present in BufReader (never reads from the socket).
+fn pipelined_command_ready(reader: &BufReader<ServerConn>) -> bool {
+    let buf = reader.buffer();
+    if buf.len() < protocol::PROTO_HEADER_SIZE {
+        return false;
+    }
+    let payload_len = u32::from_be_bytes(buf[1..5].try_into().unwrap()) as usize;
+    if (payload_len as u64) > protocol::MAX_COMMAND_SIZE {
+        return false;
+    }
+    buf.len() >= protocol::PROTO_HEADER_SIZE + payload_len
 }
 
 fn read_full(r: &mut impl Read, buf: &mut [u8]) -> io::Result<()> {
