@@ -20,6 +20,7 @@ fn read_wal_value(
     WAL_VALUE_SCRATCH.with(|scratch| {
         let mut buf = scratch.borrow_mut();
         log.read_value_at_into(offset, val_len, &mut buf)?;
+        buf.truncate(val_len as usize);
         Ok(buf.clone())
     })
 }

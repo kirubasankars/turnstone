@@ -38,6 +38,7 @@ pub(crate) enum ServerConn {
 
 impl ServerConn {
     fn from_tcp(tcp: TcpStream, tls: Option<Arc<rustls::ServerConfig>>) -> io::Result<Self> {
+        let _ = tcp.set_nodelay(true);
         if let Some(cfg) = tls {
             let Ok(conn) = ServerConnection::new(cfg) else {
                 return Ok(Self::Plain(tcp));
@@ -120,6 +121,43 @@ pub struct Server {
     db_conns: Mutex<HashMap<String, i64>>,
     active_clients: Mutex<HashMap<String, HashMap<usize, ()>>>,
     next_conn_id: AtomicU64,
+    payload_pool: Mutex<Vec<Vec<u8>>>,
+}
+
+const MAX_POOLABLE_PAYLOAD: usize = 4 * 1024 * 1024;
+const PAYLOAD_POOL_CAP: usize = 512;
+const DEFAULT_PAYLOAD_BUF: usize = 4096;
+
+/// Batches wire responses before a single flush to the socket (important for TLS).
+struct ResponseBuffer {
+    inner: Vec<u8>,
+}
+
+impl ResponseBuffer {
+    fn new() -> Self {
+        Self {
+            inner: Vec::with_capacity(64 * 1024),
+        }
+    }
+
+    fn drain_to(&mut self, stream: &mut ServerConn) -> io::Result<()> {
+        if !self.inner.is_empty() {
+            stream.write_all(&self.inner)?;
+            self.inner.clear();
+        }
+        stream.flush()
+    }
+}
+
+impl Write for ResponseBuffer {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 struct Semaphore {
@@ -234,6 +272,7 @@ pub fn new_server(
         db_conns: Mutex::new(HashMap::new()),
         active_clients: Mutex::new(HashMap::new()),
         next_conn_id: AtomicU64::new(0),
+        payload_pool: Mutex::new(Vec::new()),
     }))
 }
 
@@ -332,20 +371,11 @@ impl Server {
             conn_id,
         };
         let mut reader = BufReader::with_capacity(64 * 1024, stream);
+        let mut response_buf = ResponseBuffer::new();
         let mut header = [0u8; protocol::PROTO_HEADER_SIZE];
-        let mut pending_flush = false;
         loop {
             if self.closing.load(Ordering::Acquire) {
                 break;
-            }
-            // Flush buffered TLS/TCP responses when no further pipelined commands remain
-            // in the read buffer (matches Go not flushing after every response).
-            if pending_flush {
-                let more = reader.fill_buf().map(|b| b.len()).unwrap_or(0);
-                if more == 0 {
-                    let _ = reader.get_mut().flush();
-                    pending_flush = false;
-                }
             }
             let _ = reader.get_mut().set_read_timeout(Some(protocol::IDLE_TIMEOUT));
             if read_full(&mut reader, &mut header).is_err() {
@@ -359,22 +389,30 @@ impl Server {
             let op = header[0];
             let payload_len = u32::from_be_bytes(header[1..5].try_into().unwrap()) as usize;
             if payload_len as u64 > protocol::MAX_COMMAND_SIZE {
-                let _ = write_binary_response(reader.get_mut(), protocol::RES_ENTITY_TOO_LARGE, &[]);
+                let _ = write_binary_response(&mut response_buf, protocol::RES_ENTITY_TOO_LARGE, &[]);
+                let _ = response_buf.drain_to(reader.get_mut());
                 break;
             }
-            let mut payload = vec![0u8; payload_len];
-            if payload_len > 0 && read_full(&mut reader, &mut payload).is_err() {
+            let mut payload = self.get_payload_buffer(payload_len);
+            if payload_len > 0 && read_full(&mut reader, &mut payload[..payload_len]).is_err() {
+                self.recycle_payload_buffer(payload);
                 break;
             }
-            if self.dispatch_command(reader.get_mut(), op, &payload, &mut state) {
-                pending_flush = true;
+            let quit = self.dispatch_command(
+                &mut response_buf,
+                reader.get_mut(),
+                op,
+                &payload[..payload_len],
+                &mut state,
+            );
+            self.recycle_payload_buffer(payload);
+            if quit {
+                let _ = response_buf.drain_to(reader.get_mut());
                 break;
             }
-            pending_flush = true;
+            let _ = response_buf.drain_to(reader.get_mut());
         }
-        if pending_flush {
-            let _ = reader.get_mut().flush();
-        }
+        let _ = response_buf.drain_to(reader.get_mut());
         if let Some(mut tx) = state.tx.take() {
             tx.discard();
         }
@@ -383,14 +421,15 @@ impl Server {
 
     fn dispatch_command(
         self: &Arc<Self>,
-        conn: &mut ServerConn,
+        out: &mut ResponseBuffer,
+        stream: &mut ServerConn,
         op: u8,
         payload: &[u8],
         st: &mut ConnState,
     ) -> bool {
         if !is_op_allowed(&st.role, op) {
             let _ = write_binary_response(
-                conn,
+                out,
                 protocol::RES_ERR,
                 format!("Permission Denied for role: {}", st.role).as_bytes(),
             );
@@ -406,7 +445,7 @@ impl Server {
                 | protocol::OP_STAT
                 | protocol::OP_QUIT => {
                     let _ = write_binary_response(
-                        conn,
+                        out,
                         protocol::RES_ERR,
                         b"Command not allowed inside a transaction",
                     );
@@ -417,76 +456,77 @@ impl Server {
         }
         match op {
             protocol::OP_PING => {
-                let _ = write_binary_response(conn, protocol::RES_OK, b"PONG");
+                let _ = write_binary_response(out, protocol::RES_OK, b"PONG");
             }
             protocol::OP_QUIT => return true,
-            protocol::OP_SELECT => self.handle_select(conn, payload, st),
-            protocol::OP_BEGIN => self.handle_begin(conn, payload, st),
-            protocol::OP_COMMIT => self.handle_commit(conn, st),
-            protocol::OP_ABORT => self.handle_abort(conn, st),
-            protocol::OP_GET => self.handle_get(conn, payload, st),
-            protocol::OP_SET => self.handle_set(conn, payload, st),
-            protocol::OP_DEL => self.handle_del(conn, payload, st),
-            protocol::OP_STAT => self.handle_stat(conn, st),
+            protocol::OP_SELECT => self.handle_select(out, payload, st),
+            protocol::OP_BEGIN => self.handle_begin(out, payload, st),
+            protocol::OP_COMMIT => self.handle_commit(out, st),
+            protocol::OP_ABORT => self.handle_abort(out, st),
+            protocol::OP_GET => self.handle_get(out, payload, st),
+            protocol::OP_SET => self.handle_set(out, payload, st),
+            protocol::OP_DEL => self.handle_del(out, payload, st),
+            protocol::OP_STAT => self.handle_stat(out, st),
             protocol::OP_REPL_HELLO => {
-                replication::handle_replica_connection(self, conn, payload, st);
+                let _ = out.drain_to(stream);
+                replication::handle_replica_connection(self, stream, payload, st);
                 return true;
             }
             _ => {
-                let _ = write_binary_response(conn, protocol::RES_ERR, b"Unknown OpCode");
+                let _ = write_binary_response(out, protocol::RES_ERR, b"Unknown OpCode");
             }
         }
         false
     }
 
-    fn handle_select(&self, conn: &mut ServerConn, payload: &[u8], st: &mut ConnState) {
+    fn handle_select(&self, out: &mut ResponseBuffer, payload: &[u8], st: &mut ConnState) {
         let name = String::from_utf8_lossy(payload);
         if let Some(db) = self.stores.get(name.as_ref()) {
             self.track_conn(&st.db_name, -1);
             st.db_name = name.into_owned();
             st.db = Arc::clone(db);
             self.track_conn(&st.db_name, 1);
-            let _ = write_binary_response(conn, protocol::RES_OK, &[]);
+            let _ = write_binary_response(out, protocol::RES_OK, &[]);
         } else {
-            let _ = write_binary_response(conn, protocol::RES_ERR, b"Database not found");
+            let _ = write_binary_response(out, protocol::RES_ERR, b"Database not found");
         }
     }
 
-    fn handle_begin(&self, conn: &mut ServerConn, payload: &[u8], st: &mut ConnState) {
+    fn handle_begin(&self, out: &mut ResponseBuffer, payload: &[u8], st: &mut ConnState) {
         let state = st.db.get_state();
         if state != STATE_PRIMARY && state != STATE_REPLICA {
             let _ = write_binary_response(
-                conn,
+                out,
                 protocol::RES_ERR,
                 b"Database not available for transactions",
             );
             return;
         }
         if st.tx.is_some() {
-            let _ = write_binary_response(conn, protocol::RES_TX_IN_PROGRESS, &[]);
+            let _ = write_binary_response(out, protocol::RES_TX_IN_PROGRESS, &[]);
             return;
         }
         let read_only = payload.first().copied() == Some(protocol::BEGIN_READ_ONLY);
         if payload.len() > 1 {
-            let _ = write_binary_response(conn, protocol::RES_ERR, b"Invalid BEGIN payload");
+            let _ = write_binary_response(out, protocol::RES_ERR, b"Invalid BEGIN payload");
             return;
         }
         let update = state == STATE_PRIMARY && !read_only;
         st.tx = Some(st.db.new_transaction(update));
         st.tx_start = Some(Instant::now());
-        let _ = write_binary_response(conn, protocol::RES_OK, &[]);
+        let _ = write_binary_response(out, protocol::RES_OK, &[]);
     }
 
-    fn handle_commit(&self, conn: &mut ServerConn, st: &mut ConnState) {
+    fn handle_commit(&self, out: &mut ResponseBuffer, st: &mut ConnState) {
         let Some(mut tx) = st.tx.take() else {
-            let _ = write_binary_response(conn, protocol::RES_TX_REQUIRED, &[]);
+            let _ = write_binary_response(out, protocol::RES_TX_REQUIRED, &[]);
             return;
         };
         if !self.dev_mode {
             if let Some(start) = st.tx_start {
                 if start.elapsed() > protocol::MAX_TX_DURATION {
                     let _ = write_binary_response(
-                        conn,
+                        out,
                         protocol::RES_TX_TIMEOUT,
                         b"Transaction exceeded 5s limit",
                     );
@@ -500,86 +540,86 @@ impl Server {
                 if st.db.min_replicas() > 0 {
                     let off = st.db.durable_offset();
                     if let Err(e) = st.db.wait_for_quorum(off, Duration::ZERO, None) {
-                        let _ = write_binary_response(conn, protocol::RES_SERVER_BUSY, e.to_string().as_bytes());
+                        let _ = write_binary_response(out, protocol::RES_SERVER_BUSY, e.to_string().as_bytes());
                         return;
                     }
                 }
-                let _ = write_binary_response(conn, protocol::RES_OK, &[]);
+                let _ = write_binary_response(out, protocol::RES_OK, &[]);
             }
             Err(EngineError::WriteConflict) => {
-                let _ = write_binary_response(conn, protocol::RES_TX_CONFLICT, b"write conflict detected");
+                let _ = write_binary_response(out, protocol::RES_TX_CONFLICT, b"write conflict detected");
             }
             Err(EngineError::DiskFull) => {
-                let _ = write_binary_response(conn, protocol::RES_SERVER_BUSY, b"ERR disk is full");
+                let _ = write_binary_response(out, protocol::RES_SERVER_BUSY, b"ERR disk is full");
             }
             Err(e) => {
-                let _ = write_binary_response(conn, protocol::RES_ERR, e.to_string().as_bytes());
+                let _ = write_binary_response(out, protocol::RES_ERR, e.to_string().as_bytes());
             }
         }
     }
 
-    fn handle_abort(&self, conn: &mut ServerConn, st: &mut ConnState) {
+    fn handle_abort(&self, out: &mut ResponseBuffer, st: &mut ConnState) {
         if let Some(mut tx) = st.tx.take() {
             tx.discard();
         }
         st.tx_start = None;
-        let _ = write_binary_response(conn, protocol::RES_OK, &[]);
+        let _ = write_binary_response(out, protocol::RES_OK, &[]);
     }
 
-    fn handle_get(&self, conn: &mut ServerConn, payload: &[u8], st: &mut ConnState) {
+    fn handle_get(&self, out: &mut ResponseBuffer, payload: &[u8], st: &mut ConnState) {
         let Some(tx) = st.tx.as_mut() else {
-            let _ = write_binary_response(conn, protocol::RES_TX_REQUIRED, &[]);
+            let _ = write_binary_response(out, protocol::RES_TX_REQUIRED, &[]);
             return;
         };
         if st.db.get_state() == STATE_UNDEFINED {
-            let _ = write_binary_response(conn, protocol::RES_ERR, b"Database undefined (no reads)");
+            let _ = write_binary_response(out, protocol::RES_ERR, b"Database undefined (no reads)");
             return;
         }
         let key = String::from_utf8_lossy(payload);
         if !protocol::is_ascii(&key) {
-            let _ = write_binary_response(conn, protocol::RES_ERR, b"Key must be ASCII");
+            let _ = write_binary_response(out, protocol::RES_ERR, b"Key must be ASCII");
             return;
         }
         match tx.get(payload) {
             Ok(val) => {
-                let _ = write_binary_response(conn, protocol::RES_OK, &val);
+                let _ = write_binary_response(out, protocol::RES_OK, &val);
             }
             Err(EngineError::KeyNotFound) => {
-                let _ = write_binary_response(conn, protocol::RES_NOT_FOUND, &[]);
+                let _ = write_binary_response(out, protocol::RES_NOT_FOUND, &[]);
             }
             Err(EngineError::WriteConflict) => {
-                let _ = write_binary_response(conn, protocol::RES_TX_CONFLICT, b"write conflict detected");
+                let _ = write_binary_response(out, protocol::RES_TX_CONFLICT, b"write conflict detected");
             }
             Err(e) => {
-                let _ = write_binary_response(conn, protocol::RES_ERR, e.to_string().as_bytes());
+                let _ = write_binary_response(out, protocol::RES_ERR, e.to_string().as_bytes());
             }
         }
     }
 
-    fn handle_set(&self, conn: &mut ServerConn, payload: &[u8], st: &mut ConnState) {
+    fn handle_set(&self, out: &mut ResponseBuffer, payload: &[u8], st: &mut ConnState) {
         let state = st.db.get_state();
         if state != STATE_PRIMARY && state != STATE_STEPPING_DOWN {
-            let _ = write_binary_response(conn, protocol::RES_ERR, b"Read-only/Undefined state");
+            let _ = write_binary_response(out, protocol::RES_ERR, b"Read-only/Undefined state");
             return;
         }
         let Some(tx) = st.tx.as_mut() else {
-            let _ = write_binary_response(conn, protocol::RES_TX_REQUIRED, &[]);
+            let _ = write_binary_response(out, protocol::RES_TX_REQUIRED, &[]);
             return;
         };
         if payload.len() < 4 {
-            let _ = write_binary_response(conn, protocol::RES_ERR, &[]);
+            let _ = write_binary_response(out, protocol::RES_ERR, &[]);
             return;
         }
         let k_len = u32::from_be_bytes(payload[0..4].try_into().unwrap()) as usize;
         if payload.len() < 4 + k_len {
-            let _ = write_binary_response(conn, protocol::RES_ERR, b"Invalid payload size");
+            let _ = write_binary_response(out, protocol::RES_ERR, b"Invalid payload size");
             return;
         }
         let key = &payload[4..4 + k_len];
         let val = &payload[4 + k_len..];
         if val.len() as u64 > protocol::MAX_VALUE_SIZE {
             let _ = write_binary_response(
-                conn,
+                out,
                 protocol::RES_ENTITY_TOO_LARGE,
                 b"Value size exceeds 64KB limit",
             );
@@ -587,28 +627,28 @@ impl Server {
         }
         let key_str = String::from_utf8_lossy(key);
         if !protocol::is_ascii(&key_str) {
-            let _ = write_binary_response(conn, protocol::RES_ERR, b"Key must be ASCII");
+            let _ = write_binary_response(out, protocol::RES_ERR, b"Key must be ASCII");
             return;
         }
         match tx.put(key, val) {
             Ok(()) => {
-                let _ = write_binary_response(conn, protocol::RES_OK, &[]);
+                let _ = write_binary_response(out, protocol::RES_OK, &[]);
             }
             Err(EngineError::WriteConflict) => {
-                let _ = write_binary_response(conn, protocol::RES_TX_CONFLICT, b"write conflict detected");
+                let _ = write_binary_response(out, protocol::RES_TX_CONFLICT, b"write conflict detected");
             }
             Err(e) => {
-                let _ = write_binary_response(conn, protocol::RES_ERR, e.to_string().as_bytes());
+                let _ = write_binary_response(out, protocol::RES_ERR, e.to_string().as_bytes());
             }
         }
     }
 
-    fn handle_del(&self, conn: &mut ServerConn, payload: &[u8], st: &mut ConnState) {
+    fn handle_del(&self, out: &mut ResponseBuffer, payload: &[u8], _st: &mut ConnState) {
         let _ = payload;
-        let _ = write_binary_response(conn, protocol::RES_ERR, b"DEL not fully ported");
+        let _ = write_binary_response(out, protocol::RES_ERR, b"DEL not fully ported");
     }
 
-    fn handle_stat(&self, conn: &mut ServerConn, st: &mut ConnState) {
+    fn handle_stat(&self, out: &mut ResponseBuffer, st: &mut ConnState) {
         let stats = st.db.stats();
         let conns = self.database_conns(&st.db_name);
         let body = serde_json::json!({
@@ -625,7 +665,7 @@ impl Server {
             "uptime": stats.uptime,
             "min_replicas": st.db.min_replicas(),
         });
-        let _ = write_binary_response(conn, protocol::RES_OK, &body.to_string().into_bytes());
+        let _ = write_binary_response(out, protocol::RES_OK, &body.to_string().into_bytes());
     }
 
     fn track_conn(&self, db: &str, delta: i64) {
@@ -635,6 +675,36 @@ impl Server {
 
     fn database_conns(&self, db: &str) -> i64 {
         *self.db_conns.lock().get(db).unwrap_or(&0)
+    }
+
+    fn get_payload_buffer(&self, len: usize) -> Vec<u8> {
+        if len == 0 {
+            return Vec::new();
+        }
+        if len > MAX_POOLABLE_PAYLOAD {
+            return vec![0u8; len];
+        }
+        if let Some(mut buf) = self.payload_pool.lock().pop() {
+            if buf.len() < len {
+                buf.resize(len, 0);
+            } else {
+                buf.truncate(len);
+            }
+            return buf;
+        }
+        let cap = len.max(DEFAULT_PAYLOAD_BUF);
+        vec![0u8; cap]
+    }
+
+    fn recycle_payload_buffer(&self, mut buf: Vec<u8>) {
+        if buf.capacity() > MAX_POOLABLE_PAYLOAD || buf.capacity() < 256 {
+            return;
+        }
+        buf.clear();
+        let mut pool = self.payload_pool.lock();
+        if pool.len() < PAYLOAD_POOL_CAP {
+            pool.push(buf);
+        }
     }
 
     fn register_conn(&self, db: &str, id: u64) {
