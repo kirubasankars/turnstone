@@ -1048,7 +1048,6 @@ dependencies = [
  "crc32fast",
  "parking_lot",
  "thiserror 2.0.20",
- "turnstone-mlock",
 ]
 
 [[package]]

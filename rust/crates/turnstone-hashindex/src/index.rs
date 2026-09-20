@@ -85,7 +85,7 @@ impl Index {
         Self::open(false).unwrap_or_else(|e| panic!("hashindex: {e}"))
     }
 
-    /// Like [`Self::new`] with optional mlock of shard arenas.
+    /// Like [`Self::new`] (`lock` is retained for API compatibility; ignored for map-backed shards).
     pub fn open(lock: bool) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let inner = Arc::new(IndexInner {
             max_arena_bytes: AtomicI64::new(0),

@@ -10,4 +10,3 @@ repository.workspace = true
 crc32fast.workspace = true
 thiserror.workspace = true
 parking_lot.workspace = true
-turnstone-mlock = { path = "../turnstone-mlock" }

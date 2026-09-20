@@ -3,11 +3,8 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root of this source tree.
 
-//! Sharded in-memory MVCC hash index (compatible with Go `engine/hashindex`).
+//! Sharded in-memory MVCC hash index (compatible with Go `engine/hashindex` semantics).
 
-mod arena;
-mod arena_heap;
-mod buffer_size;
 mod budget;
 mod compact;
 mod encoding;
@@ -259,16 +256,6 @@ mod tests {
     }
 
     #[test]
-    fn shard_buffer_is_heap_backed() {
-        let idx = Index::new();
-        let stats = idx.stats();
-        assert_eq!(stats.shards.len(), NUM_SHARDS);
-        for st in &stats.shards {
-            assert!(st.allocated_bytes > 0);
-        }
-    }
-
-    #[test]
     fn compact_shard_removes_key_when_filter_empty() {
         let idx = Index::new();
         let key = b"drop-me";
@@ -291,5 +278,13 @@ mod tests {
             }
         });
         assert!(!seen);
+    }
+
+    #[test]
+    fn empty_shard_reports_baseline_allocation() {
+        let idx = Index::new();
+        let st = idx.stats().shards[0];
+        assert!(st.allocated_bytes >= crate::encoding::HEADER_SIZE as u64);
+        assert_eq!(st.key_count, 0);
     }
 }

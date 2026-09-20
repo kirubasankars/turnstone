@@ -3,15 +3,11 @@
 // This source code is licensed under the MIT license found in the
 // LICENSE file in the root of this source tree.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::arena::new_shard_buffer_locked;
-use crate::encoding::{
-    read_u32, read_u64, write_u64, write_u32, write_version, HEADER_SIZE, INITIAL_SLOTS,
-    VERSION_NODE_SZ, VERSION_SIZE, HDR_TABLE_OFF_OFF,
-};
 use crate::index::Index;
-use crate::shard::Shard;
+use crate::shard::{live_bytes_for_map, Shard};
 use crate::Version;
 
 /// Per-shard arena usage report.
@@ -86,19 +82,8 @@ impl Index {
             return Err(format!("hashindex: invalid shard index {shard_index}").into());
         }
         let seg = &self.shards[shard_index as usize];
-        let res = seg.compact(filter)?;
-        Ok(ShardStats {
-            shard_index: shard_index as u32,
-            slot_count: seg
-                .with_shard_buffer(|b| Shard::slot_count_on_data(b.as_slice()))
-                .unwrap_or(0),
-            key_count: seg
-                .with_shard_buffer(|b| Shard::key_count_on_data(b.as_slice()))
-                .unwrap_or(0),
-            arena_used: res.arena_after,
-            allocated_bytes: seg.buffer_len() as u64,
-            live_bytes: res.arena_after,
-        })
+        let _res = seg.compact(filter)?;
+        Ok(seg.stats(shard_index as u32))
     }
 
     pub fn compact_all(
@@ -114,150 +99,55 @@ impl Index {
     }
 }
 
-impl Shard {
-    pub fn filtered_live_bytes(&self, filter: Option<&VersionFilter<'_>>) -> (u64, u64, u32) {
-        let st = self.state.read();
-        let Some(ref buf) = st.buf else {
-            return (0, 0, 0);
-        };
-        if buf.is_closed() {
-            return (0, 0, 0);
-        }
-        let data = buf.as_slice();
-        let arena_used = Shard::arena_used_on_data(data);
-        let key_count = Shard::key_count_on_data(data);
-        let live_bytes = if key_count > 0 {
-            self.live_bytes_locked(data, filter)
-        } else {
-            0
-        };
-        (arena_used, live_bytes, key_count)
-    }
-}
-
 pub(crate) fn compact_shard(
     shard: &Shard,
     filter: Option<&VersionFilter<'_>>,
 ) -> Result<CompactResult, Box<dyn std::error::Error + Send + Sync>> {
-    let mut st = shard.state.write();
-    let buf = st.buf.as_mut().ok_or("hashindex: shard is closed")?;
-    if buf.is_closed() {
-        return Err("hashindex: shard is closed".into());
-    }
-
     shard.parent().set_enforce_limit(false);
     let _restore = RestoreEnforce(Arc::clone(shard.parent()));
 
+    let mut st = shard.state.write();
+    if st.closed {
+        return Err("hashindex: shard is closed".into());
+    }
+
     let res_before = CompactResult {
-        arena_before: Shard::arena_used_on_data(buf.as_slice()),
-        keys_before: Shard::key_count_on_data(buf.as_slice()),
+        arena_before: live_bytes_for_map(&st.keys),
+        keys_before: st.keys.len() as u32,
         arena_after: 0,
         keys_after: 0,
     };
 
-    struct CompactEntry {
-        rec_off: u64,
-        versions: Vec<Version>,
-    }
-
-    let old_data = buf.as_slice();
-    let keys_before_count = res_before.keys_before.max(1) as usize;
-    let mut entries: Vec<CompactEntry> = Vec::with_capacity(keys_before_count);
-    {
-        let slots = Shard::slot_count_on_data(old_data);
-        let table = read_u64(old_data, HDR_TABLE_OFF_OFF) as usize;
-        for slot in 0..slots {
-            let rec_off = read_u64(old_data, table + slot as usize * 8);
-            if rec_off == 0 {
-                continue;
-            }
-            let key = Shard::key_bytes(old_data, rec_off);
-            let chain = shard.read_chain_locked(old_data, rec_off);
-            let versions = if let Some(f) = filter {
-                f(key, &chain)
-            } else {
-                chain
-            };
-            if versions.is_empty() {
-                continue;
-            }
-            entries.push(CompactEntry { rec_off, versions });
+    let mut next: HashMap<Vec<u8>, Vec<Version>> = HashMap::new();
+    for (key, chain) in st.keys.drain() {
+        let versions = if let Some(f) = filter {
+            f(&key, &chain)
+        } else {
+            chain
+        };
+        if !versions.is_empty() {
+            next.insert(key, versions);
         }
     }
 
-    let mut slot_count = Shard::slot_count_on_data(buf.as_slice());
-    if slot_count == 0 {
-        slot_count = INITIAL_SLOTS;
-    }
-    let table_bytes = u64::from(slot_count) * 8;
-    let mut live_bytes = 0u64;
-    for e in &entries {
-        let key_len = Shard::key_bytes(old_data, e.rec_off).len();
-        live_bytes += (12 + key_len) as u64 + (e.versions.len() as u64) * VERSION_NODE_SZ as u64;
-    }
-    let mut new_size =
-        HEADER_SIZE as i64 + table_bytes as i64 + live_bytes as i64 + HEADER_SIZE as i64;
-    let min_floor = HEADER_SIZE as i64 + table_bytes as i64 + HEADER_SIZE as i64;
-    if new_size < min_floor {
-        new_size = min_floor;
-    }
-
-    let lock = shard.parent().mlock;
-    let mut new_buf = new_shard_buffer_locked(new_size, lock)?;
-    Shard::init_header_on_buf(&mut new_buf, slot_count);
-    let table_off = HEADER_SIZE as u64;
-    let arena_off = table_off + table_bytes;
-
-    for e in &entries {
-        let key = Shard::key_bytes(old_data, e.rec_off);
-        let rec_size = 12 + key.len();
-        let rec_off = arena_off + Shard::arena_used_on_data(new_buf.as_slice());
-        if rec_off as i64 + rec_size as i64 > new_buf.len() as i64 {
-            new_buf.close();
-            return Err("compact: buffer too small".into());
-        }
-        {
-            let data = new_buf.as_mut_slice();
-            write_u32(data, rec_off as usize, key.len() as u32);
-            write_u64(data, rec_off as usize + 4, 0);
-            data[rec_off as usize + 12..rec_off as usize + 12 + key.len()].copy_from_slice(key);
-            Shard::set_arena_used_on_data(data, Shard::arena_used_on_data(data) + rec_size as u64);
-        }
-
-        let mut head = 0u64;
-        for i in (0..e.versions.len()).rev() {
-            let node_off = arena_off + Shard::arena_used_on_data(new_buf.as_slice());
-            if node_off as usize + VERSION_NODE_SZ > new_buf.len() {
-                new_buf.close();
-                return Err("compact: buffer too small".into());
-            }
-            {
-                let data = new_buf.as_mut_slice();
-                write_version(data, node_off as usize, &e.versions[i]);
-                write_u64(data, node_off as usize + VERSION_SIZE, head);
-                head = node_off;
-                Shard::set_arena_used_on_data(
-                    data,
-                    Shard::arena_used_on_data(data) + VERSION_NODE_SZ as u64,
-                );
-            }
-        }
-        {
-            let data = new_buf.as_mut_slice();
-            write_u64(data, rec_off as usize + 4, head);
-        }
-
-        Shard::insert_key_slot_on_data(new_buf.as_mut_slice(), key, rec_off)?;
-    }
-
+    let before_alloc = crate::encoding::HEADER_SIZE as i64 + res_before.arena_before as i64;
+    st.keys = next;
+    let arena_after = live_bytes_for_map(&st.keys);
+    let after_alloc = crate::encoding::HEADER_SIZE as i64 + arena_after as i64;
     drop(st);
-    shard.replace_buffer(new_buf)?;
-    let st = shard.state.read();
-    let buf = st.buf.as_ref().unwrap();
+
+    let delta = after_alloc - before_alloc;
+    if delta != 0 {
+        shard
+            .parent()
+            .account_delta(delta)
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+    }
+
     Ok(CompactResult {
         arena_before: res_before.arena_before,
         keys_before: res_before.keys_before,
-        arena_after: Shard::arena_used_on_data(buf.as_slice()),
-        keys_after: Shard::key_count_on_data(buf.as_slice()),
+        arena_after,
+        keys_after: shard.state.read().keys.len() as u32,
     })
 }

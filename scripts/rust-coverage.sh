@@ -14,8 +14,8 @@ if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
   cargo install cargo-llvm-cov --locked
 fi
 
-mkdir -p "$ROOT/rust/target/llvm-cov"
-cargo llvm-cov --workspace --lcov --output-path "$ROOT/rust/target/llvm-cov/lcov.info"
+mkdir -p target/llvm-cov
+cargo llvm-cov --workspace --lcov --output-path target/llvm-cov/lcov.info
 cargo llvm-cov --workspace --summary-only
 
 echo "LCOV report: rust/target/llvm-cov/lcov.info"
