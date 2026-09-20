@@ -24,7 +24,7 @@ fn bench_opts() -> Options {
     }
 }
 
-fn open_db(path: &std::path::Path) -> Db {
+fn open_db(path: &std::path::Path) -> Arc<Db> {
     Db::open(path, bench_opts()).expect("open")
 }
 
@@ -138,13 +138,14 @@ fn insert_parallel(c: &mut Criterion) {
     let val = b"benchmark_value_data_1234567890";
     c.bench_function("db_insert_parallel", |b| {
         let dir = tempfile::tempdir().expect("tempdir");
-        let db = Arc::new(open_db(dir.path()));
-        let seq = AtomicU64::new(0);
+        let db = open_db(dir.path());
+        let seq = Arc::new(AtomicU64::new(0));
         b.iter(|| {
             std::thread::scope(|scope| {
                 for _ in 0..4 {
                     let db = Arc::clone(&db);
-                    scope.spawn(|| {
+                    let seq = Arc::clone(&seq);
+                    scope.spawn(move || {
                         let n = seq.fetch_add(1, Ordering::Relaxed);
                         let key = format!("p-ins-{n}");
                         let mut tx = db.new_transaction(true);
@@ -155,7 +156,7 @@ fn insert_parallel(c: &mut Criterion) {
             });
             black_box(());
         });
-        Arc::try_unwrap(db).unwrap_or_else(|_| panic!("db still shared")).close().expect("close");
+        db.close().expect("close");
     });
 }
 
@@ -169,7 +170,7 @@ fn group(c: &mut Criterion) {
 
 criterion_group! {
     name = engine_benches;
-    config = Criterion::default().sample_size(50);
+    config = Criterion::default().sample_size(20);
     targets = group
 }
 criterion_main!(engine_benches);
