@@ -4,7 +4,7 @@
 // LICENSE file in the root of this source tree.
 
 use turnstone_engine::EngineError;
-use turnstone_protocol::{self as protocol, KeyNotFound};
+use turnstone_protocol as protocol;
 
 use crate::{Database, DatabaseError, STATE_PRIMARY, STATE_STEPPING_DOWN};
 
@@ -36,19 +36,20 @@ impl Database {
     pub fn get(&self, key: &str) -> Result<Vec<u8>, KvError> {
         let db = self.engine.read();
         let mut tx = db.new_transaction(false);
-        let val = tx.get(key.as_bytes()).map_err(|e| match e {
-            EngineError::KeyNotFound => KvError::Engine(e),
-            _ => KvError::Engine(e),
-        })?;
-        tx.discard();
-        Ok(val)
-    }
-
-    pub fn get_protocol(&self, key: &str) -> Result<Vec<u8>, KeyNotFound> {
-        self.get(key).map_err(|e| match e {
-            KvError::Engine(EngineError::KeyNotFound) => KeyNotFound,
-            _ => KeyNotFound,
-        })
+        match tx.get(key.as_bytes()) {
+            Ok(val) => {
+                tx.discard();
+                Ok(val)
+            }
+            Err(EngineError::KeyNotFound) => {
+                tx.discard();
+                Err(KvError::Engine(EngineError::KeyNotFound))
+            }
+            Err(e) => {
+                tx.discard();
+                Err(KvError::Engine(e))
+            }
+        }
     }
 
     pub fn set(&self, key: &str, value: &[u8]) -> Result<(), KvError> {

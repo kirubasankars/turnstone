@@ -13,7 +13,7 @@ mod wire;
 pub use limits::*;
 pub use opcode::*;
 pub use payload::{PayloadError, *};
-pub use wire::*;
+pub use wire::{decode_header, encode_frame, FrameHeader};
 
 /// Key missing on GET (matches Go `protocol.ErrKeyNotFound`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]

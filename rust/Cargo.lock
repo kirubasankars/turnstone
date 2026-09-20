@@ -1031,13 +1031,19 @@ dependencies = [
 name = "turnstone-repl"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
  "log",
  "parking_lot",
  "rustls",
+ "rustls-pemfile",
+ "tempfile",
  "thiserror 2.0.20",
  "turnstone-client",
+ "turnstone-config",
  "turnstone-database",
+ "turnstone-engine",
  "turnstone-protocol",
+ "turnstone-tls",
 ]
 
 [[package]]
