@@ -141,7 +141,6 @@ enum CliSub {
 }
 
 fn main() -> ExitCode {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let cli = Cli::parse();
     match run(&cli) {
         Ok(()) => ExitCode::SUCCESS,

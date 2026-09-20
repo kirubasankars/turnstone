@@ -20,4 +20,3 @@ turnstone-repl = { path = "../turnstone-repl" }
 turnstone-server = { path = "../turnstone-server" }
 turnstone-tls = { path = "../turnstone-tls" }
 serde_json = { workspace = true }
-rustls.workspace = true

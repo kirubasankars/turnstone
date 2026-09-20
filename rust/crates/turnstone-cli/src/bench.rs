@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use rand::Rng;
 use serde_json::Value;
 use turnstone_client::Client;
+use turnstone_tls::{cert_paths, Role};
 
 use crate::bench_io::BenchConn;
 use turnstone_protocol::{
@@ -56,9 +57,13 @@ pub fn run_bench(opts: BenchOptions) -> Result<(), String> {
     let payload: Vec<u8> = (0..opts.value_size).map(|i| (i % 251) as u8).collect();
     let soak = !opts.duration.is_zero();
 
+    let (ca, _, _) = cert_paths(&opts.home, Role::Client);
+    let transport = if ca.exists() { "mTLS" } else { "plain TCP" };
+
     println!("--- TurnstoneDB Benchmark (Rust client) ---");
     println!("Server:       {}", opts.addr);
     println!("Home:         {}", opts.home.display());
+    println!("Transport:    {transport}");
     println!("Database:     {}", opts.db);
     println!("Concurrency:  {} clients", opts.concurrency);
     if soak {
