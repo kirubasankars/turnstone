@@ -9,7 +9,7 @@ Rust port of [TurnstoneDB](../README.md). The Go tree remains in-repo for compar
 | Wire protocol | `turnstone-protocol` | Opcode/framing parity |
 | mTLS | `turnstone-tls` | Client + server cert loading |
 | Hash index | `turnstone-hashindex` | Mmap/heaps, compact, budget |
-| Engine | `turnstone-engine` | WAL, MVCC `Db`, transactions; no group-commit batching yet |
+| Engine | `turnstone-engine` | WAL, MVCC `Db`, group commit, shared buffer pool, index GC, WAL copy-forward/retention |
 | Database layer | `turnstone-database` | Roles, slots, quorum, retention hooks |
 | Replication | `turnstone-repl` | Outbound follower sync |
 | Server | `turnstone-server` | mTLS accept, KV + tx + partial admin/repl |
