@@ -1,0 +1,16 @@
+[package]
+name = "turnstone-cli"
+description = "TurnstoneDB Rust CLI (early port)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "turnstone-rs"
+path = "src/main.rs"
+
+[dependencies]
+turnstone-client = { path = "../turnstone-client" }
+turnstone-tls = { path = "../turnstone-tls" }
+clap.workspace = true

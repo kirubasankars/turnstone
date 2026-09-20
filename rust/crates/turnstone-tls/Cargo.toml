@@ -1,0 +1,12 @@
+[package]
+name = "turnstone-tls"
+description = "mTLS helpers for Turnstone home directories"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rustls.workspace = true
+rustls-pemfile.workspace = true
+thiserror.workspace = true

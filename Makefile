@@ -7,6 +7,14 @@ build:
 	mkdir -p ./bin
 	go build -o bin/turnstone ./cmd/turnstone
 
+build-rust:
+	cd rust && cargo build --release
+	mkdir -p ./bin
+	cp rust/target/release/turnstone-rs ./bin/turnstone-rs
+
+test-rust:
+	cd rust && cargo test
+
 clean:
 	rm -rf ./bin
 

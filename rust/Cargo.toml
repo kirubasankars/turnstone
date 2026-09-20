@@ -1,0 +1,27 @@
+# Copyright (c) 2026 Kiruba Sankar Swaminathan
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root of this source tree.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/turnstone-protocol",
+    "crates/turnstone-engine",
+    "crates/turnstone-tls",
+    "crates/turnstone-client",
+    "crates/turnstone-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/kirubasankars/turnstone"
+
+[workspace.dependencies]
+thiserror = "2.0"
+crc32fast = "1.4"
+rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
+rustls-pemfile = "2.2"
+clap = { version = "4.5", features = ["derive"] }

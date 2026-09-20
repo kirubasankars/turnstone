@@ -45,6 +45,39 @@ jobs:
       - name: Test (race detector, all packages)
         run: go test -race -count=1 ./...
 
+  rust:
+    name: Rust workspace
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Rust fmt
+        run: cargo fmt --manifest-path rust/Cargo.toml --all -- --check
+
+      - name: Rust unit tests
+        run: cargo test --manifest-path rust/Cargo.toml
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Wire-compat smoke (Rust client vs Go server)
+        run: |
+          go build -o bin/turnstone ./cmd/turnstone
+          rm -rf /tmp/tsdata-rust-ci
+          ./bin/turnstone init --home /tmp/tsdata-rust-ci --ip 127.0.0.1
+          ./bin/turnstone server --home /tmp/tsdata-rust-ci --dev &
+          srv_pid=$!
+          trap 'kill $srv_pid 2>/dev/null || true' EXIT
+          sleep 2
+          cargo build --release --manifest-path rust/Cargo.toml
+          ./rust/target/release/turnstone-rs --home /tmp/tsdata-rust-ci ping
+          ./rust/target/release/turnstone-rs --home /tmp/tsdata-rust-ci smoke rust-ci-key ok
+
   ui:
     name: Console UI (Playwright)
     runs-on: ubuntu-latest

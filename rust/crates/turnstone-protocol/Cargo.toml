@@ -1,0 +1,10 @@
+[package]
+name = "turnstone-protocol"
+description = "TurnstoneDB wire protocol constants and framing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true

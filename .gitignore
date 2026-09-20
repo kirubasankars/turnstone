@@ -6,6 +6,9 @@
 bin
 *.log
 
+# Rust workspace
+/rust/target/
+
 # Console UI e2e
 console/e2e/node_modules/
 console/e2e/.testdata/

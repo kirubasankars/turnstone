@@ -54,7 +54,7 @@ On Unix the hash index lives in anonymous mmap arenas (heap fallback elsewhere) 
 
 ## Quick start
 
-**Prerequisites:** Go 1.26+ (see `go.mod`)
+**Prerequisites:** Go 1.26+ (see `go.mod`). An in-progress **Rust** client and shared crates live under [`rust/`](rust/README.md) (`make build-rust`).
 
 ```bash
 git clone https://github.com/kirubasankars/turnstone.git

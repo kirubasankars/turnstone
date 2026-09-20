@@ -1,0 +1,11 @@
+[package]
+name = "turnstone-engine"
+description = "TurnstoneDB storage engine types and WAL record encoding"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+crc32fast.workspace = true
+thiserror.workspace = true
