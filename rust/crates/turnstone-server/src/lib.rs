@@ -175,9 +175,14 @@ impl Server {
     }
 
     pub fn run(self: &Arc<Self>) -> io::Result<()> {
-        let listener = TcpListener::bind(&self.addr)?;
-        listener.set_nonblocking(false)?;
-        *self.listener.lock() = Some(listener);
+        {
+            let mut guard = self.listener.lock();
+            if guard.is_none() {
+                let listener = TcpListener::bind(&self.addr)?;
+                listener.set_nonblocking(false)?;
+                *guard = Some(listener);
+            }
+        }
         if let Some(rm) = &self.repl_manager {
             rm.start();
         }
@@ -185,7 +190,12 @@ impl Server {
             if self.closing.load(Ordering::Acquire) {
                 return Ok(());
             }
-            let (tcp, _) = self.listener.lock().as_ref().unwrap().accept()?;
+            let (tcp, _) = {
+                let guard = self.listener.lock();
+                let ln = guard.as_ref().unwrap().try_clone().map_err(io::Error::other)?;
+                drop(guard);
+                ln.accept()?
+            };
             if !self.sem.acquire() {
                 let _ = reject_busy(tcp, &self.tls_config.read());
                 continue;
@@ -202,14 +212,10 @@ impl Server {
 
     fn handle_connection(self: &Arc<Self>, tcp: TcpStream) {
         let cfg = self.tls_config.read().clone();
-        let Ok(mut tls) = ServerConnection::new(cfg) else {
+        let Ok(tls) = ServerConnection::new(cfg) else {
             return;
         };
         let mut stream = StreamOwned::new(tls, tcp);
-        if stream.flush().is_err() {
-            return;
-        }
-        let (role, client_id) = peer_identity(&mut stream);
         let default_db = self.default_db.clone();
         let db = self.stores.get(&default_db).cloned().unwrap();
         let mut state = ConnState {
@@ -217,8 +223,8 @@ impl Server {
             db,
             tx: None,
             tx_start: None,
-            role,
-            client_id,
+            role: ROLE_CLIENT.to_string(),
+            client_id: "unknown".to_string(),
         };
         self.track_conn(&state.db_name, 1);
         let conn_id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
@@ -236,6 +242,11 @@ impl Server {
             let _ = stream.get_mut().set_read_timeout(Some(protocol::IDLE_TIMEOUT));
             if read_full(&mut stream, &mut header).is_err() {
                 break;
+            }
+            if state.client_id == "unknown" {
+                let (role, client_id) = peer_identity(&mut stream);
+                state.role = role;
+                state.client_id = client_id;
             }
             let op = header[0];
             let payload_len = u32::from_be_bytes(header[1..5].try_into().unwrap()) as usize;
@@ -599,7 +610,6 @@ fn reject_busy(tcp: TcpStream, cfg: &Arc<rustls::ServerConfig>) -> io::Result<()
         return Ok(());
     };
     let mut stream = StreamOwned::new(conn, tcp);
-    let _ = stream.flush();
     let _ = write_binary_response(&mut stream, protocol::RES_SERVER_BUSY, b"Max connections");
     Ok(())
 }

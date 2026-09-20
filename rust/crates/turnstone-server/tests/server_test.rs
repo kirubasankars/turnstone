@@ -77,7 +77,6 @@ fn server_lifecycle_and_ping() {
     });
     thread::sleep(Duration::from_millis(200));
     let addr = srv.addr().expect("listening").to_string();
-
     let client = Client::from_mtls_files(
         &addr,
         _dir.path().join("certs/ca.crt"),
