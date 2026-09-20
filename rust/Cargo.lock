@@ -1300,6 +1300,7 @@ dependencies = [
  "serde_json",
  "turnstone-backup",
  "turnstone-client",
+ "turnstone-protocol",
  "turnstone-tls",
 ]
 

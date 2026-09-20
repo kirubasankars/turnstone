@@ -119,7 +119,7 @@ Flag reference: **[docs/cli.md](docs/cli.md)**
 | `turnstone init` | Create home directory, TLS certs, and `turnstone.json` |
 | `turnstone server` | Run the database (`--dev` adds the Console) |
 | `turnstone cli` | Interactive REPL or `cli exec <command>` |
-| `turnstone bench` | Load test (`--ops` or `--duration`) |
+| `turnstone bench` | Load test (`--ops` or `--duration`, optional `--depth` pipeline) |
 | `turnstone backup` | Stream a physical WAL backup from a primary |
 | `turnstone restore` | Restore a backup chain into a new home directory |
 
@@ -146,6 +146,7 @@ Data commands need a transaction. `cli exec` uses a fresh connection, so run `be
 ./bin/turnstone cli exec ping
 ./bin/turnstone cli --admin exec promote
 ./bin/turnstone bench --home tsdata --ops 10000 --concurrency 50
+./bin/turnstone bench --home tsdata --ops 100000 --concurrency 50 --depth 8 --batch 4
 ./bin/turnstone bench --home tsdata --duration 30s --concurrency 50
 ```
 

@@ -80,6 +80,12 @@ enum Commands {
         read_ratio: Option<f64>,
         #[arg(long, default_value = "1")]
         batch: usize,
+        #[arg(
+            long,
+            default_value = "1",
+            help = "Pipeline depth (transactions per network round-trip)"
+        )]
+        depth: usize,
         #[arg(long, default_value = "1")]
         db: i32,
         #[arg(long, default_value = "bench")]
@@ -172,6 +178,7 @@ fn run(cli: &Cli) -> Result<(), String> {
             key_size,
             read_ratio,
             batch,
+            depth,
             db,
             prefix,
         } => run_bench(BenchOptions {
@@ -179,6 +186,7 @@ fn run(cli: &Cli) -> Result<(), String> {
             addr: addr.clone(),
             db: *db,
             concurrency: *concurrency,
+            pipeline_depth: *depth,
             ops: *ops,
             duration: Duration::from_secs(*duration_secs),
             report: Duration::from_secs(*report_secs),

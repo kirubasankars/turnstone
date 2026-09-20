@@ -3,7 +3,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use turnstone_client::{Client, ClientConfig};
+use turnstone_client::{Client, ClientConfig, PipelineResponse};
+use turnstone_protocol::{encode_frame, OP_PING};
 use turnstone_config::{generate_config_artifacts, Config};
 use turnstone_database::{open, OpenOptions, STATE_PRIMARY};
 use turnstone_repl::Manager;
@@ -114,6 +115,33 @@ fn server_set_get_in_tx() {
     let val = client.get("mykey").unwrap();
     client.commit().unwrap();
     assert_eq!(val, b"myval");
+
+    srv.close_all();
+}
+
+#[test]
+fn client_pipeline_write_then_read_responses() {
+    let (dir, _stores, srv) = setup_test_env();
+    let srv_run = Arc::clone(&srv);
+    thread::spawn(move || {
+        let _ = srv_run.run();
+    });
+    thread::sleep(Duration::from_millis(200));
+    let addr = srv.addr().expect("listening").to_string();
+
+    let client = Client::from_mtls_files(
+        &addr,
+        dir.path().join("certs/ca.crt"),
+        dir.path().join("certs/client.crt"),
+        dir.path().join("certs/client.key"),
+    )
+    .unwrap();
+
+    let mut buf = encode_frame(OP_PING, &[]);
+    buf.extend_from_slice(&encode_frame(OP_PING, &[]));
+    client.write_raw(&buf).unwrap();
+    assert_eq!(client.read_response().unwrap(), PipelineResponse::Ok);
+    assert_eq!(client.read_response().unwrap(), PipelineResponse::Ok);
 
     srv.close_all();
 }

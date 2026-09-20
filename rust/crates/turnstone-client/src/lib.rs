@@ -4,9 +4,11 @@
 // LICENSE file in the root of this source tree.
 
 mod error;
+mod pipeline;
 mod transport;
 
 pub use error::ClientError;
+pub use pipeline::PipelineResponse;
 pub use transport::{default_io_timeout, Transport};
 
 use std::sync::Arc;
@@ -90,6 +92,16 @@ impl Client {
     fn round_trip(&self, op: u8, payload: &[u8]) -> Result<Vec<u8>, ClientError> {
         let frame = protocol::encode_frame(op, payload);
         self.transport.round_trip(&frame)
+    }
+
+    /// Sends one or more concatenated request frames without reading responses.
+    pub fn write_raw(&self, data: &[u8]) -> Result<(), ClientError> {
+        self.transport.write_all(data)
+    }
+
+    /// Reads the next response frame from the server.
+    pub fn read_response(&self) -> Result<PipelineResponse, ClientError> {
+        pipeline::read_response(&self.transport)
     }
 
     pub fn ping(&self) -> Result<(), ClientError> {

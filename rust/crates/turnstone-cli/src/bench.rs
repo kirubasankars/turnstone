@@ -10,9 +10,14 @@ use std::time::{Duration, Instant};
 
 use rand::Rng;
 use serde_json::Value;
-use turnstone_client::{Client, ClientError};
+use turnstone_client::{Client, ClientError, PipelineResponse};
+use turnstone_protocol::{
+    append_header, BEGIN_READ_ONLY, OP_BEGIN, OP_COMMIT, OP_GET, OP_SET,
+};
 
 use crate::connect::{connect, ConnectOptions};
+
+const SOAK_KEY_SPACE: usize = 10_000;
 
 #[derive(Debug, Clone)]
 pub struct BenchOptions {
@@ -20,6 +25,7 @@ pub struct BenchOptions {
     pub addr: String,
     pub db: i32,
     pub concurrency: usize,
+    pub pipeline_depth: usize,
     pub ops: u64,
     pub duration: Duration,
     pub report: Duration,
@@ -31,8 +37,8 @@ pub struct BenchOptions {
 }
 
 pub fn run_bench(opts: BenchOptions) -> Result<(), String> {
-    if opts.concurrency == 0 || opts.batch == 0 {
-        return Err("concurrency and batch must be > 0".into());
+    if opts.concurrency == 0 || opts.batch == 0 || opts.pipeline_depth == 0 {
+        return Err("concurrency, depth, and batch must be > 0".into());
     }
     if opts.duration.is_zero() && opts.ops == 0 {
         return Err("set --ops > 0 or --duration".into());
@@ -58,6 +64,7 @@ pub fn run_bench(opts: BenchOptions) -> Result<(), String> {
     } else {
         println!("Total Ops:    {}", opts.ops);
     }
+    println!("Pipeline:     {} tx/batch (inflight)", opts.pipeline_depth);
     println!("Batch Size:   {} ops/tx", opts.batch);
     println!("Payload:      {} bytes", opts.value_size);
     println!("Key Prefix:   {}", opts.prefix);
@@ -75,12 +82,19 @@ pub fn run_bench(opts: BenchOptions) -> Result<(), String> {
     if soak {
         run_duration(&opts, &payload)?;
     } else if let Some(ratio) = opts.read_ratio {
-        run_phase(&opts, &payload, ratio, "MIXED")?;
+        run_phase(&opts, &payload, PhaseKind::Mixed(ratio), "MIXED")?;
     } else {
-        run_phase(&opts, &payload, 0.0, "WRITE")?;
-        run_phase(&opts, &payload, 1.0, "READ ")?;
+        run_phase(&opts, &payload, PhaseKind::Write, "WRITE")?;
+        run_phase(&opts, &payload, PhaseKind::Read, "READ ")?;
     }
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum PhaseKind {
+    Write,
+    Read,
+    Mixed(f64),
 }
 
 fn bench_preflight(opts: &BenchOptions) -> Result<(), String> {
@@ -115,7 +129,7 @@ fn connect_opts(opts: &BenchOptions) -> ConnectOptions {
 fn run_phase(
     opts: &BenchOptions,
     payload: &[u8],
-    read_pct: f64,
+    phase: PhaseKind,
     label: &str,
 ) -> Result<(), String> {
     println!("Starting {label} phase...");
@@ -124,6 +138,8 @@ fn run_phase(
     let start = Instant::now();
     let ops_total = opts.ops;
     let concurrency = opts.concurrency;
+    let depth = opts.pipeline_depth;
+    let batch = opts.batch;
 
     let mut handles = Vec::new();
     for worker in 0..concurrency {
@@ -133,7 +149,6 @@ fn run_phase(
         let failed_c = Arc::clone(&failed);
         let conn_opts = connect_opts(opts);
         let prefix = opts.prefix.clone();
-        let batch = opts.batch;
         let key_size = opts.key_size;
         let db = opts.db;
         let payload = payload.to_vec();
@@ -152,36 +167,44 @@ fn run_phase(
                 failed_c.fetch_add(ops, Ordering::Relaxed);
                 return;
             }
+
+            let txs_per_client = (ops / batch as u64).max(if ops > 0 { 1 } else { 0 });
+            let batches_of_pipeline =
+                (txs_per_client / depth as u64).max(if txs_per_client > 0 { 1 } else { 0 });
+
+            let est_op_size = 20 + payload.len() + key_size;
+            let mut write_buf = Vec::with_capacity(depth * (40 + batch * est_op_size));
             let mut rng = rand::thread_rng();
-            let mut done = 0u64;
-            while done < ops {
-                let n = batch.min((ops - done) as usize);
-                let read_tx = rng.gen::<f64>() < read_pct;
-                let res = if read_tx {
-                    run_read_batch(&client, &prefix, key_size, worker, done as usize, n, &mut rng)
-                } else {
-                    run_write_batch(
-                        &client,
-                        &prefix,
-                        key_size,
+            let mut tx_count = 0u64;
+
+            for _ in 0..batches_of_pipeline {
+                write_buf.clear();
+                for _ in 0..depth {
+                    append_workload_transaction(
+                        &mut write_buf,
+                        phase,
                         worker,
-                        done as usize,
-                        n,
+                        ops,
+                        tx_count,
+                        batch,
+                        key_size,
+                        &prefix,
                         &payload,
-                    )
-                };
-                match res {
-                    Ok(k) => {
-                        completed_c.fetch_add(k as u64, Ordering::Relaxed);
-                        done += k as u64;
+                        &mut rng,
+                    );
+                    tx_count += 1;
+                }
+                let ops_in_batch = (depth * batch) as u64;
+                match flush_pipeline(&client, &write_buf, depth, batch) {
+                    PipelineFlushOutcome::Success => {
+                        completed_c.fetch_add(ops_in_batch, Ordering::Relaxed);
                     }
-                    Err(ClientError::NotFound) => {
-                        completed_c.fetch_add(n as u64, Ordering::Relaxed);
-                        done += n as u64;
+                    PipelineFlushOutcome::BatchFailed => {
+                        failed_c.fetch_add(ops_in_batch, Ordering::Relaxed);
                     }
-                    Err(_) => {
-                        failed_c.fetch_add(n as u64, Ordering::Relaxed);
-                        done += n as u64;
+                    PipelineFlushOutcome::IoError => {
+                        failed_c.fetch_add(ops_in_batch, Ordering::Relaxed);
+                        return;
                     }
                 }
             }
@@ -209,6 +232,8 @@ fn run_duration(opts: &BenchOptions, payload: &[u8]) -> Result<(), String> {
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let start = Instant::now();
     let deadline = start + opts.duration;
+    let depth = opts.pipeline_depth;
+    let batch = opts.batch;
 
     let mut handles = Vec::new();
     for worker in 0..opts.concurrency {
@@ -217,7 +242,6 @@ fn run_duration(opts: &BenchOptions, payload: &[u8]) -> Result<(), String> {
         let stop_c = Arc::clone(&stop);
         let conn_opts = connect_opts(opts);
         let prefix = opts.prefix.clone();
-        let batch = opts.batch;
         let key_size = opts.key_size;
         let db = opts.db;
         let payload = payload.to_vec();
@@ -229,34 +253,35 @@ fn run_duration(opts: &BenchOptions, payload: &[u8]) -> Result<(), String> {
             if client.select_db(&db.to_string()).is_err() {
                 return;
             }
+            let est_op_size = 20 + payload.len() + key_size;
+            let mut write_buf = Vec::with_capacity(depth * (40 + batch * est_op_size));
             let mut rng = rand::thread_rng();
-            let mut seq = 0usize;
-            while !stop_c.load(Ordering::Relaxed) {
-                let read_tx = rng.gen::<f64>() < read_pct;
-                let res = if read_tx {
-                    run_read_batch(&client, &prefix, key_size, worker, seq, batch, &mut rng)
-                } else {
-                    run_write_batch(
-                        &client,
-                        &prefix,
-                        key_size,
+            let mut write_seq = 0usize;
+
+            while !stop_c.load(Ordering::Relaxed) && Instant::now() < deadline {
+                write_buf.clear();
+                for _ in 0..depth {
+                    append_soak_transaction(
+                        &mut write_buf,
+                        read_pct,
                         worker,
-                        seq,
                         batch,
+                        key_size,
+                        &prefix,
                         &payload,
-                    )
-                };
-                seq += batch;
-                match res {
-                    Ok(k) => {
-                        completed_c.fetch_add(k as u64, Ordering::Relaxed);
+                        &mut write_seq,
+                        &mut rng,
+                    );
+                }
+                let ops_in_batch = (depth * batch) as u64;
+                match flush_pipeline(&client, &write_buf, depth, batch) {
+                    PipelineFlushOutcome::Success => {
+                        completed_c.fetch_add(ops_in_batch, Ordering::Relaxed);
                     }
-                    Err(ClientError::NotFound) => {
-                        completed_c.fetch_add(batch as u64, Ordering::Relaxed);
+                    PipelineFlushOutcome::BatchFailed => {
+                        failed_c.fetch_add(ops_in_batch, Ordering::Relaxed);
                     }
-                    Err(_) => {
-                        failed_c.fetch_add(batch as u64, Ordering::Relaxed);
-                    }
+                    PipelineFlushOutcome::IoError => return,
                 }
             }
         }));
@@ -276,49 +301,173 @@ fn run_duration(opts: &BenchOptions, payload: &[u8]) -> Result<(), String> {
     for h in handles {
         h.join().map_err(|_| "worker panicked".to_string())?;
     }
-    print_summary("SOAK", completed.load(Ordering::Relaxed), failed.load(Ordering::Relaxed), start.elapsed());
+    print_summary(
+        "SOAK",
+        completed.load(Ordering::Relaxed),
+        failed.load(Ordering::Relaxed),
+        start.elapsed(),
+    );
     Ok(())
 }
 
-fn run_write_batch(
-    client: &Client,
-    prefix: &str,
-    key_size: usize,
+fn append_workload_transaction(
+    buf: &mut Vec<u8>,
+    phase: PhaseKind,
     worker: usize,
-    base: usize,
-    n: usize,
+    num_ops: u64,
+    tx_count: u64,
+    batch: usize,
+    key_size: usize,
+    prefix: &str,
     payload: &[u8],
-) -> Result<usize, ClientError> {
-    client.begin()?;
-    for i in 0..n {
-        let key = make_key(prefix, key_size, worker, base + i);
-        client.set(&key, payload)?;
+    rng: &mut impl Rng,
+) {
+    let mut op_is_read = vec![false; batch];
+    let mut all_read = true;
+    match phase {
+        PhaseKind::Write => all_read = false,
+        PhaseKind::Read => {
+            for slot in &mut op_is_read {
+                *slot = true;
+            }
+        }
+        PhaseKind::Mixed(read_pct) => {
+            all_read = true;
+            for slot in op_is_read.iter_mut() {
+                *slot = rng.gen::<f64>() < read_pct;
+                if !*slot {
+                    all_read = false;
+                }
+            }
+        }
     }
-    client.commit()?;
-    Ok(n)
+
+    if all_read {
+        append_header(buf, OP_BEGIN, 1);
+        buf.push(BEGIN_READ_ONLY);
+    } else {
+        append_header(buf, OP_BEGIN, 0);
+    }
+
+    for k in 0..batch {
+        let key_index = match phase {
+            PhaseKind::Mixed(_) => rng.gen_range(0..num_ops as usize),
+            _ => tx_count as usize * batch + k,
+        };
+        append_op(buf, op_is_read[k], worker, key_index, key_size, prefix, payload);
+    }
+    append_header(buf, OP_COMMIT, 0);
 }
 
-fn run_read_batch(
-    client: &Client,
-    prefix: &str,
-    key_size: usize,
+fn append_soak_transaction(
+    buf: &mut Vec<u8>,
+    read_pct: f64,
     worker: usize,
-    base: usize,
-    n: usize,
+    batch: usize,
+    key_size: usize,
+    prefix: &str,
+    payload: &[u8],
+    write_seq: &mut usize,
     rng: &mut impl Rng,
-) -> Result<usize, ClientError> {
-    client.begin_read_only()?;
-    for i in 0..n {
-        let idx = if n > 1 {
-            base + rng.gen_range(0..n)
+) {
+    let mut op_is_read = vec![false; batch];
+    let mut key_index = vec![0usize; batch];
+    let mut all_read = true;
+
+    for k in 0..batch {
+        let mut is_read = rng.gen::<f64>() < read_pct;
+        if is_read && *write_seq == 0 {
+            is_read = false;
+        }
+        op_is_read[k] = is_read;
+        if is_read {
+            let mut span = *write_seq;
+            if span > SOAK_KEY_SPACE {
+                span = SOAK_KEY_SPACE;
+            }
+            key_index[k] = if span > 0 { rng.gen_range(0..span) } else { 0 };
         } else {
-            base + i
-        };
-        let key = make_key(prefix, key_size, worker, idx);
-        let _ = client.get(&key)?;
+            key_index[k] = *write_seq % SOAK_KEY_SPACE;
+            *write_seq += 1;
+            all_read = false;
+        }
     }
-    client.commit()?;
-    Ok(n)
+
+    if all_read {
+        append_header(buf, OP_BEGIN, 1);
+        buf.push(BEGIN_READ_ONLY);
+    } else {
+        append_header(buf, OP_BEGIN, 0);
+    }
+
+    for k in 0..batch {
+        append_op(
+            buf,
+            op_is_read[k],
+            worker,
+            key_index[k],
+            key_size,
+            prefix,
+            payload,
+        );
+    }
+    append_header(buf, OP_COMMIT, 0);
+}
+
+fn append_op(
+    buf: &mut Vec<u8>,
+    is_read: bool,
+    worker: usize,
+    key_index: usize,
+    key_size: usize,
+    prefix: &str,
+    payload: &[u8],
+) {
+    let key = make_key(prefix, key_size, worker, key_index);
+    let key_bytes = key.as_bytes();
+    if is_read {
+        append_header(buf, OP_GET, key_bytes.len());
+        buf.extend_from_slice(key_bytes);
+    } else {
+        let total_len = 4 + key_bytes.len() + payload.len();
+        append_header(buf, OP_SET, total_len);
+        buf.extend_from_slice(&(key_bytes.len() as u32).to_be_bytes());
+        buf.extend_from_slice(key_bytes);
+        buf.extend_from_slice(payload);
+    }
+}
+
+enum PipelineFlushOutcome {
+    Success,
+    BatchFailed,
+    IoError,
+}
+
+fn flush_pipeline(
+    client: &Client,
+    write_buf: &[u8],
+    depth: usize,
+    batch: usize,
+) -> PipelineFlushOutcome {
+    if client.write_raw(write_buf).is_err() {
+        return PipelineFlushOutcome::IoError;
+    }
+    let expected = depth * (2 + batch);
+    let mut batch_failed = false;
+    for _ in 0..expected {
+        match client.read_response() {
+            Ok(PipelineResponse::Ok) | Ok(PipelineResponse::NotFound) => {}
+            Err(ClientError::Connection(_) | ClientError::Protocol(_)) => {
+                return PipelineFlushOutcome::IoError;
+            }
+            Err(_) => batch_failed = true,
+        }
+    }
+    if batch_failed {
+        PipelineFlushOutcome::BatchFailed
+    } else {
+        PipelineFlushOutcome::Success
+    }
 }
 
 fn make_key(prefix: &str, key_size: usize, worker: usize, index: usize) -> String {

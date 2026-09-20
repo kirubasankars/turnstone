@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 turnstone-backup = { path = "../turnstone-backup" }
 turnstone-client = { path = "../turnstone-client" }
+turnstone-protocol = { path = "../turnstone-protocol" }
 turnstone-tls = { path = "../turnstone-tls" }
 clap.workspace = true
 serde_json = { workspace = true }

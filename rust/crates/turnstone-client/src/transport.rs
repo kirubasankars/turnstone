@@ -100,21 +100,36 @@ impl Transport {
     }
 
     pub fn round_trip(&self, frame: &[u8]) -> Result<Vec<u8>, ClientError> {
+        self.write_all(frame)?;
+        let (status, body) = self.read_frame()?;
+        crate::error::map_status(status, &body)?;
+        Ok(body)
+    }
+
+    /// Writes raw bytes (one or more concatenated frames) without waiting for responses.
+    pub fn write_all(&self, data: &[u8]) -> Result<(), ClientError> {
         let mut guard = self.inner.lock().unwrap();
-        let Some(mut stream) = guard.take() else {
-            return Err(ClientError::Connection("connection closed".into()));
-        };
+        let stream = guard.as_mut().ok_or_else(|| {
+            ClientError::Connection("connection closed".into())
+        })?;
+        drive_client_handshake(stream)?;
+        set_write_timeout(stream, self.write_timeout)?;
+        stream
+            .write_all(data)
+            .map_err(|e| ClientError::Connection(format!("I/O failed: {e}")))?;
+        stream
+            .flush()
+            .map_err(|e| ClientError::Connection(format!("I/O failed: {e}")))?;
+        Ok(())
+    }
 
-        let result =
-            round_trip_on_stream(&mut stream, frame, self.read_timeout, self.write_timeout);
-
-        match result {
-            Ok(body) => {
-                *guard = Some(stream);
-                Ok(body)
-            }
-            Err(e) => Err(e),
-        }
+    /// Reads one response frame (status byte + payload).
+    pub fn read_frame(&self) -> Result<(u8, Vec<u8>), ClientError> {
+        let mut guard = self.inner.lock().unwrap();
+        let stream = guard.as_mut().ok_or_else(|| {
+            ClientError::Connection("connection closed".into())
+        })?;
+        read_frame_on_stream(stream, self.read_timeout)
     }
 
     pub fn close(&self) {
@@ -137,21 +152,10 @@ fn drive_client_handshake(stream: &mut Stream) -> Result<(), ClientError> {
     Ok(())
 }
 
-fn round_trip_on_stream(
+fn read_frame_on_stream(
     stream: &mut Stream,
-    frame: &[u8],
     read_timeout: Duration,
-    write_timeout: Duration,
-) -> Result<Vec<u8>, ClientError> {
-    drive_client_handshake(stream)?;
-    set_write_timeout(stream, write_timeout)?;
-    stream
-        .write_all(frame)
-        .map_err(|e| ClientError::Connection(format!("I/O failed: {e}")))?;
-    stream
-        .flush()
-        .map_err(|e| ClientError::Connection(format!("I/O failed: {e}")))?;
-
+) -> Result<(u8, Vec<u8>), ClientError> {
     set_read_timeout(stream, read_timeout)?;
     let mut header = [0u8; turnstone_protocol::PROTO_HEADER_SIZE];
     stream
@@ -164,9 +168,7 @@ fn round_trip_on_stream(
             .read_exact(&mut body)
             .map_err(|e| ClientError::Connection(format!("I/O failed: {e}")))?;
     }
-    let status = header[0];
-    crate::error::map_status(status, &body)?;
-    Ok(body)
+    Ok((header[0], body))
 }
 
 fn set_write_timeout(stream: &mut Stream, timeout: Duration) -> Result<(), ClientError> {
