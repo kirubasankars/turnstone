@@ -1297,6 +1297,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "rand",
+ "rustls",
  "serde_json",
  "turnstone-backup",
  "turnstone-client",
